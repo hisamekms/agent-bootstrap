@@ -31,7 +31,8 @@ cat > /usr/local/bin/agent-bootstrap-postgres <<'AGENT_BOOTSTRAP_EOF'
 #!/bin/sh
 set -eu
 data=$(mktemp -d /tmp/agent-bootstrap-pg.XXXXXX)
-chown postgres:postgres "$data"
+# As root, hand the directory to postgres. As non-root the caller must already
+# be postgres (it owns the new directory), so no chown is attempted.
 as_postgres() {
   if [ "$(id -u)" = 0 ]; then
     su -s /bin/sh -c "$1" postgres
@@ -40,6 +41,9 @@ as_postgres() {
   fi
 }
 # $data is a mktemp path made of fixed characters, so it is safe to expand.
+if [ "$(id -u)" = 0 ]; then
+  chown postgres:postgres "$data"
+fi
 as_postgres "initdb -D '$data/db' -A trust -U postgres --no-instructions" >/dev/null 2>&1
 as_postgres "pg_ctl -D '$data/db' -o '-c listen_addresses=127.0.0.1 -c port=5432 -c unix_socket_directories=/run/postgresql' -w -t 60 -l '$data/log' start" >/dev/null 2>&1
 
@@ -222,9 +226,24 @@ export function BUILD_SCRIPT(name: string): string {
     // fixed contents keep rebuilds of the same inputs byte-identical.
     "printf 'localhost\\n' > /etc/hostname",
     "printf '127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n' > /etc/hosts",
+    // No backend or host DNS settings may be archived.
+    ": > /etc/resolv.conf",
     "rm -f /var/log/apk.log",
     "cd /",
-    "tar -cf /tmp/rootfs.tar $(ls -A / | grep -vxE 'proc|sys|dev|tmp|\\.msb')",
+    // Top-level entries except proc, sys, dev, tmp and .msb; unmatched globs
+    // stay literal and are skipped by the existence test.
+    "set --",
+    "for entry in .[!.]* ..?* *; do",
+    '  case "$entry" in',
+    "    proc|sys|dev|tmp|.msb) ;;",
+    "    *)",
+    '      if [ -e "$entry" ] || [ -L "$entry" ]; then set -- "$@" "$entry"; fi',
+    "      ;;",
+    "  esac",
+    "done",
+    // The backend's guest runtime directory is left out of the archive (not
+    // removed: the backend may be using it during exec).
+    'tar -cf /tmp/rootfs.tar --exclude run/microsandbox "$@"',
     "",
   ].join("\n");
 }

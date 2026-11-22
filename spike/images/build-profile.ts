@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  stat,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -16,6 +17,7 @@ import {
   recipeFor,
 } from "../../src/image-recipes.ts";
 import {
+  MAX_INPUT_BYTES,
   layoutTar,
   normalizeLayer,
   ociImage,
@@ -170,7 +172,11 @@ async function main(): Promise<void> {
     );
 
     stage = "image assembly";
-    const layer = normalizeLayer(await readFile(join(work, "rootfs.tar")));
+    const rootfsPath = join(work, "rootfs.tar");
+    if ((await stat(rootfsPath)).size > MAX_INPUT_BYTES) {
+      throw new Error("rootfs.tar exceeds the maximum input size");
+    }
+    const layer = normalizeLayer(await readFile(rootfsPath));
     const image = ociImage({
       baseConfig: base.config,
       layer,
@@ -206,10 +212,21 @@ async function main(): Promise<void> {
     stage = "lock update";
     const lockPath = join(root, PROFILE_LOCK_PATH);
     let existing: ProfileLock = { version: 1, profiles: {} };
+    let text: string | undefined;
     try {
-      existing = parseProfileLock(await readFile(lockPath, "utf8"));
+      text = await readFile(lockPath, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (text !== undefined) {
+      // The entry being rebuilt is expected to be stale. Every other entry is
+      // still validated strictly.
+      const raw = JSON.parse(text) as {
+        profiles?: Record<string, unknown>;
+      };
+      const others = { ...raw, profiles: { ...raw.profiles } };
+      delete others.profiles[profile];
+      existing = parseProfileLock(JSON.stringify(others));
     }
     const entry = lockEntry(profile, digest);
     const lock = {

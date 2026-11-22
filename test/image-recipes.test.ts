@@ -74,6 +74,23 @@ describe("image recipes", () => {
     assert.ok(script.includes("--no-network"));
     assert.ok(script.includes("agent-bootstrap-postgres"));
   });
+
+  test("build script excludes runtime state and resets DNS config", () => {
+    const script = BUILD_SCRIPT("db");
+    assert.ok(script.includes(": > /etc/resolv.conf"));
+    assert.ok(script.includes("proc|sys|dev|tmp|.msb) ;;"));
+    assert.ok(script.includes("--exclude run/microsandbox"));
+    assert.ok(!script.includes("$(ls"));
+  });
+
+  test("postgres helper chowns only in the root branch", () => {
+    const setup = (FEATURES.postgres as { setup: string }).setup;
+    const chowns = setup
+      .split("\n")
+      .filter((l) => l.includes('chown postgres:postgres "$data"'));
+    assert.equal(chowns.length, 1);
+    assert.ok(setup.includes('if [ "$(id -u)" = 0 ]; then\n  chown postgres'));
+  });
 });
 
 describe("profile lock", () => {

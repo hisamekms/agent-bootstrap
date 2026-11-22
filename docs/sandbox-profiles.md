@@ -233,7 +233,7 @@ pinned Alpine image digest. Verification was recorded under its own role,
 `Verification`, with no `provider.egress` grant.
 
 On 2026-11-22 the `db` image was built from the pinned packages. Two
-consecutive builds gave the same digest, `cc1367fd…` (46.6 MiB). Two causes
+consecutive builds gave the same digest, `45116dcf…` (after the review fixes). Two causes
 of differing digests were fixed first:
 
 - the backend writes the build VM's name into `/etc/hosts` and
@@ -242,7 +242,14 @@ of differing digests were fixed first:
   traversal order. The normalized layer now makes the smallest path the
   file.
 
-The builder also excludes the backend's runtime directory `/.msb`.
+The builder also excludes the backend's runtime directories, `/.msb` and
+`/run/microsandbox`, and writes an empty `/etc/resolv.conf`. That file had
+held the backend's internal DNS addresses.
+
+The run-time digest check was confirmed against the real backend. An image
+loaded under a wrong `@sha256:ffff…` tag is still reported by
+`msb image inspect` with its true digest, so the check compares real
+digests.
 
 `spike/images/db-verification-smoke.ts` then ran in real VMs:
 

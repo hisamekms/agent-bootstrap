@@ -2,8 +2,8 @@
   "version": 1,
   "profiles": {
     "db": {
-      "image": "localhost/agent-bootstrap/db@sha256:cc1367fd27af2876f72299abdb18d65ebc1e1b354cdd4fff40fa81b892b72850",
-      "recipeDigest": "fe2ce2c915f57866f4ad9c9d7c6932c6998be33701fbf5b00cd93007cd1b94d8",
+      "image": "localhost/agent-bootstrap/db@sha256:45116dcf1511f4e87c79d364bc89dbfb180133c8b99a5968ca6f5ccd5b3cef47",
+      "recipeDigest": "88aeb3456ed5bfb85660fc1799156c2206ffe61c1fd6c87add33425527ecfd7d",
       "memoryMiB": 1024,
       "cpus": 2
     }

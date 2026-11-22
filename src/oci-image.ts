@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
  */
 
 const BLOCK = 512;
-const MAX_INPUT_BYTES = 1024 ** 3;
+export const MAX_INPUT_BYTES = 1024 ** 3;
 const MAX_ENTRIES = 200_000;
 
 type EntryType = "0" | "1" | "2" | "3" | "4" | "5" | "6";
@@ -44,7 +44,8 @@ function cstr(block: Uint8Array, off: number, len: number): Uint8Array {
 
 function parseNumber(block: Uint8Array, off: number, len: number): number {
   if ((block[off]! & 0x80) !== 0) {
-    // GNU base-256 (positive only).
+    // GNU base-256 (positive only): a set sign bit means negative.
+    if ((block[off]! & 0x40) !== 0) fail("tar: negative numeric field");
     let value = block[off]! & 0x7f;
     for (let i = 1; i < len; i++) {
       value = value * 256 + block[off + i]!;
@@ -86,9 +87,10 @@ function parsePax(data: Uint8Array): Map<string, string> {
   while (pos < data.length) {
     let sp = pos;
     while (sp < data.length && data[sp] !== 0x20) sp++;
-    const len = Number(dec.decode(data.subarray(pos, sp)));
+    const lenText = dec.decode(data.subarray(pos, sp));
+    const len = /^[0-9]+$/.test(lenText) ? Number(lenText) : -1;
     if (
-      !Number.isInteger(len) ||
+      !Number.isSafeInteger(len) ||
       len <= sp - pos + 1 ||
       pos + len > data.length
     ) {
@@ -100,10 +102,34 @@ function parsePax(data: Uint8Array): Map<string, string> {
     while (eq < end && data[eq] !== 0x3d) eq++;
     if (eq >= end) fail("tar: malformed PAX record");
     const key = dec.decode(data.subarray(sp + 1, eq));
-    if (PAX_USED.has(key)) out.set(key, dec.decode(data.subarray(eq + 1, end)));
+    if (PAX_USED.has(key)) {
+      const value = dec.decode(data.subarray(eq + 1, end));
+      if ((key === "path" || key === "linkpath") && /[\0\n]/.test(value)) {
+        fail("tar: control character in PAX name");
+      }
+      out.set(key, value);
+    }
     pos += len;
   }
   return out;
+}
+
+/** GNU long name/link payload: one trailing NUL is the terminator; any other
+ * NUL would let the name be read differently by other tar readers. */
+function gnuName(data: Uint8Array): string {
+  const end = data.length > 0 && data[data.length - 1] === 0 ? -1 : undefined;
+  const text = dec.decode(
+    data.subarray(0, end === -1 ? data.length - 1 : undefined),
+  );
+  if (text.includes("\0")) fail("tar: NUL in GNU long name");
+  return text;
+}
+
+function strictInt(text: string | undefined): number {
+  if (text === undefined || !/^[0-9]+$/.test(text)) fail("tar: bad PAX number");
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) fail("tar: bad PAX number");
+  return value;
 }
 
 function normalizePath(raw: string): string {
@@ -133,8 +159,7 @@ function parseTar(tar: Uint8Array): TarEntry[] {
     const flag = header[156] === 0 ? "0" : String.fromCharCode(header[156]!);
     const paxSize = pax?.get("size");
     if (paxSize !== undefined && flag !== "x" && flag !== "g") {
-      size = Number(paxSize);
-      if (!Number.isSafeInteger(size) || size < 0) fail("tar: bad PAX size");
+      size = strictInt(paxSize);
     }
     const start = pos + BLOCK;
     if (start + size > tar.length) fail("tar: truncated archive");
@@ -142,11 +167,11 @@ function parseTar(tar: Uint8Array): TarEntry[] {
     pos = start + Math.ceil(size / BLOCK) * BLOCK;
 
     if (flag === "L") {
-      longName = dec.decode(cstr(data, 0, data.length));
+      longName = gnuName(data);
       continue;
     }
     if (flag === "K") {
-      longLink = dec.decode(cstr(data, 0, data.length));
+      longLink = gnuName(data);
       continue;
     }
     if (flag === "x") {
@@ -170,14 +195,11 @@ function parseTar(tar: Uint8Array): TarEntry[] {
     name = pax?.get("path") ?? longName ?? name;
     linkname = pax?.get("linkpath") ?? longLink ?? linkname;
     const uid = pax?.has("uid")
-      ? Number(pax.get("uid"))
+      ? strictInt(pax.get("uid"))
       : parseNumber(header, 108, 8);
     const gid = pax?.has("gid")
-      ? Number(pax.get("gid"))
+      ? strictInt(pax.get("gid"))
       : parseNumber(header, 116, 8);
-    if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid)) {
-      fail("tar: bad PAX ids");
-    }
     longName = longLink = pax = undefined;
 
     const path = normalizePath(name);
@@ -346,6 +368,21 @@ export function normalizeLayer(tar: Uint8Array): Uint8Array {
     const target = byName.get(e.linkname);
     if (target === undefined) fail("tar: hardlink target missing");
     if (target.type === "1") fail("tar: hardlink to hardlink");
+    if (target.type !== "0") fail("tar: hardlink target is not a regular file");
+  }
+  // Every proper ancestor of every entry must be an explicit directory entry.
+  // This keeps an extractor from writing through a symlink or file used as a
+  // parent. Absolute symlink targets are NOT rejected: Alpine's rootfs has
+  // them legitimately (e.g. /sbin/* -> /bin/busybox); a symlink can only be
+  // dangerous as a parent, which this rule already forbids. The root itself
+  // is implicit.
+  for (const e of entries) {
+    const parts = e.path.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      if (byName.get(parts.slice(0, i).join("/"))?.type !== "5") {
+        fail("tar: entry parent is not a directory entry");
+      }
+    }
   }
   // Which member of a hardlink group the archiver wrote as the file depends
   // on its traversal order. Canonicalize: the bytewise-smallest path holds

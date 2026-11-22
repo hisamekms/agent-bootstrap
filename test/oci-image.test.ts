@@ -164,6 +164,9 @@ function read(t: Uint8Array) {
 
 const sample: In[] = [
   { name: "./etc/", type: "5", mode: 0o755, mtime: 99, uname: "root" },
+  { name: "./bin/", type: "5", mode: 0o755 },
+  { name: "./dev/", type: "5", mode: 0o755 },
+  { name: "./run/", type: "5", mode: 0o755 },
   {
     name: "./etc/passwd",
     data: "root\n",
@@ -224,14 +227,16 @@ test("entries sorted and hardlinks follow their targets", () => {
 test("long names round-trip via PAX, from PAX and GNU inputs", () => {
   const long = `./${"d".repeat(60)}/${"f".repeat(80)}`;
   const target = `${"t".repeat(150)}`;
+  const dir = D(`./${"d".repeat(60)}`);
   for (const mk of [
     (): In[] => [
+      dir,
       { name: "x", pax: { path: long, linkpath: target }, type: "2" },
     ],
-    (): In[] => [{ name: long, gnuLong: true, data: "hi" }],
+    (): In[] => [dir, { name: long, gnuLong: true, data: "hi" }],
   ]) {
     const out = normalizeLayer(tar(mk()));
-    const e = read(out);
+    const e = read(out).slice(1);
     assert.equal(e.length, 1);
     assert.ok(e[0]!.pax?.includes(`path=${long.slice(2)}\n`));
     assert.ok(!e[0]!.pax?.includes("mtime"));
@@ -431,6 +436,7 @@ test("hardlink groups are canonical whichever member the archiver wrote first", 
   body.write("zone");
   const archive = (file: string, link: string) =>
     Buffer.concat([
+      header("zone/", "5", 0),
       header(file, "0", 4),
       body,
       header(link, "1", 0, file),
@@ -439,4 +445,90 @@ test("hardlink groups are canonical whichever member the archiver wrote first", 
   const first = normalizeLayer(archive("zone/Bissau", "zone/Asmara"));
   const second = normalizeLayer(archive("zone/Asmara", "zone/Bissau"));
   assert.deepEqual(Buffer.from(first), Buffer.from(second));
+});
+
+const D = (name: string): In => ({ name, type: "5", mode: 0o755 });
+
+test("entries under a symlink or file parent are rejected", () => {
+  assert.throws(
+    () =>
+      normalizeLayer(
+        tar([{ name: "a", type: "2", link: "/x" }, { name: "a/evil" }]),
+      ),
+    /parent/,
+  );
+  assert.throws(
+    () => normalizeLayer(tar([{ name: "f" }, { name: "f/g" }])),
+    /parent/,
+  );
+  assert.throws(() => normalizeLayer(tar([{ name: "missing/g" }])), /parent/);
+  // Absolute symlink targets are legitimate (Alpine /sbin/* -> /bin/busybox).
+  normalizeLayer(
+    tar([D("sbin"), { name: "sbin/x", type: "2", link: "/bin/busybox" }]),
+  );
+});
+
+test("NUL and newline in PAX names are rejected", () => {
+  assert.throws(
+    () => normalizeLayer(tar([{ name: "a", pax: { path: "a\0b" } }])),
+    /control/,
+  );
+  assert.throws(
+    () => normalizeLayer(tar([{ name: "a", pax: { path: "a\nb" } }])),
+    /control/,
+  );
+  assert.throws(
+    () =>
+      normalizeLayer(
+        tar([{ name: "a", type: "2", link: "x", pax: { linkpath: "x\0y" } }]),
+      ),
+    /control/,
+  );
+});
+
+test("NUL inside a GNU long name is rejected; the terminator is fine", () => {
+  const long = "d".repeat(120);
+  normalizeLayer(tar([{ name: long, gnuLong: true }]));
+  assert.throws(
+    () => normalizeLayer(tar([{ name: `${long}\0evil`, gnuLong: true }])),
+    /NUL/,
+  );
+});
+
+test("hardlink targets must be regular files", () => {
+  for (const target of [
+    { name: "t", type: "5" },
+    { name: "t", type: "2", link: "x" },
+    { name: "t", type: "3" },
+  ]) {
+    assert.throws(
+      () => normalizeLayer(tar([target, { name: "h", type: "1", link: "t" }])),
+      /regular file/,
+    );
+  }
+});
+
+test("PAX numbers are strict decimals", () => {
+  for (const bad of ["+5", "0x10", "1e3", " 5", "-1", ""]) {
+    assert.throws(() =>
+      normalizeLayer(tar([{ name: "a", pax: { uid: bad } }])),
+    );
+    assert.throws(() =>
+      normalizeLayer(tar([{ name: "a", pax: { size: bad } }])),
+    );
+  }
+  assert.throws(() =>
+    normalizeLayer(tar([{ name: "a", pax: { gid: "9".repeat(30) } }])),
+  );
+  const ok = read(normalizeLayer(tar([{ name: "a", pax: { uid: "5" } }])));
+  assert.equal(ok[0]!.uid, 5);
+});
+
+test("negative base-256 numbers are rejected", () => {
+  const t = tar([{ name: "a" }]);
+  t.fill(0xff, 108, 116);
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : t[i]!;
+  t.set(enc.encode(sum.toString(8).padStart(6, "0") + "\0 "), 148);
+  assert.throws(() => normalizeLayer(t), /negative/);
 });
