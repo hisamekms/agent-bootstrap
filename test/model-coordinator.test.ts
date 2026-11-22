@@ -6,18 +6,19 @@ import { join } from "node:path";
 import test from "node:test";
 import { type AuditInput, SqliteAudit } from "../src/audit.ts";
 import {
-  boundedLines,
   CODEX_COORDINATOR_CONFIG,
   CodexAppServerCoordinator,
   type JsonlChannel,
 } from "../src/codex-app-server.ts";
 import { CoordinatorTask, type CoordinatorDriver } from "../src/coordinator.ts";
+import { boundedLines } from "../src/lines.ts";
 import {
   COORDINATOR_TOOLS,
   encodeToolCall,
   modelStep,
 } from "../src/model-coordinator.ts";
-import type { SandboxRuntime } from "../src/sandbox-runtime.ts";
+import type { SandboxRuntime, SandboxSession } from "../src/sandbox-runtime.ts";
+import { taskTrace } from "../src/task-trace.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
 
 /** What the mock provider makes the model emit in one turn. */
@@ -164,9 +165,33 @@ function fakeAppServer(turns: Emission[][], observed: Observed) {
   };
 }
 
-const runtime: SandboxRuntime = {
+/** Adapter options that open a channel directly, without a host session. */
+const direct = (connect: () => Promise<JsonlChannel>) => ({
+  async open<T>(_id: string, use: (channel: JsonlChannel) => Promise<T>) {
+    return use(await connect());
+  },
+});
+
+/** A fake streaming sandbox whose session is the fake app-server channel. */
+const runtime = (connect: () => Promise<JsonlChannel>): SandboxRuntime => ({
   async create() {
     return { id: "fixture" };
+  },
+  async openSession(): Promise<SandboxSession> {
+    const channel = await connect();
+    let stopped: () => void = () => {};
+    const finished = new Promise<"cancelled">((resolve) => {
+      stopped = () => resolve("cancelled");
+    });
+    return {
+      send: (line) => channel.send(line),
+      lines: channel.lines,
+      close() {
+        channel.close();
+        stopped();
+      },
+      finished,
+    };
   },
   async exec() {
     return {
@@ -180,7 +205,7 @@ const runtime: SandboxRuntime = {
     return { files: [{ path: "hello.txt", bytes: Buffer.from("hi\n") }] };
   },
   async destroy() {},
-};
+});
 
 async function fixture(
   t: { after(cleanup: () => Promise<void> | void): void },
@@ -193,6 +218,13 @@ async function fixture(
   t.after(() => rm(root, { recursive: true, force: true }));
   const audit = new SqliteAudit(join(root, "audit.sqlite"));
   t.after(() => audit.close());
+  const observed: Observed = {
+    tools: [],
+    prompts: [],
+    toolResults: [],
+    declined: 0,
+    interrupts: 0,
+  };
   const appended: AuditInput[] = [];
   const host = new TrustedHost(
     {
@@ -201,18 +233,21 @@ async function fixture(
         return audit.append(event);
       },
     },
-    runtime,
+    runtime(fakeAppServer(turns, observed)),
   );
-  const observed: Observed = {
-    tools: [],
-    prompts: [],
-    toolResults: [],
-    declined: 0,
-    interrupts: 0,
-  };
   const delegated: string[] = [];
   const model = new CodexAppServerCoordinator({
-    connect: fakeAppServer(turns, observed),
+    async open(id, use) {
+      const result = await host.runCoordinatorSession(
+        {
+          sandbox: { maxLifetimeMs: 10_000 },
+          command: { argv: ["/fixture/codex"], timeoutMs: 5000 },
+        },
+        id,
+        use,
+      );
+      return result.value as never;
+    },
     timeoutMs,
   });
   const driver: CoordinatorDriver = {
@@ -261,9 +296,11 @@ test("a model-proposed delegation passes the router and the host audit", async (
   assert.deepEqual(await kinds(task), [
     "submitted",
     "turn.started",
+    "turn.proposed",
     "tool.authorized",
     "delegate.finished",
     "turn.started",
+    "turn.proposed",
     "turn.done",
   ]);
   assert.equal(delegated.length, 1);
@@ -283,6 +320,23 @@ test("a model-proposed delegation passes the router and the host audit", async (
     JSON.stringify(await task.trace()),
     /fixture-task-secret|change/,
   );
+  // One task ID reaches every Coordinator turn, its proposal and the Worker.
+  const joined = await taskTrace(task, audit);
+  assert.deepEqual(
+    joined.proposals.map((proposal) => JSON.parse(proposal.text ?? "")),
+    [{ key: "change", role: "Worker", tool: "delegate" }, { done: true }],
+  );
+  const roles = joined.invocations.map((entry) => entry.events[0]?.role);
+  assert.deepEqual(roles, ["Coordinator", "Worker", "Coordinator"]);
+  for (const entry of joined.invocations.filter(
+    (item) => item.events[0]?.role === "Coordinator",
+  ))
+    assert.deepEqual(
+      entry.events
+        .filter((event) => event.kind === "operation.finished")
+        .map((event) => `${event.operation} ${event.outcome}`),
+      ["sandbox.create ok", "sandbox.exec ok", "sandbox.destroy ok"],
+    );
 });
 
 test("a registered tool requested out of policy is denied before any effect", async (t) => {
@@ -293,10 +347,15 @@ test("a registered tool requested out of policy is denied before any effect", as
   assert.deepEqual(await kinds(task), [
     "submitted",
     "turn.started",
+    "turn.proposed",
     "tool.denied",
   ]);
   assert.equal(delegated.length, 0);
-  assert.equal(appended.length, 0);
+  // Only the Coordinator session was audited; no role was started.
+  assert.deepEqual(
+    [...new Set(appended.map((event) => event.role))],
+    ["Coordinator"],
+  );
 });
 
 test("forged roles, injected fields and extra calls cannot widen a turn", async (t) => {
@@ -337,16 +396,32 @@ test("a native approval request or a turn without a tool call is denied", async 
   ] satisfies Emission[][]) {
     const { task, observed } = await fixture(t, [turn]);
     assert.equal(await task.run(), "denied");
-    assert.equal((await kinds(task)).at(-1), "turn.denied");
+    const tail = (await task.trace()).at(-1);
+    assert.equal(tail?.kind, "turn.voided");
+    assert.equal(
+      tail?.kind === "turn.voided" && tail.reason,
+      "request" in turn[0]!
+        ? "server-request/item/commandExecution/requestApproval"
+        : "no-call",
+    );
     assert.equal(observed.declined, "request" in turn[0]! ? 1 : 0);
   }
 });
 
 test("a stalled model turn times out and is never retried automatically", async (t) => {
-  const { task, reopen } = await fixture(t, [[{ hang: true }]], 50);
+  const { task, reopen, audit } = await fixture(t, [[{ hang: true }]], 50);
   await assert.rejects(task.run(), /Codex app-server: timed-out/);
   assert.equal(await reopen().run(), "uncertain");
-  assert.equal((await kinds(task)).at(-1), "turn.started");
+  const tail = (await task.trace()).at(-1);
+  assert.equal(tail?.kind === "turn.failed" && tail.code, "timed-out");
+  // The host audit labels the same turn as a timeout, and teardown finished.
+  const [session] = (await taskTrace(task, audit)).invocations;
+  assert.deepEqual(
+    session?.events
+      .filter((event) => event.kind === "operation.finished")
+      .map((event) => `${event.operation} ${event.outcome}`),
+    ["sandbox.create ok", "sandbox.exec timed-out", "sandbox.destroy ok"],
+  );
 });
 
 test("encoding keeps the router as the only authority", () => {
@@ -380,6 +455,7 @@ test("a native tool item voids the turn even without an approval request", async
     "webSearch",
     "imageView",
     "sleep",
+    "futureToolFromGuest",
   ]) {
     const { task, delegated } = await fixture(t, [
       [
@@ -388,7 +464,11 @@ test("a native tool item voids the turn even without an approval request", async
       ],
     ]);
     assert.equal(await task.run(), "denied", item);
-    assert.equal((await kinds(task)).at(-1), "turn.denied");
+    const tail = (await task.trace()).at(-1);
+    assert.equal(
+      tail?.kind === "turn.voided" && tail.reason,
+      `native-item/${item === "futureToolFromGuest" ? "other" : item}`,
+    );
     assert.equal(delegated.length, 0);
   }
 });
@@ -403,6 +483,7 @@ test("malformed, oversized or truncated app-server output stops the turn", async
     const { task, reopen, delegated } = await fixture(t, [turn]);
     await assert.rejects(task.run(), code);
     assert.equal(await reopen().run(), "uncertain");
+    assert.equal((await kinds(task)).at(-1), "turn.failed");
     assert.equal(delegated.length, 0);
   }
   const lines = async (chunks: string[], max: number) => {
@@ -425,9 +506,9 @@ test("a failed or slow connection reports a fixed error and closes late channels
   const input = { prompt: "fixture", tools: COORDINATOR_TOOLS };
   await assert.rejects(
     new CodexAppServerCoordinator({
-      async connect() {
+      ...direct(async () => {
         throw new Error("fixture-private-detail");
-      },
+      }),
       timeoutMs: 1000,
     }).turn(input, randomUUID()),
     (error: Error) =>
@@ -437,7 +518,7 @@ test("a failed or slow connection reports a fixed error and closes late channels
   let closedLate = false;
   await assert.rejects(
     new CodexAppServerCoordinator({
-      async connect() {
+      ...direct(async () => {
         await new Promise((resolve) => setTimeout(resolve, 60));
         return {
           send() {},
@@ -446,7 +527,7 @@ test("a failed or slow connection reports a fixed error and closes late channels
             closedLate = true;
           },
         };
-      },
+      }),
       timeoutMs: 20,
     }).turn(input, randomUUID()),
     /timed-out/,
@@ -479,7 +560,7 @@ test("violations after a captured call still void the turn, and request floods s
   ] satisfies Emission[]) {
     const { task, delegated } = await fixture(t, [[delegate, after]]);
     assert.equal(await task.run(), "denied");
-    assert.equal((await kinds(task)).at(-1), "turn.denied");
+    assert.equal((await kinds(task)).at(-1), "turn.voided");
     assert.equal(delegated.length, 0);
   }
   const flood = Array.from({ length: 65 }, () => ({
@@ -493,18 +574,41 @@ test("violations after a captured call still void the turn, and request floods s
 test("a transport error is reported with a fixed code", async () => {
   await assert.rejects(
     new CodexAppServerCoordinator({
-      async connect() {
-        return {
-          send() {},
-          lines: (async function* () {
-            yield* [];
-            throw new Error("fixture-premature-close");
-          })(),
-          close() {},
-        };
-      },
+      ...direct(async () => ({
+        send() {},
+        lines: (async function* () {
+          yield* [];
+          throw new Error("fixture-premature-close");
+        })(),
+        close() {},
+      })),
       timeoutMs: 1000,
     }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID()),
     (error: Error) => error.message === "Codex app-server: closed",
   );
+});
+
+test("a host audit failure outranks the adapter timeout", async () => {
+  const { HostAuditError } = await import("../src/trusted-host.ts");
+  await assert.rejects(
+    new CodexAppServerCoordinator({
+      async open() {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        throw new HostAuditError(randomUUID());
+      },
+      timeoutMs: 10,
+    }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID()),
+    HostAuditError,
+  );
+});
+
+test("stored proposals escape bidirectional controls in the trace", async (t) => {
+  const { task, audit } = await fixture(t, [
+    [{ call: "delegate", arguments: { key: "x", role: "\u202eWorker" } }],
+  ]);
+  assert.equal(await task.run(), "denied");
+  const joined = await taskTrace(task, audit);
+  assert.equal(joined.proposals.length, 1);
+  assert.ok(joined.proposals[0]?.text?.includes("\\u202eWorker"));
+  assert.ok(!joined.proposals[0]?.text?.includes("\u202e"));
 });

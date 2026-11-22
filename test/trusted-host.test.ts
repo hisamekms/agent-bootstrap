@@ -248,3 +248,245 @@ test("delegate and integration receipts replay across restart and reject conflic
     reopened.close();
   }
 });
+
+test("a Coordinator session is audited, fails closed and always tears down", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const calls: string[] = [];
+  const runtime: SandboxRuntime = {
+    async create(spec) {
+      calls.push(
+        `create ${spec.hostTcpPort ?? "-"} ${spec.tools?.length ?? 0}`,
+      );
+      return { id: "fixture" };
+    },
+    async exec() {
+      throw new Error("not used");
+    },
+    async collect() {
+      throw new Error("not used");
+    },
+    async destroy() {
+      calls.push("destroy");
+    },
+    async openSession() {
+      calls.push("open");
+      return {
+        send() {},
+        lines: (async function* () {})(),
+        close() {
+          calls.push("close");
+        },
+        finished: Promise.resolve("cancelled" as const),
+      };
+    },
+  };
+  const host = new TrustedHost(audit, runtime);
+  const plan = {
+    sandbox: { hostTcpPort: 4242, maxLifetimeMs: 10_000 },
+    command: { argv: ["/fixture"], timeoutMs: 500 },
+  };
+  const ok = await host.runCoordinatorSession(
+    plan,
+    randomUUID(),
+    async () => 7,
+  );
+  assert.deepEqual(ok.value, 7);
+  assert.deepEqual(calls.splice(0), [
+    "create 4242 0",
+    "open",
+    "close",
+    "destroy",
+  ]);
+  const operations = (id: string) =>
+    audit
+      .read(id)
+      .filter((event) => event.kind === "operation.finished")
+      .map((event) => `${event.operation} ${event.outcome}`);
+  assert.deepEqual(operations(ok.id), [
+    "sandbox.create ok",
+    "sandbox.exec ok",
+    "sandbox.destroy ok",
+  ]);
+  const failing = randomUUID();
+  await assert.rejects(
+    host.runCoordinatorSession(plan, failing, async () => {
+      throw new Error("fixture model failure");
+    }),
+    /fixture model failure/,
+  );
+  assert.deepEqual(calls.splice(0), [
+    "create 4242 0",
+    "open",
+    "close",
+    "destroy",
+  ]);
+  assert.deepEqual(operations(failing), [
+    "sandbox.create ok",
+    "sandbox.exec failed",
+    "sandbox.destroy ok",
+  ]);
+  assert.equal(audit.read(failing).at(-1)?.outcome, "failed");
+  // Files and other sandbox fields are not accepted for a Coordinator session.
+  await assert.rejects(
+    host.runCoordinatorSession(
+      { ...plan, sandbox: { ...plan.sandbox, files: [] } as never },
+      randomUUID(),
+      async () => 1,
+    ),
+    /streaming sandbox/,
+  );
+  // A failed audit write stops before any sandbox effect.
+  const broken = new TrustedHost(
+    {
+      append() {
+        throw new Error("fixture audit failure");
+      },
+    },
+    runtime,
+  );
+  await assert.rejects(
+    broken.runCoordinatorSession(plan, randomUUID(), async () => 1),
+    HostAuditError,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("Coordinator session failures are audited in order and keep their codes", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const plan = {
+    sandbox: { maxLifetimeMs: 10_000 },
+    command: { argv: ["/fixture"], timeoutMs: 500 },
+  };
+  const session = (finished: "cancelled" | "timed-out" = "cancelled") => ({
+    send() {},
+    lines: (async function* () {})(),
+    close() {},
+    finished: Promise.resolve(finished),
+  });
+  const make = (overrides: Partial<SandboxRuntime>, calls: string[]) =>
+    new TrustedHost(audit, {
+      async create() {
+        calls.push("create");
+        return { id: "fixture" };
+      },
+      async exec() {
+        throw new Error("not used");
+      },
+      async collect() {
+        throw new Error("not used");
+      },
+      async destroy() {
+        calls.push("destroy");
+      },
+      async openSession() {
+        calls.push("open");
+        return session();
+      },
+      ...overrides,
+    });
+  const finished = (id: string) =>
+    audit
+      .read(id)
+      .filter((event) => event.kind === "operation.finished")
+      .map((event) => `${event.operation} ${event.outcome}`);
+  const cases: [
+    Partial<SandboxRuntime>,
+    (() => Promise<number>) | null,
+    string[],
+    string[],
+  ][] = [
+    [
+      {
+        async create() {
+          throw new Error("fixture create failure");
+        },
+      },
+      null,
+      ["sandbox.create failed"],
+      [],
+    ],
+    [
+      {
+        async openSession() {
+          throw new Error("fixture open failure");
+        },
+      },
+      null,
+      ["sandbox.create ok", "sandbox.exec failed", "sandbox.destroy ok"],
+      ["create", "destroy"],
+    ],
+    [
+      {
+        async destroy() {
+          throw new Error("fixture destroy failure");
+        },
+      },
+      async () => 1,
+      ["sandbox.create ok", "sandbox.exec ok", "sandbox.destroy failed"],
+      ["create", "open"],
+    ],
+    [
+      {},
+      async () => {
+        throw Object.assign(new Error("fixture timeout"), {
+          code: "timed-out",
+        });
+      },
+      ["sandbox.create ok", "sandbox.exec timed-out", "sandbox.destroy ok"],
+      ["create", "open", "destroy"],
+    ],
+  ];
+  for (const [overrides, use, expected, calls] of cases) {
+    const seen: string[] = [];
+    const id = randomUUID();
+    const result = make(overrides, seen).runCoordinatorSession(
+      plan,
+      id,
+      use ?? (async () => 1),
+    );
+    if (expected.at(-1) === "sandbox.destroy failed") {
+      const value = await result;
+      assert.equal(value.outcome, "failed");
+      assert.equal(value.value, undefined);
+    } else await assert.rejects(result);
+    assert.deepEqual(finished(id), expected);
+    assert.equal(audit.read(id).at(-1)?.kind, "invocation.finished");
+    assert.deepEqual(seen, calls);
+  }
+  // An audit failure after create stops before any further effect.
+  let writes = 0;
+  const calls: string[] = [];
+  const host = new TrustedHost(
+    {
+      append() {
+        if (++writes === 5) throw new Error("fixture audit failure");
+      },
+    },
+    {
+      async create() {
+        calls.push("create");
+        return { id: "fixture" };
+      },
+      async exec() {
+        throw new Error("not used");
+      },
+      async collect() {
+        throw new Error("not used");
+      },
+      async destroy() {
+        calls.push("destroy");
+      },
+      async openSession() {
+        calls.push("open");
+        return session();
+      },
+    },
+  );
+  await assert.rejects(
+    host.runCoordinatorSession(plan, randomUUID(), async () => 1),
+    HostAuditError,
+  );
+  assert.deepEqual(calls, ["create"]);
+});

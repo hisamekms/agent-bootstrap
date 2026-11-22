@@ -1,20 +1,16 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { SqliteAudit } from "../../src/audit.ts";
-import {
-  boundedLines,
-  CodexAppServerCoordinator,
-  type JsonlChannel,
-} from "../../src/codex-app-server.ts";
+import { CodexAppServerCoordinator } from "../../src/codex-app-server.ts";
 import { CoordinatorTask } from "../../src/coordinator.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
 import { modelStep } from "../../src/model-coordinator.ts";
+import { taskTrace } from "../../src/task-trace.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
 
 // Real Codex app-server in a disposable VM, driven by a local mock Responses
@@ -145,97 +141,29 @@ const address = server.address();
 assert.ok(address && typeof address !== "string");
 const port = String(address.port);
 
-const env = { PATH: process.env.PATH, MSB_HOME: msbHome, MSB_BACKEND: "local" };
-const msb = promisify(execFile);
-const cleanups: Promise<unknown>[] = [];
-
-/** Spike-only streamed transport. The product port has no streaming exec yet,
- * so these Coordinator VMs are not in the SQLite sandbox audit. */
-const remove = (name: string) =>
-  msb(msbPath, ["rm", "--force", name], {
-    env,
-    timeout: 15_000,
-    killSignal: "SIGKILL",
-  }).catch(() => {});
-
-async function connect(id: string): Promise<JsonlChannel> {
-  const name = `coord-${id.slice(0, 8)}`;
-  try {
-    return await open(name);
-  } catch (error) {
-    cleanups.push(remove(name));
-    throw error;
-  }
-}
-
-async function open(name: string): Promise<JsonlChannel> {
-  await msb(
-    msbPath,
-    [
-      "create",
-      "--name",
-      name,
-      "--pull",
-      "never",
-      "--no-net",
-      "--net-rule",
-      `allow@host:tcp:${port}`,
-      "--max-duration",
-      "60s",
-      "--copy-file",
-      `${binary}:/tmp/codex`,
-      image,
-    ],
-    { env, timeout: 20_000, killSignal: "SIGKILL" },
-  );
-  const child = spawn(
-    msbPath,
-    [
-      "exec",
-      "--stream",
-      "--timeout",
-      "50s",
-      name,
-      "--",
-      "/bin/sh",
-      "-ec",
-      `
-        gateway=$(ip -4 route show default | awk '$1 == "default" && $2 == "via" { print $3; exit }')
-        test -n "$gateway"
-        printf '%s  /tmp/codex\\n' '${codexDigest}' | sha256sum -c - >/dev/null
-        chmod 700 /tmp/codex
-        exec /tmp/codex app-server --listen stdio:// \
-          -c 'model_provider="fixture"' \
-          -c 'model_providers.fixture.name="Coordinator fixture"' \
-          -c 'model_providers.fixture.base_url="http://'"$gateway:$1"'/v1"' \
-          -c 'model_providers.fixture.wire_api="responses"' \
-          -c 'model_providers.fixture.request_max_retries=0' \
-          -c 'model_providers.fixture.stream_max_retries=0'
-      `,
-      "sh",
-      port,
-    ],
-    { env },
-  );
-  child.stdin.on("error", () => {});
-  child.stderr.resume();
-  let closed = false;
-  // A spawn failure ends stdout, so the adapter sees a closed channel.
-  child.on("error", () => child.stdout.destroy());
-  return {
-    send(line) {
-      if (!closed) child.stdin.write(`${line}\n`);
-    },
-    lines: boundedLines(child.stdout),
-    close() {
-      if (closed) return;
-      closed = true;
-      child.stdin.end();
-      child.kill("SIGKILL");
-      cleanups.push(remove(name));
-    },
-  };
-}
+// The guest checks the copied binary again before running it.
+const coordinatorCommand = {
+  argv: [
+    "/bin/sh",
+    "-ec",
+    `
+      gateway=$(ip -4 route show default | awk '$1 == "default" && $2 == "via" { print $3; exit }')
+      test -n "$gateway"
+      printf '%s  /tmp/codex\\n' '${codexDigest}' | sha256sum -c - >/dev/null
+      chmod 700 /tmp/codex
+      exec /tmp/codex app-server --listen stdio:// \\
+        -c 'model_provider="fixture"' \\
+        -c 'model_providers.fixture.name="Coordinator fixture"' \\
+        -c 'model_providers.fixture.base_url="http://'"$gateway:$1"'/v1"' \\
+        -c 'model_providers.fixture.wire_api="responses"' \\
+        -c 'model_providers.fixture.request_max_retries=0' \\
+        -c 'model_providers.fixture.stream_max_retries=0'
+    `,
+    "sh",
+    port,
+  ],
+  timeoutMs: 50_000,
+};
 
 await mkdir(local, { recursive: true, mode: 0o700 });
 const root = await realpath(await mkdtemp(join(local, "m4-model-")));
@@ -251,12 +179,34 @@ try {
       stagingRoot: join(root, "sandboxes"),
     }),
   );
+  const model = new CodexAppServerCoordinator({
+    async open(id, use) {
+      const result = await host.runCoordinatorSession(
+        {
+          sandbox: {
+            tools: [
+              {
+                hostPath: binary,
+                guestPath: "/tmp/codex",
+                sha256: codexDigest,
+              },
+            ],
+            hostTcpPort: Number(port),
+            maxLifetimeMs: 60_000,
+          },
+          command: coordinatorCommand,
+        },
+        id,
+        use,
+      );
+      return result.value as never;
+    },
+    timeoutMs: 90_000,
+  });
   const delegated: string[] = [];
   const coordinator = () =>
     new CoordinatorTask(join(root, "tasks"), randomUUID(), {
-      step: modelStep(
-        new CodexAppServerCoordinator({ connect, timeoutMs: 90_000 }),
-      ),
+      step: modelStep(model),
       async delegate(role, _control, id) {
         assert.equal(role, "Worker");
         const run = await host.runWorker(
@@ -287,62 +237,94 @@ try {
         return "denied";
       },
     });
+  const summary = async (task: CoordinatorTask) => {
+    const trace = await taskTrace(task, audit);
+    return {
+      coordinator: trace.coordinator.map((event) =>
+        event.kind === "turn.voided"
+          ? `${event.kind} ${event.reason}`
+          : event.kind,
+      ),
+      proposals: trace.proposals.map((proposal) => proposal.text),
+      invocations: trace.invocations.map((entry) => ({
+        role: entry.events[0]?.role,
+        operations: entry.events
+          .filter((event) => event.kind === "operation.finished")
+          .map((event) => `${event.operation} ${event.outcome}`),
+        outcome: entry.events.at(-1)?.outcome,
+      })),
+    };
+  };
+  const audited = (role: string) => ({
+    role,
+    operations: [
+      "sandbox.create ok",
+      "sandbox.exec ok",
+      ...(role === "Worker" ? ["sandbox.collect ok"] : []),
+      "sandbox.destroy ok",
+    ],
+    outcome: "ok",
+  });
+
   const task = coordinator();
   await task.submit("Change the greeting in hello.txt.");
   const outcome = await task.run();
-  const kinds = (await task.trace()).map((event) => event.kind);
-  const worker = delegated[0] ? audit.read(delegated[0]) : [];
+  // A native tool item voids the turn even though no approval is requested.
+  provider.mode = "native";
+  const native = coordinator();
+  await native.submit("Change the greeting in hello.txt.");
+  const nativeOutcome = await native.run();
+  const first = await summary(task);
+  const second = await summary(native);
   console.log(
     JSON.stringify(
       {
-        outcome,
-        coordinator: kinds,
+        journalRoot: join(root, "tasks"),
+        audit: join(root, "audit.sqlite"),
+        router: { outcome, ...first },
+        native: { outcome: nativeOutcome, ...second },
         provider,
-        worker: worker.map((e) =>
-          [e.kind, e.operation, e.outcome].filter(Boolean).join(" "),
-        ),
       },
       null,
       2,
     ),
   );
   assert.equal(outcome, "denied");
-  assert.deepEqual(kinds, [
+  assert.deepEqual(first.coordinator, [
     "submitted",
     "turn.started",
+    "turn.proposed",
     "tool.authorized",
     "delegate.finished",
     "turn.started",
+    "turn.proposed",
     "tool.denied",
   ]);
-  assert.deepEqual(provider.calls, ["delegate", "requestIntegration"]);
-  assert.equal(worker.at(-1)?.outcome, "ok");
+  assert.deepEqual(first.invocations, [
+    audited("Coordinator"),
+    audited("Worker"),
+    audited("Coordinator"),
+  ]);
+  assert.equal(nativeOutcome, "denied");
+  assert.deepEqual(second.coordinator, [
+    "submitted",
+    "turn.started",
+    "turn.voided native-item/sleep",
+  ]);
+  assert.deepEqual(second.invocations, [audited("Coordinator")]);
+  assert.deepEqual(provider.calls, ["delegate", "requestIntegration", "sleep"]);
+  assert.equal(delegated.length, 1);
   // Native tools that remain visible are recorded. Shell access must not be.
   const shell = /(^|[.>])(exec_command|write_stdin|shell|unified_exec)$/;
   assert.deepEqual(
     provider.tools.filter((name) => shell.test(name)),
     [],
   );
-  // A native tool item voids the turn even though no approval is requested.
-  provider.mode = "native";
-  const native = coordinator();
-  await native.submit("Change the greeting in hello.txt.");
-  assert.equal(await native.run(), "denied");
-  assert.deepEqual(
-    (await native.trace()).map((event) => event.kind),
-    ["submitted", "turn.started", "turn.denied"],
-  );
-  assert.deepEqual(provider.calls, ["delegate", "requestIntegration", "sleep"]);
-  assert.equal(delegated.length, 1);
   console.log(
-    "A native clock.sleep call voided its turn, and the router recorded turn.denied.",
-  );
-  console.log(
-    "Real app-server turns proposed one authorized delegation and one out-of-policy integration request; the router denied the second.",
+    "Every Coordinator turn ran as an audited host session. One delegation was authorized, one integration request was denied, and a native clock.sleep call voided its turn.",
   );
 } finally {
   audit.close();
-  await Promise.allSettled(cleanups);
   server.closeAllConnections();
   server.close();
 }

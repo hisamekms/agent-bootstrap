@@ -22,6 +22,7 @@
   and `src/credentials.ts` defines the trusted-host credential boundary.
   `src/model-coordinator.ts` owns the provider-neutral Coordinator model port,
   and `src/codex-app-server.ts` owns its first adapter.
+  `src/task-trace.ts` joins one task's journal with the host audit.
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and
   milestone evidence. `.codex/` configures development roles and models.

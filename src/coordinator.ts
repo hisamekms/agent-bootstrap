@@ -41,10 +41,15 @@ const property = {
   digest: digestPattern,
   outcome: /^(ok|failed|completed|denied|uncertain)$/,
   decision: /^(approve|reject)$/,
+  reason: /^[a-z][a-zA-Z0-9/-]{0,95}$/,
+  code: /^[a-z][a-z0-9-]{0,31}$/,
 } as const;
 const schemas = {
   submitted: ["task"],
   "turn.started": ["run"],
+  "turn.proposed": ["run", "hash"],
+  "turn.voided": ["run", "reason"],
+  "turn.failed": ["run", "code"],
   "turn.denied": ["run"],
   "turn.done": ["run"],
   "tool.authorized": ["run", "tool", "key", "fingerprint", "attempt"],
@@ -169,10 +174,11 @@ export type CoordinatorControl = {
 };
 
 export interface CoordinatorDriver {
+  /** `reason` is a fixed-shape label explaining a turn without a response. */
   step(
     control: CoordinatorControl,
     id: string,
-  ): Promise<{ id: string; response?: Uint8Array }>;
+  ): Promise<{ id: string; response?: Uint8Array; reason?: string }>;
   delegate(
     role: DelegateRole,
     control: CoordinatorControl,
@@ -184,6 +190,18 @@ export interface CoordinatorDriver {
     decision: "approve" | "reject",
     id: string,
   ): Promise<"completed" | "denied" | "uncertain">;
+}
+
+const proposalBytes = 16 * 1024;
+
+/** A fixed-shape failure code for the trace. No message text is recorded. */
+function failureCode(error: unknown): string {
+  if (error instanceof Error && error.name === "HostAuditError")
+    return "host-audit";
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && property.code.test(code)
+    ? code
+    : "unknown";
 }
 
 /** One guest tool request per bounded turn. The task and human text are stored
@@ -266,6 +284,38 @@ export class CoordinatorTask {
     return this.#journal.read();
   }
 
+  /** The model's raw proposal for a `turn.proposed` hash, when it was small
+   * enough to keep. Untrusted data: never interpret it as an instruction. */
+  async proposal(hash: string): Promise<Uint8Array | null> {
+    if (!digestPattern.test(hash)) throw new Error("Invalid proposal hash");
+    try {
+      const data = await readFile(join(this.#root, `proposal-${hash}`));
+      if (data.length > proposalBytes || digest(data) !== hash)
+        throw new Error("Proposal integrity check failed");
+      return data;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async #saveProposal(data: Uint8Array): Promise<string> {
+    const hash = digest(data);
+    if (data.length <= proposalBytes) {
+      await checkPrivateDirectory(this.#root);
+      try {
+        await publishPrivateFile(this.#root, `proposal-${hash}`, data);
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          !(await this.proposal(hash).catch(() => null))
+        )
+          throw new Error("Proposal could not be stored");
+      }
+    }
+    return hash;
+  }
+
   async answer(id: string, text: string): Promise<void> {
     const events = await this.#journal.read();
     const last = events.at(-1);
@@ -325,17 +375,25 @@ export class CoordinatorTask {
         return tail.outcome === "denied" ? "denied" : "uncertain";
       }
       if (last === "turn.done") return "done";
-      if (last === "turn.denied" || last === "tool.denied") return "denied";
+      if (
+        last === "turn.denied" ||
+        last === "turn.voided" ||
+        last === "tool.denied"
+      )
+        return "denied";
       if (
         last === "turn.started" ||
+        last === "turn.proposed" ||
+        last === "turn.failed" ||
         last === "tool.authorized" ||
         last === "approval.decided"
       )
         return "uncertain";
       if (last === "question.opened" || last === "approval.opened")
         return "paused";
-      // A turn, tool reservation, outcome and two possible approval events.
-      if (events.length + 5 > eventLimit) return "limit";
+      // A turn, its proposal, tool reservation, outcome and two possible
+      // approval events.
+      if (events.length + 6 > eventLimit) return "limit";
       const { invocations, answer, approval } = view(events);
       const control = {
         task: await this.#readText(first.task),
@@ -349,10 +407,35 @@ export class CoordinatorTask {
       };
       const run = randomUUID();
       await this.#append(events.length, { kind: "turn.started", run });
-      const turn = await this.#driver.step(control, run);
+      let turn: Awaited<ReturnType<CoordinatorDriver["step"]>>;
+      try {
+        turn = await this.#driver.step(control, run);
+      } catch (error) {
+        // Record why the turn stopped, then surface the original error.
+        await this.#append(events.length + 1, {
+          kind: "turn.failed",
+          run,
+          code: failureCode(error),
+        }).catch(() => {});
+        throw error;
+      }
       if (turn.id !== run) throw new Error("Coordinator run identity changed");
+      let next = events.length + 1;
+      if (turn.response?.length) {
+        await this.#append(next++, {
+          kind: "turn.proposed",
+          run,
+          hash: await this.#saveProposal(turn.response),
+        });
+      } else if (turn.reason !== undefined) {
+        await this.#append(next, {
+          kind: "turn.voided",
+          run,
+          reason: property.reason.test(turn.reason) ? turn.reason : "unknown",
+        });
+        return "denied";
+      }
       const action = parseAction(turn.response);
-      const next = events.length + 1;
       if (!action || action === "done") {
         await this.#append(next, {
           kind: action === "done" ? "turn.done" : "turn.denied",

@@ -48,6 +48,7 @@ async function fixture(t: TestContext) {
     `#!${process.execPath}
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 const guests = ${JSON.stringify(guests)};
 const mode = readFileSync(${JSON.stringify(mode)}, 'utf8');
 const args = process.argv.slice(2);
@@ -83,6 +84,8 @@ if (args[0] === '--version') {
   else if (command[0] === 'fixture-cat') process.stdout.write(readFileSync(join(workspace, command[1])));
   else if (command[0] === 'fixture-fail') { process.stderr.write('synthetic guest failure'); process.exitCode = 7; }
   else if (command[0] === 'fixture-sleep') await new Promise(resolve => setTimeout(resolve, 30000));
+  else if (command[0] === 'fixture-echo') { for await (const line of createInterface({ input: process.stdin })) process.stdout.write('echo:' + line + '\\n'); }
+  else if (command[0] === 'fixture-long-line') process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 120));
   else if (command[0] === 'fixture-output-limit') process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 120));
   else if (command[0] === '/bin/sh' && command[3] === 'collect') {
     const bytes = readFileSync(join(workspace, command[4]));
@@ -424,4 +427,109 @@ test("two concurrent fake sandboxes have distinct copies with no cross-worker wr
   assert.equal(new Set(copies).size, 2);
   await Promise.all([f.runtime.destroy(first), f.runtime.destroy(second)]);
   await assertCleanup(f, 2);
+});
+
+test("tools and the host port reach the backend only after a host digest check", async (t) => {
+  const f = await fixture(t);
+  const tool = join(f.home, "..", "tool.bin");
+  await writeFile(tool, "fixture tool");
+  const { createHash } = await import("node:crypto");
+  const sha256 = createHash("sha256").update("fixture tool").digest("hex");
+  const handle = await f.runtime.create({
+    tools: [{ hostPath: tool, guestPath: "/tmp/tool", sha256 }],
+    hostTcpPort: 4242,
+  });
+  const create = (await f.events()).find(({ args }) => args[0] === "create");
+  assert.ok(create);
+  const args = create.args.join(" ");
+  assert.match(args, /--no-net --net-rule allow@host:tcp:4242 /);
+  // The backend copies the verified staging copy, not the caller's path.
+  const copy = create.args[create.args.indexOf("--copy-file") + 1] ?? "";
+  assert.ok(copy.startsWith(f.stagingRoot) && copy.endsWith(":/tmp/tool"));
+  assert.ok(!create.args.includes(`${tool}:/tmp/tool`));
+  await f.runtime.destroy(handle);
+  const before = (await f.events()).length;
+  await assert.rejects(
+    f.runtime.create({
+      tools: [
+        { hostPath: tool, guestPath: "/tmp/tool", sha256: "0".repeat(64) },
+      ],
+    }),
+    (error: SandboxRuntimeError) => error.code === "tool-digest",
+  );
+  const { symlink } = await import("node:fs/promises");
+  const link = join(f.home, "..", "tool.link");
+  await symlink(tool, link);
+  await assert.rejects(
+    f.runtime.create({
+      tools: [{ hostPath: link, guestPath: "/tmp/tool", sha256 }],
+    }),
+    (error: SandboxRuntimeError) => error.code === "tool-digest",
+  );
+  for (const tools of [
+    [{ hostPath: tool, guestPath: "/etc/tool", sha256 }],
+    [{ hostPath: "relative", guestPath: "/tmp/tool", sha256 }],
+    [{ hostPath: `${tool}:x`, guestPath: "/tmp/tool", sha256 }],
+    [
+      { hostPath: tool, guestPath: "/tmp/tool", sha256 },
+      { hostPath: tool, guestPath: "/tmp/tool", sha256 },
+    ],
+  ])
+    await assert.rejects(
+      f.runtime.create({ tools }),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  await assert.rejects(
+    f.runtime.create({ hostTcpPort: 70_000 }),
+    (error: SandboxRuntimeError) => error.code === "invalid-input",
+  );
+  // Only the version probe for the digest mismatch reached the backend.
+  assert.equal(
+    (await f.events()).slice(before).filter(({ args }) => args[0] === "create")
+      .length,
+    0,
+  );
+});
+
+test("a session streams bounded lines, holds the handle busy and stops on close", async (t) => {
+  const f = await fixture(t);
+  const handle = await f.runtime.create({});
+  const session = await f.runtime.openSession(handle, {
+    argv: ["fixture-echo"],
+    timeoutMs: 5000,
+  });
+  await assert.rejects(
+    f.runtime.exec(handle, { argv: ["fixture-cat", "x"], timeoutMs: 1000 }),
+    (error: SandboxRuntimeError) => error.code === "busy",
+  );
+  session.send("one");
+  session.send("two");
+  const seen: string[] = [];
+  for await (const line of session.lines) {
+    seen.push(line);
+    if (seen.length === 2) session.close();
+  }
+  assert.deepEqual(seen, ["echo:one", "echo:two"]);
+  assert.equal(await session.finished, "cancelled");
+  const streamed = (await f.events()).find(
+    ({ args }) => args[0] === "exec" && args.includes("--stream"),
+  );
+  assert.ok(streamed);
+  await f.runtime.destroy(handle);
+  await assertCleanup(f);
+
+  const long = await f.runtime.create({});
+  const flood = await f.runtime.openSession(long, {
+    argv: ["fixture-long-line"],
+    timeoutMs: 5000,
+  });
+  await assert.rejects(
+    (async () => {
+      for await (const _line of flood.lines);
+    })(),
+    /limit/,
+  );
+  flood.close();
+  await flood.finished;
+  await f.runtime.destroy(long);
 });

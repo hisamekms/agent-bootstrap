@@ -184,8 +184,8 @@ test("the task stops at its event limit before starting another sandbox", async 
   });
   for (let batch = 0; batch < 4; batch++)
     assert.equal(await reopen().run(), "limit");
-  assert.equal(calls, 41);
+  assert.equal(calls, 31);
   assert.equal(await reopen().run(), "limit");
-  assert.equal(calls, 41);
+  assert.equal(calls, 31);
   assert.equal((await task.trace()).at(-1)?.kind, "query.finished");
 });
