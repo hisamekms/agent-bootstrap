@@ -869,6 +869,53 @@ run live.
   - Data blocks are delimited with a random marker for each invocation.
     The script stops if the marker is not 24 hexadecimal characters.
 
+### Harness per actor
+
+Each actor (Coordinator, Planner, Worker, Reviewer) can run on the official
+Codex CLI or the official Claude Code CLI. `src/actors.ts` reads a choice such
+as `Coordinator=claude,Worker=codex` (or `all=claude`). Unnamed actors use
+Codex.
+
+- **Codex** roles come from `src/codex-exec.ts`: `codex exec` for Planner,
+  Worker and Reviewer, and `codex app-server` for the Coordinator. The M5 runner
+  used to build these commands itself.
+- **Claude Code** roles come from `src/claude-code.ts`. The Claude Coordinator
+  (`src/claude-coordinator.ts`) runs the CLI once per turn with no tools. Its
+  only input is the host-prepared `control.json`, and it answers with one JSON
+  action. The router validates that action exactly as it does a Codex tool
+  call.
+- Every harness follows one output contract. Worker prints the collect
+  request. Reviewer yields `{"review", "notes"}`; the Claude result object is
+  unwrapped by `reviewerOutput`, and verification output is never
+  transformed. Planner prints its plan.
+
+A runtime adapter holds one credential, so `RoutingSandboxRuntime` keeps one
+adapter per provider binding: plain, OpenAI and Anthropic. It sends each
+sandbox to the adapter whose binding matches the spec exactly, and it refuses
+unknown bindings and handles it did not create. The adapter lives for the
+task. Each VM still lives for one invocation: one planning, coding or review
+run, or one Coordinator turn.
+
+The fixture run serves a mock Responses API over HTTP and a mock Messages API
+over HTTPS with a disposable CA:
+
+```sh
+MSB_HOME=/absolute/short/msb-home M5_ACTORS="Coordinator=claude,Worker=codex" \
+  bun spike/m5/dogfood.ts --fixture /absolute/path/to/msb /absolute/path/to/codex
+```
+
+On 2026-11-22, four fixture configurations completed with outcome `done`, three
+Coordinator turns, one Worker and one Reviewer, and every VM finished `ok`:
+`all=codex`, `all=claude`, `Coordinator=claude,Worker=codex,Reviewer=claude`
+and `Coordinator=codex,Worker=claude`. Every Claude VM recorded the
+`provider.egress` grant. The Codex fixture uses a plain host port and records no
+grant, and verification never has one.
+
+For a live run, `M5_CLAUDE_AUTH` selects `api-key` or
+`operator:<VARIABLE>:<header>`. `M5_CLAUDE_KEYCHAIN` names the macOS keychain
+service that holds the Claude credential. The launcher forwards only these
+non-secret `M5_*` settings and `USER`. Codex tokens still arrive on stdin.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |

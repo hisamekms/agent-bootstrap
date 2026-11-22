@@ -268,7 +268,20 @@ async function runSmoke(
 ) {
   signal.throwIfAborted();
   const child = spawn(process.execPath, [smoke, "--live", msb, codex], {
-    env: { PATH: "/usr/bin:/bin", MSB_HOME: home },
+    // Only the non-secret M5 actor settings (and USER, for the keychain
+    // lookup) pass through; the token goes on stdin.
+    env: {
+      PATH: "/usr/bin:/bin",
+      MSB_HOME: home,
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([name, value]) =>
+            value !== undefined &&
+            (name === "USER" ||
+              /^M5_(ACTORS|CLAUDE_(BINARY|MODEL|AUTH|KEYCHAIN))$/.test(name)),
+        ),
+      ),
+    },
     stdio: ["pipe", "inherit", "inherit"],
   });
   const cancel = () => child.kill("SIGTERM");
