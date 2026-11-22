@@ -549,14 +549,13 @@ async function main() {
           # Compare digests of candidate tokens without supplying the key.
           tokenPattern='sk-ant-synthetic-[0-9a-f]{36}'
           testToken="sk-ant-synthetic-$(printf '%036d' 0)"
+          # The control token sits in a real file the scan must find.
+          printf '%s\\n' "$testToken" > /tmp/m6-scan-control
           matches=$(
             {
-              cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline || :
-              find /tmp /root /etc /.msb -type f -exec cat {} + || :
-              printf '\\000%s\\000' "$testToken"
+              grep -a -o -h -E "$tokenPattern" /proc/[0-9]*/environ /proc/[0-9]*/cmdline || :
+              grep -r -a -o -h -E "$tokenPattern" /tmp /root /etc /.msb || :
             } 2>/dev/null |
-            LC_ALL=C tr -c '[:print:]' '\\n' |
-            grep -o -E "$tokenPattern" |
             while IFS= read -r candidate; do
               if [ "$candidate" = "$testToken" ]; then echo control; fi
               digest=$(printf '%s' "$candidate" | sha256sum)
@@ -576,6 +575,7 @@ async function main() {
         timeoutMs: 210_000,
       },
     });
+    if (probe.outcome !== "ok") console.error("PROBE", JSON.stringify(probe).slice(0, 3000));
     assert.equal(probe.outcome, "ok");
     const probeOutput = Buffer.from(probe.response ?? []).toString("latin1");
 
