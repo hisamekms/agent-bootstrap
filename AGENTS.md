@@ -29,6 +29,9 @@
   the Claude Code Coordinator model, `src/actors.ts` the harness choice per
   actor, and `src/routing-runtime.ts` routing to one runtime adapter per
   credential.
+  `src/sandbox-profiles.ts` owns sandbox profiles (digest-pinned images,
+  resources, and the profiles each role may use); see
+  `docs/sandbox-profiles.md`.
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and
   milestone evidence. `.codex/` configures development roles and models.
