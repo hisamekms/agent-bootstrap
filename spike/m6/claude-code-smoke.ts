@@ -575,7 +575,8 @@ async function main() {
         timeoutMs: 210_000,
       },
     });
-    if (probe.outcome !== "ok") console.error("PROBE", JSON.stringify(probe).slice(0, 3000));
+    if (probe.outcome !== "ok")
+      console.error("PROBE", JSON.stringify(probe).slice(0, 3000));
     assert.equal(probe.outcome, "ok");
     const probeOutput = Buffer.from(probe.response ?? []).toString("latin1");
 
