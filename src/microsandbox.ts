@@ -34,8 +34,21 @@ export interface MicrosandboxConfig {
   /** Required only for specs with `provider`. Used on the host to pass the
    * credential to the backend's TLS substitution at create time. */
   readonly credentials?: CredentialProvider;
-  /** Exact provider hosts that specs may name. Default: none. */
-  readonly providerHosts?: readonly string[];
+  /** The provider egress bindings that specs may request, each binding the
+   * credential to one host, header, variable, port and upstream CA. A spec's
+   * `provider` must equal one entry exactly. Default: none. */
+  readonly providers?: readonly SandboxProvider[];
+}
+
+/** A provider binding with defaults filled in, for exact comparison. */
+function providerKey(provider: SandboxProvider): string {
+  return JSON.stringify([
+    provider.host,
+    provider.secretEnv,
+    provider.header ?? "authorization",
+    provider.port ?? 443,
+    provider.upstreamCaCertPath ?? null,
+  ]);
 }
 
 /** Conservative fixed bounds for this initial offline adapter. */
@@ -169,8 +182,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       invalid();
     this.#config = {
       ...config,
-      ...(config.providerHosts
-        ? { providerHosts: Object.freeze([...config.providerHosts]) }
+      ...(config.providers
+        ? {
+            providers: Object.freeze(
+              config.providers.map((provider) =>
+                Object.freeze({ ...provider }),
+              ),
+            ),
+          }
         : {}),
     };
   }
@@ -296,7 +315,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       (port !== undefined ||
         !this.#config.credentials ||
         typeof provider.host !== "string" ||
-        !this.#config.providerHosts?.includes(provider.host) ||
+        !this.#config.providers?.some(
+          (allowed) => providerKey(allowed) === providerKey(provider),
+        ) ||
         !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
           provider.host,
         ) ||

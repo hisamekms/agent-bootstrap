@@ -27,7 +27,10 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
   const script = command.argv[2]!;
   // The prompt never appears in the script, which is built only from constants.
   assert.ok(!script.includes("pwned") && !script.includes("Edit hello.txt"));
-  assert.match(script, /-p --bare --output-format json/);
+  assert.match(
+    script,
+    /-p --bare --strict-mcp-config --setting-sources '' --output-format json/,
+  );
   assert.match(script, /--permission-mode acceptEdits/);
   assert.match(
     script,

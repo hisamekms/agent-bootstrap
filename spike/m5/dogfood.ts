@@ -424,7 +424,9 @@ async function main() {
         home,
         image,
         stagingRoot: join(root, "sandboxes"),
-        ...(live ? { credentials, providerHosts: [providerHost] } : {}),
+        ...(live
+          ? { credentials, providers: [{ host: providerHost, secretEnv }] }
+          : {}),
       }),
     );
     const journal = new IntegrationJournal(reviewDir, randomUUID());

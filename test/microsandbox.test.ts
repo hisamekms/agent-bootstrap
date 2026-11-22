@@ -110,7 +110,9 @@ if (args[0] === '--version') {
         home,
         stagingRoot,
         image,
-        providerHosts: ["api.openai.com"],
+        providers: [
+          { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
+        ],
         credentials: {
           async withAccessToken(consume) {
             if (token === "throw")
@@ -601,6 +603,17 @@ test("provider egress passes the credential only to the create process", async (
     runtime.create({ provider, hostTcpPort: 4242 }),
     (error: SandboxRuntimeError) => error.code === "invalid-input",
   );
+  // A spec cannot rebind the configured credential to another header, port
+  // or upstream CA for the same host.
+  for (const rebind of [
+    { ...provider, header: "x-api-key" as const },
+    { ...provider, port: 8443 },
+    { ...provider, upstreamCaCertPath: "/tmp/other-ca.pem" },
+  ])
+    await assert.rejects(
+      runtime.create({ provider: rebind }),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
 });
 
 test("Anthropic-style provider egress uses x-api-key, a custom port and an upstream CA", async (t) => {
@@ -610,7 +623,15 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
     home: f.home,
     stagingRoot: f.stagingRoot,
     image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}`,
-    providerHosts: ["host.microsandbox.internal"],
+    providers: [
+      {
+        host: "host.microsandbox.internal",
+        secretEnv: "ANTHROPIC_API_KEY",
+        header: "x-api-key",
+        port: 8443,
+        upstreamCaCertPath: "/tmp/fixture-ca.pem",
+      },
+    ],
     credentials: {
       async withAccessToken(consume) {
         return consume("fixture-anthropic-key");

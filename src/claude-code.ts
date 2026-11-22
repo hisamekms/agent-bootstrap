@@ -187,7 +187,7 @@ export function claudeCodeCommand(task: ClaudeCodeTask): SandboxCommand {
       ${task.baseUrl ? `ANTHROPIC_BASE_URL='${task.baseUrl}' ` : ""}\\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
-      ${CLAUDE_CODE.guestPath} -p --bare --output-format json \\
+      ${CLAUDE_CODE.guestPath} -p --bare --strict-mcp-config --setting-sources '' --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
         --permission-mode ${tools.mode} \\
         --allowedTools '${tools.allowed.join(",")}' --disallowedTools '${tools.removed.join(",")}' \\

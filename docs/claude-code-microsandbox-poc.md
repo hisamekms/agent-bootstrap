@@ -16,21 +16,22 @@ image lacks. In the guest, `claude --version` prints `2.1.330 (Claude Code)`.
 
 The results were verified on 2026-11-22.
 
-| Capability                                             | Result                                                                 | Evidence                                                                                                                              |
-| ------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Secret held on the host and substituted by the backend | Supported as-is                                                        | `msb create --secret ENV[:OPTIONS]@HOST`. The value comes from the host environment at create time, and the guest gets a placeholder. |
-| `x-api-key` substitution                               | Supported as-is (`headers=x-api-key`); verified against a fixture host | In the smoke, every Messages request reached the stand-in with the synthetic key in `x-api-key` and no `Authorization` header.        |
-| Streaming (SSE) through the TLS proxy                  | Supported as-is; verified against a fixture host                       | The CLI sent `stream: true`, and the streamed text and tool calls round-tripped.                                                      |
-| Trust in the guest CA for the CLI                      | Supported as-is                                                        | The backend sets `NODE_EXTRA_CA_CERTS=/.msb/tls/ca.pem`, and the adapter passes it through `env -i`.                                  |
-| Destination scope (host and port)                      | Adapter needed (implemented)                                           | Network rules allow DNS plus one host and port. The adapter also enforces a `providerHosts` allowlist and a header allowlist.         |
-| Method, path or request-count scope                    | Upstream extension needed                                              | The backend matches host and header only.                                                                                             |
-| Unapproved destination                                 | Verified for one case                                                  | An HTTP listener on another host port received no request.                                                                            |
-| Direct IP, IPv6, LAN, metadata, redirects              | Unverified                                                             | Deferred with Gate B.                                                                                                                 |
-| Real key absent from the guest                         | Verified with a synthetic key                                          | No match in `/proc/*/environ`, `/proc/*/cmdline`, `/tmp`, `/root`, `/etc` or `/.msb`. The guest variable held the placeholder.        |
-| Real key absent from captured output                   | Verified with a synthetic key                                          | The key was absent from every captured stdout, and the audit records only fixed labels.                                               |
-| Concurrent sandboxes                                   | Verified for two                                                       | Two Planner VMs ran in parallel with separate config directories and both succeeded.                                                  |
-| CPU and memory limits                                  | Backend supports them, adapter does not                                | `--cpus` and `--memory` exist, but the adapter does not pass them yet.                                                                |
-| Real `api.anthropic.com` traffic                       | Unverified                                                             | No real key was authorized.                                                                                                           |
+| Capability                                             | Result                                                                 | Evidence                                                                                                                                                                                                  |
+| ------------------------------------------------------ | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Secret held on the host and substituted by the backend | Supported as-is                                                        | `msb create --secret ENV[:OPTIONS]@HOST`. The value comes from the host environment at create time, and the guest gets a placeholder.                                                                     |
+| `x-api-key` substitution                               | Supported as-is (`headers=x-api-key`); verified against a fixture host | In the smoke, every Messages request reached the stand-in with the synthetic key in `x-api-key` and no `Authorization` header.                                                                            |
+| Streaming (SSE) through the TLS proxy                  | SSE framing verified against a fixture host                            | The CLI sent `stream: true`. The stand-in wrote each event separately, 50 ms apart, and the streamed text and tool calls round-tripped. Whether the proxy forwards events incrementally was not measured. |
+| Trust in the guest CA for the CLI                      | Supported as-is                                                        | The backend sets `NODE_EXTRA_CA_CERTS=/.msb/tls/ca.pem`, and the adapter passes it through `env -i`.                                                                                                      |
+| Destination scope (host and port)                      | Adapter needed (implemented)                                           | Network rules allow DNS plus one host and port. The adapter binds each credential to configured `providers` entries: host, variable, header, port and CA must all match.                                  |
+| Method, path or request-count scope                    | Upstream extension needed                                              | The backend matches host and header only.                                                                                                                                                                 |
+| Unapproved destination                                 | Verified for one case                                                  | An HTTP listener on another host port received no request.                                                                                                                                                |
+| Direct IP, IPv6, LAN, metadata, redirects              | Unverified                                                             | Deferred with Gate B.                                                                                                                                                                                     |
+| Real key absent from the guest                         | Verified with a synthetic key                                          | After the CLI ran in the same VM, the full key matched nothing in `/proc/*/environ`, `/proc/*/cmdline`, `/tmp`, `/root`, `/etc` or `/.msb`. The guest variable held the placeholder.                      |
+| Real key absent from output and host files             | Verified with a synthetic key                                          | The key was absent from all captured stdout and from the probe CLI's stderr. A scan found it in no file under the run directory (including `audit.sqlite`) or under `MSB_HOME`.                           |
+| Planted repository settings ignored                    | Adapter needed (implemented)                                           | `--setting-sources ''` is required: `--bare` alone still applied a planted `env` block. With the flag, the planted hooks, `env` and `apiKeyHelper` were all ignored.                                      |
+| Concurrent sandboxes                                   | Verified for two                                                       | Two Planner VMs ran in parallel with separate config directories and both succeeded.                                                                                                                      |
+| CPU and memory limits                                  | Backend supports them, adapter does not                                | `--cpus` and `--memory` exist, but the adapter does not pass them yet.                                                                                                                                    |
+| Real `api.anthropic.com` traffic                       | Unverified                                                             | No real key was authorized.                                                                                                                                                                               |
 
 The Claude Code facts come from the official docs, read on 2026-11-22:
 
@@ -56,7 +57,8 @@ MSB_HOME=/absolute/short/msb-home \
 ```
 
 The smoke uses the product path: `MicrosandboxRuntime` with a credential
-provider and `providerHosts`, and `TrustedHost.runPlanner` and `runWorker`
+provider and a bound `providers` entry, and `TrustedHost.runPlanner` and
+`runWorker`
 with the `src/claude-code.ts` adapter. Its fixtures are:
 
 - **API stand-in.** A loopback HTTPS server with a disposable CA stands in
@@ -65,16 +67,25 @@ with the `src/claude-code.ts` adapter. Its fixtures are:
   CA option and a custom intercept port.
 - **Key.** The trusted host holds a synthetic `sk-ant-synthetic-…` key.
 
-On 2026-11-22 it passed in about 19 seconds:
+The Planner and Worker inputs also include planted `.claude/settings.json`
+and `.claude/settings.local.json`. They contain a hook that appends to
+`hello.txt`, an `env` block that redirects the API to an unapproved port,
+and an `apiKeyHelper`.
+
+On 2026-11-22 it passed in about 23 seconds:
 
 - **Planners.** Two Planner VMs ran in parallel. Each returned the CLI's
   JSON result, and `parseClaudeCodeResult` read `FIXTURE-PLAN-OK`.
 - **Worker.** The stand-in drove `Read` and then `Edit`. The edited
   `hello.txt` was collected as `Good day from Claude Code.`
-- **Requests.** All five Messages requests were streamed and carried the
+- **Requests.** All six Messages requests were streamed and carried the
   substituted key in `x-api-key`. None had an `Authorization` header.
-- **Probe VM.** The placeholder was present, the key was found nowhere, and
-  an unapproved port was blocked.
+- **Planted settings.** None took effect: the edited file had no appended
+  text, and no request went to the redirected URL.
+- **Probe VM.** After a CLI run, the placeholder was present and the full
+  key was found nowhere in the guest. An unapproved port was blocked.
+- **Host.** The key appeared in no captured output and in no file under the
+  run directory or `MSB_HOME`.
 - **Audit.** Each role VM recorded the `provider.egress` grant as requested,
   allowed and finished `ok`.
 
@@ -86,6 +97,10 @@ On 2026-11-22 it passed in about 19 seconds:
   offers the model only `Read` and `Edit`, so a `Write` call failed with
   "No such tool available". Planner and Reviewer now remove `Edit` and
   `Write`, so they see only `Read`.
+- **Planted `env` applied under `--bare`.** A planted project
+  `settings.json` `env` block redirected `ANTHROPIC_BASE_URL` even with
+  `--bare`. Every role then timed out at the network policy. Adding
+  `--setting-sources ''` fixed it.
 - **Search hits from the probe itself.** The first exposure probe matched
   its own command line. It now joins the search string inside the shell and
   writes it to a file outside the searched paths.

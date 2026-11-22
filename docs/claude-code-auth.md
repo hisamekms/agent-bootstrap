@@ -43,12 +43,27 @@ Without the backend, the guest has no way to recover the key. A guest
 process can still use the key while the VM lives, by sending the
 placeholder to `api.anthropic.com`. See the risks below.
 
-The CLI always runs with `--bare`. According to the Claude Code
-documentation, bare mode never reads OAuth credentials or the system
-keychain. Combined with a clean environment (`env -i`) and a fresh
-`CLAUDE_CONFIG_DIR`, this keeps API-key mode from picking up a
-pre-existing subscription session or host profile. No host home, `~/.claude`,
-SSH agent, Docker socket or cloud credential directory is mounted.
+The CLI always runs with `--bare --strict-mcp-config --setting-sources ''`.
+According to the Claude Code documentation, bare mode never reads OAuth
+credentials or the system keychain. Together with a clean environment
+(`env -i`) and a fresh `CLAUDE_CONFIG_DIR`, this keeps API-key mode from
+picking up a pre-existing subscription session or host profile. No host
+home, `~/.claude`, SSH agent, Docker socket or cloud credential directory is
+mounted.
+
+`--setting-sources ''` matters because the CLI runs inside untrusted
+repository content. A test on 2026-11-22 with CLI 2.1.330 planted
+`.claude/settings.json` and `.claude/settings.local.json` in the working
+directory:
+
+- **With `--bare` alone,** the CLI ignored the planted hooks but still
+  applied the planted `env` block. That block redirected
+  `ANTHROPIC_BASE_URL`, and the requests stalled at the network policy.
+- **With `--setting-sources ''`,** the planted hooks, `env` and
+  `apiKeyHelper` were all ignored.
+
+Managed settings and `--settings` still apply under bare mode. The adapter
+passes neither.
 
 ### Direct injection
 
@@ -95,7 +110,10 @@ this traffic.
    `apk` checks their signatures with the image's keys.
 3. Keep both under `.local/`, which Git ignores.
 4. Configure `MicrosandboxRuntime` with:
-   - `providerHosts: ["api.anthropic.com"]`;
+   - `providers: [claudeCodeProvider({ mode: "api-key", credential: "host-secret" })]`.
+     This binds the credential to that host, the `x-api-key` header, the
+     `ANTHROPIC_API_KEY` variable, port 443 and no extra CA. A sandbox spec
+     whose `provider` differs in any field is refused.
    - a `CredentialProvider` that returns the API key from the host's own
      secret store.
 
@@ -112,13 +130,13 @@ Do not put keys in repository files, CLI flags or shell history.
 values only. The untrusted prompt is a single argv entry (`$1`), passed after
 `--`. An agent's text cannot choose host commands or CLI flags.
 
-| Item        | How it is set                                                                                                                                                                                               |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Flags       | Always `-p --bare --output-format json --max-turns N --model M --permission-mode ... --allowedTools ... --disallowedTools ...`.                                                                             |
-| Environment | Only `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, the placeholder key, the backend CA path (`NODE_EXTRA_CA_CERTS`) and the variables that disable nonessential traffic, telemetry, error reporting and auto-update. |
-| Tools       | Bash is removed for every role. Planner and Reviewer get Read only, and Edit and Write are removed. Worker can Read and Edit in `/workspace`.                                                               |
-| Output      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                          |
-| Limits      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                               |
+| Item        | How it is set                                                                                                                                                                                                                             |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flags       | Always `-p --bare --strict-mcp-config --setting-sources '' --output-format json --max-turns N --model M --permission-mode ... --allowedTools ... --disallowedTools ...`.                                                                  |
+| Environment | Only `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, the placeholder key, the backend CA path (`NODE_EXTRA_CA_CERTS`) and the variables that disable nonessential traffic, telemetry, error reporting and auto-update.                               |
+| Tools       | Bash is removed for every role. Planner and Reviewer are allowed Read, Glob and Grep, with Edit and Write removed; in bare mode CLI 2.1.330 then offers only Read. Worker is also allowed Edit and Write; bare mode offers Read and Edit. |
+| Output      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                        |
+| Limits      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                             |
 
 ## Trust boundaries and risks
 
@@ -137,6 +155,13 @@ machine` process holds the key in its environment. A process running as
 - **Untested bypass routes.** Direct IP, IPv6, LAN, metadata and redirect
   bypass attempts are not yet covered by tests. Gate B in the Codex PoC
   tracks the same matrix.
+- **Host-side variable name.** On the host, the key sits in the `msb
+create` environment as `ANTHROPIC_API_KEY`, because Microsandbox uses the
+  same name in the guest. It has not been verified that `msb` itself never
+  interprets that variable.
+- **Placeholder format.** The guest check expects the literal placeholder
+  `$MSB_ANTHROPIC_API_KEY`. This fails closed, but depends on the
+  Microsandbox version.
 - **Reviewer verdicts can be steered.** The Reviewer reads untrusted
   candidate text, so prompt injection can influence its verdict. The human
   approval of the full diff remains the independent check.
