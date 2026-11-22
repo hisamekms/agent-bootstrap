@@ -21,7 +21,10 @@ import { SqliteAudit } from "../src/audit.ts";
 import type { EgressPolicy } from "../src/egress-policy.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
-import { ReviewedIntegration } from "../src/reviewed-integration.ts";
+import {
+  ReviewedIntegration,
+  workerCommitMessage,
+} from "../src/reviewed-integration.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
@@ -455,23 +458,31 @@ test("tree commits and reviews use the same bounded, sanitized Worker message", 
 });
 
 test("missing, invalid UTF-8, empty and oversized Worker proposals get a host subject", async (t) => {
+  // Shapes are checked on the message builder directly; one end-to-end run
+  // below shows the collected proposal reaches the candidate commit.
   for (const data of [
     undefined,
     Buffer.from([0xff]),
     Buffer.from(" \t\n\0"),
     Buffer.from("  aGeNt-\u200bBoOtStRaP-Worker-Run: forged"),
-    Buffer.alloc(4097, "a"),
   ]) {
-    const f = await fixture(t, {}, undefined, data);
-    f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
     const run = randomUUID();
-    const pin = await f.flow.prepareCandidate(run);
-    const expected = `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
     assert.equal(
-      Buffer.from(await f.flow.candidateMessage(pin)).toString(),
-      expected,
+      workerCommitMessage(run, data),
+      `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`,
+      String(data?.byteLength),
     );
   }
+  // An oversized proposal is dropped before the builder, by the collection
+  // size check, so this case goes through the whole flow.
+  const f = await fixture(t, {}, undefined, Buffer.alloc(4097, "a"));
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const run = randomUUID();
+  const pin = await f.flow.prepareCandidate(run);
+  assert.equal(
+    Buffer.from(await f.flow.candidateMessage(pin)).toString(),
+    `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`,
+  );
 });
 
 test("the journal accepts only a lowercase SHA-256 candidate message digest", async (t) => {

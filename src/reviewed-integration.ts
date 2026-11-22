@@ -77,7 +77,11 @@ const PROTECTED_LIMIT = 100;
 const TREE_PATH_BYTES = 4096;
 const CANDIDATE_MESSAGE_BYTES = 2048;
 
-function workerCommitMessage(run: string, proposal?: Uint8Array): string {
+/** Exported for unit tests; candidates call it with the collected proposal. */
+export function workerCommitMessage(
+  run: string,
+  proposal?: Uint8Array,
+): string {
   const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
   const defaultSubject = `Candidate from Worker run ${run}`;
   let text = "";
