@@ -142,8 +142,11 @@ function normalizePath(raw: string): string {
   return parts.join("/");
 }
 
-function parseTar(tar: Uint8Array): TarEntry[] {
-  if (tar.length > MAX_INPUT_BYTES) fail("tar: input too large");
+function parseTar(
+  tar: Uint8Array,
+  maxBytes: number = MAX_INPUT_BYTES,
+): TarEntry[] {
+  if (tar.length > maxBytes) fail("tar: input too large");
   const entries: TarEntry[] = [];
   let pos = 0;
   let longName: string | undefined;
@@ -347,17 +350,11 @@ function byPath(a: TarEntry, b: TarEntry): number {
   return Buffer.compare(Buffer.from(a.path), Buffer.from(b.path));
 }
 
-/**
- * Rewrite a tar deterministically. Entries are sorted by normalized path
- * (bytewise); non-hardlink entries come first, then all hardlinks (sorted), so
- * every hardlink follows its target. Hardlinks to hardlinks are rejected.
- * In each hardlink group the bytewise-smallest path becomes the file, so the
- * output does not depend on which member the archiver saw first.
- * The root directory entry is dropped. mtime, uname and gname are cleared.
- * PAX extended attributes (xattrs, e.g. file capabilities) are dropped.
- */
-export function normalizeLayer(tar: Uint8Array): Uint8Array {
-  const entries = parseTar(tar);
+function validateTar(
+  tar: Uint8Array,
+  maxBytes: number,
+): { entries: TarEntry[]; byName: Map<string, TarEntry> } {
+  const entries = parseTar(tar, maxBytes);
   const byName = new Map<string, TarEntry>();
   for (const e of entries) {
     if (byName.has(e.path)) fail("tar: duplicate path");
@@ -384,6 +381,65 @@ export function normalizeLayer(tar: Uint8Array): Uint8Array {
       }
     }
   }
+  return { entries, byName };
+}
+
+export interface TarEntryView {
+  readonly path: string;
+  readonly type:
+    "file" | "hardlink" | "symlink" | "directory" | "char" | "block" | "fifo";
+  readonly mode: number;
+  readonly linkname: string;
+  readonly data: Uint8Array;
+}
+
+const VIEW_TYPES = {
+  "0": "file",
+  "1": "hardlink",
+  "2": "symlink",
+  "3": "char",
+  "4": "block",
+  "5": "directory",
+  "6": "fifo",
+} as const;
+
+/**
+ * Strictly read a tar: the same validation as normalizeLayer (ancestors must
+ * be explicit directories, hardlink targets must be regular files, no
+ * duplicates, no "..", size and entry caps). Returns frozen entry views in
+ * archive order.
+ */
+export function readTar(
+  tar: Uint8Array,
+  maxBytes: number = MAX_INPUT_BYTES,
+): readonly TarEntryView[] {
+  return Object.freeze(
+    validateTar(tar, maxBytes).entries.map((e) =>
+      Object.freeze({
+        path: e.path,
+        type: VIEW_TYPES[e.type],
+        mode: e.mode,
+        linkname: e.linkname,
+        data: e.data,
+      }),
+    ),
+  );
+}
+
+/**
+ * Rewrite a tar deterministically. Entries are sorted by normalized path
+ * (bytewise); non-hardlink entries come first, then all hardlinks (sorted), so
+ * every hardlink follows its target. Hardlinks to hardlinks are rejected.
+ * In each hardlink group the bytewise-smallest path becomes the file, so the
+ * output does not depend on which member the archiver saw first.
+ * The root directory entry is dropped. mtime, uname and gname are cleared.
+ * PAX extended attributes (xattrs, e.g. file capabilities) are dropped.
+ */
+export function normalizeLayer(
+  tar: Uint8Array,
+  maxBytes: number = MAX_INPUT_BYTES,
+): Uint8Array {
+  const { entries, byName } = validateTar(tar, maxBytes);
   // Which member of a hardlink group the archiver wrote as the file depends
   // on its traversal order. Canonicalize: the bytewise-smallest path holds
   // the data and every other member links to it.

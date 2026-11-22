@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CLAUDE_CODE,
+  CLAUDE_CODE_BUILDS,
   CLAUDE_CODE_GUEST_PACKAGES,
   ClaudeCodeUnsupportedError,
   claudeCodeCommand,
@@ -271,4 +272,39 @@ test("shell adds Bash for the Worker only, and only as a boolean", () => {
       () => claudeCodeCommand({ ...task, shell: shell as never }),
       /Invalid shell option/,
     );
+});
+
+test("the Debian guest uses the glibc build, no apk step, and the same isolation", () => {
+  const alpine = claudeCodeCommand(task).argv[2]!;
+  const debian = claudeCodeCommand(task, undefined, "debian").argv[2]!;
+  assert.ok(debian.includes(CLAUDE_CODE_BUILDS.debian.sha256));
+  assert.ok(!debian.includes(CLAUDE_CODE_BUILDS.alpine.sha256));
+  assert.doesNotMatch(debian, /apk/);
+  assert.match(debian, /command -v bash >\/dev\/null/);
+  for (const flag of [
+    /-p --bare --strict-mcp-config --setting-sources ''/,
+    /--disable-slash-commands --no-session-persistence/,
+    /--permission-mode acceptEdits/,
+    /env -i PATH=/,
+    /claude_home=\$\(mktemp -d\)/,
+    /NODE_EXTRA_CA_CERTS=/,
+    /test "\$ANTHROPIC_API_KEY" = '\$MSB_ANTHROPIC_API_KEY'/,
+  ])
+    assert.match(debian, flag);
+  assert.match(alpine, /apk add --no-network/);
+  assert.throws(
+    () => claudeCodeCommand(task, undefined, "arch" as never),
+    /Invalid guest kind/,
+  );
+});
+
+test("claudeCodeTools ships the apks on Alpine and only the binary on Debian", () => {
+  const install = { binary: "/h/claude", packageDir: "/h/apk" };
+  const alpine = claudeCodeTools(install);
+  assert.equal(alpine.length, 1 + CLAUDE_CODE_GUEST_PACKAGES.length);
+  assert.equal(alpine[0]!.sha256, CLAUDE_CODE.sha256);
+  const debian = claudeCodeTools(install, "debian");
+  assert.equal(debian.length, 1);
+  assert.equal(debian[0]!.sha256, CLAUDE_CODE_BUILDS.debian.sha256);
+  assert.equal(CLAUDE_CODE_BUILDS.alpine.sha256, CLAUDE_CODE.sha256);
 });

@@ -4,9 +4,40 @@ import type { ProfileName } from "./sandbox-profiles.ts";
 /** Alpine 3.23 base image and where its signed packages are kept (relative to
  * the repository root). */
 export const ALPINE_3_23 = {
+  kind: "alpine",
   reference:
     "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
   packageDir: ".local/alpine/v3.23/main/aarch64",
+} as const;
+
+/** Debian 13 (trixie) slim. Packages come from one fixed snapshot.debian.org
+ * timestamp; the build VM may reach only `egress` (host:port, TCP). */
+export const DEBIAN_TRIXIE = {
+  kind: "debian-snapshot",
+  reference:
+    "docker.io/library/debian@sha256:24a01011d10eba3a023bc8585b9650b8b29021240d4217c05b905e09ef4a5232",
+  snapshot: "20261120T000000Z",
+  inRelease: [
+    {
+      archive: "debian",
+      suite: "trixie",
+      sha256:
+        "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+    },
+    {
+      archive: "debian",
+      suite: "trixie-updates",
+      sha256:
+        "6f57bff7c8bf51425b0d654b57a93a8cf83f07a6a5d6116ee766f4612336c642",
+    },
+    {
+      archive: "debian-security",
+      suite: "trixie-security",
+      sha256:
+        "d0b3748b4eb57be9fe9c58b867fe6f1634863313af007d47767658a0fd7abd90",
+    },
+  ],
+  egress: "snapshot.debian.org:80",
 } as const;
 
 export interface PinnedPackage {
@@ -142,24 +173,148 @@ export const FEATURES = {
     ],
     setup: POSTGRES_SETUP,
   },
+  git: {
+    packages: [
+      pkg(
+        "git-2.52.1-r0.apk",
+        "b7f80755f78ab9b52f62e5bd3c9d75986e13fced5917ce5348eb9ecb2cad2ab2",
+      ),
+      pkg(
+        "libcurl-8.23.0-r0.apk",
+        "a7cf7d0813d3a96f2cb65fbf873e8a8661866a843f2b7769b629024d9e5809bc",
+      ),
+      pkg(
+        "brotli-libs-1.2.1-r0.apk",
+        "bec9ee522095e9fd01113d8732119847944e3152f228034246a33e2ab82e4195",
+      ),
+      pkg(
+        "c-ares-1.34.9-r0.apk",
+        "2af302c4a232fff2abeb56ec9f16edabdb06f0e5f8d040d6e466e91f1c473d00",
+      ),
+      pkg(
+        "libidn2-2.3.8-r0.apk",
+        "71db3591a2cb251aae463b966f9731c9ecae3bff4dccea552e0033002b92fd75",
+      ),
+      pkg(
+        "libunistring-1.4.1-r0.apk",
+        "03f26b1c897ad74af51b475d5f6cebad50efe90e4d42a0c38ffcb37859077481",
+      ),
+      pkg(
+        "nghttp2-libs-1.69.0-r0.apk",
+        "2e17aa1d7d4a37b2d029210d239b8b2e4ac40748d9a8c8912a6b607011034fd1",
+      ),
+      pkg(
+        "libpsl-0.21.5-r3.apk",
+        "3078398181f0955da453826965a9e184494e4d9dfd22391e28d72f7561a0ca2b",
+      ),
+      pkg(
+        "libexpat-2.10.0-r0.apk",
+        "f6483389ab602a351891337be7e9975106d0749d57aa5339b0725bb4051e4bc3",
+      ),
+      pkg(
+        "pcre2-10.49-r0.apk",
+        "a0af38fe98cb22c358aca1e1e504141c6673efef7635c539a914b83fb5c13b58",
+      ),
+    ],
+  },
 } as const satisfies Record<string, Feature>;
 
 export type FeatureName = keyof typeof FEATURES;
 
-export interface ProfileRecipe {
+export interface DebianFeature {
+  /** Debian package names, installed with apt from the snapshot. */
+  readonly apt: readonly string[];
+  /** Shell run in the build VM after the packages are installed. */
+  readonly setup?: string;
+}
+
+const DEBIAN_POSTGRES_SETUP = `# The package builds a random cluster at install time; drop it so rebuilds match.
+if command -v pg_dropcluster >/dev/null 2>&1 && [ -d /etc/postgresql/17/main ]; then
+  pg_dropcluster 17 main --stop
+fi
+rm -f /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/ssl/private/ssl-cert-snakeoil.key
+mkdir -p /run/postgresql
+chown postgres:postgres /run/postgresql
+chmod 2775 /run/postgresql
+cat > /usr/local/bin/agent-bootstrap-postgres <<'AGENT_BOOTSTRAP_EOF'
+#!/bin/sh
+set -eu
+# Fixed binary directory: no PATH lookup, and su may reset PATH.
+bin=/usr/lib/postgresql/17/bin
+data=$(mktemp -d /tmp/agent-bootstrap-pg.XXXXXX)
+as_postgres() {
+  if [ "$(id -u)" = 0 ]; then
+    su -s /bin/sh -c "$1" postgres
+  else
+    /bin/sh -c "$1"
+  fi
+}
+if [ "$(id -u)" = 0 ]; then
+  mkdir -p /run/postgresql
+  chown postgres:postgres "$data" /run/postgresql
+fi
+# $data is a mktemp path made of fixed characters, so it is safe to expand.
+as_postgres "$bin/initdb -D '$data/db' -A trust -U postgres --no-instructions" >/dev/null 2>&1
+as_postgres "$bin/pg_ctl -D '$data/db' -o '-c listen_addresses=127.0.0.1 -c port=5432 -c unix_socket_directories=/run/postgresql' -w -t 60 -l '$data/log' start" >/dev/null 2>&1
+
+printf '%s\\n' 'postgresql://postgres@127.0.0.1:5432/postgres'
+AGENT_BOOTSTRAP_EOF
+chmod 0755 /usr/local/bin/agent-bootstrap-postgres
+`;
+
+const DEBIAN_CHROMIUM_SETUP = `cat > /usr/local/bin/agent-bootstrap-chromium <<'AGENT_BOOTSTRAP_EOF'
+#!/bin/sh
+exec chromium --headless --no-sandbox --disable-gpu "$@"
+AGENT_BOOTSTRAP_EOF
+chmod 0755 /usr/local/bin/agent-bootstrap-chromium
+cat > /etc/profile.d/agent-bootstrap-browser.sh <<'AGENT_BOOTSTRAP_EOF'
+export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+export CHROMIUM_PATH=/usr/bin/chromium
+AGENT_BOOTSTRAP_EOF
+chmod 0644 /etc/profile.d/agent-bootstrap-browser.sh
+`;
+
+export const DEBIAN_FEATURES = {
+  sqlite: { apt: ["sqlite3"] },
+  postgres: { apt: ["postgresql"], setup: DEBIAN_POSTGRES_SETUP },
+  chromium: {
+    apt: ["chromium", "fonts-liberation"],
+    setup: DEBIAN_CHROMIUM_SETUP,
+  },
+  git: { apt: ["git"] },
+} as const satisfies Record<string, DebianFeature>;
+
+export type DebianFeatureName = keyof typeof DEBIAN_FEATURES;
+
+export interface AlpineRecipe {
   readonly base: typeof ALPINE_3_23;
   readonly features: readonly FeatureName[];
   readonly memoryMiB: number;
   readonly cpus: number;
 }
 
+export interface DebianRecipe {
+  readonly base: typeof DEBIAN_TRIXIE;
+  readonly features: readonly DebianFeatureName[];
+  readonly memoryMiB: number;
+  readonly cpus: number;
+}
+
+export type ProfileRecipe = AlpineRecipe | DebianRecipe;
+
 export const PROFILE_RECIPES: Readonly<
   Partial<Record<ProfileName, ProfileRecipe>>
 > = {
   db: {
     base: ALPINE_3_23,
-    features: ["sqlite", "postgres"],
+    features: ["sqlite", "postgres", "git"],
     memoryMiB: 1024,
+    cpus: 2,
+  },
+  browser: {
+    base: DEBIAN_TRIXIE,
+    features: ["sqlite", "postgres", "chromium", "git"],
+    memoryMiB: 2048,
     cpus: 2,
   },
 };
@@ -172,14 +327,32 @@ export function recipeFor(name: string): ProfileRecipe {
   return recipe;
 }
 
-function setupOf(feature: FeatureName): string | undefined {
-  return (FEATURES[feature] as Feature).setup;
+function setupOf(recipe: ProfileRecipe, feature: string): string | undefined {
+  const table = (
+    recipe.base.kind === "alpine" ? FEATURES : DEBIAN_FEATURES
+  ) as Readonly<Record<string, { readonly setup?: string }>>;
+  return table[feature]?.setup;
 }
 
-/** Union of the features' packages, one entry per file name, sorted by name. */
+function setupsOf(recipe: ProfileRecipe): string[] {
+  return recipe.features.flatMap((f) => {
+    const s = setupOf(recipe, f);
+    return s === undefined ? [] : [s];
+  });
+}
+
+function alpineRecipe(name: string): AlpineRecipe {
+  const recipe = recipeFor(name);
+  if (recipe.base.kind !== "alpine")
+    throw new Error(`Profile ${name} is not an Alpine recipe`);
+  return recipe as AlpineRecipe;
+}
+
+/** Union of the features' packages, one entry per file name, sorted by name.
+ * Alpine recipes only. */
 export function profilePackages(name: string): PinnedPackage[] {
   const byName = new Map<string, string>();
-  for (const feature of recipeFor(name).features) {
+  for (const feature of alpineRecipe(name).features) {
     for (const item of FEATURES[feature].packages as readonly PinnedPackage[]) {
       const seen = byName.get(item.name);
       if (seen !== undefined && seen !== item.sha256)
@@ -192,20 +365,133 @@ export function profilePackages(name: string): PinnedPackage[] {
     .map(([n, sha256]) => ({ name: n, sha256 }));
 }
 
+/** Sorted, de-duplicated apt package names of a Debian recipe. */
+export function aptPackages(name: string): string[] {
+  const recipe = recipeFor(name);
+  if (recipe.base.kind !== "debian-snapshot")
+    throw new Error(`Profile ${name} is not a Debian recipe`);
+  const names = new Set<string>();
+  for (const f of (recipe as DebianRecipe).features)
+    for (const p of DEBIAN_FEATURES[f].apt) names.add(p);
+  return [...names].sort();
+}
+
 /** SHA-256 (hex) of the recipe inputs: base, packages, setup scripts, limits. */
 export function recipeDigest(name: string): string {
   const recipe = recipeFor(name);
-  const canonical = JSON.stringify({
-    base: recipe.base.reference,
-    packages: profilePackages(name).map((p) => [p.name, p.sha256]),
-    setup: recipe.features.flatMap((f) => {
-      const s = setupOf(f);
-      return s === undefined ? [] : [s];
-    }),
-    memoryMiB: recipe.memoryMiB,
-    cpus: recipe.cpus,
-  });
+  const canonical =
+    recipe.base.kind === "alpine"
+      ? JSON.stringify({
+          base: recipe.base.reference,
+          packages: profilePackages(name).map((p) => [p.name, p.sha256]),
+          setup: setupsOf(recipe),
+          memoryMiB: recipe.memoryMiB,
+          cpus: recipe.cpus,
+        })
+      : JSON.stringify({
+          kind: recipe.base.kind,
+          base: recipe.base.reference,
+          snapshot: recipe.base.snapshot,
+          inRelease: recipe.base.inRelease,
+          egress: recipe.base.egress,
+          apt: aptPackages(name),
+          setup: setupsOf(recipe),
+          memoryMiB: recipe.memoryMiB,
+          cpus: recipe.cpus,
+        });
   return createHash("sha256").update(canonical).digest("hex");
+}
+
+/** Shell lines shared by both builds: fixed identity files. */
+function archiveLines(): string[] {
+  return [
+    // The backend writes the build VM's name into these: fixed contents keep
+    // rebuilds of the same inputs byte-identical.
+    "printf 'localhost\\n' > /etc/hostname",
+    "printf '127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n' > /etc/hosts",
+    // No backend or host DNS settings may be archived.
+    ": > /etc/resolv.conf",
+  ];
+}
+
+const TOP_LEVEL_LOOP = [
+  "cd /",
+  // Top-level entries except proc, sys, dev, tmp and .msb; unmatched globs
+  // stay literal and are skipped by the existence test.
+  "set --",
+  "for entry in .[!.]* ..?* *; do",
+  '  case "$entry" in',
+  "    proc|sys|dev|tmp|.msb) ;;",
+  "    *)",
+  '      if [ -e "$entry" ] || [ -L "$entry" ]; then set -- "$@" "$entry"; fi',
+  "      ;;",
+  "  esac",
+  "done",
+];
+
+function debianBuildScript(recipe: DebianRecipe, name: string): string {
+  const { snapshot, inRelease } = recipe.base;
+  const lists = "/var/lib/apt/lists";
+  const releases = inRelease.map(({ archive, suite, sha256 }) => ({
+    path: `${lists}/snapshot.debian.org_archive_${archive}_${snapshot}_dists_${suite}_InRelease`,
+    sha256,
+  }));
+  const keyring = "/usr/share/keyrings/debian-archive-keyring.gpg";
+  const sources = [
+    "Types: deb",
+    `URIs: http://snapshot.debian.org/archive/debian/${snapshot}/`,
+    "Suites: trixie trixie-updates",
+    "Components: main",
+    `Signed-By: ${keyring}`,
+    "",
+    "Types: deb",
+    `URIs: http://snapshot.debian.org/archive/debian-security/${snapshot}/`,
+    "Suites: trixie-security",
+    "Components: main",
+    `Signed-By: ${keyring}`,
+    "",
+  ].join("\n");
+  return [
+    "set -e",
+    "rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list",
+    "cat > /etc/apt/sources.list.d/snapshot.sources <<'AGENT_BOOTSTRAP_EOF'",
+    sources + "AGENT_BOOTSTRAP_EOF",
+    // Snapshot Release files are old by design; their signatures still apply.
+    `printf 'Acquire::Check-Valid-Until "false";\\n' > /etc/apt/apt.conf.d/99snapshot`,
+    "apt-get update >/dev/null",
+    // Signatures alone would still allow replay of older snapshot metadata.
+    "printf '%s  %s\\n' \\",
+    ...releases.map(({ path, sha256 }) => `  '${sha256}' '${path}' \\`),
+    "  | sha256sum -c -",
+    `for release in ${lists}/*Release ${lists}/.*Release; do`,
+    '  [ -e "$release" ] || [ -L "$release" ] || continue',
+    '  case "$release" in',
+    `    ${releases.map(({ path }) => `'${path}'`).join("|")}) ;;`,
+    '    *) printf "Unexpected apt release file: %s\\n" "$release" >&2; exit 1 ;;',
+    "  esac",
+    "done",
+    `DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates ${aptPackages(name).join(" ")} >/dev/null`,
+    ...setupsOf(recipe),
+    // Cleanup for determinism. The snapshot sources stay: they record where
+    // the packages came from, and task VMs have no network.
+    "apt-get clean",
+    "rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/* /var/cache/debconf/*-old /var/lib/dpkg/*-old /var/cache/ldconfig/aux-cache /tmp/*",
+    "find / -xdev -name '__pycache__' -prune -exec rm -rf {} + || true",
+    // Account change dates are install-day numbers; fix them.
+    // An empty last-change field disables password aging and carries no date.
+    // (0 would mean "change the password now", which makes su refuse.)
+    "sed -i -E 's/^([^:]*:[^:]*):[0-9]*:/\\1::/' /etc/shadow",
+    ": > /etc/machine-id",
+    // Random per install: an empty machine id, and font caches that fontconfig
+    // regenerates on demand (they embed build-time data).
+    "if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then : > /var/lib/dbus/machine-id; fi",
+    "rm -rf /var/cache/fontconfig/*",
+    ...archiveLines(),
+    "dpkg-query -W -f='${Package}=${Version}\\n' | sort > /etc/agent-bootstrap-packages.txt",
+    ...TOP_LEVEL_LOOP,
+    'tar --format=gnu --numeric-owner -cf /tmp/rootfs.tar --exclude run/microsandbox "$@"',
+    "",
+  ].join("\n");
 }
 
 /** The script the build VM runs. It leaves the root filesystem in
@@ -213,37 +499,53 @@ export function recipeDigest(name: string): string {
  * own /.msb, where it places runtime state such as an interception CA). */
 export function BUILD_SCRIPT(name: string): string {
   const recipe = recipeFor(name);
-  const setups = recipe.features.flatMap((f) => {
-    const s = setupOf(f);
-    return s === undefined ? [] : [s];
-  });
+  if (recipe.base.kind === "debian-snapshot")
+    return debianBuildScript(recipe as DebianRecipe, name);
   return [
     "set -e",
     "apk add --no-network --repositories-file /dev/null /tmp/pkgs/*.apk >/dev/null",
-    ...setups,
+    ...setupsOf(recipe),
     "rm -rf /tmp/pkgs /var/cache/apk/*",
-    // The backend writes the build VM's name into these, and apk logs times:
-    // fixed contents keep rebuilds of the same inputs byte-identical.
-    "printf 'localhost\\n' > /etc/hostname",
-    "printf '127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n' > /etc/hosts",
-    // No backend or host DNS settings may be archived.
-    ": > /etc/resolv.conf",
+    ...archiveLines(),
     "rm -f /var/log/apk.log",
-    "cd /",
-    // Top-level entries except proc, sys, dev, tmp and .msb; unmatched globs
-    // stay literal and are skipped by the existence test.
-    "set --",
-    "for entry in .[!.]* ..?* *; do",
-    '  case "$entry" in',
-    "    proc|sys|dev|tmp|.msb) ;;",
-    "    *)",
-    '      if [ -e "$entry" ] || [ -L "$entry" ]; then set -- "$@" "$entry"; fi',
-    "      ;;",
-    "  esac",
-    "done",
+    ...TOP_LEVEL_LOOP,
     // The backend's guest runtime directory is left out of the archive (not
     // removed: the backend may be using it during exec).
     'tar -cf /tmp/rootfs.tar --exclude run/microsandbox "$@"',
     "",
   ].join("\n");
+}
+
+/** Where the build VM may connect, as `msb create --net-rule` values. */
+export function buildNetRules(name: string): string[] {
+  const { base } = recipeFor(name);
+  if (base.kind === "alpine") return [];
+  const [host, port] = base.egress.split(":");
+  // The allow@dns rule is unscoped and permits queries for any name.
+  return ["allow@dns", `allow@${host}:tcp:${port}`];
+}
+
+/** A shell script run in a VM of the finished image, and the exact output
+ * lines it must print. */
+export function smokeTest(name: string): {
+  script: string;
+  expected: string[];
+} {
+  const features: readonly string[] = recipeFor(name).features;
+  const script = [
+    'sqlite3 :memory: "select 1;"; url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"',
+  ];
+  const expected = ["1", "1"];
+  if (features.includes("chromium")) {
+    script.push(
+      'out=$(agent-bootstrap-chromium --dump-dom "data:text/html,<p>browser-ok</p>" 2>/dev/null)',
+      'case "$out" in *browser-ok*) echo browser-ok ;; esac',
+    );
+    expected.push("browser-ok");
+  }
+  if (features.includes("git")) {
+    script.push("git --version >/dev/null && echo git-ok");
+    expected.push("git-ok");
+  }
+  return { script: script.join("\n"), expected };
 }

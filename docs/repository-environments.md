@@ -17,6 +17,74 @@ host prepares everything they need before they run.
   digest-pinned directory mounted read-only, for example a Microsandbox
   volume or a `--mount-dir` mount.
 
+## Worker changes and git history
+
+Decided on 2026-11-22.
+
+- **Result path.** The host places the base tree in the workspace. After the
+  Worker run, the host exports the workspace as a tar and reads it with the
+  strict parser. It computes the changes against the base tree (changed,
+  added and deleted files, and mode changes) and creates the candidate commit
+  itself, with the host as author. The Worker may propose a bounded commit
+  message, which is treated as untrusted text. `.git` is never collected.
+  Path policy rejects changes outside the allowed paths. Scope and protected
+  paths match after NFC normalization and lowercasing, an approximation of
+  APFS case-insensitive folding. A trailing slash matches a directory prefix.
+  Files and directory prefixes in the resulting tree must have distinct folded
+  names wherever their original names differ.
+- **Git in the VM.** The workspace includes a git repository for the
+  Worker's own use, for example `git diff`, `git log`, `git blame` and
+  `git stash`. The host never reads it.
+- **Full history.** agent-bootstrap provides a full clone of the target
+  branch, without other remotes, hooks or credentials. Shallow clones and
+  answering requests for more history are left to dagq-lite.
+- **Monorepo paths.** Restricting a Worker to some paths is for focus, not
+  confidentiality. The workspace uses sparse checkout for those paths, and
+  the history stays that of the whole repository. Collection still rejects
+  changes outside the allowed paths.
+- **Revisions.** A revision run starts from the previous candidate's tree.
+  The VM repository has the base and the previous candidate as commits, so
+  the Worker can see both what changed in this run and what changed overall.
+
+### Implementation status
+
+The result path and git in the VM are implemented. The pieces are
+`prepareWorkspace`, `createCandidateTree` and the multi-file `diff` and
+`advance` in `src/git-integration.ts`, the `repository` and `{ tree: true }`
+collection in the adapter, `src/workspace-tree.ts`, and the `tree` plan in
+`src/reviewed-integration.ts`. The Worker's proposed commit message is not
+implemented yet; the host writes a fixed message.
+
+Before approval, the operator interface must show the exact paths returned
+by `ReviewedIntegration.protectedPaths(pin)` alongside the pinned review
+diff. The host recomputes the list from the pinned base and candidate. It
+includes changes covered by the plan's `protectedPaths` and all new or
+retargeted symlinks. Symlink targets must be relative and stay within the
+repository when resolved lexically from the link's directory. NUL and newline
+characters are forbidden in targets.
+
+When the list is non-empty, the operator must explicitly acknowledge the
+whole list. The interface passes those paths through
+`decide(pin, "approve", { acknowledgeProtected: paths })`. The host requires
+an exact match as a set and records a digest of the acknowledged paths.
+Rejection needs no acknowledgement.
+
+On 2026-11-23, `spike/workspace/tree-smoke.ts` ran in real VMs with the
+`browser` profile for Worker and verification:
+
+- **Unscoped run.** The Worker saw the full history and a clean
+  `git status`. Its four changes became a host-authored commit whose only
+  parent is the old head, with the exact modes: a modified file, a deleted
+  file, an added executable and an executable bit removed. Verification
+  checked the candidate tree with 4 tests passing, and the commit was
+  integrated.
+- **Scope `app/`, a new file outside it.** No candidate was created.
+- **Scope `app/`, an edit inside it.** Paths left out by sparse checkout were
+  absent in the VM but were not treated as deletions. The candidate changed
+  only `app/lib/util.sh`.
+- **Audit.** The Worker and verification VMs used `browser` with the locked
+  digest, and the Reviewer used `base`.
+
 ## Toolchains as features
 
 - **Features.** A toolchain is a feature, such as `node22`, `bun1.3`,

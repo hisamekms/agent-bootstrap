@@ -54,11 +54,23 @@ type Base = {
     readonly [F in (typeof eventFields)[K][number]]: string;
   };
 }[Kind];
-type Event =
-  | Base
-  | (Extract<Base, { kind: "verification.finished" }> & {
-      readonly tests?: { readonly passed: number; readonly failed: number };
-    });
+type EventDetails = {
+  "verification.finished": {
+    readonly tests?: { readonly passed: number; readonly failed: number };
+  };
+  "candidate.created": {
+    /** Tree mode only. The paths are recomputed from the pinned diff. */
+    readonly protectedCount?: number;
+  };
+  "human.decided": {
+    /** Digest of the sorted protected paths the operator acknowledged. */
+    readonly protectedDigest?: string;
+  };
+};
+type Event = {
+  [K in Kind]: Extract<Base, { kind: K }> &
+    (K extends keyof EventDetails ? EventDetails[K] : unknown);
+}[Kind];
 
 export type IntegrationEvent = Event & { readonly at: string };
 
@@ -85,13 +97,35 @@ function decode(value: unknown): IntegrationEvent {
   if (typeof kind !== "string" || !Object.hasOwn(eventFields, kind))
     throw new Error("Invalid integration event kind");
   const expected = eventFields[kind as Kind];
-  // Only verification.finished may carry the optional `tests` counts.
   const optional =
-    kind === "verification.finished" && Object.hasOwn(data, "tests") ? 1 : 0;
+    (kind === "verification.finished" && Object.hasOwn(data, "tests")) ||
+    (kind === "candidate.created" && Object.hasOwn(data, "protectedCount")) ||
+    (kind === "human.decided" && Object.hasOwn(data, "protectedDigest"))
+      ? 1
+      : 0;
   if (
+    kind === "candidate.created" &&
+    optional &&
+    !(
+      Number.isSafeInteger(data.protectedCount) &&
+      (data.protectedCount as number) >= 0 &&
+      (data.protectedCount as number) <= 10_000
+    )
+  )
+    throw new Error("Invalid integration event fields");
+  if (
+    kind === "verification.finished" &&
     optional &&
     (!validTests(data.tests) ||
       (data.review === "pass" && (data.tests as { failed: number }).failed > 0))
+  )
+    throw new Error("Invalid integration event fields");
+  if (
+    kind === "human.decided" &&
+    optional &&
+    (data.decision !== "approve" ||
+      typeof data.protectedDigest !== "string" ||
+      !fields.digest.test(data.protectedDigest))
   )
     throw new Error("Invalid integration event fields");
   if (

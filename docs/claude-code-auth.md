@@ -182,6 +182,18 @@ this traffic.
 
 Do not put keys in repository files, CLI flags or shell history.
 
+## Guest kinds and builds
+
+The same pinned version (2.1.330) has one binary per libc. `alpine` guests
+(base and db profiles: musl, busybox) run `linux-arm64-musl` and install bash
+from the copied, hash-checked apks. `debian` guests (browser profile: Debian 13
+slim, glibc, GNU coreutils, bash present) run `linux-arm64` (sha256
+`6016f90c...dd444`, `/lib/ld-linux-aarch64.so.1`) and need no apk step;
+the command only checks `command -v bash`. `claudeCodeTools(install, guest)`
+and `claudeCodeCommand(task, auth, guest)` select the build; `guestOf(profile)`
+in `src/actors.ts` maps a profile to its guest kind. Isolation flags, fresh
+home and config, and credential placeholder checks are identical.
+
 ## Command contract
 
 `claudeCodeCommand` builds the guest command from constants and validated

@@ -6,6 +6,8 @@ export interface ProfileLockEntry {
   readonly recipeDigest: string;
   readonly memoryMiB: number;
   readonly cpus: number;
+  /** Debian profiles only: installed `name=version` pairs, sorted. */
+  readonly packages?: readonly string[];
 }
 
 export interface ProfileLock {
@@ -26,15 +28,47 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): void {
 }
 
 /** The lock entry for a freshly built image digest (64 hex). */
-export function lockEntry(name: string, digest: string): ProfileLockEntry {
+export function lockEntry(
+  name: string,
+  digest: string,
+  packages?: readonly string[],
+): ProfileLockEntry {
   if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("Bad image digest");
   const recipe = recipeFor(name);
+  if (packages !== undefined) checkPackages(name, packages);
   return {
     image: `localhost/agent-bootstrap/${name}@sha256:${digest}`,
     recipeDigest: recipeDigest(name),
     memoryMiB: recipe.memoryMiB,
     cpus: recipe.cpus,
+    ...(packages === undefined ? {} : { packages: [...packages] }),
   };
+}
+
+const PACKAGE_RE = /^[a-z0-9][a-z0-9+.-]*=[A-Za-z0-9.+~:-]+$/;
+const MAX_PACKAGES = 2000;
+
+/** `name=version` strings, strictly sorted (so unique); Debian recipes only. */
+function checkPackages(
+  name: string,
+  value: unknown,
+): asserts value is string[] {
+  if (recipeFor(name).base.kind !== "debian-snapshot")
+    throw new Error(`Packages are not allowed for ${name}`);
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > MAX_PACKAGES
+  )
+    throw new Error(`Bad package list for ${name}`);
+  let previous: string | undefined;
+  for (const item of value) {
+    if (typeof item !== "string" || !PACKAGE_RE.test(item))
+      throw new Error(`Bad package entry for ${name}`);
+    if (previous !== undefined && !(previous < item))
+      throw new Error(`Package list for ${name} is not sorted`);
+    previous = item;
+  }
 }
 
 export function parseProfileLock(text: string): ProfileLock {
@@ -49,7 +83,14 @@ export function parseProfileLock(text: string): ProfileLock {
     if (!Object.hasOwn(PROFILE_RECIPES, name))
       throw new Error(`Profile lock names unknown profile ${name}`);
     if (!isRecord(entry)) throw new Error(`Bad lock entry for ${name}`);
-    exactKeys(entry, ["image", "recipeDigest", "memoryMiB", "cpus"]);
+    const hasPackages = Object.hasOwn(entry, "packages");
+    exactKeys(
+      entry,
+      hasPackages
+        ? ["image", "recipeDigest", "memoryMiB", "cpus", "packages"]
+        : ["image", "recipeDigest", "memoryMiB", "cpus"],
+    );
+    if (hasPackages) checkPackages(name, entry["packages"]);
     const image = entry["image"];
     if (
       typeof image !== "string" ||
@@ -71,6 +112,7 @@ export function parseProfileLock(text: string): ProfileLock {
       recipeDigest: entry["recipeDigest"] as string,
       memoryMiB: recipe.memoryMiB,
       cpus: recipe.cpus,
+      ...(hasPackages ? { packages: entry["packages"] as string[] } : {}),
     };
   }
   return { version: 1, profiles: out };

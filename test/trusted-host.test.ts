@@ -52,7 +52,7 @@ function adapter(request: string, status: ExecResult["status"] = "exited") {
     },
     async collect(_handle, spec) {
       calls.push("collect");
-      assert.deepEqual(spec.paths, ["report.txt"]);
+      assert.deepEqual("paths" in spec && spec.paths, ["report.txt"]);
       return { files: [{ path: "report.txt", bytes: Buffer.from("fixture") }] };
     },
     async destroy() {
@@ -830,4 +830,118 @@ test("verification never forwards egress or tools, even hidden ones", async (t) 
   assert.equal(spec.provider, undefined);
   assert.equal(spec.tools, undefined);
   assert.equal(spec.profile, "base");
+});
+
+test("collectTree requests a tree collection under the audited sandbox.collect operation", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const specs: unknown[] = [];
+  const created: unknown[] = [];
+  const runtime: SandboxRuntime = {
+    async create(spec) {
+      created.push(spec.repository);
+      return { id: "fixture" };
+    },
+    async exec() {
+      return {
+        status: "exited",
+        exitCode: 0,
+        stdout: Buffer.from('{"tool":"collect"}'),
+        stderr: Buffer.alloc(0),
+      };
+    },
+    async collect(_handle, spec) {
+      specs.push(spec);
+      return { files: [], tree: Buffer.from("TAR") };
+    },
+    async destroy() {},
+  };
+  const repository = { gitDir: "/x/git", tree: "/x/tree.tar" };
+  const result = await new TrustedHost(audit, runtime, profiles).runWorker({
+    sandbox: { repository },
+    command: plan.command,
+    collectPaths: [],
+    collectTree: true,
+  });
+  assert.equal(result.outcome, "ok");
+  assert.deepEqual(specs, [{ tree: true }]);
+  assert.deepEqual(created, [repository]);
+  assert.equal(Buffer.from(result.artifacts!.tree!).toString(), "TAR");
+  const trace = audit.read(result.id);
+  assert.deepEqual(
+    trace
+      .filter((event) => event.operation === "sandbox.collect")
+      .map((event) => event.kind),
+    ["operation.requested", "operation.allowed", "operation.finished"],
+  );
+});
+
+test("collectTree with paths and repository on other roles are refused before any audit write", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { runtime, calls } = adapter("");
+  const host = new TrustedHost(audit, runtime, profiles);
+  const repository = { gitDir: "/x/git", tree: "/x/tree.tar" };
+  await assert.rejects(
+    host.runWorker(
+      { ...plan, collectTree: true },
+      "11111111-1111-4111-8111-111111111111",
+    ),
+    /collectTree/,
+  );
+  const sandbox = { repository } as never;
+  const command = plan.command;
+  await assert.rejects(host.runReviewer({ sandbox, command }), /repository/);
+  await assert.rejects(host.runPlanner({ sandbox, command }), /repository/);
+  await assert.rejects(
+    host.runCoordinator({ sandbox, command }),
+    /Coordinator requires/,
+  );
+  await assert.rejects(
+    host.runCoordinatorSession({ sandbox, command }, "id", async () => 1),
+    /Coordinator session/,
+  );
+  assert.deepEqual(calls, []);
+  assert.deepEqual(audit.read("11111111-1111-4111-8111-111111111111"), []);
+});
+
+test("Verification may carry a host-prepared repository but never collects or gets extras", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const created: unknown[] = [];
+  const runtime: SandboxRuntime = {
+    async create(spec) {
+      created.push(spec);
+      return { id: "fixture" };
+    },
+    async exec() {
+      return {
+        status: "exited",
+        exitCode: 0,
+        stdout: Buffer.from('{"review":"pass"}'),
+        stderr: Buffer.alloc(0),
+      };
+    },
+    async collect() {
+      throw new Error("verification never collects");
+    },
+    async destroy() {},
+  };
+  const host = new TrustedHost(audit, runtime, profiles);
+  const repository = { gitDir: "/x/git", tree: "/x/tree.tar" };
+  const run = await host.runVerification({
+    sandbox: { repository, maxLifetimeMs: 1000 },
+    command: plan.command,
+  });
+  assert.equal(run.outcome, "ok");
+  assert.deepEqual((created[0] as SandboxSpec).repository, repository);
+  for (const extra of [{ tools: [] }, { hostTcpPort: 1 }, { provider: {} }])
+    await assert.rejects(
+      host.runVerification({
+        sandbox: { repository, ...extra } as never,
+        command: plan.command,
+      }),
+      /only/i,
+    );
+  assert.equal(created.length, 1);
 });

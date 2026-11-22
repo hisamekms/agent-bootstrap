@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import type { LocalGitIntegration } from "./git-integration.ts";
+import type {
+  LocalGitIntegration,
+  PreparedWorkspace,
+  TreeChange,
+} from "./git-integration.ts";
 import {
   IntegrationJournal,
   MAX_REVISIONS,
@@ -13,13 +17,28 @@ import type {
   SandboxSpec,
 } from "./sandbox-runtime.ts";
 import type { ReviewerRun, TrustedHost } from "./trusted-host.ts";
+import {
+  diffWorkspace,
+  parseLsTree,
+  workspaceFiles,
+} from "./workspace-tree.ts";
 
 type Review = "pass" | "revise" | "concern";
 type Decision = "approve" | "reject";
 type Event = Parameters<IntegrationJournal["append"]>[1];
 type IntegrationGit = Pick<
   LocalGitIntegration,
-  "head" | "snapshot" | "createCandidate" | "diff" | "advance" | "targetId"
+  | "head"
+  | "snapshot"
+  | "createCandidate"
+  | "diff"
+  | "advance"
+  | "targetId"
+  | "prepareWorkspace"
+  | "cleanupWorkspace"
+  | "createCandidateTree"
+  | "listTree"
+  | "protectedPaths"
 >;
 
 /** Extra sandbox inputs for model-driven roles. Verification gets none. */
@@ -42,8 +61,59 @@ const SUITE_LIMIT = 32;
 const SUITE_FILE_BYTES = 256 * 1024;
 const SUITE_TOTAL_BYTES = 512 * 1024;
 
+/** Whole-repository mode. `scope` and `protectedPaths` use the workspace-tree
+ * convention: a trailing `/` names a directory prefix, anything else one
+ * exact file. Without `scope` the Worker may change any path. */
+export type TreePlan = {
+  readonly scope?: readonly string[];
+  readonly protectedPaths?: readonly string[];
+};
+
+const SCOPE_LIMIT = 256;
+const PROTECTED_LIMIT = 100;
+const TREE_PATH_BYTES = 4096;
+
+function copyTreePaths(
+  value: readonly string[] | undefined,
+  limit: number,
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > limit)
+    throw new Error("Invalid tree plan");
+  const seen = new Set<string>();
+  return value.map((entry) => {
+    const name = typeof entry === "string" ? entry.replace(/\/$/, "") : "";
+    if (
+      typeof entry !== "string" ||
+      !name ||
+      Buffer.byteLength(entry) > TREE_PATH_BYTES ||
+      /[\0\\]/.test(entry) ||
+      name.startsWith("/") ||
+      name.split("/").some((part) => !part || part === "." || part === "..") ||
+      seen.has(entry)
+    )
+      throw new Error("Invalid tree plan");
+    seen.add(entry);
+    return entry;
+  });
+}
+
+function copyTree(input: TreePlan): TreePlan {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    throw new Error("Invalid tree plan");
+  const scope = copyTreePaths(input.scope, SCOPE_LIMIT);
+  const protectedPaths = copyTreePaths(input.protectedPaths, PROTECTED_LIMIT);
+  return {
+    ...(scope ? { scope } : {}),
+    ...(protectedPaths ? { protectedPaths } : {}),
+  };
+}
+
 type Plan = {
-  readonly path: string;
+  /** Single-file mode: one top-level file. Exclusive with `tree`. */
+  readonly path?: string;
+  /** Tree mode: the Worker edits a whole repository workspace. */
+  readonly tree?: TreePlan;
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
   readonly verification: Verification;
@@ -274,8 +344,11 @@ export class ReviewedIntegration {
       argv: [...command.argv],
     });
     const verification = copyVerification(plan.verification);
+    if ((plan.path === undefined) === (plan.tree === undefined))
+      throw new Error("A plan needs exactly one of path and tree");
     this.#plan = {
-      path: plan.path,
+      ...(plan.path !== undefined ? { path: plan.path } : {}),
+      ...(plan.tree !== undefined ? { tree: copyTree(plan.tree) } : {}),
       worker: copy(plan.worker),
       reviewer: copy(plan.reviewer),
       verification,
@@ -286,11 +359,16 @@ export class ReviewedIntegration {
   }
 
   async #target() {
-    const { path, verification } = this.#plan;
+    const { path, tree, verification } = this.#plan;
+    const sorted = (list?: readonly string[]) =>
+      list ? [...list].sort() : null;
     return sha256(
       JSON.stringify([
         await this.#git.targetId(),
-        path,
+        path ?? null,
+        tree ? "tree" : "file",
+        sorted(tree?.scope),
+        sorted(tree?.protectedPaths),
         verification.command.argv,
         verification.command.timeoutMs,
         verification.profile ?? "base",
@@ -327,11 +405,17 @@ export class ReviewedIntegration {
   }
 
   async #candidateFiles(pin: PinnedCandidate, diff: Uint8Array) {
-    const bytes = await this.#git.snapshot(pin.candidate, this.#plan.path);
+    if (this.#plan.tree) return [{ path: "candidate.diff", bytes: diff }];
+    const bytes = await this.#git.snapshot(pin.candidate, this.#plan.path!);
     return [
       { path: "candidate.diff", bytes: diff },
       { path: "candidate.source", bytes },
     ];
+  }
+
+  #fileExpectation() {
+    const { path } = this.#plan;
+    return path === undefined ? undefined : { path };
   }
 
   #suiteFiles(): SandboxFile[] {
@@ -350,10 +434,11 @@ export class ReviewedIntegration {
     if ((await this.#journal.read()).length)
       throw new Error("Integration already exists");
     const append = this.#writer(0);
-    const { path } = this.#plan;
     const base = await this.#git.head();
     await append({ kind: "requested", target: await this.#target(), base });
-    const source = await this.#git.snapshot(base, path);
+    if (this.#plan.tree)
+      return this.#produceTree(append, base, undefined, [], id);
+    const source = await this.#git.snapshot(base, this.#plan.path!);
     return this.#produce(append, base, source, [], id);
   }
 
@@ -366,7 +451,7 @@ export class ReviewedIntegration {
     readOnlyFiles: SandboxFile[],
     id?: string,
   ): Promise<PinnedCandidate> {
-    const { path } = this.#plan;
+    const path = this.#plan.path!;
     const profile =
       this.#plan.workerSandbox?.profile ?? this.#plan.verification.profile;
     const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
@@ -403,7 +488,7 @@ export class ReviewedIntegration {
     let diff: Uint8Array;
     try {
       candidate = await this.#git.createCandidate(base, path, workerBytes);
-      diff = await this.#git.diff(base, candidate);
+      diff = await this.#git.diff(base, candidate, { path });
     } catch (error) {
       const cleanup = (error as { cleanupFailed?: boolean } | null)
         ?.cleanupFailed
@@ -415,6 +500,119 @@ export class ReviewedIntegration {
     const pin = { base, candidate, digest: sha256(diff) };
     await append({ kind: "candidate.created", candidate, digest: pin.digest });
     return pin;
+  }
+
+  /** Tree mode: place the base (or the previous candidate) in a host-prepared
+   * workspace, run Worker, then compute the changes against `base` from the
+   * collected workspace tar and create the candidate commit on the host. The
+   * candidate is always a single-parent commit on `base`. */
+  async #produceTree(
+    append: (event: Event) => Promise<void>,
+    base: string,
+    previous: string | undefined,
+    readOnlyFiles: SandboxFile[],
+    id?: string,
+  ): Promise<PinnedCandidate> {
+    const { scope, protectedPaths } = this.#plan.tree!;
+    const profile =
+      this.#plan.workerSandbox?.profile ?? this.#plan.verification.profile;
+    const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
+    const prepared = await this.#git.prepareWorkspace({
+      base,
+      ...(previous !== undefined ? { previous } : {}),
+      ...(scope ? { sparsePaths: scope.map((p) => p.replace(/\/$/, "")) } : {}),
+    });
+    try {
+      const worker = await this.#host.runWorker(
+        {
+          sandbox: {
+            ...this.#plan.workerSandbox,
+            ...(profile !== undefined ? { profile } : {}),
+            maxLifetimeMs: 300_000,
+            repository: { gitDir: prepared.gitDir, tree: prepared.tree },
+            ...(allReadOnly.length ? { readOnlyFiles: allReadOnly } : {}),
+          },
+          command: this.#plan.worker,
+          collectPaths: [],
+          collectTree: true,
+        },
+        id,
+      );
+      let changes: TreeChange[] = [];
+      let flagged = 0;
+      if (worker.outcome === "ok" && worker.artifacts?.tree) {
+        try {
+          const result = diffWorkspace({
+            base: parseLsTree(await this.#git.listTree(base)),
+            workspace: workspaceFiles(worker.artifacts.tree),
+            ...(scope ? { scope } : {}),
+            ...(protectedPaths ? { protectedPaths } : {}),
+          });
+          changes = [
+            ...result.changes,
+            ...result.deletions.map((path) => ({
+              path,
+              deleted: true as const,
+            })),
+          ];
+          flagged = result.protected.length;
+        } catch {
+          changes = [];
+        }
+      }
+      if (!changes.length) {
+        await append({ kind: "denied", reason: "worker" });
+        throw new Error("Worker did not produce an eligible change");
+      }
+      await append({
+        kind: "candidate.authorized",
+        run: worker.id,
+        digest: sha256(
+          JSON.stringify(
+            changes.map((change) =>
+              "deleted" in change
+                ? [change.path, "deleted"]
+                : [change.path, change.mode, sha256(change.bytes)],
+            ),
+          ),
+        ),
+      });
+      let candidate: string;
+      let diff: Uint8Array;
+      try {
+        candidate = await this.#git.createCandidateTree(
+          base,
+          changes,
+          `Candidate from Worker run ${worker.id}`,
+        );
+        diff = await this.#git.diff(base, candidate);
+      } catch (error) {
+        const cleanup = (error as { cleanupFailed?: boolean } | null)
+          ?.cleanupFailed
+          ? "unknown"
+          : "complete";
+        await append({ kind: "candidate.failed", cleanup });
+        throw new Error("Could not create a review candidate");
+      }
+      const pin = { base, candidate, digest: sha256(diff) };
+      await append({
+        kind: "candidate.created",
+        candidate,
+        digest: pin.digest,
+        protectedCount: flagged,
+      });
+      return pin;
+    } finally {
+      await this.#cleanup(prepared);
+    }
+  }
+
+  async #cleanup(prepared: PreparedWorkspace): Promise<void> {
+    try {
+      await this.#git.cleanupWorkspace(prepared.directory);
+    } catch {
+      // A leftover private directory must not mask the run's own outcome.
+    }
   }
 
   /** Start a revised candidate after the current one was reviewed as
@@ -447,7 +645,6 @@ export class ReviewedIntegration {
       from: pin.digest,
       notes,
     });
-    const source = await this.#git.snapshot(pin.candidate, this.#plan.path);
     const readOnly =
       notes === NO_NOTES
         ? []
@@ -457,6 +654,9 @@ export class ReviewedIntegration {
               bytes: await this.#journal.readNote(notes),
             },
           ];
+    if (this.#plan.tree)
+      return this.#produceTree(append, pin.base, pin.candidate, readOnly, id);
+    const source = await this.#git.snapshot(pin.candidate, this.#plan.path!);
     return this.#produce(append, pin.base, source, readOnly, id);
   }
 
@@ -478,7 +678,11 @@ export class ReviewedIntegration {
     const pin = candidatePin(events, await this.#target());
     if (events.at(-1)?.kind !== "candidate.created")
       throw new Error("Candidate review has already been attempted");
-    const diff = await this.#git.diff(pin.base, pin.candidate);
+    const diff = await this.#git.diff(
+      pin.base,
+      pin.candidate,
+      this.#fileExpectation(),
+    );
     if (sha256(diff) !== pin.digest)
       throw new Error("Candidate evidence does not match its durable pin");
     const append = this.#writer(events.length);
@@ -515,7 +719,31 @@ export class ReviewedIntegration {
     return { ...pin, review };
   }
 
-  async decide(pin: PinnedCandidate, decision: Decision): Promise<void> {
+  #protectedPaths(pin: PinnedCandidate): Promise<string[]> {
+    return this.#git.protectedPaths(
+      pin.base,
+      pin.candidate,
+      this.#plan.tree?.protectedPaths ?? [],
+    );
+  }
+
+  /** Return the protected paths of the current pinned tree candidate. */
+  async protectedPaths(pin: PinnedCandidate): Promise<string[]> {
+    if (!this.#plan.tree) return [];
+    const expected = candidatePin(
+      await this.#journal.read(),
+      await this.#target(),
+    );
+    if (!samePin(pin, expected))
+      throw new Error("Candidate evidence does not match its durable pin");
+    return this.#protectedPaths(expected);
+  }
+
+  async decide(
+    pin: PinnedCandidate,
+    decision: Decision,
+    options?: { acknowledgeProtected?: readonly string[] },
+  ): Promise<void> {
     const events = await this.#journal.read();
     const expected = latestPin(events, await this.#target());
     if (
@@ -525,10 +753,30 @@ export class ReviewedIntegration {
       (decision === "approve" && expected.review !== "pass")
     )
       throw new Error("Human decision does not match an eligible review");
+    let protectedDigest: string | undefined;
+    if (decision === "approve" && this.#plan.tree) {
+      const paths = await this.#protectedPaths(expected.pin);
+      if (paths.length) {
+        const acknowledged = options?.acknowledgeProtected;
+        if (
+          !Array.isArray(acknowledged) ||
+          acknowledged.some((path) => typeof path !== "string")
+        )
+          throw new Error("Human decision does not match an eligible review");
+        const sorted = [...new Set(acknowledged)].sort();
+        if (
+          sorted.length !== paths.length ||
+          paths.some((path, i) => path !== sorted[i])
+        )
+          throw new Error("Human decision does not match an eligible review");
+        protectedDigest = sha256(JSON.stringify(paths));
+      }
+    }
     await this.#journal.append(events.length, {
       kind: "human.decided",
       ...expected.pin,
       decision,
+      ...(protectedDigest ? { protectedDigest } : {}),
     });
   }
 
@@ -552,27 +800,54 @@ export class ReviewedIntegration {
       await append({ kind: "denied", reason: "stale-base" });
       return "denied";
     }
-    const diff = await this.#git.diff(pin.base, pin.candidate);
+    if (this.#plan.tree) {
+      const paths = await this.#protectedPaths(pin);
+      if (
+        paths.length &&
+        last.protectedDigest !== sha256(JSON.stringify(paths))
+      ) {
+        await append({ kind: "denied", reason: "no-approval" });
+        return "denied";
+      }
+    }
+    const diff = await this.#git.diff(
+      pin.base,
+      pin.candidate,
+      this.#fileExpectation(),
+    );
     if (sha256(diff) !== pin.digest) {
       await append({ kind: "denied", reason: "evidence" });
       return "denied";
     }
     await append({ kind: "verification.authorized", ...pin });
     const { profile } = this.#plan.verification;
-    const verification = await this.#host.runVerification(
-      {
-        sandbox: {
-          maxLifetimeMs: 300_000,
-          readOnlyFiles: [
-            ...(await this.#candidateFiles(pin, diff)),
-            ...this.#suiteFiles(),
-          ],
-          ...(profile !== undefined ? { profile } : {}),
+    const files = [
+      ...(await this.#candidateFiles(pin, diff)),
+      ...this.#suiteFiles(),
+    ];
+    // Tree mode: the whole candidate tree, not sparse, so tests see the repo.
+    const prepared = this.#plan.tree
+      ? await this.#git.prepareWorkspace({ base: pin.candidate })
+      : undefined;
+    let verification: ReviewerRun;
+    try {
+      verification = await this.#host.runVerification(
+        {
+          sandbox: {
+            maxLifetimeMs: 300_000,
+            readOnlyFiles: files,
+            ...(profile !== undefined ? { profile } : {}),
+            ...(prepared
+              ? { repository: { gitDir: prepared.gitDir, tree: prepared.tree } }
+              : {}),
+          },
+          command: this.#plan.verification.command,
         },
-        command: this.#plan.verification.command,
-      },
-      id,
-    );
+        id,
+      );
+    } finally {
+      if (prepared) await this.#cleanup(prepared);
+    }
     const { review: verified, tests } = verificationResult(verification);
     await append({
       kind: "verification.finished",
@@ -587,7 +862,7 @@ export class ReviewedIntegration {
     }
     await append({ kind: "integration.authorized", ...pin });
     try {
-      await this.#git.advance(pin.base, pin.candidate);
+      await this.#git.advance(pin.base, pin.candidate, this.#fileExpectation());
     } catch (error) {
       if ((error as { code?: string } | null)?.code === "stale-base") {
         await append({ kind: "denied", reason: "stale-base" });
