@@ -232,6 +232,9 @@ v4, and every `sandbox.create` request recorded profile `base` with the
 pinned Alpine image digest. Verification was recorded under its own role,
 `Verification`, with no `provider.egress` grant.
 
+Toolchains, language packages, the preparer VM and dependency changes are
+planned in `docs/repository-environments.md`.
+
 ## Not in this step
 
 - The `db` and `browser` image builds, the PostgreSQL start script, and glibc
