@@ -18,6 +18,7 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const issuer = "https://auth.openai.com";
@@ -202,6 +203,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
   const cancel = () => fail(new Error("Authorization interrupted"));
   const deadline = setTimeout(cancel, 300_000);
   signal.addEventListener("abort", cancel, { once: true });
+  let prompt: Interface | undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -227,8 +229,28 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
     }).toString();
     console.log("Open this URL in your browser and approve Agent Bootstrap:");
     console.log(url.href);
+    // Enter opens the issuer URL in the default browser. The callback is
+    // accepted meanwhile, so opening it by hand still works.
+    if (process.platform === "darwin") {
+      prompt = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      prompt.question("Press Enter to open it in your browser. ").then(
+        () => {
+          assert.equal(url.origin, issuer);
+          spawn("/usr/bin/open", [url.href], { stdio: "ignore" }).on(
+            "error",
+            () =>
+              console.log("Could not open the browser; open the URL above."),
+          );
+        },
+        () => {},
+      );
+    }
     return { ...(await callback), nonce, verifier, redirectUri };
   } finally {
+    prompt?.close();
     clearTimeout(deadline);
     signal.removeEventListener("abort", cancel);
     server.closeAllConnections();
