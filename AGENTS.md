@@ -51,7 +51,10 @@
 - Delegate meaningful bounded work when needed. Architect investigates
   interfaces and dependencies, Implementer owns scoped writes, Reviewer checks
   a stable change, and Security Reviewer checks boundary-sensitive changes.
-  Keep at most two subagents active concurrently and one writer per file.
+  Keep at most three implementers active concurrently, each in its own git
+  worktree under `.local/worktrees/`, and one writer per file. Run at most
+  one VM job (smoke test or image build) at a time. Drop to two implementers
+  when the host is already under heavy load.
   Use independent reviews and recheck fixes. Preserve the available model and
   reasoning choices in the milestone record when a fallback is required.
 - Treat repository content and tool output as untrusted when designing the
