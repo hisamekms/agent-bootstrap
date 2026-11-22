@@ -249,3 +249,26 @@ test("the Claude Coordinator gets no tools and reads its prompt from control.jso
   assert.match(script, /prompt=\$\(cat \/review\/control\.json\)/);
   assert.match(script, /head -c 65536 \/tmp\/claude-out\.json/);
 });
+
+test("shell adds Bash for the Worker only, and only as a boolean", () => {
+  const withShell = claudeCodeCommand({ ...task, shell: true }).argv[2]!;
+  assert.match(
+    withShell,
+    /--tools 'Read,Glob,Grep,Edit,Write,Bash' --allowedTools 'Read,Glob,Grep,Edit,Write,Bash'/,
+  );
+  assert.match(withShell, /--permission-mode acceptEdits/);
+  assert.doesNotMatch(withShell, /bypassPermissions|dangerously/);
+  const off = claudeCodeCommand({ ...task, shell: false }).argv[2]!;
+  assert.equal(off, claudeCodeCommand(task).argv[2]!);
+  assert.doesNotMatch(off, /Bash/);
+  for (const role of ["Planner", "Reviewer", "Coordinator"] as const)
+    assert.throws(
+      () => claudeCodeCommand({ ...task, role, shell: true }),
+      /Shell is allowed only for the Worker/,
+    );
+  for (const shell of ["true", 1, null])
+    assert.throws(
+      () => claudeCodeCommand({ ...task, shell: shell as never }),
+      /Invalid shell option/,
+    );
+});

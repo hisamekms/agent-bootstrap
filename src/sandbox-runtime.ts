@@ -1,4 +1,6 @@
 /** Provider-neutral, host-owned sandbox lifecycle. No credential or integration API. */
+import type { ProfileName } from "./sandbox-profiles.ts";
+
 export interface SandboxFile {
   readonly path: string;
   readonly bytes: Uint8Array;
@@ -61,6 +63,12 @@ export function sameProvider(
 }
 
 export interface SandboxSpec {
+  /** Named VM environment. Default: `base`. */
+  readonly profile?: ProfileName;
+  /** The 64-hex image digest the trusted host recorded for `profile`. The
+   * adapter refuses the spec if its own catalog resolves a different image,
+   * so the audit cannot name one image while another boots. */
+  readonly imageDigest?: string;
   readonly files?: readonly SandboxFile[];
   readonly tools?: readonly SandboxTool[];
   /** The only network egress: TCP to this port on the host. Default: none. */

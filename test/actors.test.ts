@@ -208,3 +208,25 @@ test("the Claude Coordinator turns the CLI answer into one proposal for the rout
     undefined,
   );
 });
+
+test("the Claude harness passes shell to the Worker command only", () => {
+  const input = { prompt: "do it", timeoutMs: 1000 };
+  const make = (shell?: boolean) =>
+    claudeRoleHarness({
+      auth: { mode: "api-key", credential: "host-secret" },
+      model: "claude-opus-5-5",
+      tools: [],
+      ...(shell === undefined ? {} : { shell }),
+    });
+  const shelled = make(true);
+  assert.match(
+    shelled.command({ ...input, role: "Worker" }).argv[2]!,
+    /--allowedTools 'Read,Glob,Grep,Edit,Write,Bash'/,
+  );
+  for (const role of ["Planner", "Reviewer"] as const)
+    assert.doesNotMatch(shelled.command({ ...input, role }).argv[2]!, /Bash/);
+  assert.doesNotMatch(
+    make().command({ ...input, role: "Worker" }).argv[2]!,
+    /Bash/,
+  );
+});

@@ -14,9 +14,11 @@ import {
   MICROSANDBOX_LIMITS,
   MicrosandboxRuntime,
 } from "../src/microsandbox.ts";
+import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
 
 const image = `fixture.invalid/alpine@sha256:${"a".repeat(64)}`;
+const profiles = new ProfileCatalog({ base: { image } });
 const diagnostic = "synthetic-backend-diagnostic-do-not-propagate";
 
 type Event = {
@@ -101,7 +103,12 @@ if (args[0] === '--version') {
 `,
     { mode: 0o700 },
   );
-  const runtime = new MicrosandboxRuntime({ binary, home, stagingRoot, image });
+  const runtime = new MicrosandboxRuntime({
+    binary,
+    home,
+    stagingRoot,
+    profiles,
+  });
   return {
     runtime,
     withCredentials: (token: string) =>
@@ -109,7 +116,7 @@ if (args[0] === '--version') {
         binary,
         home,
         stagingRoot,
-        image,
+        profiles,
         providers: [
           { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
         ],
@@ -271,10 +278,14 @@ test("adapter rejects mutable images and incompatible backend versions", async (
     binary: "/fixture/msb",
     home: f.home,
     stagingRoot: f.stagingRoot,
-    image,
+    profiles,
   };
   assert.throws(
-    () => new MicrosandboxRuntime({ ...config, image: "alpine:latest" }),
+    () =>
+      new MicrosandboxRuntime({
+        ...config,
+        profiles: { base: { image } } as unknown as ProfileCatalog,
+      }),
     /invalid-input/,
   );
   assert.throws(
@@ -622,7 +633,7 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
     binary: join(f.home, "..", "fake-msb.mjs"),
     home: f.home,
     stagingRoot: f.stagingRoot,
-    image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}`,
+    profiles,
     providers: [
       {
         host: "host.microsandbox.internal",
@@ -688,7 +699,7 @@ test("one runtime binds its single credential to at most one provider", () => {
         binary: "/fixture/msb",
         home: "/fixture/home",
         stagingRoot: "/fixture/staging",
-        image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}`,
+        profiles,
         providers: [
           provider,
           { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
@@ -696,4 +707,50 @@ test("one runtime binds its single credential to at most one provider", () => {
       }),
     (error: SandboxRuntimeError) => error.code === "invalid-input",
   );
+});
+
+test("profiles select the image and resources; unconfigured or malformed profiles fail before any backend call", async (t) => {
+  const f = await fixture(t);
+  const dbImage = `fixture.invalid/db@sha256:${"b".repeat(64)}`;
+  const runtime = new MicrosandboxRuntime({
+    binary: join(f.home, "..", "fake-msb.mjs"),
+    home: f.home,
+    stagingRoot: f.stagingRoot,
+    profiles: new ProfileCatalog({
+      base: { image },
+      db: { image: dbImage, memoryMiB: 2048, cpus: 2 },
+    }),
+  });
+  const base = await runtime.create({});
+  await runtime.destroy(base);
+  let create = (await f.events()).find(({ args }) => args[0] === "create")!;
+  assert.equal(create.args.at(-1), image);
+  assert.ok(!create.args.includes("--memory"));
+  assert.ok(!create.args.includes("--cpus"));
+  const db = await runtime.create({ profile: "db" });
+  await runtime.destroy(db);
+  create = (await f.events()).filter(({ args }) => args[0] === "create")[1]!;
+  assert.equal(create.args.at(-1), dbImage);
+  assert.equal(create.args[create.args.indexOf("--memory") + 1], "2048M");
+  assert.equal(create.args[create.args.indexOf("--cpus") + 1], "2");
+  assert.ok(create.args.indexOf("--cpus") < create.args.length - 1);
+  const before = (await f.events()).length;
+  for (const profile of ["browser", "nope", 1, null, {}]) {
+    await assert.rejects(
+      runtime.create({ profile } as never),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  }
+  // The digest the host audited must be the image this adapter boots.
+  for (const imageDigest of ["c".repeat(64), "a".repeat(64), 1])
+    await assert.rejects(
+      runtime.create({ profile: "db", imageDigest } as never),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  assert.equal((await f.events()).length, before);
+  const matched = await runtime.create({
+    profile: "db",
+    imageDigest: "b".repeat(64),
+  });
+  await runtime.destroy(matched);
 });

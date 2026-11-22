@@ -9,6 +9,7 @@ import { SqliteAudit } from "../../src/audit.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { ReviewedIntegration } from "../../src/reviewed-integration.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
 
@@ -93,15 +94,16 @@ async function main() {
   });
   const audit = new SqliteAudit(auditFile);
   try {
+    const profiles = new ProfileCatalog({ base: { image } });
     const runtime = new MicrosandboxRuntime({
       binary,
       home,
-      image,
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     });
     const integration = new ReviewedIntegration(
       git,
-      new TrustedHost(audit, runtime),
+      new TrustedHost(audit, runtime, profiles),
       journal,
       {
         path,
@@ -116,10 +118,12 @@ async function main() {
         test "$(cat /review/candidate.source)" = "hello from Worker"
         printf '%s' '{"review":"pass"}'
       `),
-        verification: command(`
+        verification: {
+          command: command(`
         test "$(cat /review/candidate.source)" = "hello from Worker"
         printf '%s' '{"review":"pass"}'
       `),
+        },
       },
     );
     if (mode === "prepare") {

@@ -10,7 +10,12 @@ import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
 import { ReviewedIntegration } from "../src/reviewed-integration.ts";
 import type { SandboxRuntime } from "../src/sandbox-runtime.ts";
+import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+
+const profiles = new ProfileCatalog({
+  base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+});
 
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(
@@ -74,9 +79,9 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     path: "hello.txt",
     worker: { argv: ["worker"], timeoutMs: 123 },
     reviewer: { argv: ["reviewer"], timeoutMs: 123 },
-    verification: { argv: ["verify"], timeoutMs: 123 },
+    verification: { command: { argv: ["verify"], timeoutMs: 123 } },
   };
-  const host = new TrustedHost(audit, runtime);
+  const host = new TrustedHost(audit, runtime, profiles);
   const flow = new ReviewedIntegration(git, host, journal, plan);
   return { flow, plan, git, config, journal, journalDir, host, audit, calls };
 }
@@ -98,7 +103,7 @@ test("approval binds one candidate, the target and the verifier, and applies onc
   );
   await assert.rejects(wrongTarget.decide(pin, "approve"), /incomplete/);
   await flow.decide(pin, "approve");
-  plan.verification.argv[0] = "changed-verifier";
+  plan.verification.command.argv[0] = "changed-verifier";
   const results = await Promise.allSettled([
     flow.integrate(),
     flow.integrate(),
@@ -152,7 +157,9 @@ test("failed verification records its result without advancing the branch", asyn
   const { plan, git, host, journal } = await fixture(t);
   const flow = new ReviewedIntegration(git, host, journal, {
     ...plan,
-    verification: { ...plan.verification, argv: ["revise"] },
+    verification: {
+      command: { ...plan.verification.command, argv: ["revise"] },
+    },
   });
   const pin = await flow.prepare();
   await flow.decide(pin, "approve");

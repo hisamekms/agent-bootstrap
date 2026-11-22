@@ -9,6 +9,7 @@ import { SqliteAudit } from "../../src/audit.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { ReviewedIntegration } from "../../src/reviewed-integration.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
 
@@ -45,14 +46,16 @@ const git = new LocalGitIntegration({
 });
 const audit = new SqliteAudit(join(root, "audit.sqlite"));
 try {
+  const profiles = new ProfileCatalog({ base: { image } });
   const host = new TrustedHost(
     audit,
     new MicrosandboxRuntime({
       binary,
       home,
-      image,
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     }),
+    profiles,
   );
   const journal = new IntegrationJournal(journalDir, randomUUID());
   const flow = new ReviewedIntegration(git, host, journal, {
@@ -79,7 +82,7 @@ try {
         printf '%s' '{"review":"pass"}'
       fi
     `),
-    verification: command(`printf '%s' '{"review":"pass"}'`),
+    verification: { command: command(`printf '%s' '{"review":"pass"}'`) },
   });
   const started = performance.now();
   const first = await flow.prepareCandidate();

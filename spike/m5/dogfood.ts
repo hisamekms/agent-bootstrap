@@ -48,6 +48,7 @@ import type { CredentialProvider } from "../../src/credentials.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import {
   modelStep,
   type CoordinatorModel,
@@ -563,6 +564,7 @@ async function main() {
     });
   }
 
+  const profiles = new ProfileCatalog({ base: { image } });
   // One runtime adapter per credential. Each VM still lives for one run.
   const adapter = (
     name: string,
@@ -572,7 +574,7 @@ async function main() {
     new MicrosandboxRuntime({
       binary: msb,
       home,
-      image,
+      profiles,
       stagingRoot: join(root, `sandboxes-${name}`),
       ...(provider && value
         ? { providers: [provider], credentials: credential(value) }
@@ -609,7 +611,11 @@ async function main() {
   const harnessFor = (actor: "Planner" | "Worker" | "Reviewer") =>
     (actors[actor] === "codex" ? codexHarness : claudeHarness)!;
   try {
-    const host = new TrustedHost(audit, new RoutingSandboxRuntime(routes));
+    const host = new TrustedHost(
+      audit,
+      new RoutingSandboxRuntime(routes),
+      profiles,
+    );
     const journal = new IntegrationJournal(reviewDir, randomUUID());
     const flow = (control?: CoordinatorControl) => {
       const worker = harnessFor("Worker");
@@ -635,14 +641,16 @@ async function main() {
           timeoutMs: 240_000,
         }),
         verification: {
-          argv: [
-            "/bin/sh",
-            "-ec",
-            `test "$(wc -l < /review/candidate.source)" = 1
+          command: {
+            argv: [
+              "/bin/sh",
+              "-ec",
+              `test "$(wc -l < /review/candidate.source)" = 1
           grep -q '[A-Za-z]' /review/candidate.source
           printf '%s' '{"review":"pass"}'`,
-          ],
-          timeoutMs: 10_000,
+            ],
+            timeoutMs: 10_000,
+          },
         },
         workerSandbox: worker.sandbox,
         reviewerSandbox: reviewer.sandbox,

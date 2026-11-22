@@ -89,6 +89,8 @@ export function claudeRoleHarness(options: {
   /** Local stand-in for the provider host, for fixtures. */
   readonly fixture?: { host: string; port: number; upstreamCaCertPath: string };
   readonly maxTurns?: number;
+  /** Opt-in Bash for the Worker command only. */
+  readonly shell?: boolean;
 }): RoleHarness {
   const provider = claudeCodeProvider(options.auth, options.fixture);
   const baseUrl = options.fixture
@@ -106,6 +108,7 @@ export function claudeRoleHarness(options: {
           maxTurns: options.maxTurns ?? 8,
           timeoutMs: task.timeoutMs,
           ...(baseUrl ? { baseUrl } : {}),
+          ...(options.shell && task.role === "Worker" ? { shell: true } : {}),
         },
         options.auth,
       ),

@@ -49,13 +49,33 @@ const eventFields = {
 } as const;
 
 type Kind = keyof typeof eventFields;
-type Event = {
+type Base = {
   [K in Kind]: { readonly kind: K } & {
     readonly [F in (typeof eventFields)[K][number]]: string;
   };
 }[Kind];
+type Event =
+  | Base
+  | (Extract<Base, { kind: "verification.finished" }> & {
+      readonly tests?: { readonly passed: number; readonly failed: number };
+    });
 
 export type IntegrationEvent = Event & { readonly at: string };
+
+const testCount = (value: unknown) =>
+  Number.isSafeInteger(value) &&
+  (value as number) >= 0 &&
+  (value as number) <= 100_000;
+
+function validTests(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const tests = value as Record<string, unknown>;
+  return (
+    Object.keys(tests).sort().join(",") === "failed,passed" &&
+    testCount(tests.passed) &&
+    testCount(tests.failed)
+  );
+}
 
 function decode(value: unknown): IntegrationEvent {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -65,8 +85,17 @@ function decode(value: unknown): IntegrationEvent {
   if (typeof kind !== "string" || !Object.hasOwn(eventFields, kind))
     throw new Error("Invalid integration event kind");
   const expected = eventFields[kind as Kind];
+  // Only verification.finished may carry the optional `tests` counts.
+  const optional =
+    kind === "verification.finished" && Object.hasOwn(data, "tests") ? 1 : 0;
   if (
-    Object.keys(data).length !== expected.length + 2 ||
+    optional &&
+    (!validTests(data.tests) ||
+      (data.review === "pass" && (data.tests as { failed: number }).failed > 0))
+  )
+    throw new Error("Invalid integration event fields");
+  if (
+    Object.keys(data).length !== expected.length + 2 + optional ||
     typeof data.at !== "string" ||
     new Date(data.at).toISOString() !== data.at ||
     expected.some((field) => {

@@ -19,7 +19,12 @@ import {
 } from "../src/model-coordinator.ts";
 import type { SandboxRuntime, SandboxSession } from "../src/sandbox-runtime.ts";
 import { taskTrace } from "../src/task-trace.ts";
+import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+
+const profiles = new ProfileCatalog({
+  base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+});
 
 /** What the mock provider makes the model emit in one turn. */
 type Emission =
@@ -234,6 +239,7 @@ async function fixture(
       },
     },
     runtime(fakeAppServer(turns, observed)),
+    profiles,
   );
   const delegated: string[] = [];
   const model = new CodexAppServerCoordinator({
