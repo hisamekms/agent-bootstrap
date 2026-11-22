@@ -151,7 +151,9 @@ export class TrustedHost {
     let handle: SandboxHandle | undefined;
     let failure: { error: unknown } | undefined;
     let value: T | undefined;
+    const egress = sandbox.provider !== undefined;
     try {
+      if (egress) await allow("provider.egress");
       await allow("sandbox.create");
       try {
         handle = await this.#sandbox.create({ ...sandbox, invocationId: id });
@@ -211,6 +213,12 @@ export class TrustedHost {
         outcome: destroyed,
       });
     }
+    if (egress)
+      await append({
+        kind: "operation.finished",
+        operation: "provider.egress",
+        outcome: handle && outcome !== "failed" ? "ok" : "failed",
+      });
     await append({ kind: "invocation.finished", outcome });
     if (failure) throw failure.error;
     return outcome === "ok"
@@ -315,6 +323,10 @@ export class TrustedHost {
     let outcome: Outcome = "failed";
     let artifacts: CollectedArtifacts | undefined;
     let response: Uint8Array | undefined;
+    // Credentialed provider egress is its own audited grant, recorded before
+    // the sandbox that receives it exists and closed after teardown.
+    const egress = plan.sandbox.provider !== undefined;
+    if (egress) await authorize("provider.egress", true);
     try {
       const created = await execute("sandbox.create", () =>
         this.#sandbox.create({ ...plan.sandbox, invocationId: id }),
@@ -370,7 +382,18 @@ export class TrustedHost {
         this.#sandbox.destroy(current),
       );
       if (!destroyed) outcome = "failed";
-    }
+      if (egress)
+        await append({
+          kind: "operation.finished",
+          operation: "provider.egress",
+          outcome: destroyed ? "ok" : "failed",
+        });
+    } else if (egress)
+      await append({
+        kind: "operation.finished",
+        operation: "provider.egress",
+        outcome: "failed",
+      });
     await append({ kind: "invocation.finished", outcome });
     return {
       id,

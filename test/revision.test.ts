@@ -32,6 +32,10 @@ async function fixture(
   t: { after(fn: () => Promise<void>): void },
   reviews: string[],
   verification = '{"review":"pass"}',
+  extras: {
+    workerSandbox?: { provider: { host: string; secretEnv: string } };
+    reviewerSandbox?: { provider: { host: string; secretEnv: string } };
+  } = {},
 ) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "bootstrap-revision-"),
@@ -100,9 +104,10 @@ async function fixture(
       worker: { argv: ["worker"], timeoutMs: 123 },
       reviewer: { argv: ["reviewer"], timeoutMs: 123 },
       verification: { argv: ["verify"], timeoutMs: 123 },
+      ...extras,
     },
   );
-  return { flow, git, journal, journalDir, workers };
+  return { flow, git, journal, journalDir, workers, specs, audit };
 }
 
 test("a revision is a new candidate that needs its own review and approval", async (t) => {
@@ -270,4 +275,43 @@ test("blank review notes mean a review without notes", async (t) => {
   assert.ok(
     !(await journal.read()).some((event) => event.kind === "review.noted"),
   );
+});
+
+test("provider egress reaches Worker and Reviewer VMs, never verification, and is audited", async (t) => {
+  const provider = {
+    host: "api.openai.com",
+    secretEnv: "AGENT_BOOTSTRAP_TOKEN",
+  };
+  const { flow, specs, journal, audit } = await fixture(
+    t,
+    [],
+    '{"review":"pass"}',
+    { workerSandbox: { provider }, reviewerSandbox: { provider } },
+  );
+  const pin = await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  await flow.decide(pin, "approve");
+  assert.equal(await flow.integrate(), "completed");
+  const created = [...specs.values()];
+  assert.equal(created.length, 3);
+  // Worker, Reviewer, then verification.
+  assert.deepEqual(
+    created.map((spec) => spec.provider?.host ?? null),
+    ["api.openai.com", "api.openai.com", null],
+  );
+  const runs = (await journal.read()).flatMap((event) =>
+    "run" in event ? [event.run] : [],
+  );
+  const egress = (id: string) =>
+    audit
+      .read(id)
+      .filter((event) => event.operation === "provider.egress")
+      .map((event) => `${event.kind} ${event.outcome ?? ""}`.trim());
+  for (const run of runs.slice(0, 2))
+    assert.deepEqual(egress(run), [
+      "operation.requested",
+      "operation.allowed",
+      "operation.finished ok",
+    ]);
+  assert.deepEqual(egress(runs.at(-1)!), []);
 });

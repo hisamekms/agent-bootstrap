@@ -643,10 +643,25 @@ The product gains these pieces for it:
   - `--secret <ENV>:headers=authorization@<host>`;
   - `--secret-violation-action block`.
 
-  The adapter's `CredentialProvider` puts the token only into the `msb
-create` process environment. It is never in argv, in other backend
-  commands or in the guest.
+  The adapter's `CredentialProvider` passes the token only in the
+  environment of the `msb create` process. It is never in argv, in other
+  backend commands or in the guest. A canary run on 2026-11-22 showed where
+  it lives on the host. The long-lived `msb machine` supervisor of that VM
+  inherits it in its environment for the VM's lifetime, and it disappears
+  after destroy. No file under `MSB_HOME` contained the canary, and the
+  guest variable held only the placeholder.
 
+- **Allowed hosts and variable names.** The adapter accepts only hosts in
+  its configured `providerHosts` allowlist. The guest variable name must
+  match `AGENT_BOOTSTRAP_*`.
+- **Audit of the grant.** Before creating any sandbox that receives
+  provider egress, the trusted host records `provider.egress` as requested
+  and allowed. After teardown it records the grant as finished. This uses
+  audit schema version 3. Version 1 and 2 databases still open, but they
+  refuse this event, so the grant fails closed.
+- **Failure handling in the runner.** Only an ineligible Worker change
+  counts as a failed delegation; audit, journal and unexpected errors stop
+  the run. The runner exits non-zero unless the task finishes `done`.
 - **Per-role sandbox options.** `ReviewedIntegration` passes tools and
   egress to Worker and Reviewer VMs, but not to verification. Model-driven
   roles get a 300-second VM lifetime and a 240-second command limit.
@@ -695,7 +710,16 @@ Known risks and gaps before the live run:
   requests with the run's credential. Method, path and request count are
   not enforced, and provider requests are not audited one by one.
 - **The token is not refreshed.** It must stay valid for at least 20
-  minutes when the run starts.
+  minutes when the run starts. After the run, the launcher revokes the
+  refresh token, but the access token stays valid until it expires.
+- **Same-user processes can read the token.** While a credentialed VM is
+  alive, its `msb machine` process holds the token in its environment, so
+  a process running as the same user can read it with `ps eww`.
+- **Guest egress has further side channels.** `allow@dns` lets the guest
+  send whatever data it can see out through DNS queries. Within the
+  account, the guest can also create lasting objects, such as files or
+  stored responses, and use up plan quota, with no request cap. An allowed
+  upstream could also reflect the substituted header back to the guest.
 - **Some usage is not collected.** Planner, Worker and Reviewer token usage
   are missing; only the Coordinator reports usage.
 - **Native tools are detected, not prevented.** Native tools in the

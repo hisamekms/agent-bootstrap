@@ -33,6 +33,8 @@ export interface MicrosandboxConfig {
   /** Required only for specs with `provider`. Used on the host to pass the
    * credential to the backend's TLS substitution at create time. */
   readonly credentials?: CredentialProvider;
+  /** Exact provider hosts that specs may name. Default: none. */
+  readonly providerHosts?: readonly string[];
 }
 
 /** Conservative fixed bounds for this initial offline adapter. */
@@ -138,7 +140,12 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       !/^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[a-f0-9]{64}$/.test(config.image)
     )
       invalid();
-    this.#config = { ...config };
+    this.#config = {
+      ...config,
+      ...(config.providerHosts
+        ? { providerHosts: Object.freeze([...config.providerHosts]) }
+        : {}),
+    };
   }
 
   #env(extra: Record<string, string> = {}) {
@@ -262,13 +269,12 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       (port !== undefined ||
         !this.#config.credentials ||
         typeof provider.host !== "string" ||
+        !this.#config.providerHosts?.includes(provider.host) ||
         !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
           provider.host,
         ) ||
         typeof provider.secretEnv !== "string" ||
-        !/^[A-Z][A-Z0-9_]{0,63}$/.test(provider.secretEnv) ||
-        provider.secretEnv.startsWith("MSB_") ||
-        ["PATH", "HOME"].includes(provider.secretEnv))
+        !/^AGENT_BOOTSTRAP_[A-Z0-9_]{1,48}$/.test(provider.secretEnv))
     )
       invalid();
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];

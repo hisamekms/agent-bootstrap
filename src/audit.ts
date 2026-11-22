@@ -16,6 +16,7 @@ export type AuditInput = {
     | "sandbox.exec"
     | "sandbox.collect"
     | "sandbox.destroy"
+    | "provider.egress"
     | "unknown";
   readonly outcome?:
     "ok" | "denied" | "failed" | "timed-out" | "cancelled" | "interrupted";
@@ -99,6 +100,7 @@ const operations = [
   "sandbox.exec",
   "sandbox.collect",
   "sandbox.destroy",
+  "provider.egress",
   "unknown",
 ];
 const outcomes = [
@@ -159,6 +161,20 @@ const claimSchema = [
   },
 ];
 const schema = [...auditSchema, ...claimSchema];
+
+// Version 3 adds `provider.egress`, recorded before a sandbox that receives
+// credentialed provider egress is created. Version 1 and 2 databases still
+// open; their CHECK constraint rejects that event, so such a grant fails
+// closed instead of being written to an older trace.
+const auditTableV3 = auditSchema[0]!.sql.replace(
+  "'sandbox.destroy','unknown'",
+  "'sandbox.destroy','provider.egress','unknown'",
+);
+const schemaV3 = [
+  { name: "audit_events", sql: auditTableV3 },
+  ...auditSchema.slice(1),
+  ...claimSchema,
+];
 
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value))
@@ -354,11 +370,11 @@ export class SqliteAudit implements AuditSink {
         database.exec("PRAGMA journal_mode=WAL");
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of schema) database.exec(entry.sql);
+          for (const entry of schemaV3) database.exec(entry.sql);
           database.exec(
-            `PRAGMA application_id=${applicationId}; PRAGMA user_version=2; COMMIT`,
+            `PRAGMA application_id=${applicationId}; PRAGMA user_version=3; COMMIT`,
           );
-          version = 2;
+          version = 3;
         } catch {
           try {
             database.exec("ROLLBACK");
@@ -367,14 +383,18 @@ export class SqliteAudit implements AuditSink {
           }
           throw new AuditStoreError("invalid-database");
         }
-      } else if (app !== applicationId || (version !== 1 && version !== 2))
+      } else if (
+        app !== applicationId ||
+        (version !== 1 && version !== 2 && version !== 3)
+      )
         throw new AuditStoreError("invalid-database");
       const installed = database
         .query(
           "SELECT name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
         )
         .all();
-      const expectedSchema = version === 1 ? auditSchema : schema;
+      const expectedSchema =
+        version === 1 ? auditSchema : version === 2 ? schema : schemaV3;
       if (
         installed.length !== expectedSchema.length ||
         !expectedSchema.every((expected) =>

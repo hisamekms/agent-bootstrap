@@ -336,7 +336,7 @@ async function main() {
         home,
         image,
         stagingRoot: join(root, "sandboxes"),
-        ...(live ? { credentials } : {}),
+        ...(live ? { credentials, providerHosts: [providerHost] } : {}),
       }),
     );
     const journal = new IntegrationJournal(reviewDir, randomUUID());
@@ -455,8 +455,16 @@ Task: $1" >/dev/null 2>&1 </dev/null
           try {
             if (revising) await flow(control).revise(id);
             else await flow(control).prepareCandidate(id);
-          } catch {
-            return { id, outcome: "failed" };
+          } catch (error) {
+            // Only an ineligible Worker change is an ordinary failure. Audit,
+            // journal and anything unexpected stop the run.
+            const message = (error as Error | null)?.message ?? "";
+            if (
+              message === "Worker did not produce an eligible change" ||
+              message === "Could not create a review candidate"
+            )
+              return { id, outcome: "failed" };
+            throw error;
           }
           return { id, outcome: "ok" };
         }
@@ -605,6 +613,8 @@ Task: $1" >/dev/null 2>&1 </dev/null
       },
     );
     console.log(JSON.stringify({ root, ...report }, null, 2));
+    // The launcher treats exit 0 as success: only a completed task is one.
+    if (outcome !== "done") process.exitCode = 2;
   } finally {
     token = "";
     audit.close();
