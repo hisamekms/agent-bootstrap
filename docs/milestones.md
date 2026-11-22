@@ -916,6 +916,28 @@ For a live run, `M5_CLAUDE_AUTH` selects `api-key` or
 service that holds the Claude credential. The launcher forwards only these
 non-secret `M5_*` settings and `USER`. Codex tokens still arrive on stdin.
 
+### M5 with tree candidates and profiles
+
+`M5_TREE=1` gives the Worker a repository with three files. The Reviewer
+receives the candidate diff, and verification checks `hello.txt` in the
+candidate repository. `M5_PROFILE` selects `base` (default), `db` or `browser`
+for Worker and Verification. Coordinator, Planner and Reviewer use `base`.
+The browser image includes Git. Its Claude Worker uses the pinned glibc
+build, whose path can be set with `M5_CLAUDE_BINARY_GLIBC`.
+
+With `MSB_HOME`, `MSB` and `CODEX_BINARY` set to absolute paths and the
+locked images loaded, run these fixtures. The report includes `tree`,
+`profile` and `changedPaths` for the integrated commit.
+
+```sh
+MSB_HOME="$MSB_HOME" M5_TREE=1 M5_PROFILE=browser M5_ACTORS=all=codex \
+  bun spike/m5/dogfood.ts --fixture "$MSB" "$CODEX_BINARY"
+MSB_HOME="$MSB_HOME" M5_TREE=1 M5_PROFILE=browser M5_ACTORS=Worker=claude \
+  bun spike/m5/dogfood.ts --fixture "$MSB" "$CODEX_BINARY"
+MSB_HOME="$MSB_HOME" M5_TREE=0 M5_PROFILE=db M5_ACTORS=all=codex \
+  bun spike/m5/dogfood.ts --fixture "$MSB" "$CODEX_BINARY"
+```
+
 ## Planned: credential fallback per actor
 
 Status: planned, not implemented (recorded on 2026-11-22).

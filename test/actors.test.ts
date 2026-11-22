@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   claudeRoleHarness,
@@ -99,6 +103,65 @@ test("Codex role commands take the prompt as one argv entry and follow the role 
     secretEnv: "AGENT_BOOTSTRAP_TOKEN",
   });
   assert.equal(codexRoleHarness(fixture, [], 8080).sandbox.hostTcpPort, 8080);
+});
+
+test("the Codex Reviewer inlines the diff with or without candidate source", () => {
+  const reviewer = codexRoleCommand(
+    { role: "Reviewer", prompt: "Review this.", timeoutMs: 1000 },
+    { endpoint: { kind: "host-port", port: 8080 }, model: "m" },
+  );
+  const script = reviewer.argv[2]!;
+  const start = script.indexOf("cd /review");
+  assert.ok(start >= 0);
+  // Run just the review body with a local stand-in that captures the prompt.
+  const body = script
+    .slice(start)
+    .replaceAll("/review/", '"$REVIEW_DIR"/')
+    .replaceAll(" /review", ' "$REVIEW_DIR"')
+    .replaceAll("/tmp/review.json", '"$REVIEW_DIR"/review.json')
+    .replace("! command -v bwrap >/dev/null", ":")
+    .replace("/tmp/codex exec", "capture_prompt");
+  const directory = mkdtempSync(join(tmpdir(), "codex-review-"));
+  const run = () =>
+    execFileSync(
+      "/bin/sh",
+      [
+        "-ec",
+        `capture_prompt() {
+          for prompt do :; done
+          printf '%s' "$prompt" > "$REVIEW_DIR/review.json"
+        }
+        ${body}`,
+        "codex",
+        "Review this.",
+      ],
+      { encoding: "utf8", env: { ...process.env, REVIEW_DIR: directory } },
+    );
+  try {
+    const diff = join(directory, "candidate.diff");
+    const source = join(directory, "candidate.source");
+    writeFileSync(diff, "+Good day.\n");
+    const treePrompt = run();
+    assert.match(
+      treePrompt,
+      /^Review this\.[\s\S]*\n--- BEGIN candidate\.diff ([0-9a-f]{24}) ---\n\+Good day\.\n--- END candidate\.diff \1 ---$/,
+    );
+    assert.doesNotMatch(treePrompt, /candidate\.source/);
+
+    writeFileSync(source, "Good day.\n");
+    assert.match(
+      run(),
+      /--- END candidate\.diff ([0-9a-f]{24}) ---\n--- BEGIN candidate\.source \1 ---\nGood day\.\n--- END candidate\.source \1 ---$/,
+    );
+    writeFileSync(source, "x".repeat(2001));
+    assert.equal(run(), "oversized");
+
+    rmSync(source);
+    writeFileSync(diff, "x".repeat(6001));
+    assert.equal(run(), "oversized");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("the derived catalog switches one model to ordinary tools and is pinned", () => {
