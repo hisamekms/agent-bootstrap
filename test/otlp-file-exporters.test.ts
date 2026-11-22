@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as asyncFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { afterEach, beforeEach } from "node:test";
@@ -18,7 +19,10 @@ import {
   TracerProvider,
   type ReadableSpan,
 } from "@opentelemetry/sdk-trace";
-import { createOtlpFileExporters } from "../src/otlp-file-exporters.ts";
+import {
+  createOtlpFileExporters,
+  MAX_PENDING_EXPORTS,
+} from "../src/otlp-file-exporters.ts";
 
 const filename = "2026-11-23-0001.jsonl";
 const now = () => new Date("2026-11-23T00:00:00Z");
@@ -46,17 +50,36 @@ function readLines(signal: string) {
   return lines.map((line) => JSON.parse(line));
 }
 
-function exportOnce<T>(
+async function exportOnce<T>(
   exporter: { export(data: T, callback: (result: ExportResult) => void): void },
   data: T,
   expected: ExportResultCode,
-): ExportResult {
-  const results: ExportResult[] = [];
-  exporter.export(data, (result) => results.push(result));
-  assert.equal(results.length, 1);
-  const result = results[0]!;
+): Promise<ExportResult> {
+  const result = await new Promise<ExportResult>((resolve) =>
+    exporter.export(data, resolve),
+  );
   assert.equal(result.code, expected);
   return result;
+}
+
+function interceptOpen(
+  intercept: (handle: asyncFs.FileHandle) => Partial<asyncFs.FileHandle>,
+) {
+  return {
+    ...asyncFs,
+    async open(path: fs.PathLike, flags?: string | number, mode?: fs.Mode) {
+      const handle = await asyncFs.open(path, flags, mode);
+      if (!String(path).endsWith(".partial")) return handle;
+      const methods = intercept(handle);
+      return new Proxy(handle, {
+        get(target, key) {
+          const method: unknown =
+            Reflect.get(methods, key) ?? Reflect.get(target, key);
+          return typeof method === "function" ? method.bind(target) : method;
+        },
+      });
+    },
+  };
 }
 
 test("the SDKs write one OTLP request per export and publish on shutdown", async () => {
@@ -134,9 +157,8 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
     writeDiagnostic: (line) => diagnostics.push(line),
     writerOptions: {
       now,
-      fs: {
-        ...fs,
-        writeSync(fd, data) {
+      fs: interceptOpen((handle) => ({
+        write: (async (data: Buffer) => {
           if (
             diskFull &&
             data.toString("utf8").startsWith('{"resourceMetrics"')
@@ -145,25 +167,25 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
               code: "ENOSPC",
             });
           }
-          return fs.writeSync(fd, data);
-        },
-      },
+          return handle.write(data);
+        }) as asyncFs.FileHandle["write"],
+      })),
     },
   });
   const metrics = { resource, scopeMetrics: [] };
-  const failure = exportOnce(
+  const failure = await exportOnce(
     exporters.metrics,
     metrics,
     ExportResultCode.FAILED,
   );
   assert.equal(failure.error?.message, "OTLP file export: disk-full");
   elapsed = 59_999;
-  exportOnce(exporters.metrics, metrics, ExportResultCode.FAILED);
+  await exportOnce(exporters.metrics, metrics, ExportResultCode.FAILED);
   assert.deepEqual(diagnostics, [
     "obs.telemetry.dropped signal=metrics kind=disk-full\n",
   ]);
   elapsed = 60_000;
-  exportOnce(exporters.metrics, metrics, ExportResultCode.FAILED);
+  await exportOnce(exporters.metrics, metrics, ExportResultCode.FAILED);
   assert.equal(diagnostics.length, 2);
 
   const tracerProvider = new TracerProvider({
@@ -211,7 +233,7 @@ test("refuses a symlinked signal directory when the SDK first exports", async ()
   const exporters = createOtlpFileExporters(root, {
     writeDiagnostic: (line) => diagnostics.push(line),
   });
-  exportOnce(exporters.logs, [], ExportResultCode.FAILED);
+  await exportOnce(exporters.logs, [], ExportResultCode.FAILED);
   await exporters.logs.shutdown();
   assert.equal(exporters.dropped, 1);
   assert.deepEqual(diagnostics, [
@@ -229,12 +251,11 @@ test("serialization and shutdown failures are counted without exposing raw error
     },
     writerOptions: {
       now,
-      fs: {
-        ...fs,
-        fsyncSync() {
+      fs: interceptOpen(() => ({
+        async sync() {
           throw Object.assign(new Error("sensitive path"), { code: "ENOSPC" });
         },
-      },
+      })),
     },
   });
   const invalid: ReadableSpan[] = [];
@@ -244,11 +265,11 @@ test("serialization and shutdown failures are counted without exposing raw error
     },
   });
   assert.equal(
-    exportOnce(exporters.traces, invalid, ExportResultCode.FAILED).error
+    (await exportOnce(exporters.traces, invalid, ExportResultCode.FAILED)).error
       ?.message,
     "OTLP file export: serialization-failed",
   );
-  exportOnce(exporters.traces, [], ExportResultCode.SUCCESS);
+  await exportOnce(exporters.traces, [], ExportResultCode.SUCCESS);
   await exporters.traces.shutdown();
   await exporters.traces.shutdown();
   assert.equal(exporters.dropped, 2);
@@ -259,5 +280,75 @@ test("serialization and shutdown failures are counted without exposing raw error
   assert.deepEqual(fs.readdirSync(signalDir("traces")), [
     `${filename}.partial`,
   ]);
-  exportOnce(exporters.traces, [], ExportResultCode.FAILED);
+  await exportOnce(exporters.traces, [], ExportResultCode.FAILED);
+});
+
+test("charges final and partial files across signals and leaves the audit outside the budget", async () => {
+  const auditDir = join(root, "audit");
+  fs.mkdirSync(auditDir);
+  const auditFile = join(auditDir, filename);
+  fs.writeFileSync(auditFile, "a".repeat(4096));
+
+  const first = createOtlpFileExporters(root, { writerOptions: { now } });
+  await exportOnce(first.traces, [], ExportResultCode.SUCCESS);
+  await first.traces.shutdown();
+  const finalBytes = fs.statSync(join(signalDir("traces"), filename)).size;
+
+  fs.mkdirSync(signalDir("logs"));
+  fs.writeFileSync(join(signalDir("logs"), `${filename}.partial`), "pending");
+  const budget = finalBytes * 2 + Buffer.byteLength("pending");
+  const capped = createOtlpFileExporters(root, {
+    maxTotalBytes: budget,
+    writerOptions: { now },
+  });
+  await exportOnce(capped.traces, [], ExportResultCode.SUCCESS);
+  const result = await exportOnce(
+    capped.metrics,
+    { resource, scopeMetrics: [] },
+    ExportResultCode.FAILED,
+  );
+  assert.equal(result.error?.message, "OTLP file export: directory-budget");
+  assert.equal(capped.dropped, 1);
+  await Promise.all([capped.traces.shutdown(), capped.metrics.shutdown()]);
+  assert.equal(
+    fs.statSync(join(signalDir("traces"), "2026-11-23-0002.jsonl")).size,
+    finalBytes,
+  );
+  assert.deepEqual(fs.readdirSync(signalDir("metrics")), []);
+  assert.equal(fs.readFileSync(auditFile, "utf8"), "a".repeat(4096));
+});
+
+test("bounds the queue while a write stalls and flushes accepted exports on shutdown", async () => {
+  const stalled = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const diagnostics: string[] = [];
+  const exporter = createOtlpFileExporters(root, {
+    writerOptions: {
+      now,
+      fs: interceptOpen((handle) => ({
+        write: (async (data: Buffer) => {
+          entered.resolve();
+          await stalled.promise;
+          return handle.write(data);
+        }) as asyncFs.FileHandle["write"],
+      })),
+    },
+    writeDiagnostic: (line) => diagnostics.push(line),
+  });
+  const accepted = Array.from({ length: MAX_PENDING_EXPORTS }, () =>
+    exportOnce(exporter.logs, [], ExportResultCode.SUCCESS),
+  );
+  try {
+    await entered.promise;
+    await exportOnce(exporter.traces, [], ExportResultCode.FAILED);
+    assert.equal(exporter.dropped, 1);
+    assert.deepEqual(diagnostics, [
+      "obs.telemetry.dropped signal=traces kind=queue-full\n",
+    ]);
+  } finally {
+    const shutdown = exporter.logs.shutdown();
+    stalled.resolve();
+    await Promise.all([...accepted, shutdown]);
+  }
+  assert.equal(readLines("logs").length, MAX_PENDING_EXPORTS);
 });

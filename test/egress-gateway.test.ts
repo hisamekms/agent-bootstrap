@@ -27,6 +27,13 @@ import {
   type IpPort,
 } from "../src/egress-policy.ts";
 import type { RuntimeEvent } from "../src/runtime-events.ts";
+import { createTelemetry } from "../src/telemetry.ts";
+import { ExportResultCode, type ExportResult } from "@opentelemetry/core";
+import { InMemorySpanExporter } from "@opentelemetry/sdk-trace";
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+} from "@opentelemetry/sdk-metrics";
 
 const loopback = "127.0.0.1";
 const publicIp = "192.0.2.9";
@@ -333,6 +340,66 @@ test("waits for durable SOCKS decisions, relays pipelined data and counts bytes"
   assert.deepEqual(dials, [{ ip: publicIp, port: 443 }]);
 });
 
+test("a stalled telemetry exporter leaves gateway decision callbacks and replies responsive", async (t) => {
+  let exportsStarted = 0;
+  let ranInline = false;
+  const release = Promise.withResolvers<void>();
+  const decisions: RuntimeEvent[] = [];
+  const telemetry = createTelemetry(
+    {
+      enabled: true,
+      traceSamplingRatio: 1,
+      resourceSamplingIntervalMs: 1000,
+    },
+    "/unused",
+    {
+      exporters: {
+        logs: {
+          export(_records, callback: (result: ExportResult) => void) {
+            exportsStarted++;
+            void release.promise.then(() =>
+              callback({ code: ExportResultCode.SUCCESS }),
+            );
+          },
+          async forceFlush() {},
+          async shutdown() {},
+        },
+        traces: new InMemorySpanExporter(),
+        metrics: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
+      },
+    },
+  );
+  try {
+    const { proxy, audit } = await gateway(t, {
+      observer: {
+        observe(event) {
+          const before = exportsStarted;
+          telemetry.observe(event);
+          if (exportsStarted !== before) ranInline = true;
+          if (event.eventType === "network.connect.decided")
+            decisions.push(event);
+        },
+      },
+    });
+    const first = await authenticate(t, proxy);
+    first.socket.write(request(ipv4));
+    await until(() => exportsStarted > 0);
+    assert.equal(decisions.length, 1);
+    assert.equal((await first.read(10))[1], 2);
+
+    const next = await authenticate(t, proxy);
+    next.socket.write(request(ipv4));
+    assert.equal((await next.read(10))[1], 2);
+    assert.equal(decisions.length, 2);
+    assert.equal(audit.decisions.length, 2);
+    assert.equal(exportsStarted, 1);
+    assert.equal(ranInline, false);
+  } finally {
+    release.resolve();
+    await telemetry.shutdown();
+  }
+});
+
 test("DNS UDP and TCP audit only allowed-type lookups and only publish durable pins", async (t) => {
   const hold = Promise.withResolvers<void>();
   const resolved: [string, number][] = [];
@@ -583,6 +650,7 @@ test("enforces handshake and relay limits and records idle timeout", async (t) =
   over.socket.write(request(ipv4));
   assert.equal((await over.read(10))[1], 2);
   assert.equal(audit.decisions[1]?.reasonCode, "capacity");
+  await until(() => over.closed);
   await until(() => first.closed && audit.outcomes.length === 1);
   assert.equal(audit.outcomes[0]?.result, "timeout");
   assert.equal(audit.outcomes[0]?.endReason, "idle-timeout");

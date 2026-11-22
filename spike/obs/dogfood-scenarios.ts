@@ -63,7 +63,11 @@ function duckdb(directory: string, executionId: string, statements: string[]) {
     ],
     {
       cwd: repo,
-      env: { ...process.env, MISE_OFFLINE: "1" },
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        MISE_OFFLINE: "1",
+      },
       input: [
         `SET VARIABLE obs_dir = ${quote(directory)};`,
         `SET VARIABLE execution_id = ${quote(executionId)};`,

@@ -194,6 +194,7 @@ SELECT obs_attribute(attrs, 'agent_bootstrap.execution_id') ->> 'stringValue' AS
        obs_attribute(attrs, 'profile') ->> 'stringValue' AS profile,
        obs_attribute(attrs, 'agent.kind') ->> 'stringValue' AS agent_kind,
        obs_attribute(attrs, 'outcome') ->> 'stringValue' AS outcome,
+       obs_attribute(attrs, 'resource.sampling.status') ->> 'stringValue' AS resource_sampling_status,
        try_cast(obs_attribute(attrs, 'sandbox.cpu.time') ->> 'intValue' AS BIGINT) AS cpu_time_ns,
        try_cast(obs_attribute(attrs, 'sandbox.memory.usage') ->> 'intValue' AS BIGINT) AS memory_bytes,
        try_cast(obs_attribute(attrs, 'sandbox.memory.peak') ->> 'intValue' AS BIGINT) AS peak_memory_bytes

@@ -132,6 +132,7 @@ export async function createObservedHost({
     stagingRoot: msb.stagingRoot,
   });
   const required = config.audit.mode === "required";
+  const networkLimits = config.audit.network;
   if (
     providerBindings !== undefined &&
     (credentials !== undefined || providers !== undefined)
@@ -146,7 +147,12 @@ export async function createObservedHost({
   ): Promise<HostGateway> {
     if (closing) throw new Error("Observed host is closing");
     const opening = Promise.resolve()
-      .then(() => openGateway(options))
+      .then(() =>
+        openGateway({
+          ...options,
+          limits: { ...options.limits, ...networkLimits },
+        }),
+      )
       .then((gateway) => {
         let closed: Promise<void> | undefined;
         return {
@@ -285,6 +291,7 @@ export async function createObservedHost({
           sandboxLabel: `bootstrap-${randomUUID()}`,
           policy: new EgressPolicy({ allow: [] }),
           audit,
+          limits: networkLimits,
         });
         try {
           if (probe.quarantined !== false)

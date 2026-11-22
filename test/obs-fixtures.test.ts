@@ -163,7 +163,10 @@ function produceAudit(root: string, obs: string): void {
   }
 }
 
-async function produceTelemetry(obs: string): Promise<void> {
+async function produceTelemetry(
+  obs: string,
+  includeSamplingStatus = false,
+): Promise<void> {
   const exporter = createOtlpFileExporters(obs, { writerOptions: { now } });
   const resource = resourceFromAttributes({
     "service.name": "agent-bootstrap",
@@ -199,7 +202,14 @@ async function produceTelemetry(obs: string): Promise<void> {
     const execution = tracer.startSpan(
       "execution",
       {
-        attributes: { ...attributes, outcome },
+        attributes: {
+          ...attributes,
+          outcome,
+          ...(includeSamplingStatus &&
+            executionId === failedRun && {
+              "resource.sampling.status": "unavailable",
+            }),
+        },
         startTime: epoch,
       },
       parent,
@@ -277,9 +287,10 @@ async function produceTelemetry(obs: string): Promise<void> {
         },
       ],
     };
-    exporter.metrics.export(metrics, (result) => {
-      assert.equal(result.code, ExportResultCode.SUCCESS);
-    });
+    const result = await new Promise<ExportResultCode>((resolve) =>
+      exporter.metrics.export(metrics, ({ code }) => resolve(code)),
+    );
+    assert.equal(result, ExportResultCode.SUCCESS);
   }
   await exporter.metrics.shutdown();
 
@@ -352,4 +363,47 @@ test("OBS-15 fixtures match the audit and OTLP file exporters", async (t) => {
     const path = join(fixtureDir, name);
     assert.equal(fs.readFileSync(path, "utf8"), contents, name);
   }
+});
+
+test("sampling status distinguishes unavailable resources in OTLP fixtures", async (t) => {
+  const obs = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "obs-sampling-")));
+  t.after(() => fs.rmSync(obs, { recursive: true, force: true }));
+  await produceTelemetry(obs, true);
+  const spans = fs
+    .readFileSync(join(obs, "telemetry", "traces", file), "utf8")
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line).resourceSpans[0].scopeSpans[0].spans[0]);
+  const unavailable = spans.find(
+    (span) =>
+      span.name === "execution" &&
+      span.attributes.some(
+        ({ key, value }: { key: string; value: { stringValue?: string } }) =>
+          key === "agent_bootstrap.execution_id" &&
+          value.stringValue === failedRun,
+      ),
+  );
+  const noSandbox = spans.find((span) => span.name === "process.exec");
+  for (const span of [unavailable, noSandbox]) {
+    assert.ok(span);
+    assert.equal(
+      span.attributes.some(
+        ({ key }: { key: string }) =>
+          key === "sandbox.cpu.time" || key === "sandbox.memory.usage",
+      ),
+      false,
+    );
+  }
+  assert.deepEqual(
+    unavailable.attributes.find(
+      ({ key }: { key: string }) => key === "resource.sampling.status",
+    )?.value,
+    { stringValue: "unavailable" },
+  );
+  assert.equal(
+    noSandbox.attributes.find(
+      ({ key }: { key: string }) => key === "resource.sampling.status",
+    ),
+    undefined,
+  );
 });

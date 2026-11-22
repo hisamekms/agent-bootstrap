@@ -5,7 +5,12 @@ import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { JsonlFileError, JsonlWriter, scan } from "../src/jsonl-files.ts";
+import {
+  JsonlFileError,
+  JsonlWriter,
+  TelemetryJsonlDirectory,
+  scan,
+} from "../src/jsonl-files.ts";
 
 const day = "2026-11-23";
 const now = () => new Date(`${day}T00:00:00Z`);
@@ -288,4 +293,32 @@ test("leaves an unexpected final destination and the active partial intact", () 
     '{"existing":true}\n',
   );
   assert.equal(fs.readFileSync(join(dir, partial), "utf8"), '{"kept":true}\n');
+});
+
+test("one telemetry directory lock protects the budget across all signal writers", async () => {
+  const record = { value: "é" };
+  const lineBytes = Buffer.byteLength(`${JSON.stringify(record)}\n`);
+  const writer = new TelemetryJsonlDirectory(dir, 2 * lineBytes, { now });
+  const other = new TelemetryJsonlDirectory(dir, 2 * lineBytes, { now });
+  try {
+    await writer.write("traces", record);
+    await writer.write("metrics", record);
+    await writer.close("traces");
+    await assert.rejects(other.write("logs", record), {
+      code: "writer-locked",
+    });
+    await writer.close("metrics");
+
+    await assert.rejects(other.write("logs", record), {
+      code: "directory-budget",
+    });
+    assert.deepEqual(fs.readdirSync(join(dir, "logs")), []);
+    assert.equal(fs.statSync(join(dir, "traces", first)).size, lineBytes);
+    assert.equal(fs.statSync(join(dir, "metrics", first)).size, lineBytes);
+  } finally {
+    await writer.close("traces");
+    await writer.close("metrics");
+    await other.close("logs");
+  }
+  assert.equal(fs.existsSync(join(dir, "writer.lock")), false);
 });

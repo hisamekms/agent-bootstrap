@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import {
+  DEFAULT_GATEWAY_LIMITS,
+  DEFAULT_TELEMETRY_MAX_TOTAL_BYTES,
   parseObservabilityConfig,
   requireAudited,
 } from "../src/observability-config.ts";
@@ -33,11 +35,12 @@ afterEach(() => rmSync(workspace, { recursive: true, force: true }));
 test("defaults to required audit and enabled telemetry", () => {
   assert.deepEqual(parseObservabilityConfig({ directory }, roots), {
     directory,
-    audit: { mode: "required" },
+    audit: { mode: "required", network: DEFAULT_GATEWAY_LIMITS },
     telemetry: {
       enabled: true,
       resourceSamplingIntervalMs: 1000,
       traceSamplingRatio: 1,
+      maxTotalBytes: DEFAULT_TELEMETRY_MAX_TOTAL_BYTES,
     },
   });
 });
@@ -49,7 +52,10 @@ test("disabling telemetry preserves both audit modes", () => {
       roots,
     );
     assert.equal(config.telemetry.enabled, false);
-    assert.deepEqual(config.audit, audit);
+    assert.deepEqual(config.audit, {
+      ...audit,
+      network: DEFAULT_GATEWAY_LIMITS,
+    });
   }
   assert.equal(
     parseObservabilityConfig(
@@ -68,7 +74,11 @@ test("accepts inclusive telemetry bounds and rejects invalid values", () => {
   ]) {
     assert.deepEqual(
       parseObservabilityConfig({ directory, telemetry }, roots).telemetry,
-      { enabled: true, ...telemetry },
+      {
+        enabled: true,
+        maxTotalBytes: DEFAULT_TELEMETRY_MAX_TOTAL_BYTES,
+        ...telemetry,
+      },
     );
   }
   for (const resourceSamplingIntervalMs of [
@@ -96,6 +106,60 @@ test("accepts inclusive telemetry bounds and rejects invalid values", () => {
           roots,
         ),
       /telemetry\.traceSamplingRatio/,
+    );
+  }
+});
+
+test("validates explicit gateway limits and the telemetry byte budget", () => {
+  const network = {
+    attemptBurst: 20,
+    attemptsPerSecond: 10,
+    maxNetworkRows: 100,
+    maxRelays: 5,
+  };
+  const config = parseObservabilityConfig(
+    {
+      directory,
+      audit: { network },
+      telemetry: { maxTotalBytes: 16_384 },
+    },
+    roots,
+  );
+  assert.deepEqual(config.audit.network, network);
+  assert.equal(config.telemetry.maxTotalBytes, 16_384);
+  assert.ok(Object.isFrozen(config.audit.network));
+
+  for (const [key, aboveMax] of Object.entries({
+    attemptBurst: 4097,
+    attemptsPerSecond: 4097,
+    maxNetworkRows: 1_000_001,
+    maxRelays: 1025,
+  })) {
+    for (const value of [0, 1.5, aboveMax, Infinity, "2"]) {
+      assert.throws(
+        () =>
+          parseObservabilityConfig(
+            {
+              directory,
+              audit: { network: { [key]: value } },
+            },
+            roots,
+          ),
+        { message: `Invalid observability config: audit.network.${key}` },
+      );
+    }
+  }
+  for (const value of [0, 1.5, 1024 ** 4 + 1, Infinity, "2"]) {
+    assert.throws(
+      () =>
+        parseObservabilityConfig(
+          {
+            directory,
+            telemetry: { maxTotalBytes: value },
+          },
+          roots,
+        ),
+      /telemetry\.maxTotalBytes/,
     );
   }
 });

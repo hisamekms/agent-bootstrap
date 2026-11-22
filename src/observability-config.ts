@@ -11,13 +11,29 @@ import {
 import { types } from "node:util";
 import type { SandboxSpec } from "./sandbox-runtime.ts";
 
+export const DEFAULT_TELEMETRY_MAX_TOTAL_BYTES = 1024 ** 3;
+export const DEFAULT_GATEWAY_LIMITS = Object.freeze({
+  attemptBurst: 32,
+  attemptsPerSecond: 16,
+  maxNetworkRows: 4096,
+  maxRelays: 64,
+});
+
+type NetworkLimits = {
+  readonly [K in keyof typeof DEFAULT_GATEWAY_LIMITS]: number;
+};
+
 export interface ObservabilityConfig {
   readonly directory: string;
-  readonly audit: { readonly mode: "required" | "disabled" };
+  readonly audit: {
+    readonly mode: "required" | "disabled";
+    readonly network?: NetworkLimits;
+  };
   readonly telemetry: {
     readonly enabled: boolean;
     readonly resourceSamplingIntervalMs: number;
     readonly traceSamplingRatio: number;
+    readonly maxTotalBytes?: number;
   };
 }
 
@@ -115,11 +131,17 @@ function bounded(
   return value;
 }
 
+function integerLimit(value: unknown, max: number, field: string): number {
+  const number = bounded(value, 1, max, field);
+  if (!Number.isSafeInteger(number)) return invalid(field);
+  return number;
+}
+
 /** Parse host config without creating directories or reading environment variables. */
 export function parseObservabilityConfig(
   value: unknown,
   roots: ObservabilityRoots,
-): ObservabilityConfig {
+) {
   const input = dataRecord(value, "config", [
     "directory",
     "audit",
@@ -128,19 +150,36 @@ export function parseObservabilityConfig(
   const audit = dataRecord(
     Object.hasOwn(input, "audit") ? input.audit : {},
     "audit",
-    ["mode"],
+    ["mode", "network"],
   );
   const telemetry = dataRecord(
     Object.hasOwn(input, "telemetry") ? input.telemetry : {},
     "telemetry",
-    ["enabled", "resourceSamplingIntervalMs", "traceSamplingRatio"],
+    [
+      "enabled",
+      "resourceSamplingIntervalMs",
+      "traceSamplingRatio",
+      "maxTotalBytes",
+    ],
   );
+  const network = dataRecord(
+    Object.hasOwn(audit, "network") ? audit.network : {},
+    "audit.network",
+    Object.keys(DEFAULT_GATEWAY_LIMITS),
+  );
+  const {
+    attemptBurst = DEFAULT_GATEWAY_LIMITS.attemptBurst,
+    attemptsPerSecond = DEFAULT_GATEWAY_LIMITS.attemptsPerSecond,
+    maxNetworkRows = DEFAULT_GATEWAY_LIMITS.maxNetworkRows,
+    maxRelays = DEFAULT_GATEWAY_LIMITS.maxRelays,
+  } = network;
   const { mode = "required" } = audit;
   if (mode !== "required" && mode !== "disabled") return invalid("audit.mode");
   const {
     enabled = true,
     resourceSamplingIntervalMs = 1000,
     traceSamplingRatio = 1,
+    maxTotalBytes = DEFAULT_TELEMETRY_MAX_TOTAL_BYTES,
   } = telemetry;
   if (typeof enabled !== "boolean") return invalid("telemetry.enabled");
 
@@ -157,9 +196,34 @@ export function parseObservabilityConfig(
 
   return Object.freeze({
     directory,
-    audit: Object.freeze({ mode }),
+    audit: Object.freeze({
+      mode,
+      network: Object.freeze({
+        attemptBurst: integerLimit(
+          attemptBurst,
+          4096,
+          "audit.network.attemptBurst",
+        ),
+        attemptsPerSecond: integerLimit(
+          attemptsPerSecond,
+          4096,
+          "audit.network.attemptsPerSecond",
+        ),
+        maxNetworkRows: integerLimit(
+          maxNetworkRows,
+          1_000_000,
+          "audit.network.maxNetworkRows",
+        ),
+        maxRelays: integerLimit(maxRelays, 1024, "audit.network.maxRelays"),
+      }),
+    }),
     telemetry: Object.freeze({
       enabled,
+      maxTotalBytes: integerLimit(
+        maxTotalBytes,
+        1024 ** 4,
+        "telemetry.maxTotalBytes",
+      ),
       resourceSamplingIntervalMs: bounded(
         resourceSamplingIntervalMs,
         250,
@@ -173,7 +237,7 @@ export function parseObservabilityConfig(
         "telemetry.traceSamplingRatio",
       ),
     }),
-  });
+  } satisfies ObservabilityConfig);
 }
 
 /** An unaudited agent run requires an opt-in from the caller for this run. */

@@ -104,6 +104,34 @@ const checks = {
   `,
 };
 
+const samplingFixture = JSON.stringify({
+  resourceSpans: [
+    {
+      scopeSpans: [
+        {
+          spans: [
+            {
+              name: "execution",
+              spanId: "0000000000000001",
+              attributes: [
+                {
+                  key: "agent_bootstrap.sandbox_id",
+                  value: { stringValue: "fixture-sandbox" },
+                },
+                {
+                  key: "resource.sampling.status",
+                  value: { stringValue: "unavailable" },
+                },
+              ],
+            },
+            { name: "execution", spanId: "0000000000000002", attributes: [] },
+          ],
+        },
+      ],
+    },
+  ],
+});
+
 const sql = [
   "SET VARIABLE obs_dir = 'test/fixtures/obs';",
   `SET VARIABLE execution_id = '${run}';`,
@@ -113,6 +141,16 @@ const sql = [
     ([name, condition]) =>
       `SELECT CASE WHEN (${condition}) IS TRUE THEN 'ok' ELSE error('${name}') END;`,
   ),
+  // Exercise the view with a resource status and an execution without a sandbox.
+  `CREATE OR REPLACE TEMP MACRO obs_records(stream) AS TABLE
+     SELECT 'sampling-fixture' AS filename, '${samplingFixture}'::JSON AS record;`,
+  `SELECT CASE WHEN (
+    SELECT count(*) = 2
+      AND count(*) FILTER (WHERE sandbox_id IS NOT NULL AND resource_sampling_status = 'unavailable') = 1
+      AND count(*) FILTER (WHERE sandbox_id IS NULL AND resource_sampling_status IS NULL) = 1
+      AND bool_and(cpu_time_ns IS NULL AND memory_bytes IS NULL)
+    FROM obs_spans
+  ) IS TRUE THEN 'ok' ELSE error('resource sampling status') END;`,
 ].join("\n");
 
 const result = spawnSync(
@@ -132,7 +170,11 @@ const result = spawnSync(
   ],
   {
     cwd: root,
-    env: { ...process.env, MISE_OFFLINE: "1" },
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      MISE_OFFLINE: "1",
+    },
     input: sql,
     encoding: "utf8",
   },
@@ -140,4 +182,4 @@ const result = spawnSync(
 
 if (result.error) throw result.error;
 assert.equal(result.status, 0, result.stderr);
-console.log(`DuckDB smoke passed (${Object.keys(checks).length} checks)`);
+console.log(`DuckDB smoke passed (${Object.keys(checks).length + 1} checks)`);

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as asyncFs from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
@@ -38,6 +39,7 @@ export type JsonlWriterOptions = {
 type JsonlErrorCode =
   | "closed"
   | "disk-full"
+  | "directory-budget"
   | "invalid-record"
   | "record-too-large"
   | "unsafe-directory"
@@ -68,14 +70,29 @@ function writeError(error: unknown): JsonlFileError {
   );
 }
 
-function checkDirectories(io: JsonlFs, dir: string, create: boolean): void {
+function directoryChain(dir: string): string[] {
   const path: string[] = [];
   for (let entry = dir; ; entry = dirname(entry)) {
     path.push(entry);
-    if (dirname(entry) === entry) break;
+    if (dirname(entry) === entry) return path.reverse();
   }
-  const uid = process.geteuid?.();
-  for (const entry of path.reverse()) {
+}
+
+function checkDirectory(stat: fs.Stats | undefined, stickyAllowed: boolean) {
+  // Under a trusted sticky ancestor such as /tmp, other users cannot
+  // replace entries owned by a trusted user. Check every child in turn.
+  if (
+    !stat?.isDirectory() ||
+    (stat.uid !== 0 && stat.uid !== process.geteuid?.()) ||
+    ((stat.mode & 0o022) !== 0 &&
+      !(stickyAllowed && (stat.mode & 0o1000) !== 0))
+  ) {
+    throw new JsonlFileError("unsafe-directory");
+  }
+}
+
+function checkDirectories(io: JsonlFs, dir: string, create: boolean): void {
+  for (const entry of directoryChain(dir)) {
     let stat = io.lstatSync(entry, { throwIfNoEntry: false });
     if (!stat && create) {
       try {
@@ -85,22 +102,24 @@ function checkDirectories(io: JsonlFs, dir: string, create: boolean): void {
       }
       stat = io.lstatSync(entry);
     }
-    // Under a trusted sticky ancestor such as /tmp, other users cannot
-    // replace entries owned by a trusted user. Check every child in turn.
-    const trustedStickyAncestor =
-      stat && entry !== dir && (stat.mode & 0o1000) !== 0;
-    if (
-      !stat?.isDirectory() ||
-      (stat.uid !== 0 && stat.uid !== uid) ||
-      ((stat.mode & 0o022) !== 0 && !trustedStickyAncestor)
-    ) {
-      throw new JsonlFileError("unsafe-directory");
-    }
+    checkDirectory(stat, entry !== dir);
   }
 }
 
+function describeLock(value: string): JsonlFileError {
+  if (!/^[1-9]\d{0,9}\n?$/u.test(value))
+    return new JsonlFileError("writer-locked");
+  const pid = Number(value);
+  if (pid > 0x7fff_ffff) return new JsonlFileError("writer-locked");
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (hasCode(error, "ESRCH")) return new JsonlFileError("stale-lock", pid);
+  }
+  return new JsonlFileError("writer-locked", pid);
+}
+
 function lockError(io: JsonlFs, path: string): JsonlFileError {
-  let pid: number;
   try {
     const fd = io.openSync(path, READ);
     try {
@@ -108,23 +127,13 @@ function lockError(io: JsonlFs, path: string): JsonlFileError {
       if (!io.fstatSync(fd).isFile())
         return new JsonlFileError("writer-locked");
       const length = io.readSync(fd, data, 0, data.length, 0);
-      const value = data.toString("utf8", 0, length);
-      if (!/^[1-9]\d{0,9}\n?$/u.test(value))
-        return new JsonlFileError("writer-locked");
-      pid = Number(value);
-      if (pid > 0x7fff_ffff) return new JsonlFileError("writer-locked");
+      return describeLock(data.toString("utf8", 0, length));
     } finally {
       io.closeSync(fd);
     }
   } catch {
     return new JsonlFileError("writer-locked");
   }
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    if (hasCode(error, "ESRCH")) return new JsonlFileError("stale-lock", pid);
-  }
-  return new JsonlFileError("writer-locked", pid);
 }
 
 function writeLine(io: JsonlFs, fd: number, line: Buffer): void {
@@ -169,6 +178,19 @@ function encodeRecord(record: object): Buffer {
   return Buffer.from(`${json}\n`, "utf8");
 }
 
+function nextFile(names: string[], dir: string, date: string): string {
+  let last = 0;
+  for (const name of names) {
+    const match = FILE_NAME.exec(name);
+    if (match?.[1] === date) last = Math.max(last, Number(match[2]));
+  }
+  if (last >= 9999) throw new JsonlFileError("write-failed");
+  return join(
+    dir,
+    `${date}-${String(last + 1).padStart(4, "0")}.jsonl.partial`,
+  );
+}
+
 type ActiveFile = {
   readonly fd: number;
   readonly date: string;
@@ -176,7 +198,10 @@ type ActiveFile = {
   bytes: number;
 };
 
-/** Use a canonical output path. Close the writer to release its lock. */
+/**
+ * Use a canonical output path. Close the writer to release its lock.
+ * Audit export uses this uncapped writer and can share a volume with telemetry.
+ */
 export class JsonlWriter {
   readonly #io: JsonlFs;
   readonly #dir: string;
@@ -256,16 +281,7 @@ export class JsonlWriter {
   }
 
   #openActive(date: string): ActiveFile {
-    let last = 0;
-    for (const name of this.#io.readdirSync(this.#dir)) {
-      const match = FILE_NAME.exec(name);
-      if (match?.[1] === date) last = Math.max(last, Number(match[2]));
-    }
-    if (last >= 9999) throw new JsonlFileError("write-failed");
-    const path = join(
-      this.#dir,
-      `${date}-${String(last + 1).padStart(4, "0")}.jsonl.partial`,
-    );
+    const path = nextFile(this.#io.readdirSync(this.#dir), this.#dir, date);
     const fd = this.#io.openSync(path, CREATE, 0o600);
     return { fd, date, path, bytes: 0 };
   }
@@ -285,6 +301,208 @@ export class JsonlWriter {
       throw new JsonlFileError("write-failed");
     }
     this.#io.renameSync(active.path, finalPath);
+  }
+}
+
+type AsyncJsonlFs = Pick<
+  typeof asyncFs,
+  "lstat" | "mkdir" | "open" | "readdir" | "rename" | "unlink"
+>;
+
+export type TelemetryJsonlOptions = {
+  readonly maxBytes?: number;
+  readonly now?: () => Date;
+  readonly fs?: AsyncJsonlFs;
+};
+
+const telemetrySignals = ["traces", "metrics", "logs"] as const;
+export type TelemetrySignal = (typeof telemetrySignals)[number];
+
+type AsyncActiveFile = Omit<ActiveFile, "fd"> & {
+  readonly handle: asyncFs.FileHandle;
+};
+
+async function lstatIfPresent(io: AsyncJsonlFs, path: string) {
+  try {
+    return await io.lstat(path);
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+    return undefined;
+  }
+}
+
+async function makeSafeDirectory(io: AsyncJsonlFs, dir: string) {
+  for (const entry of directoryChain(dir)) {
+    let stat = await lstatIfPresent(io, entry);
+    if (!stat) {
+      try {
+        await io.mkdir(entry, { mode: 0o700 });
+      } catch (error) {
+        if (!hasCode(error, "EEXIST")) throw error;
+      }
+      stat = await io.lstat(entry);
+    }
+    checkDirectory(stat, entry !== dir);
+  }
+}
+
+async function asyncLockError(io: AsyncJsonlFs, path: string) {
+  try {
+    const handle = await io.open(path, READ);
+    try {
+      if (!(await handle.stat()).isFile())
+        return new JsonlFileError("writer-locked");
+      const data = Buffer.alloc(16);
+      const { bytesRead } = await handle.read(data, 0, data.length, 0);
+      return describeLock(data.toString("utf8", 0, bytesRead));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return new JsonlFileError("writer-locked");
+  }
+}
+
+/** Calls must be serialized. The root lock covers the shared signal budget. */
+export class TelemetryJsonlDirectory {
+  readonly #io: AsyncJsonlFs;
+  readonly #dir: string;
+  readonly #lock: string;
+  readonly #maxTotalBytes: number;
+  readonly #maxBytes: number;
+  readonly #now: () => Date;
+  readonly #openSignals = new Set<TelemetrySignal>();
+  readonly #active = new Map<TelemetrySignal, AsyncActiveFile>();
+  #totalBytes = 0;
+
+  constructor(
+    dir: string,
+    maxTotalBytes: number,
+    options: TelemetryJsonlOptions = {},
+  ) {
+    this.#io = options.fs ?? asyncFs;
+    this.#dir = resolve(dir);
+    this.#lock = join(this.#dir, "writer.lock");
+    this.#maxTotalBytes = maxTotalBytes;
+    this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    this.#now = options.now ?? (() => new Date());
+    for (const limit of [this.#maxTotalBytes, this.#maxBytes]) {
+      if (!Number.isSafeInteger(limit) || limit <= 0)
+        throw new RangeError(
+          "JSONL byte limits must be positive safe integers",
+        );
+    }
+  }
+
+  async #acquireBudget() {
+    const io = this.#io;
+    await makeSafeDirectory(io, this.#dir);
+    let lock: asyncFs.FileHandle;
+    try {
+      lock = await io.open(this.#lock, CREATE, 0o600);
+    } catch (error) {
+      if (hasCode(error, "EEXIST")) throw await asyncLockError(io, this.#lock);
+      throw error;
+    }
+    try {
+      try {
+        await lock.writeFile(`${process.pid}\n`);
+      } finally {
+        await lock.close();
+      }
+      this.#totalBytes = 0;
+      for (const signal of telemetrySignals) {
+        const dir = join(this.#dir, signal);
+        const stat = await lstatIfPresent(io, dir);
+        if (!stat?.isDirectory()) continue;
+        for (const name of await io.readdir(dir)) {
+          if (!FILE_NAME.test(name)) continue;
+          const file = await lstatIfPresent(io, join(dir, name));
+          if (file?.isFile()) this.#totalBytes += file.size;
+        }
+      }
+    } catch (error) {
+      await io.unlink(this.#lock);
+      throw error;
+    }
+  }
+
+  async write(signal: TelemetrySignal, record: object): Promise<void> {
+    const line = encodeRecord(record);
+    if (line.length > this.#maxBytes)
+      throw new JsonlFileError("record-too-large");
+    try {
+      const dir = join(this.#dir, signal);
+      if (!this.#openSignals.has(signal)) {
+        await makeSafeDirectory(this.#io, dir);
+        if (!this.#openSignals.size) await this.#acquireBudget();
+        this.#openSignals.add(signal);
+      }
+      if (line.length > this.#maxTotalBytes - this.#totalBytes)
+        throw new JsonlFileError("directory-budget");
+      const date = this.#now().toISOString().split("T")[0];
+      if (!date || !/^\d{4}-\d{2}-\d{2}$/u.test(date))
+        throw new JsonlFileError("write-failed");
+      let active = this.#active.get(signal);
+      if (
+        active &&
+        (active.date !== date || active.bytes + line.length > this.#maxBytes)
+      ) {
+        await this.#finish(signal);
+        active = undefined;
+      }
+      if (!active) {
+        const path = nextFile(await this.#io.readdir(dir), dir, date);
+        const handle = await this.#io.open(path, CREATE, 0o600);
+        active = { path, date, handle, bytes: 0 };
+        this.#active.set(signal, active);
+      }
+      // Reserve the whole line until the write or a post-failure stat tells us
+      // how much space was consumed.
+      this.#totalBytes += line.length;
+      try {
+        const { bytesWritten } = await active.handle.write(line);
+        if (bytesWritten !== line.length)
+          throw new JsonlFileError("write-failed");
+      } catch (error) {
+        this.#active.delete(signal);
+        const stat = await active.handle.stat().catch(() => undefined);
+        if (stat) this.#totalBytes += stat.size - active.bytes - line.length;
+        await active.handle.close().catch(() => {});
+        throw error;
+      }
+      active.bytes += line.length;
+    } catch (error) {
+      throw writeError(error);
+    }
+  }
+
+  async close(signal: TelemetrySignal): Promise<void> {
+    if (!this.#openSignals.delete(signal)) return;
+    try {
+      try {
+        await this.#finish(signal);
+      } finally {
+        if (!this.#openSignals.size) await this.#io.unlink(this.#lock);
+      }
+    } catch (error) {
+      throw writeError(error);
+    }
+  }
+
+  async #finish(signal: TelemetrySignal): Promise<void> {
+    const active = this.#active.get(signal);
+    if (!active) return;
+    this.#active.delete(signal);
+    try {
+      await active.handle.sync();
+    } finally {
+      await active.handle.close();
+    }
+    const finalPath = active.path.slice(0, -".partial".length);
+    if (await lstatIfPresent(this.#io, finalPath))
+      throw new JsonlFileError("write-failed");
+    await this.#io.rename(active.path, finalPath);
   }
 }
 

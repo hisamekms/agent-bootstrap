@@ -1,5 +1,4 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { writeSync } from "node:fs";
 import { isIP } from "node:net";
 import {
   ROOT_CONTEXT,
@@ -34,7 +33,11 @@ import {
   type SpanExporter,
 } from "@opentelemetry/sdk-trace";
 import type { ObservabilityConfig } from "./observability-config.ts";
-import { createOtlpFileExporters } from "./otlp-file-exporters.ts";
+import {
+  createExportQueue,
+  createOtlpFileExporters,
+  writeTelemetryDiagnostic,
+} from "./otlp-file-exporters.ts";
 import {
   createResourceSampler,
   type ResourceSampler,
@@ -160,23 +163,34 @@ function protectExporter<T>(exporter: Exporter<T>, dropped: () => void) {
     }
   }
 
+  const queue = createExportQueue();
+  let closing: Promise<void> | undefined;
+  const failed = { code: ExportResultCode.FAILED } as const;
+
   return {
     export(data: T, callback: (result: ExportResult) => void): void {
-      let completed = false;
-      const done = (result: ExportResult) => {
-        if (completed) return;
-        completed = true;
-        if (result.code !== ExportResultCode.SUCCESS) dropped();
-        callback({ code: result.code });
-      };
-      try {
-        exporter.export(data, done);
-      } catch {
-        done({ code: ExportResultCode.FAILED });
-      }
+      if (
+        !closing &&
+        queue.enqueue(async () => {
+          const result = await new Promise<ExportResult>((resolve) => {
+            try {
+              exporter.export(data, (result) => resolve({ code: result.code }));
+            } catch {
+              resolve(failed);
+            }
+          });
+          if (result.code !== ExportResultCode.SUCCESS) dropped();
+          callback(result);
+        })
+      )
+        return;
+      dropped();
+      callback(failed);
     },
-    forceFlush: () => finish(() => exporter.forceFlush?.()),
-    shutdown: () => finish(() => exporter.shutdown()),
+    forceFlush: () =>
+      queue.afterPending(() => finish(() => exporter.forceFlush?.())),
+    shutdown: () =>
+      (closing ??= queue.afterPending(() => finish(() => exporter.shutdown()))),
   };
 }
 
@@ -196,14 +210,18 @@ export function createTelemetry(
     if (now - lastDiagnostic < 60_000) return;
     lastDiagnostic = now;
     try {
-      writeSync(2, "obs.telemetry.dropped kind=instrumentation\n");
+      writeTelemetryDiagnostic("obs.telemetry.dropped kind=instrumentation\n");
     } catch {
       // Diagnostics are best effort.
     }
   }
 
   const injected = options.exporters;
-  const files = createOtlpFileExporters(dir);
+  const files = createOtlpFileExporters(dir, {
+    ...(config.maxTotalBytes !== undefined && {
+      maxTotalBytes: config.maxTotalBytes,
+    }),
+  });
   const traces = injected
     ? protectExporter(injected.traces, reportDrop)
     : files.traces;

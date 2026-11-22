@@ -161,8 +161,20 @@ test("required mode creates the durably bound sandbox and samples its original h
   let finalSample: ResourceSample | undefined;
   let sampledId: string | undefined;
   let executionId: string | undefined;
+  const limits = {
+    attemptBurst: 24,
+    attemptsPerSecond: 12,
+    maxNetworkRows: 512,
+    maxRelays: 8,
+  };
+  const passedLimits: unknown[] = [];
   const observed = await createObservedHost({
     ...f.options,
+    config: { ...f.options.config, audit: { network: limits } },
+    openGateway(options) {
+      passedLimits.push(options.limits);
+      return f.options.openGateway(options);
+    },
     observers: [
       {
         observe(event) {
@@ -230,6 +242,7 @@ test("required mode creates the durably bound sandbox and samples its original h
     "gateway.open",
     "gateway.close",
   ]);
+  assert.deepEqual(passedLimits, [limits, limits]);
   await observed.close();
   assert.equal(observed.audit.isV5Writable, false);
 });

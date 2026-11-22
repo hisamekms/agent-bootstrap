@@ -24,6 +24,7 @@ import {
   type DnsQuestion,
   type DnsResponse,
 } from "./dns-wire.ts";
+import { DEFAULT_GATEWAY_LIMITS } from "./observability-config.ts";
 import {
   canonicalizeIp,
   type EgressPolicy,
@@ -45,6 +46,7 @@ import {
 } from "./socks5.ts";
 
 const LOOPBACK = "127.0.0.1";
+const REFUSAL_DRAIN_MS = 250;
 const DNS_TIMEOUT_MS = 5000;
 const MAX_EARLY_DATA_BYTES = 65536;
 const MAX_ANSWER_TTL = 300;
@@ -191,7 +193,9 @@ export class EgressGateway {
       invocationId: options.executionId,
       sandboxId: options.sandboxLabel,
     };
-    this.#maxRelays = positiveLimit(options.limits?.maxRelays ?? 64);
+    this.#maxRelays = positiveLimit(
+      options.limits?.maxRelays ?? DEFAULT_GATEWAY_LIMITS.maxRelays,
+    );
     this.#maxPending = positiveLimit(
       options.limits?.maxPendingHandshakes ?? 64,
     );
@@ -199,13 +203,18 @@ export class EgressGateway {
     this.#handshakeMs = positiveLimit(
       options.limits?.handshakeTimeoutMs ?? 10_000,
     );
-    this.#attemptBurst = positiveLimit(options.limits?.attemptBurst ?? 32);
+    this.#attemptBurst = positiveLimit(
+      options.limits?.attemptBurst ?? DEFAULT_GATEWAY_LIMITS.attemptBurst,
+    );
     this.#attemptsPerSecond = positiveLimit(
-      options.limits?.attemptsPerSecond ?? 16,
+      options.limits?.attemptsPerSecond ??
+        DEFAULT_GATEWAY_LIMITS.attemptsPerSecond,
     );
     this.#tokens = this.#attemptBurst;
     // TrustedHost opens one gateway per execution.
-    this.#remainingRows = positiveLimit(options.limits?.maxNetworkRows ?? 4096);
+    this.#remainingRows = positiveLimit(
+      options.limits?.maxNetworkRows ?? DEFAULT_GATEWAY_LIMITS.maxNetworkRows,
+    );
     if (options.resolver) this.#resolver = options.resolver;
     else {
       const resolver = new Resolver({ timeout: DNS_TIMEOUT_MS, tries: 1 });
@@ -482,7 +491,10 @@ export class EgressGateway {
       client.removeListener("data", handshake);
       upstream?.destroy();
       if (reply && !client.destroyed) {
-        client.setTimeout(this.#handshakeMs, () => client.destroy());
+        // A refusal is a small final write. Bound the drain independently of
+        // the handshake timeout, even if the peer keeps sending data.
+        const drain = setTimeout(() => client.destroy(), REFUSAL_DRAIN_MS);
+        client.once("close", () => clearTimeout(drain));
         client.end(reply, () => client.destroy());
       } else client.destroy();
       recordOutcome();
@@ -577,7 +589,10 @@ export class EgressGateway {
       destination?: IpPort,
       earlyData: Uint8Array = new Uint8Array(),
     ) => {
-      if (!this.#admit(decision.decision === "allow" ? 3 : 2)) return;
+      if (!this.#admit(decision.decision === "allow" ? 3 : 2)) {
+        stop("error");
+        return;
+      }
       client.pause();
       client.removeListener("data", handshake);
       reader.close();

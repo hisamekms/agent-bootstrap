@@ -1,4 +1,5 @@
-import { writeSync } from "node:fs";
+import { write } from "node:fs";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { join } from "node:path";
 import { ValueType, type Meter } from "@opentelemetry/api";
 import { ExportResultCode, type ExportResult } from "@opentelemetry/core";
@@ -12,21 +13,57 @@ import type { PushMetricExporter } from "@opentelemetry/sdk-metrics";
 import type { SpanExporter } from "@opentelemetry/sdk-trace";
 import {
   JsonlFileError,
-  JsonlWriter,
-  type JsonlWriterOptions,
+  TelemetryJsonlDirectory,
+  type TelemetryJsonlOptions,
+  type TelemetrySignal as Signal,
 } from "./jsonl-files.ts";
+import { DEFAULT_TELEMETRY_MAX_TOTAL_BYTES } from "./observability-config.ts";
 
-type Signal = "traces" | "metrics" | "logs";
-type FailureKind = JsonlFileError["code"] | "serialization-failed";
+type FailureKind =
+  JsonlFileError["code"] | "queue-full" | "serialization-failed";
 
 export type OtlpFileExporterOptions = {
-  readonly writerOptions?: JsonlWriterOptions;
+  readonly maxTotalBytes?: number;
+  readonly writerOptions?: TelemetryJsonlOptions;
   readonly monotonicNow?: () => number;
   readonly writeDiagnostic?: (line: string) => void;
 };
 
-function writeStderr(line: string): void {
-  writeSync(2, line);
+// Bound pending work including the active export. Flush and shutdown only
+// add barriers, and can still run when the queue is full.
+export const MAX_PENDING_EXPORTS = 256;
+
+export function createExportQueue() {
+  let tail = Promise.resolve();
+  let pending = 0;
+
+  function afterPending(work: () => Promise<void>): Promise<void> {
+    const task = tail.then(work);
+    tail = task.catch(() => {});
+    return task;
+  }
+
+  return {
+    enqueue(work: () => Promise<void>): boolean {
+      if (pending >= MAX_PENDING_EXPORTS) return false;
+      pending++;
+      void afterPending(async () => {
+        try {
+          await nextTurn();
+          await work();
+        } finally {
+          pending--;
+        }
+      });
+      return true;
+    },
+    flush: () => tail,
+    afterPending,
+  };
+}
+
+export function writeTelemetryDiagnostic(line: string): void {
+  write(2, line, () => {});
 }
 
 function writerFailure(error: unknown): FailureKind {
@@ -42,9 +79,15 @@ export function createOtlpFileExporters(
   options: OtlpFileExporterOptions = {},
 ) {
   const monotonicNow = options.monotonicNow ?? (() => performance.now());
-  const writeDiagnostic = options.writeDiagnostic ?? writeStderr;
+  const writeDiagnostic = options.writeDiagnostic ?? writeTelemetryDiagnostic;
   const lastDiagnostic = new Map<FailureKind, number>();
   let dropped = 0;
+  const queue = createExportQueue();
+  const writer = new TelemetryJsonlDirectory(
+    join(obsDir, "telemetry"),
+    options.maxTotalBytes ?? DEFAULT_TELEMETRY_MAX_TOTAL_BYTES,
+    options.writerOptions,
+  );
 
   function failure(signal: Signal, kind: FailureKind): ExportResult {
     dropped++;
@@ -70,14 +113,10 @@ export function createOtlpFileExporters(
     signal: Signal,
     serialize: (data: Input) => Uint8Array | undefined,
   ) {
-    const dir = join(obsDir, "telemetry", signal);
     const decoder = new TextDecoder();
-    let writer: JsonlWriter | undefined;
-    let closed = false;
+    let closing: Promise<void> | undefined;
 
-    function write(data: Input): ExportResult {
-      if (closed) return failure(signal, "closed");
-
+    async function write(data: Input): Promise<ExportResult> {
       let record: object;
       try {
         record = JSON.parse(decoder.decode(serialize(data)));
@@ -85,10 +124,7 @@ export function createOtlpFileExporters(
         return failure(signal, "serialization-failed");
       }
       try {
-        // Acquire each lock on demand so open failures are reported as drops
-        // and a later export can retry.
-        writer ??= new JsonlWriter(dir, options.writerOptions);
-        writer.write(record);
+        await writer.write(signal, record);
       } catch (error) {
         return failure(signal, writerFailure(error));
       }
@@ -97,21 +133,19 @@ export function createOtlpFileExporters(
 
     return {
       export(data: Input, callback: (result: ExportResult) => void): void {
-        callback(write(data));
+        if (closing) callback(failure(signal, "closed"));
+        else if (!queue.enqueue(async () => callback(await write(data))))
+          callback(failure(signal, "queue-full"));
       },
-      // Exports are synchronous. Shutdown publishes the active file.
-      forceFlush(): Promise<void> {
-        return Promise.resolve();
-      },
-      async shutdown(): Promise<void> {
-        closed = true;
-        try {
-          writer?.close();
-        } catch (error) {
-          failure(signal, writerFailure(error));
-        } finally {
-          writer = undefined;
-        }
+      forceFlush: queue.flush,
+      shutdown(): Promise<void> {
+        return (closing ??= queue.afterPending(async () => {
+          try {
+            await writer.close(signal);
+          } catch (error) {
+            failure(signal, writerFailure(error));
+          }
+        }));
       },
     };
   }

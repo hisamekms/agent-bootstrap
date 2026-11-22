@@ -44,9 +44,14 @@ const sandboxKey = "agent_bootstrap.sandbox_id";
 
 function memoryExporters() {
   return {
-    traces: new InMemorySpanExporter(),
+    // Retain exported records so assertions can follow the shutdown flush.
+    traces: new (class extends InMemorySpanExporter {
+      override async shutdown() {}
+    })(),
     metrics: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
-    logs: new InMemoryLogRecordExporter(),
+    logs: new (class extends InMemoryLogRecordExporter {
+      override async shutdown() {}
+    })(),
   };
 }
 
@@ -140,6 +145,7 @@ for (const outcome of [
       });
       finishRun(run, outcome);
 
+      await telemetry.shutdown();
       const spans = exporters.traces.getFinishedSpans();
       assert.deepEqual(
         spans.map(({ name }) => name),
@@ -254,6 +260,7 @@ test("sandbox creation failure has no process or destroy span", async () => {
       runtimeKind: "microsandbox",
     });
     run.emit("execution.finished", { outcome: "failed", durationMs: 10 });
+    await telemetry.shutdown();
     assert.deepEqual(
       exporters.traces
         .getFinishedSpans()
@@ -316,6 +323,7 @@ test("sampling combines periodic points with the forwarded terminal sample", asy
     assert.equal(tick, undefined);
     run.emit("sandbox.destroyed", { outcome: "succeeded", durationMs: 1 });
     run.emit("execution.finished", { outcome: "succeeded", durationMs: 10 });
+    await telemetry.shutdown();
     const execution = exporters.traces
       .getFinishedSpans()
       .find(({ name }) => name === "execution");
@@ -387,6 +395,7 @@ test("network logs retain correlation and allowlisted destinations and redact de
     run.emit("network.dns.query", denied);
     run.emit("execution.finished", { outcome: "succeeded", durationMs: 10 });
 
+    await telemetry.shutdown();
     assert.equal(exporters.traces.getFinishedSpans().length, 0);
     const records = exporters.logs.getFinishedLogRecords();
     assert.equal(records.length, 4);
