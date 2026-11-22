@@ -284,6 +284,33 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     );
   }
 
+  /** The backend does not verify digest-form local tags, so before every
+   * create the reported image digest must equal the one in the reference.
+   * Run failures keep the backend codes; a wrong answer is invalid-input.
+   * Backend output never reaches the error. */
+  async #verifyImage(image: string): Promise<void> {
+    const result = await this.#checked([
+      "image",
+      "inspect",
+      "--format",
+      "json",
+      image,
+    ]);
+    let reported: unknown;
+    try {
+      const parsed: unknown = JSON.parse(result.stdout.toString("utf8"));
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      )
+        reported = (parsed as { digest?: unknown }).digest;
+    } catch {
+      invalid();
+    }
+    if (reported !== `sha256:${image.slice(-64)}`) invalid();
+  }
+
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
     const invocationId = spec.invocationId;
     if (
@@ -367,6 +394,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       const version = await this.#checked(["--version"]);
       if (version.stdout.toString("utf8").trim() !== "msb 0.7.16")
         throw new SandboxRuntimeError("unsupported-version");
+      await this.#verifyImage(profile.image);
       await mkdir(this.#config.stagingRoot, { recursive: true, mode: 0o700 });
       directory = await mkdtemp(join(this.#config.stagingRoot, "msb-"));
       // Copy each tool into private staging and verify the copy, so the
