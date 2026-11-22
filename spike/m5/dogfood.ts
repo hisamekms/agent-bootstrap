@@ -601,11 +601,22 @@ $current_file
           operator.say(
             new TextDecoder().decode(diff).replace(/[^\x20-\x7e\n]/gu, "?"),
           );
-          const typed = await operator.ask(
-            `Type "approve ${approval.candidate}" to integrate, anything else rejects: `,
-          );
-          decision =
-            typed === `approve ${approval.candidate}` ? "approve" : "reject";
+          // Approval needs the exact candidate ID. Rejection must be explicit;
+          // anything else asks again, and three unclear answers reject.
+          decision = "reject";
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const typed = (
+              await operator.ask(
+                `Type "approve ${approval.candidate}" to integrate, or "reject": `,
+              )
+            ).trim();
+            if (typed === `approve ${approval.candidate}`) {
+              decision = "approve";
+              break;
+            }
+            if (typed === "reject") break;
+            operator.say("That did not match. Nothing was decided yet.");
+          }
         }
         await coordinatorTask.decide(approval.id, approval, decision);
       }
