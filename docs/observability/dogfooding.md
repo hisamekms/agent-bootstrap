@@ -123,6 +123,12 @@ repository under `.local`. Review the candidate at the approval prompt.
        "$MSB" "$CODEX_BINARY"
    ```
 
+   Set `M5_DEBUG_WORKER=1` to capture up to 4096 bytes of stderr from a
+   failing live Codex Worker. M5 prints only the path to the private local
+   `worker-stderr-<invocation id>.txt` file in the run directory (mode 0600).
+   Treat this file as sensitive. The guest sees a credential placeholder,
+   which Microsandbox replaces with the real token at egress.
+
 2. For a Claude Worker, use Claude Code API-key mode and the macOS Keychain
    item for account `$USER`. Supply the service name via
    `M5_CLAUDE_KEYCHAIN` and the pinned binary via `M5_CLAUDE_BINARY`.

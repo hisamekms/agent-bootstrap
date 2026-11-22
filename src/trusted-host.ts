@@ -147,6 +147,8 @@ export interface TrustedHostOptions {
 export interface TrustedHostRunOptions {
   readonly allowUnauditedRun?: boolean;
   readonly hostServices?: readonly HostService[];
+  /** Best-effort host callback for the last 4096 bytes of Worker stderr. */
+  readonly onWorkerStderr?: (bytes: Uint8Array, invocationId: string) => void;
 }
 
 type Role = NonNullable<AuditInput["role"]>;
@@ -919,6 +921,18 @@ export class TrustedHost {
           operationId,
         );
         if (kind) emit("resource.limit_exceeded", { kind }, operationId);
+
+        if (role === "Worker" && result && input.options?.onWorkerStderr) {
+          try {
+            const delivery = input.options.onWorkerStderr(
+              new Uint8Array(result.stderr.subarray(-4096)),
+              id,
+            );
+            void Promise.resolve(delivery).catch(() => {});
+          } catch {
+            // Worker diagnostics are best effort.
+          }
+        }
 
         if (outcome === "ok" && result && "plan" in input) {
           const request =

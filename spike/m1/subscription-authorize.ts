@@ -385,7 +385,7 @@ async function runSmoke(
 ) {
   signal.throwIfAborted();
   const child = spawn(process.execPath, [smoke, "--live", msb, codex], {
-    // Only the non-secret M5 actor settings (and USER, for the keychain
+    // Only the non-secret M5 settings (and USER, for the keychain
     // lookup) pass through; the token goes on stdin.
     env: {
       PATH: "/usr/bin:/bin",
@@ -395,7 +395,9 @@ async function runSmoke(
           ([name, value]) =>
             value !== undefined &&
             (name === "USER" ||
-              /^M5_(ACTORS|CLAUDE_(BINARY|MODEL|AUTH|KEYCHAIN))$/.test(name)),
+              /^M5_(ACTORS|DEBUG_WORKER|CLAUDE_(BINARY|MODEL|AUTH|KEYCHAIN))$/.test(
+                name,
+              )),
         ),
       ),
     },

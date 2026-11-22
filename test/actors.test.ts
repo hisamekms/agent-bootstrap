@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -106,6 +106,66 @@ test("Codex role commands take the prompt as one argv entry and follow the role 
     secretEnv: "AGENT_BOOTSTRAP_TOKEN",
   });
   assert.equal(codexRoleHarness(fixture, [], 8080).sandbox.hostTcpPort, 8080);
+});
+
+test("Codex Worker diagnostics preserve the default command and report bounded failure stderr", (t) => {
+  const task = {
+    role: "Worker" as const,
+    prompt: "Change it.",
+    timeoutMs: 1000,
+  };
+  const options = {
+    endpoint: { kind: "host-service" as const, port: 18080 },
+    model: "gpt-6.2-sol",
+  };
+  const normal = codexRoleCommand(task, options);
+  assert.deepEqual(
+    codexRoleCommand(task, { ...options, diagnostics: false }),
+    normal,
+  );
+  // Hash of the generated script before Worker diagnostics were added.
+  assert.equal(
+    createHash("sha256").update(normal.argv[2]!).digest("hex"),
+    "d23c20bd45d4e02aa4d7a7db3ed8ede381c7429ae14ae750f1f7daeec4a62592",
+  );
+
+  const directory = mkdtempSync(join(tmpdir(), "bootstrap-codex-worker-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const fake = join(directory, "codex");
+  const diagnostic = join(directory, "stderr");
+  const script = codexRoleCommand(task, { ...options, diagnostics: true })
+    .argv[2]!;
+  // Run the real Worker body with a fake CLI and local paths, skipping the
+  // guest-only prelude that verifies the pinned binary.
+  const bodyStart = script.indexOf("cd /workspace\n");
+  assert.ok(bodyStart >= 0);
+  const body = script
+    .slice(bodyStart)
+    .replaceAll("/tmp/agent-bootstrap-codex.err", '"$WORKER_STDERR"')
+    .replaceAll("/tmp/codex", '"$FAKE_CODEX"')
+    .replace("cd /workspace", 'cd "$WORKER_DIR"');
+  writeFileSync(
+    fake,
+    '#!/bin/sh\nprintf stdout\nprintf "%s" "$FAKE_STDERR" >&2\nexit "$FAKE_STATUS"\n',
+    { mode: 0o700 },
+  );
+  const tail = "x".repeat(4089) + "failure";
+  for (const status of [7, 0]) {
+    const result = spawnSync("/bin/sh", ["-ec", body, "codex", task.prompt], {
+      encoding: "utf8",
+      env: {
+        PATH: "/usr/bin:/bin",
+        FAKE_CODEX: fake,
+        WORKER_DIR: directory,
+        WORKER_STDERR: diagnostic,
+        FAKE_STATUS: String(status),
+        FAKE_STDERR: "discarded prefix " + tail,
+      },
+    });
+    assert.equal(result.status, status);
+    assert.equal(result.stdout, status ? "" : '{"tool":"collect"}');
+    assert.equal(result.stderr, status ? tail : "");
+  }
 });
 
 test("Codex uses the audited host service for HTTP fixtures", () => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, writeFileSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -86,6 +86,8 @@ import { createTelemetry } from "../../src/telemetry.ts";
 //                      (default: all=codex)
 //   M5_TREE            1 for a repository tree candidate
 //   M5_PROFILE         Worker and Verification: base (default), db or browser
+//   M5_DEBUG_WORKER    1 in live mode saves Codex Worker stderr on CLI
+//                      failure to a sensitive, private local file
 //   M5_CLAUDE_BINARY   Claude Code binary (default: the pinned .local build)
 //   M5_CLAUDE_BINARY_GLIBC  Claude Code binary for the Debian Worker
 //   M5_CLAUDE_MODEL    default claude-opus-5-5
@@ -552,6 +554,8 @@ async function main() {
   );
   assert.ok(profiles.has(profile), "M5_PROFILE must be configured");
   const actors = parseActorHarnesses(process.env.M5_ACTORS, "codex");
+  const debugWorker =
+    live && actors.Worker === "codex" && process.env.M5_DEBUG_WORKER === "1";
   const uses = (harness: "codex" | "claude") =>
     Object.values(actors).includes(harness);
   const claudeBinary =
@@ -643,7 +647,12 @@ async function main() {
     });
     codexHarness = codexRoleHarness(codexOptions, tools);
     if (actors.Worker === "codex")
-      workerHarness = codexRoleHarness(codexOptions, tools, undefined, profile);
+      workerHarness = codexRoleHarness(
+        debugWorker ? { ...codexOptions, diagnostics: true } : codexOptions,
+        tools,
+        undefined,
+        profile,
+      );
   }
 
   // Claude: provider binding, tools and role harness.
@@ -864,6 +873,18 @@ async function main() {
         workerSandbox: worker.sandbox,
         reviewerSandbox: reviewer.sandbox,
         ...(workerHostServices ? { workerHostServices } : {}),
+        ...(debugWorker
+          ? {
+              onWorkerStderr(bytes, id) {
+                if (!bytes.length) return;
+                const file = join(root, `worker-stderr-${id}.txt`);
+                writeFileSync(file, bytes, { mode: 0o600, flag: "wx" });
+                console.error(
+                  `M5 Worker stderr saved to ${quoteForTerminal(file)}`,
+                );
+              },
+            }
+          : {}),
         ...(reviewerHostServices ? { reviewerHostServices } : {}),
         ...(reviewer.reviewerOutput
           ? { reviewerOutput: reviewer.reviewerOutput }
@@ -953,9 +974,11 @@ async function main() {
           };
         }
         if (role === "Worker") {
-          const revising = (await journal.read()).some(
-            (row) => row.kind === "candidate.created",
-          );
+          const rows = await journal.read();
+          const revising = rows.some((row) => row.kind === "candidate.created");
+          // The initial attempt is single-shot. The Coordinator counts this
+          // failed delegation toward its Worker and task limits.
+          if (rows.length && !revising) return { id, outcome: "failed" };
           try {
             if (revising) await flow(control).revise(id);
             else await flow(control).prepareCandidate(id);

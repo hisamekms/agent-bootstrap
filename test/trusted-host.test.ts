@@ -104,6 +104,54 @@ test("worker traces distinguish requested, authorized and completed operations",
   }
 });
 
+test("only Worker delivers the bounded stderr tail to an opt-in host callback", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { calls, runtime } = adapter("");
+  const tail = Buffer.from("x".repeat(4076) + "private fixture data");
+  assert.equal(tail.length, 4096);
+  const stderr = Buffer.concat([Buffer.from("discarded prefix"), tail]);
+  runtime.exec = async () => {
+    calls.push("exec");
+    return { status: "exited", exitCode: 7, stdout: Buffer.alloc(0), stderr };
+  };
+  const host = new TrustedHost(audit, runtime, profiles);
+  const diagnostics: { id: string; bytes: Uint8Array }[] = [];
+  const options = {
+    onWorkerStderr(bytes: Uint8Array, id: string) {
+      diagnostics.push({ id, bytes });
+      throw new Error(bytes.toString());
+    },
+  };
+  const worker = await host.runWorker(plan, undefined, undefined, options);
+  const reviewer = await host.runReviewer(plan, undefined, undefined, options);
+  const defaultWorker = await host.runWorker(plan);
+  assert.equal(worker.outcome, "failed");
+  assert.equal(reviewer.outcome, "failed");
+  assert.equal(defaultWorker.outcome, "failed");
+  assert.deepEqual(diagnostics, [
+    { id: worker.id, bytes: new Uint8Array(tail) },
+  ]);
+  assert.deepEqual(calls, [
+    "create",
+    "exec",
+    "destroy",
+    "create",
+    "exec",
+    "destroy",
+    "create",
+    "exec",
+    "destroy",
+  ]);
+  for (const run of [worker, reviewer, defaultWorker]) {
+    assert.doesNotMatch(JSON.stringify(run), /private fixture data/);
+    assert.doesNotMatch(
+      JSON.stringify(audit.read(run.id)),
+      /private fixture data/,
+    );
+  }
+});
+
 test("unknown guest actions are denied and timeout remains distinct from failure", async (t) => {
   const audit = new SqliteAudit(fixture(t));
   t.after(() => audit.close());
