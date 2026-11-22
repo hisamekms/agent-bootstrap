@@ -1,0 +1,22 @@
+model = "gpt-6.2-sol"
+model_reasoning_effort = "medium"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 2
+
+[agents.architect]
+description = "Read-only investigation of dependencies, trust boundaries, and interfaces."
+config_file = "agents/architect.toml"
+
+[agents.implementer]
+description = "Implement scoped changes and targeted tests in owned files."
+config_file = "agents/implementer.toml"
+
+[agents.reviewer]
+description = "Independently review a pinned change against its acceptance criteria."
+config_file = "agents/reviewer.toml"
+
+[agents.security_reviewer]
+description = "Independently review isolation, permissions, approvals, and audit evidence."
+config_file = "agents/security_reviewer.toml"

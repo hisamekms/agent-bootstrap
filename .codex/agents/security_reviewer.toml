@@ -1,0 +1,3 @@
+model = "gpt-6.2-astra"
+model_reasoning_effort = "high"
+developer_instructions = "Review read-only. Check isolation, secret handling, role permissions, approval binding, and audit failure behavior."

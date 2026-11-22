@@ -1,0 +1,11 @@
+/node_modules/
+/.bun-cache/
+/dist/
+/coverage/
+/.local/
+/spike/m1/.scratch/
+.env
+.env.*
+*.log
+.DS_Store
+/docs/claude-handoff.md

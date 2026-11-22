@@ -1,0 +1,19 @@
+{
+  "name": "agent-bootstrap",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "oxlint src test",
+    "typecheck": "bun check -p tsconfig.json",
+    "verify": "bun fmt --check && bun lint && bun typecheck && bun run build && bun test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "oxlint": "^1.67.0",
+    "typescript": "~5.9.3"
+  },
+  "packageManager": "bun@1.4.4"
+}

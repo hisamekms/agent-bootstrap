@@ -1,0 +1,3 @@
+model = "gpt-6.2-sol"
+model_reasoning_effort = "high"
+developer_instructions = "Investigate read-only. Report evidence, uncertainties, and the smallest viable recommendation."
