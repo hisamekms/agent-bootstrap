@@ -3,9 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
   copyFile,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -59,7 +62,52 @@ export const MICROSANDBOX_LIMITS = {
   sessionLineBytes: 1024 * 1024,
   sessionBytes: 16 * 1024 * 1024,
   sessionStopMs: 5000,
+  gitDirBytes: 2 * 1024 * 1024 * 1024,
+  gitDirEntries: 200_000,
+  treeBytes: 1024 * 1024 * 1024,
+  treeStepTimeoutMs: 120_000,
 } as const;
+
+const TREE_GUEST = "/tmp/agent-bootstrap-tree.tar";
+const COLLECT_GUEST = "/tmp/agent-bootstrap-collect.tar";
+
+/** Total bytes of a directory of plain files and directories. Any symlink or
+ * special file, or exceeding a bound, is invalid input. */
+async function plainTreeBytes(root: string): Promise<number> {
+  let total = 0;
+  let entries = 0;
+  const walk = async (dir: string): Promise<void> => {
+    for (const name of await readdir(dir)) {
+      if (++entries > MICROSANDBOX_LIMITS.gitDirEntries) invalid();
+      const path = join(dir, name);
+      const info = await lstat(path);
+      if (info.isDirectory()) await walk(path);
+      else if (info.isFile()) {
+        total += info.size;
+        if (total > MICROSANDBOX_LIMITS.gitDirBytes) invalid();
+      } else invalid();
+    }
+  };
+  await walk(root);
+  return total;
+}
+
+async function checkRepository(repository: {
+  gitDir: string;
+  tree: string;
+}): Promise<void> {
+  const { gitDir, tree } = repository;
+  for (const path of [gitDir, tree]) {
+    if (typeof path !== "string" || !isAbsolute(path) || /[\0:\r\n]/.test(path))
+      invalid();
+  }
+  const git = await lstat(gitDir).catch(() => null);
+  if (!git?.isDirectory()) invalid();
+  const archive = await lstat(tree).catch(() => null);
+  if (!archive?.isFile() || archive.size > MICROSANDBOX_LIMITS.treeBytes)
+    invalid();
+  await plainTreeBytes(gitDir);
+}
 
 type ProcessResult = {
   code: number | null;
@@ -368,6 +416,12 @@ export class MicrosandboxRuntime implements SandboxRuntime {
             /[\0:=,\r\n]/.test(provider.upstreamCaCertPath))))
     )
       invalid();
+    const repository = spec.repository
+      ? { gitDir: spec.repository.gitDir, tree: spec.repository.tree }
+      : undefined;
+    if (spec.repository !== undefined && (!repository || spec.files?.length))
+      invalid();
+    if (repository) await checkRepository(repository);
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
     if (fileGroups.flat().length > MICROSANDBOX_LIMITS.files) invalid();
     let total = 0;
@@ -426,6 +480,23 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           await writeFile(destination, file.bytes, { flag: "wx", mode: 0o600 });
         }
       }
+      let stagedTree: string | undefined;
+      if (repository) {
+        // Copy, then re-check the copy, so the bytes handed to the backend
+        // are the bytes that were checked.
+        await cp(repository.gitDir, join(workspace, ".git"), {
+          recursive: true,
+          verbatimSymlinks: true,
+          errorOnExist: true,
+          force: false,
+        });
+        await plainTreeBytes(join(workspace, ".git"));
+        stagedTree = join(directory, "tree.tar");
+        await copyFile(repository.tree, stagedTree);
+        const info = await lstat(stagedTree);
+        if (!info.isFile() || info.size > MICROSANDBOX_LIMITS.treeBytes)
+          invalid();
+      }
       state = {
         id: `bootstrap-${randomUUID()}`,
         directory,
@@ -459,6 +530,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           "--copy-file",
           `${staged[index]}:${tool.guestPath}`,
         ]),
+        ...(stagedTree ? ["--copy-file", `${stagedTree}:${TREE_GUEST}`] : []),
         profile.image,
       ];
       // The credential reaches only the backend process environment.
@@ -468,6 +540,19 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           this.#checked(createArgs, { [provider.secretEnv]: token }),
         );
       else await this.#checked(createArgs);
+      if (stagedTree) {
+        const extracted = await this.#execute(
+          state,
+          [
+            "/bin/sh",
+            "-ec",
+            `tar -xf ${TREE_GUEST} -C /workspace && rm -f ${TREE_GUEST} && test -d /workspace/.git`,
+          ],
+          MICROSANDBOX_LIMITS.treeStepTimeoutMs,
+        );
+        if (extracted.status !== "exited" || extracted.exitCode !== 0)
+          throw new SandboxRuntimeError("backend-failure");
+      }
       const handle = Object.freeze({ id: state.id });
       this.#states.set(handle, state);
       return handle;
@@ -675,7 +760,12 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     spec: CollectSpec,
   ): Promise<CollectedArtifacts> {
     const state = this.#state(handle);
+    if ("tree" in spec) {
+      if (spec.tree !== true || Object.keys(spec).length !== 1) invalid();
+      return this.#collectTree(state);
+    }
     if (
+      !Array.isArray(spec.paths) ||
       spec.paths.length > MICROSANDBOX_LIMITS.files ||
       new Set(spec.paths).size !== spec.paths.length
     )
@@ -729,6 +819,44 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         files.push({ path, bytes });
       }
       return { files };
+    } catch (error) {
+      return this.#withCleanup(state, error);
+    } finally {
+      state.busy = false;
+    }
+  }
+
+  async #collectTree(state: State): Promise<CollectedArtifacts> {
+    state.busy = true;
+    const staging = join(state.directory, "collect.tar");
+    try {
+      const packed = await this.#execute(
+        state,
+        [
+          "/bin/sh",
+          "-ec",
+          `cd /workspace && tar -cf ${COLLECT_GUEST} --exclude ./.git --exclude .git .`,
+        ],
+        MICROSANDBOX_LIMITS.treeStepTimeoutMs,
+      );
+      if (packed.status !== "exited" || packed.exitCode !== 0)
+        throw new SandboxRuntimeError("collection-failed");
+      const copied = await this.#run(
+        ["copy", `${state.id}:${COLLECT_GUEST}`, staging],
+        Math.min(
+          MICROSANDBOX_LIMITS.treeStepTimeoutMs,
+          Math.max(1, state.deadline - performance.now()),
+        ),
+      );
+      if (copied.failure || copied.code !== 0)
+        throw new SandboxRuntimeError(copied.failure ?? "collection-failed");
+      const info = await lstat(staging).catch(() => null);
+      if (!info?.isFile()) throw new SandboxRuntimeError("collection-failed");
+      if (info.size > MICROSANDBOX_LIMITS.treeBytes)
+        throw new SandboxRuntimeError("output-limit");
+      const tree = new Uint8Array(await readFile(staging));
+      await rm(staging, { force: true });
+      return { files: [], tree };
     } catch (error) {
       return this.#withCleanup(state, error);
     } finally {

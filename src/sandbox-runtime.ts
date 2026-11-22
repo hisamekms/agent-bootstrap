@@ -70,6 +70,14 @@ export interface SandboxSpec {
    * so the audit cannot name one image while another boots. */
   readonly imageDigest?: string;
   readonly files?: readonly SandboxFile[];
+  /** Host-prepared repository for a Worker: a git directory (full history)
+   * and the HEAD tree as a tar. The VM gets `/workspace` = the extracted tree
+   * plus `/workspace/.git` = a copy of the git directory. Absolute host
+   * paths. Mutually exclusive with `files`. */
+  readonly repository?: {
+    readonly gitDir: string;
+    readonly tree: string;
+  };
   readonly tools?: readonly SandboxTool[];
   /** The only network egress: TCP to this port on the host. Default: none. */
   readonly hostTcpPort?: number;
@@ -101,12 +109,14 @@ export interface ExecResult {
   readonly stderr: Uint8Array;
 }
 
-export interface CollectSpec {
-  readonly paths: readonly string[];
-}
+/** Either named small files, or the whole workspace except `.git` as a tar. */
+export type CollectSpec =
+  { readonly paths: readonly string[] } | { readonly tree: true };
 
 export interface CollectedArtifacts {
   readonly files: readonly SandboxFile[];
+  /** Tar of the workspace without `.git`, for `{ tree: true }`. */
+  readonly tree?: Uint8Array;
 }
 
 /** A long-running guest command with line-delimited stdin and stdout. */

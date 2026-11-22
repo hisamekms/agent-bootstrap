@@ -18,6 +18,9 @@ export interface WorkerPlan {
   readonly sandbox: SandboxSpec;
   readonly command: SandboxCommand;
   readonly collectPaths: readonly string[];
+  /** Collect the whole workspace (without `.git`) as one tar instead of
+   * named paths. Exclusive with a non-empty `collectPaths`. */
+  readonly collectTree?: true;
 }
 
 export interface WorkerRun {
@@ -162,6 +165,7 @@ export class TrustedHost {
     const open = this.#sandbox.openSession?.bind(this.#sandbox);
     if (
       !open ||
+      "repository" in plan.sandbox ||
       Object.keys(plan.sandbox).some(
         (key) =>
           key !== "tools" &&
@@ -307,6 +311,8 @@ export class TrustedHost {
   ): Promise<ReviewerRun> {
     // Verification never copies egress or tools, even from a non-enumerable
     // property that the key check in runVerification cannot see.
+    if ("repository" in plan.sandbox)
+      throw new Error("Only Worker may use a repository");
     const wide: ReviewerPlan["sandbox"] =
       role === "Verification" ? {} : (plan.sandbox as ReviewerPlan["sandbox"]);
     const sandbox: ReviewerPlan["sandbox"] = {
@@ -348,6 +354,18 @@ export class TrustedHost {
     plan: WorkerPlan,
     id: string = randomUUID(),
   ): Promise<WorkerRun & ReviewerRun> {
+    // Only Worker may carry a repository or collect the tree. Refused before
+    // any audit write.
+    if (
+      role !== "Worker" &&
+      (plan.sandbox.repository !== undefined || plan.collectTree !== undefined)
+    )
+      throw new Error("Only Worker may use a repository");
+    if (
+      plan.collectTree !== undefined &&
+      (plan.collectTree !== true || plan.collectPaths.length > 0)
+    )
+      throw new Error("collectTree excludes collectPaths");
     const profile = this.#profileFor(role, plan.sandbox.profile);
     const image = this.#profiles.imageDigest(profile);
     const append = async (event: Omit<AuditInput, "invocationId" | "role">) => {
@@ -440,10 +458,14 @@ export class TrustedHost {
             role === "Worker" ? guestRequest(executed.value.stdout) : "none";
           outcome = "ok";
           if (role !== "Worker") response = executed.value.stdout;
-          if (request === "collect" && plan.collectPaths.length > 0) {
+          if (
+            request === "collect" &&
+            (plan.collectPaths.length > 0 || plan.collectTree)
+          ) {
             const paths = plan.collectPaths;
+            const spec = plan.collectTree ? { tree: true as const } : { paths };
             const collected = await execute("sandbox.collect", () =>
-              this.#sandbox.collect(current, { paths }),
+              this.#sandbox.collect(current, spec),
             );
             if (collected) artifacts = collected.value;
             else outcome = "failed";

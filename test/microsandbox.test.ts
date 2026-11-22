@@ -8,6 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { symlink } from "node:fs/promises";
 import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -28,6 +29,7 @@ type Event = {
   workspace?: string;
   stagedPaths?: string[];
   stagedBytes?: number;
+  copyFiles?: string[];
 };
 
 // This executable simulates only CLI responses and copied fixture directories.
@@ -51,6 +53,8 @@ async function fixture(t: TestContext) {
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { truncateSync } from 'node:fs';
+const require_truncate = (p) => truncateSync(p, 1024 * 1024 * 1024 + 1);
 const guests = ${JSON.stringify(guests)};
 const mode = readFileSync(${JSON.stringify(mode)}, 'utf8');
 const args = process.argv.slice(2);
@@ -83,7 +87,9 @@ if (args[0] === '--version') {
   const files = walk(source);
   event.stagedPaths = files.map(f => f.path).sort();
   event.stagedBytes = files.reduce((n, f) => n + f.bytes, 0);
+  event.copyFiles = args.flatMap((a, i) => args[i - 1] === '--copy-file' ? [a] : []);
   log();
+  for (const c of event.copyFiles) if (c.endsWith(':/tmp/agent-bootstrap-tree.tar')) cpSync(c.split(':')[0], join(guests, name + '.tree'));
   cpSync(source, join(guests, name), { recursive: true });
   if (mode === 'partial-create-failure' || mode === 'create-and-cleanup-failure') fail();
 } else if (args[0] === 'exec') {
@@ -100,16 +106,28 @@ if (args[0] === '--version') {
   else if (command[0] === 'fixture-echo') { for await (const line of createInterface({ input: process.stdin })) process.stdout.write('echo:' + line + '\\n'); }
   else if (command[0] === 'fixture-long-line') process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 120));
   else if (command[0] === 'fixture-output-limit') process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 120));
+  else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -xf')) {
+    if (mode === 'extract-fail') { process.exitCode = 1; }
+    else cpSync(join(guests, name + '.tree'), join(workspace, 'extracted.tar'));
+  }
+  else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -cf')) { if (mode === 'pack-fail') process.exitCode = 1; }
   else if (command[0] === '/bin/sh' && command[3] === 'collect') {
     const bytes = readFileSync(join(workspace, command[4]));
     console.log(String(mode === 'oversized-collection' ? 999999999 : bytes.length));
     console.log(bytes.toString('base64'));
   } else fail();
+} else if (args[0] === 'copy') {
+  log();
+  const [name, guestPath] = args[1].split(':');
+  if (!existsSync(join(guests, name)) || guestPath !== '/tmp/agent-bootstrap-collect.tar') fail();
+  if (mode === 'big-tree') { writeFileSync(args[2], ''); require_truncate(args[2]); }
+  else writeFileSync(args[2], 'TREE-BYTES');
 } else if (args[0] === 'stop') {
   log(); if (mode === 'create-and-cleanup-failure') fail();
 } else if (args[0] === 'rm') {
   log(); if (args[1] !== '--force' || mode === 'create-and-cleanup-failure') fail();
   rmSync(join(guests, args[2]), { recursive: true, force: true });
+  rmSync(join(guests, args[2] + '.tree'), { force: true });
 } else { log(); fail(); }
 `,
     { mode: 0o700 },
@@ -815,3 +833,115 @@ for (const mode of [
     assert.deepEqual(await readdir(f.stagingRoot).catch(() => []), []);
   });
 }
+
+async function repoFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  const base = join(f.stagingRoot, "..", "repo-input");
+  await mkdir(join(base, "git", "objects"), { recursive: true });
+  await writeFile(join(base, "git", "HEAD"), "ref: refs/heads/main\n");
+  await writeFile(join(base, "git", "objects", "x"), "obj");
+  await writeFile(join(base, "tree.tar"), "TARDATA");
+  return { gitDir: join(base, "git"), tree: join(base, "tree.tar") };
+}
+
+test("repository staging copies .git and maps the tree tar, then extracts before returning", async (t) => {
+  const f = await fixture(t);
+  const repository = await repoFixture(f);
+  const handle = await f.runtime.create({ repository });
+  const events = await f.events();
+  const create = events.find(({ args }) => args[0] === "create");
+  assert.ok(create);
+  assert.deepEqual(create.stagedPaths, [".git/HEAD", ".git/objects/x"]);
+  assert.equal(create.copyFiles?.length, 1);
+  assert.match(
+    create.copyFiles![0]!,
+    /\/tree\.tar:\/tmp\/agent-bootstrap-tree\.tar$/,
+  );
+  const last = events.at(-1)!;
+  assert.equal(last.args[0], "exec");
+  assert.ok(
+    last.args
+      .join(" ")
+      .includes("tar -xf /tmp/agent-bootstrap-tree.tar -C /workspace"),
+  );
+  assert.ok(last.args.includes("--no-stdin"));
+  assert.equal(last.args[last.args.indexOf("--workdir") + 1], "/workspace");
+  await f.runtime.destroy(handle);
+  await assertCleanup(f);
+});
+
+test("failed extraction destroys the sandbox and reports backend-failure", async (t) => {
+  const f = await fixture(t);
+  const repository = await repoFixture(f);
+  await f.setMode("extract-fail");
+  await assert.rejects(f.runtime.create({ repository }), /backend-failure/);
+  await assertCleanup(f);
+});
+
+test("repository with files, symlinks, relative paths or missing parts is refused before the backend", async (t) => {
+  const f = await fixture(t);
+  const repository = await repoFixture(f);
+  await assert.rejects(
+    f.runtime.create({
+      repository,
+      files: [{ path: "a.txt", bytes: bytes("x") }],
+    }),
+    /invalid-input/,
+  );
+  await assert.rejects(
+    f.runtime.create({ repository: { ...repository, tree: "tree.tar" } }),
+    /invalid-input/,
+  );
+  await assert.rejects(
+    f.runtime.create({
+      repository: { ...repository, tree: repository.tree + ".missing" },
+    }),
+    /invalid-input/,
+  );
+  await symlink("/etc/passwd", join(repository.gitDir, "link"));
+  await assert.rejects(f.runtime.create({ repository }), /invalid-input/);
+  await rm(join(repository.gitDir, "link"));
+  await symlink(repository.tree, repository.tree + ".lnk");
+  await assert.rejects(
+    f.runtime.create({
+      repository: { ...repository, tree: repository.tree + ".lnk" },
+    }),
+    /invalid-input/,
+  );
+  assert.deepEqual(await f.events(), []);
+});
+
+test("tree collection tars in the guest, copies the tar out and returns its bytes", async (t) => {
+  const f = await fixture(t);
+  const handle = await f.runtime.create({
+    files: [{ path: "a.txt", bytes: bytes("x") }],
+  });
+  const result = await f.runtime.collect(handle, { tree: true });
+  assert.deepEqual(result.files, []);
+  assert.equal(text(result.tree!), "TREE-BYTES");
+  const events = await f.events();
+  const exec = events.filter(({ args }) => args[0] === "exec").at(-1)!;
+  const script = exec.args.at(-1)!;
+  assert.ok(script.includes("tar -cf /tmp/agent-bootstrap-collect.tar"));
+  assert.ok(script.includes("--exclude ./.git"));
+  const copy = events.at(-1)!;
+  assert.equal(copy.args[0], "copy");
+  assert.match(
+    copy.args[1]!,
+    /^bootstrap-[^:]+:\/tmp\/agent-bootstrap-collect\.tar$/,
+  );
+  await f.runtime.destroy(handle);
+  await assertCleanup(f);
+});
+
+test("tree collection failures and oversized tars clean up", async (t) => {
+  for (const [mode, pattern] of [
+    ["pack-fail", /collection-failed/],
+    ["big-tree", /output-limit/],
+  ] as const) {
+    const f = await fixture(t);
+    const handle = await f.runtime.create({});
+    await f.setMode(mode);
+    await assert.rejects(f.runtime.collect(handle, { tree: true }), pattern);
+    await assertCleanup(f);
+  }
+});
