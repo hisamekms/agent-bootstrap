@@ -152,6 +152,7 @@ export class TrustedHost {
     let failure: { error: unknown } | undefined;
     let value: T | undefined;
     const egress = sandbox.provider !== undefined;
+    let destroyedOk = false;
     try {
       if (egress) await allow("provider.egress");
       await allow("sandbox.create");
@@ -201,10 +202,12 @@ export class TrustedHost {
       const current = handle;
       await allow("sandbox.destroy");
       let destroyed: Outcome = "ok";
+      destroyedOk = true;
       try {
         await this.#sandbox.destroy(current);
       } catch {
         destroyed = "failed";
+        destroyedOk = false;
         if (outcome === "ok") outcome = "failed";
       }
       await append({
@@ -213,11 +216,13 @@ export class TrustedHost {
         outcome: destroyed,
       });
     }
+    // The grant is closed `ok` exactly when no sandbox holds it any more:
+    // none was created, or it was destroyed. The turn result is in exec.
     if (egress)
       await append({
         kind: "operation.finished",
         operation: "provider.egress",
-        outcome: handle && outcome !== "failed" ? "ok" : "failed",
+        outcome: !handle || destroyedOk ? "ok" : "failed",
       });
     await append({ kind: "invocation.finished", outcome });
     if (failure) throw failure.error;
@@ -389,10 +394,11 @@ export class TrustedHost {
           outcome: destroyed ? "ok" : "failed",
         });
     } else if (egress)
+      // No sandbox was created, so the grant ended unused.
       await append({
         kind: "operation.finished",
         operation: "provider.egress",
-        outcome: "failed",
+        outcome: "ok",
       });
     await append({ kind: "invocation.finished", outcome });
     return {

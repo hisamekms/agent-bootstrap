@@ -644,8 +644,8 @@ The product gains these pieces for it:
   - `--secret-violation-action block`.
 
   The adapter's `CredentialProvider` passes the token only in the
-  environment of the `msb create` process. It is never in argv, in other
-  backend commands or in the guest. A canary run on 2026-11-22 showed where
+  environment of the `msb create` process and the VM supervisor that it
+  starts. It is never in argv, in other backend commands or in the guest. A canary run on 2026-11-22 showed where
   it lives on the host. The long-lived `msb machine` supervisor of that VM
   inherits it in its environment for the VM's lifetime, and it disappears
   after destroy. No file under `MSB_HOME` contained the canary, and the
@@ -656,7 +656,8 @@ The product gains these pieces for it:
   match `AGENT_BOOTSTRAP_*`.
 - **Audit of the grant.** Before creating any sandbox that receives
   provider egress, the trusted host records `provider.egress` as requested
-  and allowed. After teardown it records the grant as finished. This uses
+  and allowed. It closes the grant as `ok` exactly when no sandbox holds it
+  any more, meaning none was created or the sandbox was destroyed. This uses
   audit schema version 3. Version 1 and 2 databases still open, but they
   refuse this event, so the grant fails closed.
 - **Failure handling in the runner.** Only an ineligible Worker change

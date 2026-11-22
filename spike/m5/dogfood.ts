@@ -459,8 +459,13 @@ Task: $1" >/dev/null 2>&1 </dev/null
             // Only an ineligible Worker change is an ordinary failure. Audit,
             // journal and anything unexpected stop the run.
             const message = (error as Error | null)?.message ?? "";
+            const unclean = (await journal.read()).some(
+              (row) =>
+                row.kind === "candidate.failed" && row.cleanup === "unknown",
+            );
             if (
-              message === "Worker did not produce an eligible change" ||
+              (!unclean &&
+                message === "Worker did not produce an eligible change") ||
               message === "Could not create a review candidate"
             )
               return { id, outcome: "failed" };

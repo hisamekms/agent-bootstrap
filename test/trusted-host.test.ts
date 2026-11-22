@@ -490,3 +490,32 @@ test("Coordinator session failures are audited in order and keep their codes", a
   );
   assert.deepEqual(calls, ["create"]);
 });
+
+test("a new audit database uses schema 3 and records provider egress", async (t) => {
+  const filename = fixture(t);
+  const audit = new SqliteAudit(filename);
+  const id = randomUUID();
+  audit.append({
+    invocationId: id,
+    kind: "invocation.started",
+    role: "Worker",
+  });
+  audit.append({
+    invocationId: id,
+    kind: "operation.requested",
+    operation: "provider.egress",
+    role: "Worker",
+  });
+  audit.close();
+  const reopened = new SqliteAudit(filename, { readonly: true });
+  t.after(() => reopened.close());
+  assert.equal(reopened.read(id).at(-1)?.operation, "provider.egress");
+  const version = spawnSync(
+    "/usr/bin/sqlite3",
+    [filename, "PRAGMA user_version"],
+    {
+      encoding: "utf8",
+    },
+  );
+  if (version.status === 0) assert.equal(version.stdout.trim(), "3");
+});
