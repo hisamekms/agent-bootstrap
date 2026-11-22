@@ -1,9 +1,15 @@
 {
   "version": 1,
   "profiles": {
+    "db": {
+      "image": "localhost/agent-bootstrap/db@sha256:3b967b44aa4ec181966a57aac94af81dae8205d3eda55ba950391e960ea46748",
+      "recipeDigest": "da4f9a26ce659815caaea0fff29d2d3c3687847305dbbcec22a856a2cefa2fa9",
+      "memoryMiB": 1024,
+      "cpus": 2
+    },
     "browser": {
       "image": "localhost/agent-bootstrap/browser@sha256:4ad2da06e20ef267ee03bc3a0bb35fe480984f06dfafd38d7f9574c2465f0120",
-      "recipeDigest": "10e73d671f349da0564b07e2434f1642c2544be7ad37523bee8e983116cf9bcf",
+      "recipeDigest": "2212db9f2a1fe97af2175c5153194907610b6c6cb38839a02c0d55c40d6c71a5",
       "memoryMiB": 2048,
       "cpus": 2,
       "packages": [
@@ -300,12 +306,6 @@
         "xkb-data=2.42-1",
         "zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1"
       ]
-    },
-    "db": {
-      "image": "localhost/agent-bootstrap/db@sha256:3b967b44aa4ec181966a57aac94af81dae8205d3eda55ba950391e960ea46748",
-      "recipeDigest": "da4f9a26ce659815caaea0fff29d2d3c3687847305dbbcec22a856a2cefa2fa9",
-      "memoryMiB": 1024,
-      "cpus": 2
     }
   }
 }
