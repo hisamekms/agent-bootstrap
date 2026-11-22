@@ -587,6 +587,16 @@ export class LocalGitIntegration {
     return this.#git(["cat-file", "blob", file.blob]);
   }
 
+  async candidateMessage(commit: string): Promise<Uint8Array> {
+    oid(commit);
+    await this.#repository();
+    const object = await this.#git(["cat-file", "commit", commit]);
+    const separator = object.indexOf("\n\n");
+    if (separator < 0 || object.length - separator - 2 > messageLimit)
+      throw new GitIntegrationError("invalid-candidate");
+    return object.subarray(separator + 2);
+  }
+
   async createCandidate(
     base: string,
     path: string,

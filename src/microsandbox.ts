@@ -25,6 +25,8 @@ import {
   isSafeCredentialVariable,
   sameProvider,
   SandboxRuntimeError,
+  WORKER_MESSAGE_LIMIT,
+  WORKER_MESSAGE_PATH,
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
@@ -1064,7 +1066,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         throw new SandboxRuntimeError("output-limit");
       const tree = new Uint8Array(await readFile(staging));
       await rm(staging, { force: true });
-      return { files: [], tree };
+      const message = await this.#collectMessage(state);
+      return { files: [], tree, ...(message ? { message } : {}) };
     } catch (error) {
       return this.#withCleanup(state, error);
     } finally {
@@ -1110,6 +1113,39 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const sample = state?.finalSample;
     if (state) delete state.finalSample;
     return sample ?? null;
+  }
+
+  async #collectMessage(state: State): Promise<Uint8Array | undefined> {
+    const checked = await this.#execute(
+      state,
+      [
+        "/bin/sh",
+        "-ec",
+        `test ! -L /tmp/agent-bootstrap && test ! -L ${WORKER_MESSAGE_PATH} &&
+          test -f ${WORKER_MESSAGE_PATH} &&
+          test "$(stat -c %s ${WORKER_MESSAGE_PATH})" -le ${WORKER_MESSAGE_LIMIT}`,
+      ],
+      10_000,
+    );
+    if (checked.status === "exited" && checked.exitCode === 1) return;
+    if (checked.status !== "exited" || checked.exitCode !== 0)
+      throw new SandboxRuntimeError("collection-failed");
+    const staging = join(state.directory, "commit-message");
+    try {
+      const copied = await this.#run(
+        ["copy", `${state.id}:${WORKER_MESSAGE_PATH}`, staging],
+        Math.min(10_000, Math.max(1, state.deadline - performance.now())),
+      );
+      if (copied.failure || copied.code !== 0)
+        throw new SandboxRuntimeError(copied.failure ?? "collection-failed");
+      const info = await lstat(staging);
+      // Recheck the staged file in case the guest changed it after the probe.
+      // The copy backend itself does not provide a transfer limit here.
+      if (info.isFile() && info.size <= WORKER_MESSAGE_LIMIT)
+        return new Uint8Array(await readFile(staging));
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
   }
 
   #destroy(state: State): Promise<void> {

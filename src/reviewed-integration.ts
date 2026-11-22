@@ -25,6 +25,7 @@ import {
 
 type Review = "pass" | "revise" | "concern";
 type Decision = "approve" | "reject";
+export type DecisionOptions = { acknowledgeProtected?: readonly string[] };
 type Event = Parameters<IntegrationJournal["append"]>[1];
 type IntegrationGit = Pick<
   LocalGitIntegration,
@@ -37,6 +38,7 @@ type IntegrationGit = Pick<
   | "prepareWorkspace"
   | "cleanupWorkspace"
   | "createCandidateTree"
+  | "candidateMessage"
   | "listTree"
   | "protectedPaths"
 >;
@@ -72,6 +74,34 @@ export type TreePlan = {
 const SCOPE_LIMIT = 256;
 const PROTECTED_LIMIT = 100;
 const TREE_PATH_BYTES = 4096;
+const CANDIDATE_MESSAGE_BYTES = 2048;
+
+function workerCommitMessage(run: string, proposal?: Uint8Array): string {
+  const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+  let text = "";
+  if (proposal) {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(proposal);
+    } catch {
+      // An invalid UTF-8 proposal is treated as absent.
+    }
+  }
+  const [subject = "", ...body] = text
+    .replace(/[^\P{Cc}\n\t]/gu, "")
+    .trim()
+    .split("\n");
+  const shortened = [[...subject].slice(0, 72).join(""), ...body].join("\n");
+  const available = CANDIDATE_MESSAGE_BYTES - Buffer.byteLength(trailer);
+  let end = 0;
+  let size = 0;
+  for (const character of shortened) {
+    size += Buffer.byteLength(character);
+    if (size > available) break;
+    end += character.length;
+  }
+  const message = shortened.slice(0, end).trimEnd();
+  return `${message || `Candidate from Worker run ${run}`}${trailer}`;
+}
 
 function copyTreePaths(
   value: readonly string[] | undefined,
@@ -395,6 +425,11 @@ export class ReviewedIntegration {
     extra: RoleSandbox = {},
   ) {
     const files = await this.#candidateFiles(pin, diff);
+    if (this.#plan.tree)
+      files.push({
+        path: "candidate.message",
+        bytes: await this.candidateMessage(pin),
+      });
     return this.#host.runReviewer(
       {
         sandbox: { ...extra, maxLifetimeMs: 300_000, readOnlyFiles: files },
@@ -579,12 +614,9 @@ export class ReviewedIntegration {
       });
       let candidate: string;
       let diff: Uint8Array;
+      const message = workerCommitMessage(worker.id, worker.artifacts?.message);
       try {
-        candidate = await this.#git.createCandidateTree(
-          base,
-          changes,
-          `Candidate from Worker run ${worker.id}`,
-        );
+        candidate = await this.#git.createCandidateTree(base, changes, message);
         diff = await this.#git.diff(base, candidate);
       } catch (error) {
         const cleanup = (error as { cleanupFailed?: boolean } | null)
@@ -600,6 +632,7 @@ export class ReviewedIntegration {
         candidate,
         digest: pin.digest,
         protectedCount: flagged,
+        messageDigest: sha256(message),
       });
       return pin;
     } finally {
@@ -739,10 +772,28 @@ export class ReviewedIntegration {
     return this.#protectedPaths(expected);
   }
 
+  /** Read the final message of the current pinned tree candidate. */
+  async candidateMessage(pin: PinnedCandidate): Promise<Uint8Array> {
+    const events = await this.#journal.read();
+    const expected = candidatePin(events, await this.#target());
+    if (!this.#plan.tree || !samePin(pin, expected))
+      throw new Error("Candidate evidence does not match its durable pin");
+    const message = await this.#git.candidateMessage(expected.candidate);
+    const created = events.findLast(
+      (event) => event.kind === "candidate.created",
+    );
+    if (
+      created?.messageDigest !== undefined &&
+      sha256(message) !== created.messageDigest
+    )
+      throw new Error("Candidate evidence does not match its durable pin");
+    return message;
+  }
+
   async decide(
     pin: PinnedCandidate,
     decision: Decision,
-    options?: { acknowledgeProtected?: readonly string[] },
+    options?: DecisionOptions,
   ): Promise<void> {
     const events = await this.#journal.read();
     const expected = latestPin(events, await this.#target());

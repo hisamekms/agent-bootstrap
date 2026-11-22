@@ -63,7 +63,10 @@ import {
   RoutingSandboxRuntime,
   type RuntimeRoute,
 } from "../../src/routing-runtime.ts";
-import type { SandboxProvider } from "../../src/sandbox-runtime.ts";
+import {
+  WORKER_MESSAGE_PATH,
+  type SandboxProvider,
+} from "../../src/sandbox-runtime.ts";
 import type { ProfileName } from "../../src/sandbox-profiles.ts";
 import { taskTrace } from "../../src/task-trace.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
@@ -96,6 +99,7 @@ const fixtureHost = "host.microsandbox.internal";
 const path = "hello.txt";
 const task =
   "Change the greeting in hello.txt to a polite, formal English greeting. Keep the file to exactly one line.";
+const fixtureMessage = "Use a formal greeting";
 const run = promisify(execFile);
 const gitBinary = "/usr/bin/git";
 const gitEnv = {
@@ -214,6 +218,17 @@ async function operatorTerminal() {
   };
 }
 
+function quoteForTerminal(text: string, asciiOnly = false): string {
+  const escaped = JSON.stringify(text);
+  const unsafe = asciiOnly ? /[^\x20-\x7e]/g : /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+  return escaped.replace(unsafe, (character) =>
+    character
+      .split("")
+      .map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`)
+      .join(""),
+  );
+}
+
 /** The fixture Coordinator's choice, from the host state in its prompt. */
 function fixtureDecision(prompt: string): Record<string, string> {
   const start = prompt.indexOf("\n{");
@@ -235,7 +250,7 @@ function fixtureDecision(prompt: string): Record<string, string> {
 const roleOf = (text: string) => /M5 ROLE: (\w+)/.exec(text)?.[1] ?? "unknown";
 
 /** Loopback mock OpenAI Responses API (plain HTTP) for Codex actors. */
-async function codexFixture(seen: Record<string, number>) {
+async function codexFixture(seen: Record<string, number>, tree: boolean) {
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -274,7 +289,11 @@ async function codexFixture(seen: Record<string, number>) {
       }
     } else if (role === "Worker" && !followUp)
       item = call("exec_command", {
-        cmd: "printf '%s\\n' 'Good day from Codex.' > hello.txt",
+        cmd:
+          "printf '%s\\n' 'Good day from Codex.' > hello.txt" +
+          (tree
+            ? ` && mkdir -p /tmp/agent-bootstrap && printf '%s\\n' '${fixtureMessage}' > ${WORKER_MESSAGE_PATH}`
+            : ""),
         workdir: "/workspace",
       });
     else if (role === "Reviewer")
@@ -561,7 +580,7 @@ async function main() {
   seed(repository);
   if (tree) addTreeFiles(repository);
   const codexMock =
-    !live && uses("codex") ? await codexFixture(seen) : undefined;
+    !live && uses("codex") ? await codexFixture(seen, tree) : undefined;
   const claudeMock =
     !live && uses("claude")
       ? await claudeFixture(seen, claudeToken, tls)
@@ -692,6 +711,7 @@ async function main() {
   const audit = new SqliteAudit(join(root, "audit.sqlite"));
   const usage: { turn: number; input: number; output: number }[] = [];
   const humans = { answers: 0, decisions: 0 };
+  let protectedAcknowledged: readonly string[] = [];
   const started = Date.now();
   // The fixture mocks answer by role marker; live prompts carry none.
   const marker = (role: string, text: string) =>
@@ -699,12 +719,12 @@ async function main() {
   const harnessFor = (actor: "Planner" | "Reviewer") =>
     (actors[actor] === "codex" ? codexHarness : claudeHarness)!;
   const workerTask = tree
-    ? `${task}\nEdit /workspace/hello.txt in place. Do not edit any other files.${
+    ? `${task}\nEdit /workspace/hello.txt in place. Leave other project files alone.${
         profile === "browser" ? " Git is available in /workspace." : ""
-      }`
+      }\nYou may create /tmp/agent-bootstrap and write a short commit message (subject at most 72 characters, optional body) to ${WORKER_MESSAGE_PATH}. The host treats it as untrusted data.`
     : task;
   const reviewInput = tree
-    ? "/review/candidate.diff"
+    ? "/review/candidate.diff and its commit message in /review/candidate.message"
     : "/review/candidate.diff (the new file is /review/candidate.source)";
   try {
     const host = new TrustedHost(
@@ -716,7 +736,7 @@ async function main() {
     const flow = (control?: CoordinatorControl) => {
       const reviewer = harnessFor("Reviewer");
       return new ReviewedIntegration(git, host, journal, {
-        ...(tree ? { tree: {} } : { path }),
+        ...(tree ? { tree: live ? {} : { protectedPaths: [path] } } : { path }),
         worker: worker.command({
           role: "Worker",
           prompt: marker(
@@ -866,10 +886,10 @@ async function main() {
       async reviewedCandidate() {
         return flow().reviewedPin();
       },
-      async decide(pin, decision, attempt) {
+      async decide(pin, decision, attempt, options) {
         stage = "integration";
         const integration = flow();
-        await integration.decide(pin, decision);
+        await integration.decide(pin, decision, options);
         return integration.integrate(attempt);
       },
     };
@@ -897,29 +917,56 @@ async function main() {
           createHash("sha256").update(diff).digest("hex"),
           approval.digest,
         );
+        const integration = flow();
+        const paths = tree ? await integration.protectedPaths(approval) : [];
+        const message = tree
+          ? new TextDecoder().decode(
+              await integration.candidateMessage(approval),
+            )
+          : undefined;
+        if (!live && tree && actors.Worker === "codex")
+          assert.ok(
+            message?.startsWith(
+              `${fixtureMessage}\n\nAgent-Bootstrap-Worker-Run: `,
+            ),
+          );
+        const approvalText = `approve ${approval.candidate}${paths.length ? " protected" : ""}`;
         let decision: "approve" | "reject" = "approve";
         if (operator) {
           operator.say(
             new TextDecoder().decode(diff).replace(/[^\x20-\x7e\n]/gu, "?"),
           );
+          if (message !== undefined) {
+            operator.say("Commit message");
+            for (const line of message.replace(/\n$/, "").split("\n"))
+              operator.say(`  ${quoteForTerminal(line)}`);
+            if (paths.length) {
+              operator.say("Protected paths");
+              for (const path of paths)
+                operator.say(`  ${quoteForTerminal(path, true)}`);
+            }
+          }
           // Approval needs the exact candidate ID. Rejection must be explicit;
           // anything else asks again, and three unclear answers reject.
           decision = "reject";
           for (let attempt = 0; attempt < 3; attempt++) {
-            const typed = (
-              await operator.ask(
-                `Type "approve ${approval.candidate}" to integrate, or "reject": `,
-              )
-            ).trim();
-            if (typed === `approve ${approval.candidate}`) {
+            const typed = await operator.ask(
+              `Type "${approvalText}" to integrate, or "reject": `,
+            );
+            if ((paths.length ? typed : typed.trim()) === approvalText) {
               decision = "approve";
               break;
             }
-            if (typed === "reject") break;
+            if (typed.trim() === "reject") break;
             operator.say("That did not match. Nothing was decided yet.");
           }
         }
-        await coordinatorTask.decide(approval.id, approval, decision);
+        const options =
+          tree && decision === "approve"
+            ? { acknowledgeProtected: paths }
+            : undefined;
+        await coordinatorTask.decide(approval.id, approval, decision, options);
+        protectedAcknowledged = options?.acknowledgeProtected ?? [];
       }
       outcome = await coordinatorTask.run();
     }
@@ -1018,7 +1065,7 @@ async function main() {
       result: Buffer.from(await git.snapshot(await git.head(), path))
         .toString("utf8")
         .replace(/[^\x20-\x7e\n]/gu, "?"),
-      ...(live ? {} : { fixture: seen }),
+      ...(live ? {} : { fixture: seen, protectedAcknowledged }),
     };
     await writeFile(
       join(root, "report.json"),

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -168,6 +168,7 @@ async function fixture(
   t: { after(fn: () => Promise<void>): void },
   tree: object,
   reviews: string[] = ['{"review":"pass"}'],
+  message?: Uint8Array,
 ) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "bootstrap-tree-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -232,7 +233,11 @@ async function fixture(
     async collect(handle) {
       const dir = extracted.get(handle.id);
       assert.ok(dir);
-      return { files: [], tree: await tarOf(dir) };
+      return {
+        files: [],
+        tree: await tarOf(dir),
+        ...(message ? { message } : {}),
+      };
     },
     async destroy() {},
   };
@@ -329,7 +334,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   );
   // run.sh is protected; docs/ is untouched.
   assert.equal(created?.protectedCount, 1);
-  // Worker got the repository and no loose files; Reviewer only the diff.
+  // Worker got the repository and no loose files; Reviewer got the diff and message.
   assert.ok(f.specs[0]?.repository);
   assert.equal(f.specs[0]?.files, undefined);
   assert.deepEqual(
@@ -338,7 +343,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   );
   assert.deepEqual(
     f.specs[1]?.readOnlyFiles?.map((file) => file.path),
-    ["candidate.diff"],
+    ["candidate.diff", "candidate.message"],
   );
   await f.flow.decide(pin, "approve", { acknowledgeProtected: ["run.sh"] });
   assert.equal(await f.flow.integrate(), "completed");
@@ -351,6 +356,89 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
     ["candidate.diff", "suite/t.test.ts"],
   );
   assert.equal(await f.leftovers(), 0);
+});
+
+test("tree commits and reviews use the same bounded, sanitized Worker message", async (t) => {
+  const emoji = "😀";
+  const data = Buffer.from(
+    ` \n ` +
+      emoji.repeat(73) +
+      `\n\nBody\ttext\0\r\u001b\u0085 ${"界".repeat(1000)}\n`,
+  );
+  const f = await fixture(t, {}, undefined, data);
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const run = randomUUID();
+  const pin = await f.flow.prepareCandidate(run);
+  const subjectAndBody = `${emoji.repeat(72)}\n\nBody\ttext `;
+  const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+  const bodyLength = Math.floor(
+    (2048 - Buffer.byteLength(subjectAndBody + trailer)) / 3,
+  );
+  const expected = subjectAndBody + "界".repeat(bodyLength) + trailer;
+  const message = await f.flow.candidateMessage(pin);
+  assert.deepEqual(Buffer.from(message), Buffer.from(expected));
+  assert.equal(
+    git(f.repository, ["log", "-1", "--format=%B", pin.candidate]),
+    expected.trimEnd(),
+  );
+  await f.flow.reviewCandidate();
+  assert.equal(
+    f.specs[1]?.readOnlyFiles
+      ?.find((file) => file.path === "candidate.message")
+      ?.bytes.toString(),
+    expected,
+  );
+  const events = await f.journal.read();
+  const created = events.find((event) => event.kind === "candidate.created");
+  assert.equal(
+    created?.messageDigest,
+    createHash("sha256").update(expected).digest("hex"),
+  );
+  assert.doesNotMatch(
+    JSON.stringify(events),
+    /Body|Agent-Bootstrap-Worker-Run/,
+  );
+  await assert.rejects(
+    f.flow.candidateMessage({ ...pin, digest: "0".repeat(64) }),
+    /durable pin/,
+  );
+});
+
+test("missing, invalid UTF-8, empty and oversized Worker proposals get a host subject", async (t) => {
+  for (const data of [
+    undefined,
+    Buffer.from([0xff]),
+    Buffer.from(" \t\n\0"),
+    Buffer.alloc(4097, "a"),
+  ]) {
+    const f = await fixture(t, {}, undefined, data);
+    f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+    const run = randomUUID();
+    const pin = await f.flow.prepareCandidate(run);
+    const expected = `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+    assert.equal(
+      Buffer.from(await f.flow.candidateMessage(pin)).toString(),
+      expected,
+    );
+  }
+});
+
+test("the journal accepts only a lowercase SHA-256 candidate message digest", async (t) => {
+  const { journal } = await fixture(t, {});
+  const event = {
+    kind: "candidate.created" as const,
+    candidate: "a".repeat(40),
+    digest: "b".repeat(64),
+    protectedCount: 1,
+  };
+  for (const messageDigest of ["d".repeat(63), "D".repeat(64), "message"]) {
+    await assert.rejects(
+      journal.append(0, { ...event, messageDigest }),
+      /Invalid integration event fields/,
+    );
+  }
+  await journal.append(0, { ...event, messageDigest: "d".repeat(64) });
+  assert.equal((await journal.read())[0]?.kind, "candidate.created");
 });
 
 test("a change outside the scope is denied, and nothing is left behind", async (t) => {

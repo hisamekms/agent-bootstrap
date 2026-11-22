@@ -11,6 +11,7 @@ import type {
   SandboxBindingInput,
 } from "./audit.ts";
 import type { EgressGatewayOptions } from "./egress-gateway.ts";
+import { WORKER_MESSAGE_LIMIT } from "./sandbox-runtime.ts";
 import { EgressPolicy, type HostService } from "./egress-policy.ts";
 import {
   parseExecutionContext,
@@ -898,7 +899,19 @@ export class TrustedHost {
             await authorize("sandbox.collect");
             ensureAudit();
             try {
-              artifacts = await this.#sandbox.collect(current, spec);
+              const collected = await this.#sandbox.collect(current, spec);
+              const { files, tree, message } = collected;
+              artifacts = {
+                files,
+                ...(tree ? { tree } : {}),
+                // Only a Worker tree collect may carry a proposed message.
+                ...(role === "Worker" &&
+                input.plan.collectTree &&
+                message &&
+                message.byteLength <= WORKER_MESSAGE_LIMIT
+                  ? { message }
+                  : {}),
+              };
             } catch (error) {
               if (error instanceof HostAuditError) throw error;
               outcome = "failed";

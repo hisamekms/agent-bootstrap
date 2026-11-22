@@ -142,6 +142,9 @@ if (args[0] === '--version') {
     else cpSync(join(guests, name + '.tree'), join(workspace, 'extracted.tar'));
   }
   else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -cf')) { if (mode === 'pack-fail') process.exitCode = 1; }
+  else if (command[0] === '/bin/sh' && String(command[2]).includes('test -f /tmp/agent-bootstrap/commit-message')) {
+    if (!['message', 'message-grew'].includes(mode)) process.exitCode = 1;
+  }
   else if (command[0] === '/bin/sh' && command[3] === 'collect') {
     const bytes = readFileSync(join(workspace, command[4]));
     console.log(String(mode === 'oversized-collection' ? 999999999 : bytes.length));
@@ -150,8 +153,13 @@ if (args[0] === '--version') {
 } else if (args[0] === 'copy') {
   log();
   const [name, guestPath] = args[1].split(':');
-  if (!existsSync(join(guests, name)) || guestPath !== '/tmp/agent-bootstrap-collect.tar') fail();
-  if (mode === 'big-tree') { writeFileSync(args[2], ''); require_truncate(args[2]); }
+  if (!existsSync(join(guests, name))) fail();
+  if (guestPath === '/tmp/agent-bootstrap/commit-message') {
+    if (mode === 'message') writeFileSync(args[2], 'Improve greeting\\n');
+    else if (mode === 'message-grew') writeFileSync(args[2], Buffer.alloc(4097));
+    else fail();
+  } else if (guestPath !== '/tmp/agent-bootstrap-collect.tar') fail();
+  else if (mode === 'big-tree') { writeFileSync(args[2], ''); require_truncate(args[2]); }
   else writeFileSync(args[2], 'TREE-BYTES');
 } else if (args[0] === 'stop') {
   log(); if (mode === 'create-and-cleanup-failure') fail();
@@ -1259,12 +1267,13 @@ test("tree collection tars in the guest, copies the tar out and returns its byte
   const result = await f.runtime.collect(handle, { tree: true });
   assert.deepEqual(result.files, []);
   assert.equal(text(result.tree!), "TREE-BYTES");
+  assert.equal(result.message, undefined);
   const events = await f.events();
-  const exec = events.filter(({ args }) => args[0] === "exec").at(-1)!;
+  const exec = events.find(({ args }) => args.at(-1)?.includes("tar -cf"))!;
   const script = exec.args.at(-1)!;
   assert.ok(script.includes("tar -cf /tmp/agent-bootstrap-collect.tar"));
   assert.ok(script.includes("--exclude ./.git"));
-  const copy = events.at(-1)!;
+  const copy = events.find(({ args }) => args[0] === "copy")!;
   assert.equal(copy.args[0], "copy");
   assert.match(
     copy.args[1]!,
@@ -1272,6 +1281,36 @@ test("tree collection tars in the guest, copies the tar out and returns its byte
   );
   await f.runtime.destroy(handle);
   await assertCleanup(f);
+});
+
+test("tree collection copies the fixed message path only within the byte limit", async (t) => {
+  for (const [mode, expected, copies] of [
+    ["message", "Improve greeting\n", 1],
+    ["big-message", undefined, 0],
+    ["message-grew", undefined, 1],
+  ] as const) {
+    const f = await fixture(t);
+    const handle = await f.runtime.create({});
+    await f.setMode(mode);
+    const result = await f.runtime.collect(handle, { tree: true });
+    assert.equal(result.message && text(result.message), expected);
+    assert.equal(text(result.tree!), "TREE-BYTES");
+    const events = await f.events();
+    const probe = events.find(({ args }) =>
+      args.at(-1)?.includes("test -f /tmp/agent-bootstrap/commit-message"),
+    );
+    assert.match(probe?.args.at(-1) ?? "", /stat -c %s .* -le 4096/);
+    assert.equal(
+      events.filter(
+        ({ args }) =>
+          args[0] === "copy" &&
+          args[1]?.endsWith(":/tmp/agent-bootstrap/commit-message"),
+      ).length,
+      copies,
+    );
+    await f.runtime.destroy(handle);
+    await assertCleanup(f);
+  }
 });
 
 test("tree collection failures and oversized tars clean up", async (t) => {

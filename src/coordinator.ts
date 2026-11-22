@@ -9,7 +9,10 @@ import {
   uuidPattern,
 } from "./private-journal.ts";
 import { MAX_REVISIONS } from "./integration-journal.ts";
-import type { PinnedCandidate } from "./reviewed-integration.ts";
+import type {
+  DecisionOptions,
+  PinnedCandidate,
+} from "./reviewed-integration.ts";
 
 const digest = (data: string | Uint8Array) =>
   createHash("sha256").update(data).digest("hex");
@@ -193,6 +196,7 @@ export interface CoordinatorDriver {
     pin: PinnedCandidate,
     decision: "approve" | "reject",
     id: string,
+    options?: DecisionOptions,
   ): Promise<"completed" | "denied" | "uncertain">;
 }
 
@@ -336,6 +340,7 @@ export class CoordinatorTask {
     id: string,
     pin: PinnedCandidate,
     decision: "approve" | "reject",
+    options?: DecisionOptions,
   ) {
     const events = await this.#journal.read();
     const approval = events.at(-1);
@@ -357,7 +362,7 @@ export class CoordinatorTask {
       decision,
       attempt,
     });
-    const outcome = await this.#driver.decide(pin, decision, attempt);
+    const outcome = await this.#driver.decide(pin, decision, attempt, options);
     await this.#append(events.length + 1, {
       kind: "approval.finished",
       id,

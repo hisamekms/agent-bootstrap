@@ -144,10 +144,15 @@ export interface ExecResult {
 export type CollectSpec =
   { readonly paths: readonly string[] } | { readonly tree: true };
 
+export const WORKER_MESSAGE_PATH = "/tmp/agent-bootstrap/commit-message";
+export const WORKER_MESSAGE_LIMIT = 4096;
+
 export interface CollectedArtifacts {
   readonly files: readonly SandboxFile[];
   /** Tar of the workspace without `.git`, for `{ tree: true }`. */
   readonly tree?: Uint8Array;
+  /** Untrusted Worker commit message proposal, for `{ tree: true }` only. */
+  readonly message?: Uint8Array;
 }
 
 /** A long-running guest command with line-delimited stdin and stdout. */
