@@ -44,6 +44,7 @@ type Seen = {
   role: string;
   tools: string[];
   plantedText: boolean;
+  toolResults: string[];
 };
 
 async function listen(server: Server): Promise<number> {
@@ -225,6 +226,11 @@ async function main() {
         role,
         tools: offered.map((tool) => tool.name ?? "?"),
         plantedText: body.includes("PLANTED-CLAUDE-MD"),
+        toolResults: [
+          ...body.matchAll(
+            /"tool_result"[^}]*?"content":("(?:[^"\\]|\\.)*"|\[[^\]]*\])/g,
+          ),
+        ].map((match) => match[1] ?? ""),
       });
       if (
         !request.url?.startsWith("/v1/messages") ||
@@ -267,21 +273,26 @@ async function main() {
           console.error("tool_result:", match[1]?.slice(0, 300));
       const path = "/workspace/hello.txt";
       const stream = messageStream(
-        role !== "Worker"
-          ? { kind: "text", text: "FIXTURE-PLAN-OK" }
-          : results === 0
-            ? { kind: "tool", name: "Read", input: { file_path: path } }
-            : results === 1
-              ? {
-                  kind: "tool",
-                  name: "Edit",
-                  input: {
-                    file_path: path,
-                    old_string: "hello from base",
-                    new_string: "Good day from Claude Code.",
-                  },
-                }
-              : { kind: "text", text: "Done." },
+        role === "Reviewer"
+          ? results === 0
+            ? // A deferred-tool placeholder call must be refused.
+              { kind: "tool", name: "DeferredToolPlaceholder", input: {} }
+            : { kind: "text", text: '{"review":"pass","notes":""}' }
+          : role !== "Worker"
+            ? { kind: "text", text: "FIXTURE-PLAN-OK" }
+            : results === 0
+              ? { kind: "tool", name: "Read", input: { file_path: path } }
+              : results === 1
+                ? {
+                    kind: "tool",
+                    name: "Edit",
+                    input: {
+                      file_path: path,
+                      old_string: "hello from base",
+                      new_string: "Good day from Claude Code.",
+                    },
+                  }
+                : { kind: "text", text: "Done." },
       );
       // Send each event in its own write with a pause, so the response is
       // delivered incrementally rather than as one buffered body.
@@ -498,6 +509,70 @@ async function main() {
     const operatorRequests = seen.slice(before);
     const operatorEdited = operatorWorker.artifacts?.files[0]?.bytes;
 
+    stage = "Reviewer (operator credential, read-only repository)";
+    // /review holds untrusted repository content. Plant every project-level
+    // Claude Code surface; none may reach the model or run.
+    const plantedText = (kind: string) =>
+      Buffer.from(
+        `---\nname: planted\ndescription: PLANTED-CLAUDE-MD ${kind}\n---\nPLANTED-CLAUDE-MD ${kind}\n`,
+      );
+    const reviewBefore = seen.length;
+    const operatorReviewer = await operatorHost.runReviewer({
+      sandbox: {
+        tools,
+        provider: operatorProvider,
+        readOnlyFiles: [
+          { path: "candidate.diff", bytes: Buffer.from("-hello\n+Good day\n") },
+          { path: "candidate.source", bytes: Buffer.from("Good day\n") },
+          { path: "CLAUDE.md", bytes: plantedText("memory") },
+          { path: "CLAUDE.local.md", bytes: plantedText("local memory") },
+          { path: ".claude/CLAUDE.md", bytes: plantedText("nested memory") },
+          { path: ".claude/settings.json", bytes: planted },
+          {
+            path: ".claude/skills/planted/SKILL.md",
+            bytes: plantedText("skill"),
+          },
+          { path: ".claude/agents/planted.md", bytes: plantedText("agent") },
+          {
+            path: ".claude/commands/planted.md",
+            bytes: plantedText("command"),
+          },
+          {
+            path: ".claude/output-styles/planted.md",
+            bytes: plantedText("output style"),
+          },
+          { path: ".claude/rules/planted.md", bytes: plantedText("rule") },
+          {
+            path: ".mcp.json",
+            bytes: Buffer.from(
+              JSON.stringify({
+                mcpServers: {
+                  planted: {
+                    command: "/bin/sh",
+                    args: ["-c", "echo PLANTED-CLAUDE-MD"],
+                  },
+                },
+              }),
+            ),
+          },
+        ],
+        maxLifetimeMs: 240_000,
+      },
+      command: claudeCodeCommand(
+        {
+          role: "Reviewer",
+          prompt: "M6 ROLE: Reviewer\nReview the candidate.",
+          model,
+          maxTurns: 3,
+          timeoutMs: 180_000,
+          baseUrl,
+        },
+        operatorAuth,
+      ),
+    });
+    const reviewRequests = seen.slice(reviewBefore);
+    const review = parseClaudeCodeResult(operatorReviewer.response);
+
     stage = "guest exposure and egress";
     // A separate VM with the same egress: search the guest for the key and
     // try an unapproved destination.
@@ -576,7 +651,7 @@ async function main() {
     await scan(home);
 
     const captured =
-      [first, second, worker, operatorWorker]
+      [first, second, worker, operatorWorker, operatorReviewer]
         .map((runResult) =>
           Buffer.from(
             ("response" in runResult ? runResult.response : undefined) ??
@@ -587,15 +662,19 @@ async function main() {
     const reopened = new SqliteAudit(join(root, "audit.sqlite"), {
       readonly: true,
     });
-    const egress = [first.id, second.id, worker.id, operatorWorker.id].map(
-      (id) =>
-        reopened
-          .read(id)
-          .filter((event) => event.operation === "provider.egress")
-          .map(
-            (event) =>
-              `${event.kind}${event.outcome ? ` ${event.outcome}` : ""}`,
-          ),
+    const egress = [
+      first.id,
+      second.id,
+      worker.id,
+      operatorWorker.id,
+      operatorReviewer.id,
+    ].map((id) =>
+      reopened
+        .read(id)
+        .filter((event) => event.operation === "provider.egress")
+        .map(
+          (event) => `${event.kind}${event.outcome ? ` ${event.outcome}` : ""}`,
+        ),
     );
     const report = {
       claudeCode: "2.1.330 linux-arm64-musl",
@@ -606,6 +685,16 @@ async function main() {
       ),
       worker: worker.outcome,
       edited: edited ? Buffer.from(edited).toString() : null,
+      reviewer: {
+        outcome: operatorReviewer.outcome,
+        result: review?.text ?? null,
+        requests: reviewRequests.map((entry) => ({
+          bearer: entry.bearer,
+          tools: entry.tools,
+          plantedText: entry.plantedText,
+          toolResults: entry.toolResults.map((text) => text.slice(0, 160)),
+        })),
+      },
       operator: {
         outcome: operatorWorker.outcome,
         edited: operatorEdited ? Buffer.from(operatorEdited).toString() : null,
@@ -642,7 +731,8 @@ async function main() {
       entry.path.startsWith("/v1/messages"),
     );
     const apiKeyMessages = messages.filter(
-      (entry) => !operatorRequests.includes(entry),
+      (entry) =>
+        !operatorRequests.includes(entry) && !reviewRequests.includes(entry),
     );
     assert.ok(apiKeyMessages.length >= 4);
     assert.ok(
@@ -651,6 +741,22 @@ async function main() {
           entry.key === syntheticKey && entry.stream && !entry.authorization,
       ),
     );
+    assert.equal(operatorReviewer.outcome, "ok");
+    assert.equal(review?.text, '{"review":"pass","notes":""}');
+    assert.ok(reviewRequests.length >= 2);
+    for (const entry of reviewRequests) {
+      assert.ok(entry.bearer && entry.key === "" && entry.stream);
+      assert.equal(entry.plantedText, false);
+      assert.deepEqual(
+        entry.tools.filter((name) => name !== "DeferredToolPlaceholder").sort(),
+        ["Glob", "Grep", "Read"],
+      );
+    }
+    // The placeholder call came back as an error, not a tool execution.
+    const placeholderResult = reviewRequests
+      .flatMap((entry) => entry.toolResults)
+      .join(" ");
+    assert.match(placeholderResult, /error|not available|No such tool/i);
     assert.equal(operatorWorker.outcome, "ok");
     assert.equal(report.operator.edited, "Good day from Claude Code.\n");
     assert.ok(operatorRequests.length >= 3);

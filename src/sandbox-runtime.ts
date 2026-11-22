@@ -13,31 +13,22 @@ export interface SandboxTool {
   readonly sha256: string;
 }
 
-/** A guest variable name that may carry a credential placeholder. Names the
- * backend, loader, TLS stack, proxies or the CLI's own configuration read
- * are refused, so a credential cannot change how the guest runs. */
+/** A guest variable name that may carry a credential placeholder. The host
+ * passes the real value to the backend under the same name, and the guest
+ * sees the placeholder under it, so the name must be credential-shaped
+ * (`*_TOKEN`, `*_KEY` or `*_SECRET`) and must not be read as configuration by
+ * the backend, the loader, the TLS stack, proxies, the runtime or the CLI. */
 export function isSafeCredentialVariable(name: unknown): name is string {
   if (typeof name !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(name))
     return false;
-  if (/^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_)/.test(name)) return false;
-  if (/_PROXY$/.test(name)) return false;
-  return ![
-    "PATH",
-    "HOME",
-    "SHELL",
-    "USER",
-    "TMPDIR",
-    "ENV",
-    "IFS",
-    "CLAUDE_CONFIG_DIR",
-    "ANTHROPIC_BASE_URL",
-    "CURL_CA_BUNDLE",
-    "REQUESTS_CA_BUNDLE",
-    "DISABLE_TELEMETRY",
-    "DISABLE_ERROR_REPORTING",
-    "DISABLE_AUTOUPDATER",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-  ].includes(name);
+  if (!/_(TOKEN|KEY|SECRET)$/.test(name)) return false;
+  if (
+    /^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_|RUST_|CARGO_|XDG_|LC_|BUN_|OTEL_|MCP_|ENABLE_|DISABLE_|DOCKER_|AWS_|GOOGLE_|AZURE_)/.test(
+      name,
+    )
+  )
+    return false;
+  return !/_PROXY$/.test(name);
 }
 
 export interface SandboxProvider {

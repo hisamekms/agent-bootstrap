@@ -156,6 +156,14 @@ test("an operator-chosen credential variable runs without bare mode and keeps is
   assert.match(script, /ANTHROPIC_AUTH_TOKEN="\$ANTHROPIC_AUTH_TOKEN"/);
   assert.doesNotMatch(script, /ANTHROPIC_API_KEY/);
   for (const variable of [
+    "RUST_LOG",
+    "XDG_CONFIG_HOME",
+    "BUN_OPTIONS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "ENABLE_TOOL_SEARCH",
+    "LANG",
+    "TERM",
     "PATH",
     "ANTHROPIC_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
@@ -170,4 +178,43 @@ test("an operator-chosen credential variable runs without bare mode and keeps is
   assert.throws(() =>
     claudeCodeProvider({ ...auth, header: "cookie" as never }),
   );
+});
+
+test("credential variables must be credential-shaped and fit their fixed header", async () => {
+  const { isSafeCredentialVariable } =
+    await import("../src/sandbox-runtime.ts");
+  for (const name of [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AGENT_BOOTSTRAP_TOKEN",
+    "MY_SERVICE_SECRET",
+  ])
+    assert.ok(isSafeCredentialVariable(name), name);
+  for (const name of [
+    "RUST_LOG",
+    "MSB_TOKEN",
+    "BUN_TOKEN",
+    "HTTPS_PROXY",
+    "XDG_RUNTIME_KEY",
+    "TOKEN_FILE",
+  ])
+    assert.ok(!isSafeCredentialVariable(name), name);
+  assert.throws(() =>
+    claudeCodeProvider({
+      mode: "operator-credential",
+      variable: "ANTHROPIC_API_KEY",
+      header: "authorization",
+    }),
+  );
+  assert.throws(() =>
+    claudeCodeProvider({
+      mode: "operator-credential",
+      variable: "ANTHROPIC_AUTH_TOKEN",
+      header: "x-api-key",
+    }),
+  );
+  const script = claudeCodeCommand(task).argv[2]!;
+  assert.match(script, /test ! -e \/etc\/claude-code/);
+  assert.match(script, /claude_config=\$\(mktemp -d\)/);
+  assert.match(script, /ENABLE_TOOL_SEARCH=false/);
 });

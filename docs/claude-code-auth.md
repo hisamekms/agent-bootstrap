@@ -44,7 +44,8 @@ Without the backend, the guest has no way to recover the key. A guest
 process can still use the key while the VM lives, by sending the
 placeholder to `api.anthropic.com`. See the risks below.
 
-The CLI always runs with `--bare --strict-mcp-config --setting-sources ''`.
+In API-key mode the CLI runs with `--bare --strict-mcp-config
+--setting-sources ''`. The operator-credential mode below drops `--bare`.
 According to the Claude Code documentation, bare mode never reads OAuth
 credentials or the system keychain. Together with a clean environment
 (`env -i`) and a fresh `CLAUDE_CONFIG_DIR`, this keeps API-key mode from
@@ -90,12 +91,26 @@ or `x-api-key`) on requests to the provider host. For example, the
 documented gateway variable `ANTHROPIC_AUTH_TOKEN` uses the `authorization`
 header.
 
-The variable name must pass `isSafeCredentialVariable`. Names the backend,
-loader, TLS stack, proxies or the CLI's own configuration read are refused:
-`PATH`, `HOME`, `MSB_*`, `LD_*`, `NODE_*`, `*_PROXY`, `ANTHROPIC_BASE_URL`
-and similar. Only the chosen variable is passed through `env -i`, so a
-higher-precedence credential such as `ANTHROPIC_API_KEY` is never present at
-the same time.
+The variable name must pass `isSafeCredentialVariable`:
+
+- It must be credential-shaped, ending in `_TOKEN`, `_KEY` or `_SECRET`.
+- It must not use a prefix that the backend, the loader, the TLS stack, the
+  runtime, telemetry or tool configuration reads: `MSB_`, `LD_`, `NODE_`,
+  `RUST_`, `XDG_`, `LC_`, `BUN_`, `OTEL_`, `MCP_`, `ENABLE_`, `DISABLE_` and
+  similar.
+- It must not be a proxy variable.
+
+The host passes the real value to the backend under this name, and the
+guest sees the placeholder under it, so a configuration name could change
+how either side runs. `ANTHROPIC_API_KEY` must use `x-api-key` and
+`ANTHROPIC_AUTH_TOKEN` must use `authorization`, because the CLI reads them
+into those fixed headers.
+
+Only the chosen variable is passed through `env -i`, so a higher-precedence
+credential such as `ANTHROPIC_API_KEY` is never present at the same time.
+The guest script also checks that no managed policy (`/etc/claude-code`)
+exists and starts from empty, freshly created home and configuration
+directories.
 
 Bare mode reads only API keys, so this mode runs without `--bare`. Instead,
 the adapter passes explicit isolation flags:
@@ -105,14 +120,24 @@ the adapter passes explicit isolation flags:
 - `--disable-slash-commands`
 - `--no-session-persistence`
 - `--tools`, which pins the exact tool set
+- `ENABLE_TOOL_SEARCH=false`
 
-The offline checks, recorded in the PoC, gave these results:
+The smoke checks the following, in the PoC:
 
-- **Ignored repository content.** The CLI ignored planted `.claude`
-  settings (hooks, `env`, `apiKeyHelper`), `CLAUDE.md`, skills, agents and
-  `.mcp.json`.
-- **Extra tools without `--tools`.** The CLI otherwise offered agent,
-  workflow, scheduling, worktree and deferred tools.
+- **Worker in `/workspace`.** The CLI ignored planted `.claude` settings
+  (hooks, `env`, `apiKeyHelper`) and a planted `CLAUDE.md`.
+- **Reviewer in `/review`.** The read-only mount held the CLI ignored all
+  of the following:
+  - planted `CLAUDE.md`, `CLAUDE.local.md` and `.claude/CLAUDE.md`;
+  - settings;
+  - skills, agents, commands, output styles and rules;
+  - `.mcp.json`.
+- **Pinned tools.** The model saw only the pinned tools.
+- **Placeholder call.** A call to the internal `DeferredToolPlaceholder`
+  was refused as an unknown tool.
+
+Plugins and a managed policy file are not covered by a test. The image has
+no managed policy, and the guest script refuses one if present.
 
 The repository supplies, stores, collects and refreshes no credential. The
 operator decides which credential to configure and is responsible for being
@@ -163,13 +188,14 @@ Do not put keys in repository files, CLI flags or shell history.
 values only. The untrusted prompt is a single argv entry (`$1`), passed after
 `--`. An agent's text cannot choose host commands or CLI flags.
 
-| Item        | How it is set                                                                                                                                                                                                                                   |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Flags       | Always `-p --bare --strict-mcp-config --setting-sources '' --output-format json --max-turns N --model M --permission-mode ... --allowedTools ... --disallowedTools ...`.                                                                        |
-| Environment | Only `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, the placeholder key, the backend CA path (`NODE_EXTRA_CA_CERTS`) and the variables that disable nonessential traffic, telemetry, error reporting and auto-update.                                     |
-| Tools       | `--tools` pins the exact set; Bash is never included. Planner and Reviewer get Read, Glob and Grep, and Worker also gets Edit and Write. In bare mode, CLI 2.1.330 still offers fewer: Read for Planner and Reviewer, Read and Edit for Worker. |
-| Output      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                              |
-| Limits      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                                   |
+| Item                        | How it is set                                                                                                                                                                                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flags (API key)             | `-p --bare --strict-mcp-config --setting-sources '' --disable-slash-commands --no-session-persistence --output-format json --model M --max-turns N --permission-mode ... --tools ... --allowedTools ...`                                                                |
+| Flags (operator credential) | The same flags without `--bare`.                                                                                                                                                                                                                                        |
+| Environment                 | Only `PATH`, a fresh `HOME` and `CLAUDE_CONFIG_DIR`, the one placeholder credential variable, the backend CA path (`NODE_EXTRA_CA_CERTS`), `ENABLE_TOOL_SEARCH=false`, and the variables that disable nonessential traffic, telemetry, error reporting and auto-update. |
+| Tools                       | `--tools` pins the exact set; Bash is never included. Planner and Reviewer get Read, Glob and Grep, and Worker also gets Edit and Write. In bare mode, CLI 2.1.330 still offers fewer: Read for Planner and Reviewer, Read and Edit for Worker.                         |
+| Output                      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                                                      |
+| Limits                      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                                                           |
 
 ## Trust boundaries and risks
 

@@ -78,9 +78,17 @@ function credentialOf(auth: ClaudeCodeAuth): {
   if (auth.mode === "api-key" && auth.credential === "host-secret")
     return { variable: "ANTHROPIC_API_KEY", header: "x-api-key", bare: true };
   if (auth.mode === "operator-credential") {
+    // The CLI reads these two variables into fixed headers; a different
+    // header would leave the placeholder unsubstituted and fail late.
+    const fixed: Record<string, string> = {
+      ANTHROPIC_API_KEY: "x-api-key",
+      ANTHROPIC_AUTH_TOKEN: "authorization",
+    };
     if (
       !isSafeCredentialVariable(auth.variable) ||
-      (auth.header !== "authorization" && auth.header !== "x-api-key")
+      (auth.header !== "authorization" && auth.header !== "x-api-key") ||
+      (Object.hasOwn(fixed, auth.variable) &&
+        fixed[auth.variable] !== auth.header)
     )
       throw new Error("Invalid operator credential");
     return { variable: auth.variable, header: auth.header, bare: false };
@@ -201,11 +209,13 @@ export function claudeCodeCommand(
     chmod 700 ${CLAUDE_CODE.guestPath}
     # The guest holds only the backend placeholder, never the credential.
     test "$${credential.variable}" = '$MSB_${credential.variable}'
-    test ! -e /root/.claude
-    mkdir -p /tmp/claude-home /tmp/claude-config
+    # No managed policy or pre-seeded CLI state: config and home are fresh.
+    test ! -e /root/.claude && test ! -e /etc/claude-code
+    claude_home=$(mktemp -d) && claude_config=$(mktemp -d)
+    test -z "$(ls -A "$claude_home")" && test -z "$(ls -A "$claude_config")"
     cd ${cwd}
-    env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/tmp/claude-home \\
-      CLAUDE_CONFIG_DIR=/tmp/claude-config \\
+    env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
+      CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
       ${credential.variable}="$${credential.variable}" \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" \\
       ${task.baseUrl ? `ANTHROPIC_BASE_URL='${task.baseUrl}' ` : ""}\\
