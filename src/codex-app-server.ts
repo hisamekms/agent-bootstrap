@@ -182,6 +182,40 @@ function label(value: unknown, known: ReadonlySet<string>): string {
   return typeof value === "string" && known.has(value) ? value : "other";
 }
 
+/** A fixed label for a failed turn's Codex error category, with the HTTP
+ * status when Codex reports one. Never includes provider message text. */
+function turnFailure(info: unknown): string {
+  const simple = [
+    "unauthorized",
+    "modelNotFound",
+    "badRequest",
+    "rateLimitExceeded",
+    "usageLimitExceeded",
+    "sandboxError",
+    "inferenceHookDenied",
+    "contextWindowExceeded",
+    "internalServerError",
+  ];
+  if (typeof info === "string") return simple.includes(info) ? info : "other";
+  for (const key of [
+    "httpConnectionFailed",
+    "responseStreamConnectionFailed",
+    "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+  ]) {
+    const entry = field(info, key);
+    if (entry === undefined) continue;
+    const code = field(entry, "httpStatusCode");
+    return typeof code === "number" &&
+      Number.isInteger(code) &&
+      code >= 400 &&
+      code <= 599
+      ? `${key}/${code}`
+      : key;
+  }
+  return "other";
+}
+
 /** Keep host and adapter errors, which carry fixed diagnostics; replace
  * anything else with a fixed code. */
 function transportError(error: unknown, fallback: "closed" | "connect"): Error {
@@ -443,7 +477,13 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
           ? { call: null, reason: voided }
           : call
             ? { call }
-            : { call: null, reason: "no-call" };
+            : {
+                call: null,
+                reason:
+                  field(params, "turn", "status") === "failed"
+                    ? `turn-failed/${turnFailure(field(params, "turn", "error", "codexErrorInfo"))}`
+                    : "no-call",
+              };
     }
     throw new CodexAppServerError("closed");
   }

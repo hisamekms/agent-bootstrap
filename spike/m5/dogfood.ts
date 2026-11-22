@@ -630,10 +630,13 @@ Task: $1" >/dev/null 2>&1 </dev/null
 
 try {
   await main();
+  // An open /dev/tty read can keep the event loop alive after the report.
+  process.exit(process.exitCode ?? 0);
 } catch (error) {
   // Provider and CLI errors can contain sensitive values: report the stage.
   console.error(`M5 dogfood stopped at ${stage}.`);
   if (process.env.M5_DEBUG === "1" && process.argv[2] === "--fixture")
     console.error(error, JSON.stringify(fixtureSeen));
   process.exitCode = 1;
+  process.exit(1);
 }
