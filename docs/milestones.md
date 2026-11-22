@@ -733,6 +733,36 @@ With this override, the mock provider recorded the following:
 The fixture run completed `done`. Whether the provider accepts this tool
 layout for `gpt-6.2-sol` is what the next live run shows.
 
+The third attempt failed after 40 seconds with an unclassified error. The
+adapter now records every `CodexErrorInfo` name from the 0.170.0 schema, as
+well as `none` and `unknown`.
+
+The fourth attempt, on 2026-11-22, was the first in which real models did
+the work. It took 58 seconds.
+
+1. **Worker.** The Coordinator delegated to Worker, which changed the line
+   to `Good day, and welcome.` (13 seconds).
+2. **Reviewer.** It answered `revise` (10 seconds). Its notes said that
+   Codex's own sandbox could not start because bubblewrap is unavailable,
+   so it could not read the files.
+3. **Coordinator.** It then called `getInvocation`, replayed it once, and
+   was denied by the replay limit. Its prompt had not explained that a
+   failed Reviewer means a revision is needed, nor that queries return
+   nothing new.
+4. **Usage.** Only one of five Coordinator turns reported usage before its
+   interrupt: 8,979 input and 52 output tokens.
+
+The fixes are as follows:
+
+- **Planner and Reviewer prompts.** The guest shell inlines bounded file
+  contents into these prompts, between data markers.
+- **No Codex sandbox.** Planner and Reviewer also run without Codex's own
+  sandbox, like Worker. The VM and the read-only `/review` mount are the
+  sandbox. This means every model-driven role can now run shell commands
+  in a VM that has credentialed egress.
+- **Coordinator instructions.** They now explain invocation outcomes, the
+  revision step and that queries add nothing.
+
 Known risks and gaps before the live run:
 
 - **The token is a bearer credential that the guest can use.** Every
