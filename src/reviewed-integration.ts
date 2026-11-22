@@ -31,6 +31,12 @@ type Plan = {
   readonly verification: SandboxCommand;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
+  /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
+   * wrap their answer (for example a CLI result object). Verification output
+   * is never transformed. */
+  readonly reviewerOutput?: (
+    response: Uint8Array | undefined,
+  ) => Uint8Array | undefined;
 };
 
 const roleSandbox = (extra?: RoleSandbox): RoleSandbox => ({
@@ -181,6 +187,7 @@ export class ReviewedIntegration {
       verification: copy(plan.verification),
       workerSandbox: roleSandbox(plan.workerSandbox),
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
+      ...(plan.reviewerOutput ? { reviewerOutput: plan.reviewerOutput } : {}),
     };
   }
 
@@ -374,7 +381,14 @@ export class ReviewedIntegration {
       id,
       this.#plan.reviewerSandbox,
     );
-    const { review, notes } = reviewResult(reviewer);
+    const transformed = this.#plan.reviewerOutput
+      ? this.#plan.reviewerOutput(reviewer.response)
+      : reviewer.response;
+    const { review, notes } = reviewResult({
+      id: reviewer.id,
+      outcome: reviewer.outcome,
+      ...(transformed ? { response: transformed } : {}),
+    });
     if (notes !== undefined)
       await append({
         kind: "review.noted",

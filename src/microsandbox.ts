@@ -14,6 +14,7 @@ import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
 import {
   isSafeCredentialVariable,
+  sameProvider,
   SandboxRuntimeError,
   type CollectedArtifacts,
   type CollectSpec,
@@ -40,17 +41,6 @@ export interface MicrosandboxConfig {
    * equal it exactly. At most one entry, because `credentials` is a single
    * credential. Default: none. */
   readonly providers?: readonly SandboxProvider[];
-}
-
-/** A provider binding with defaults filled in, for exact comparison. */
-function providerKey(provider: SandboxProvider): string {
-  return JSON.stringify([
-    provider.host,
-    provider.secretEnv,
-    provider.header ?? "authorization",
-    provider.port ?? 443,
-    provider.upstreamCaCertPath ?? null,
-  ]);
 }
 
 /** Conservative fixed bounds for this initial offline adapter. */
@@ -318,8 +308,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       (port !== undefined ||
         !this.#config.credentials ||
         typeof provider.host !== "string" ||
-        !this.#config.providers?.some(
-          (allowed) => providerKey(allowed) === providerKey(provider),
+        !this.#config.providers?.some((allowed) =>
+          sameProvider(allowed, provider),
         ) ||
         !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
           provider.host,
