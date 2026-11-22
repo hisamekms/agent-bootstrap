@@ -180,6 +180,9 @@ export interface CoordinatorDriver {
     control: CoordinatorControl,
     id: string,
   ): Promise<{ id: string; response?: Uint8Array; reason?: string }>;
+  /** For a Reviewer, `ok` means the review passed; `failed` means it asked
+   * for changes, raised a concern or did not finish. A Worker may revise only
+   * after a failed review. */
   delegate(
     role: DelegateRole,
     control: CoordinatorControl,
@@ -471,18 +474,17 @@ export class CoordinatorTask {
       const worked = latest("Worker", true);
       const reviewed = latest("Reviewer");
       const passed = latest("Reviewer", true);
-      const candidates = invocations.filter(
-        (invocation) =>
-          invocation.role === "Worker" && invocation.outcome === "ok",
+      // Every Worker run counts toward the cap, including failed ones.
+      const workerRuns = invocations.filter(
+        (invocation) => invocation.role === "Worker",
       ).length;
       const allowed =
         action.tool === "getInvocation"
           ? invocations.some((invocation) => invocation.id === action.id)
           : action.tool === "delegate" && action.role === "Worker"
-            ? worked === -1 ||
-              (reviewed > worked &&
-                invocations[reviewed]?.outcome !== "ok" &&
-                candidates <= MAX_REVISIONS)
+            ? workerRuns <= MAX_REVISIONS &&
+              (worked === -1 ||
+                (reviewed > worked && invocations[reviewed]?.outcome !== "ok"))
             : action.tool === "delegate" && action.role === "Reviewer"
               ? worked !== -1 && worked > reviewed
               : action.tool === "requestIntegration"

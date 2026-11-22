@@ -35,6 +35,24 @@ const sha256 = (data: Uint8Array | string) =>
 
 const NO_NOTES = sha256("");
 
+/** Verification accepts exactly `{"review": "pass" | "revise"}` in at most
+ * 128 bytes; anything else is a concern. */
+function verificationResult(run: ReviewerRun): Review {
+  const bytes = run.response;
+  if (run.outcome !== "ok" || !bytes || bytes.length > 128) return "concern";
+  try {
+    const result = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
+    if (result && !Array.isArray(result) && Object.keys(result).length === 1)
+      if (result.review === "pass" || result.review === "revise")
+        return result.review;
+  } catch {
+    return "concern";
+  }
+  return "concern";
+}
+
 /** `{"review": "pass" | "revise"}`, optionally with bounded `notes` text for
  * the next Worker. Anything else is a concern without notes. */
 function reviewResult(run: ReviewerRun): { review: Review; notes?: string } {
@@ -271,10 +289,12 @@ export class ReviewedIntegration {
         "Only a candidate reviewed as needing changes can be revised",
       );
     if (rounds >= MAX_REVISIONS) throw new Error("Revision limit reached");
-    const noted = events.findLast(
-      (event) => event.kind === "review.noted" && event.run === run,
-    );
-    const notes = noted?.kind === "review.noted" ? noted.notes : NO_NOTES;
+    // Notes count only when recorded immediately before this review.
+    const noted = events.at(-2);
+    const notes =
+      noted?.kind === "review.noted" && noted.run === run
+        ? noted.notes
+        : NO_NOTES;
     const append = this.#writer(events.length);
     // This sequence CAS wins before any snapshot or Worker VM.
     await append({
@@ -387,7 +407,7 @@ export class ReviewedIntegration {
       this.#plan.verification,
       id,
     );
-    const verified = reviewResult(verification).review;
+    const verified = verificationResult(verification);
     await append({
       kind: "verification.finished",
       run: verification.id,

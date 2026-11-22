@@ -31,6 +31,7 @@ const sha256 = (data: string | Uint8Array) =>
 async function fixture(
   t: { after(fn: () => Promise<void>): void },
   reviews: string[],
+  verification = '{"review":"pass"}',
 ) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "bootstrap-revision-"),
@@ -69,7 +70,7 @@ async function fixture(
           ? '{"tool":"collect"}'
           : entry === "reviewer"
             ? (reviews.shift() ?? '{"review":"pass"}')
-            : '{"review":"pass"}';
+            : verification;
       return {
         status: "exited",
         exitCode: 0,
@@ -207,4 +208,56 @@ test("malformed or oversized review notes are a concern without notes", async (t
       !(await journal.read()).some((event) => event.kind === "review.noted"),
     );
   }
+});
+
+test("concurrent revisions start one Worker, and a missing note stops before any Worker", async (t) => {
+  const { flow, workers } = await fixture(t, [
+    JSON.stringify({ review: "revise", notes }),
+  ]);
+  await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  const raced = await Promise.allSettled([flow.revise(), flow.revise()]);
+  assert.equal(
+    raced.filter((result) => result.status === "fulfilled").length,
+    1,
+  );
+  assert.equal(workers.length, 2);
+
+  const missing = await fixture(t, [
+    JSON.stringify({ review: "revise", notes }),
+  ]);
+  await missing.flow.prepareCandidate();
+  await missing.flow.reviewCandidate();
+  await rm(join(missing.journalDir, `note-${sha256(notes)}`));
+  await assert.rejects(missing.flow.revise());
+  assert.equal(missing.workers.length, 1);
+  // The revision request stays as the last event: uncertain, never retried.
+  assert.equal(
+    (await missing.journal.read()).at(-1)?.kind,
+    "revision.requested",
+  );
+  await assert.rejects(missing.flow.revise());
+  await assert.rejects(missing.flow.reviewCandidate());
+});
+
+test("verification keeps its strict response format", async (t) => {
+  const { flow, git, journal } = await fixture(
+    t,
+    [],
+    JSON.stringify({ review: "pass", notes }),
+  );
+  const pin = await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  await flow.decide(pin, "approve");
+  assert.equal(await flow.integrate(), "denied");
+  assert.equal(await git.head(), pin.base);
+  const events = await journal.read();
+  assert.equal(
+    events.findLast((event) => event.kind === "verification.finished")?.kind ===
+      "verification.finished" &&
+      events.findLast((event) => event.kind === "verification.finished")
+        ?.review,
+    "concern",
+  );
+  assert.ok(!events.some((event) => event.kind === "review.noted"));
 });

@@ -269,3 +269,21 @@ test("revision rules deny out-of-order delegations", async (t) => {
   assert.equal(outcome, "denied");
   assert.equal(workers, 1 + MAX_REVISIONS);
 });
+
+test("failed Worker runs also count toward the revision cap", async (t) => {
+  const { MAX_REVISIONS } = await import("../src/integration-journal.ts");
+  const attempts = Array.from({ length: MAX_REVISIONS + 3 }, (_, index) => ({
+    tool: "delegate",
+    key: `worker-${index}`,
+    role: "Worker",
+  }));
+  let started = 0;
+  const { task } = await fixture(t, attempts, {
+    async delegate(_role, _control, id) {
+      started++;
+      return { id, outcome: "failed" };
+    },
+  });
+  assert.equal(await task.run(), "denied");
+  assert.equal(started, 1 + MAX_REVISIONS);
+});

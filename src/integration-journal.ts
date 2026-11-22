@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   PrivateJournal,
@@ -25,7 +25,7 @@ const fields = {
   cleanup: /^(complete|unknown)$/,
   decision: /^(approve|reject)$/,
   reason: /^(worker|no-approval|stale-base|evidence|verification)$/,
-  round: new RegExp(`^[1-${MAX_REVISIONS}]$`),
+  round: /^[1-9][0-9]?$/,
   from: /^[a-f0-9]{64}$/,
   notes: /^[a-f0-9]{64}$/,
 } as const;
@@ -114,7 +114,11 @@ export class IntegrationJournal {
 
   async readNote(hash: string): Promise<Uint8Array> {
     if (!fields.notes.test(hash)) throw new Error("Invalid notes digest");
-    const data = await readFile(join(this.#root, `note-${hash}`));
+    const path = join(this.#root, `note-${hash}`);
+    const info = await lstat(path);
+    if (!info.isFile() || info.size > NOTE_LIMIT_BYTES)
+      throw new Error("Review notes integrity check failed");
+    const data = await readFile(path);
     if (data.length > NOTE_LIMIT_BYTES || sha256(data) !== hash)
       throw new Error("Review notes integrity check failed");
     return data;

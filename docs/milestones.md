@@ -516,7 +516,9 @@ works like this:
 3. The new candidate is a single-parent commit on the original base. It has
    its own commit, diff and digest, and needs its own review.
 
-A task allows at most `MAX_REVISIONS` (3) revisions.
+One integration journal, which the M4 smoke keeps per task, allows at most
+`MAX_REVISIONS` (3) revisions. Verification keeps its strict format:
+exactly `{"review": ...}` in at most 128 bytes, and notes are not accepted.
 
 Review, decision and integration always use the most recent candidate, and
 a review counts only if it comes after that candidate. A decision about an
@@ -527,11 +529,16 @@ review passed. The integration journal limit is now 31 events.
 The Coordinator router follows the same order:
 
 - **Worker** can run again only after the latest Reviewer invocation failed
-  (`revise` or `concern`), up to 1 + `MAX_REVISIONS` successful runs.
+  (`revise` or `concern`). The task allows up to 1 + `MAX_REVISIONS` Worker
+  runs, and failed runs count toward that limit.
 - **Reviewer** runs only when a Worker candidate is newer than the last
   review.
 - **`requestIntegration`** needs a passing review that is newer than the
   latest Worker.
+
+By the `CoordinatorDriver` contract, a Reviewer outcome of `ok` means the
+review passed, and `failed` means it asked for changes, raised a concern or
+did not finish.
 
 The credential-free tests in `test/revision.test.ts` use a real disposable
 Git repository. They cover these cases:
@@ -575,6 +582,10 @@ Known gaps:
   candidate, review and revision events have to be read separately.
 - **Revision rounds have only fixture evidence.** A real model has not yet
   run a review and revision round.
+- **Notes are not sanitized for display.** They may contain terminal escape
+  or bidirectional characters, so they must be escaped before a human sees
+  them.
+- **Note files are kept forever.** There is no retention rule yet.
 
 ## Later acceptance checks
 
