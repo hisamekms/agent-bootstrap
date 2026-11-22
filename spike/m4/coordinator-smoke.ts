@@ -193,8 +193,13 @@ async function main() {
           };
         }
         if (role === "Worker") {
-          await flow(control).prepareCandidate(id);
-          const event = (await reviewJournal.read()).find(
+          // A later Worker delegation revises the reviewed candidate.
+          const revising = (await reviewJournal.read()).some(
+            (row) => row.kind === "candidate.created",
+          );
+          if (revising) await flow(control).revise(id);
+          else await flow(control).prepareCandidate(id);
+          const event = (await reviewJournal.read()).findLast(
             (row) => row.kind === "candidate.authorized",
           );
           assert.ok(event);
@@ -209,25 +214,7 @@ async function main() {
         };
       },
       async reviewedCandidate() {
-        const events = await reviewJournal.read();
-        const request = events[0];
-        const candidate = events.find(
-          (event) => event.kind === "candidate.created",
-        );
-        const review = events.at(-1);
-        if (
-          request?.kind !== "requested" ||
-          !candidate ||
-          review?.kind !== "review.submitted" ||
-          review.review !== "pass" ||
-          review.digest !== candidate.digest
-        )
-          return null;
-        return {
-          base: request.base,
-          candidate: candidate.candidate,
-          digest: candidate.digest,
-        };
+        return flow().reviewedPin();
       },
       async decide(pin, decision, attempt) {
         const integration = flow();

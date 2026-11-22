@@ -1,4 +1,19 @@
-import { PrivateJournal, uuidPattern } from "./private-journal.ts";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  PrivateJournal,
+  checkPrivateDirectory,
+  publishPrivateFile,
+  uuidPattern,
+} from "./private-journal.ts";
+
+/** Review notes are untrusted text; only their digest enters the journal. */
+export const NOTE_LIMIT_BYTES = 2048;
+/** Revised candidates allowed after the first one. */
+export const MAX_REVISIONS = 3;
+const sha256 = (data: Uint8Array | string) =>
+  createHash("sha256").update(data).digest("hex");
 
 const fields = {
   target: /^[a-f0-9]{64}$/,
@@ -10,6 +25,9 @@ const fields = {
   cleanup: /^(complete|unknown)$/,
   decision: /^(approve|reject)$/,
   reason: /^(worker|no-approval|stale-base|evidence|verification)$/,
+  round: new RegExp(`^[1-${MAX_REVISIONS}]$`),
+  from: /^[a-f0-9]{64}$/,
+  notes: /^[a-f0-9]{64}$/,
 } as const;
 
 const eventFields = {
@@ -18,7 +36,9 @@ const eventFields = {
   "candidate.created": ["candidate", "digest"],
   "candidate.failed": ["cleanup"],
   "review.authorized": ["base", "candidate", "digest"],
+  "review.noted": ["run", "notes"],
   "review.submitted": ["run", "digest", "review"],
+  "revision.requested": ["round", "from", "notes"],
   "human.decided": ["base", "candidate", "digest", "decision"],
   "verification.authorized": ["base", "candidate", "digest"],
   "verification.finished": ["run", "digest", "review"],
@@ -58,13 +78,46 @@ function decode(value: unknown): IntegrationEvent {
   return value as IntegrationEvent;
 }
 
+// The first candidate and integration take up to 13 events; each revision
+// adds up to 6.
+const eventLimit = 13 + 6 * MAX_REVISIONS;
+
 export class IntegrationJournal {
   readonly #journal: PrivateJournal<IntegrationEvent>;
+  readonly #root: string;
   readonly id: string;
 
   constructor(root: string, id: string) {
-    this.#journal = new PrivateJournal(root, id, decode, 15);
+    this.#journal = new PrivateJournal(root, id, decode, eventLimit);
+    this.#root = root;
     this.id = id;
+  }
+
+  /** Store review notes as a private, content-addressed file. */
+  async saveNote(text: string): Promise<string> {
+    const bytes = Buffer.from(text, "utf8");
+    if (!bytes.length || bytes.length > NOTE_LIMIT_BYTES || text.includes("\0"))
+      throw new Error("Invalid review notes");
+    await checkPrivateDirectory(this.#root);
+    const hash = sha256(bytes);
+    try {
+      await publishPrivateFile(this.#root, `note-${hash}`, bytes);
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+        sha256(await this.readNote(hash)) !== hash
+      )
+        throw new Error("Review notes could not be stored");
+    }
+    return hash;
+  }
+
+  async readNote(hash: string): Promise<Uint8Array> {
+    if (!fields.notes.test(hash)) throw new Error("Invalid notes digest");
+    const data = await readFile(join(this.#root, `note-${hash}`));
+    if (data.length > NOTE_LIMIT_BYTES || sha256(data) !== hash)
+      throw new Error("Review notes integrity check failed");
+    return data;
   }
 
   read(): Promise<IntegrationEvent[]> {

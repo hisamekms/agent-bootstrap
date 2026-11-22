@@ -8,6 +8,7 @@ import {
   publishPrivateFile,
   uuidPattern,
 } from "./private-journal.ts";
+import { MAX_REVISIONS } from "./integration-journal.ts";
 import type { PinnedCandidate } from "./reviewed-integration.ts";
 
 const digest = (data: string | Uint8Array) =>
@@ -459,28 +460,35 @@ export class CoordinatorTask {
         if (!replay) return "denied";
         continue;
       }
-      if (
-        (action.tool === "getInvocation" &&
-          !invocations.some((invocation) => invocation.id === action.id)) ||
-        (action.tool === "delegate" &&
-          action.role !== "Planner" &&
-          invocations.some(
-            (invocation) =>
-              invocation.role === action.role && invocation.outcome === "ok",
-          )) ||
-        (action.tool === "requestIntegration" &&
-          (approval ||
-            !invocations.some(
-              (invocation) =>
-                invocation.role === "Reviewer" && invocation.outcome === "ok",
-            ))) ||
-        (action.tool === "delegate" &&
-          action.role === "Reviewer" &&
-          !invocations.some(
-            (invocation) =>
-              invocation.role === "Worker" && invocation.outcome === "ok",
-          ))
-      ) {
+      // A Worker may run again only to revise a candidate whose latest review
+      // did not pass. Reviewer reviews only a candidate it has not seen, and
+      // integration needs a passing review of the latest candidate.
+      const latest = (role: string, ok?: boolean) =>
+        invocations.findLastIndex(
+          (invocation) =>
+            invocation.role === role && (!ok || invocation.outcome === "ok"),
+        );
+      const worked = latest("Worker", true);
+      const reviewed = latest("Reviewer");
+      const passed = latest("Reviewer", true);
+      const candidates = invocations.filter(
+        (invocation) =>
+          invocation.role === "Worker" && invocation.outcome === "ok",
+      ).length;
+      const allowed =
+        action.tool === "getInvocation"
+          ? invocations.some((invocation) => invocation.id === action.id)
+          : action.tool === "delegate" && action.role === "Worker"
+            ? worked === -1 ||
+              (reviewed > worked &&
+                invocations[reviewed]?.outcome !== "ok" &&
+                candidates <= MAX_REVISIONS)
+            : action.tool === "delegate" && action.role === "Reviewer"
+              ? worked !== -1 && worked > reviewed
+              : action.tool === "requestIntegration"
+                ? !approval && passed !== -1 && passed > worked
+                : true;
+      if (!allowed) {
         await this.#append(next, { kind: "tool.denied", run: turn.id });
         return "denied";
       }
