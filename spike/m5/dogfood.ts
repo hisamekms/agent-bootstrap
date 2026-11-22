@@ -50,6 +50,7 @@ import {
 } from "../../src/coordinator.ts";
 import type { CredentialProvider } from "../../src/credentials.ts";
 import { EgressGateway } from "../../src/egress-gateway.ts";
+import type { ExecutionContext } from "../../src/execution-context.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import {
@@ -516,10 +517,21 @@ async function claudeFixture(
   };
 }
 
+function traceContext(executionId: string): ExecutionContext {
+  return {
+    executionId,
+    traceContext: {
+      traceparent: `00-${randomBytes(16).toString("hex")}-${randomBytes(8).toString("hex")}-01`,
+    },
+  };
+}
+
 async function main() {
   const [mode, msb, codexBinary] = process.argv.slice(2);
   const live = mode === "--live";
   assert.ok(live || mode === "--fixture");
+  if (live)
+    assert.ok(process.stdout.isTTY, "Live M5 requires an operator terminal");
   const home = process.env.MSB_HOME;
   assert.ok(home && isAbsolute(home) && msb && isAbsolute(msb));
   assert.ok(codexBinary && isAbsolute(codexBinary));
@@ -717,6 +729,7 @@ async function main() {
     : "/review/candidate.diff (the new file is /review/candidate.source)";
   const auditPath = join(root, "audit.sqlite");
   const obsDir = join(root, "observability");
+  console.error(`M5 observability artifacts: ${quoteForTerminal(obsDir)}`);
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
   let telemetry: ReturnType<typeof createTelemetry> | undefined;
   let auditExported: boolean | undefined;
@@ -744,14 +757,38 @@ async function main() {
       },
       { msbHome: home, stagingRoot: msbConfig.stagingRoot },
     );
-    telemetry = createTelemetry(config.telemetry, config.directory);
+    const telemetryObserver = createTelemetry(
+      config.telemetry,
+      config.directory,
+    );
+    telemetry = telemetryObserver;
     observed = await createObservedHost({
       config,
       auditPath,
       msb: msbConfig,
       profiles,
       providerBindings,
-      observers: [telemetry],
+      observers: [
+        {
+          ...telemetryObserver,
+          observe(event) {
+            if (
+              event.eventType !== "execution.started" ||
+              event.payload.role === "Verification"
+            ) {
+              telemetryObserver.observe(event);
+              return;
+            }
+            telemetryObserver.observe({
+              ...event,
+              payload: {
+                ...event.payload,
+                agentKind: actors[event.payload.role],
+              },
+            });
+          },
+        },
+      ],
       ...(live
         ? {}
         : {
@@ -857,7 +894,7 @@ async function main() {
             },
             id,
             use,
-            undefined,
+            traceContext(id),
             codexService ? { hostServices: [codexService] } : undefined,
           );
           return result.value as never;
@@ -865,7 +902,7 @@ async function main() {
       });
     } else
       coordinator = new ClaudeCodeCoordinator({
-        run: (plan, id) => host.runCoordinator(plan, id),
+        run: (plan, id) => host.runCoordinator(plan, id, traceContext(id)),
         sandbox: claudeHarness!.sandbox,
         auth,
         model: claudeModel,
@@ -907,7 +944,7 @@ async function main() {
               }),
             },
             id,
-            undefined,
+            traceContext(id),
             hostServices ? { hostServices } : undefined,
           );
           return {
@@ -1046,6 +1083,7 @@ async function main() {
       const first = events[0];
       const last = events.at(-1);
       return {
+        executionId: id,
         role: first?.role,
         outcome:
           last?.kind === "invocation.finished" ? last.outcome : "incomplete",
@@ -1112,6 +1150,7 @@ async function main() {
           .slice(0, -1)
       : [];
     exportRunAudit();
+    await telemetry.shutdown();
     const report = {
       mode: live ? "live" : "fixture",
       tree,
@@ -1183,9 +1222,12 @@ async function main() {
     claudeMock?.close();
     try {
       await observed?.close();
-      if (observed && auditExported === undefined) exportRunAudit();
     } finally {
-      await telemetry?.shutdown();
+      try {
+        if (observed && auditExported === undefined) exportRunAudit();
+      } finally {
+        await telemetry?.shutdown();
+      }
     }
   }
 }
