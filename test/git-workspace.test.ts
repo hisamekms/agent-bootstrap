@@ -394,6 +394,44 @@ test("createCandidateTree single-file candidate works with diff and advance", as
   assert.equal(git(repository, ["rev-parse", "main"]), candidate);
 });
 
+test("candidate creation and recheck reject traversal through another symlink", async (t) => {
+  const { integration, repository, c3 } = await fixture(t);
+  const links = [
+    { path: "sub/l1", mode: "120000", bytes: Buffer.from("..") },
+    { path: "sub/l2", mode: "120000", bytes: Buffer.from("l1/../../.ssh") },
+  ] as const;
+  await rejects(
+    integration.createCandidateTree(c3, links, "unsafe links"),
+    "invalid-input",
+  );
+
+  const env = { GIT_INDEX_FILE: join(repository, "symlink-index") };
+  git(repository, ["read-tree", c3], "", env);
+  for (const { path, mode, bytes } of links) {
+    const blob = git(
+      repository,
+      ["hash-object", "-w", "--stdin"],
+      bytes.toString(),
+    );
+    git(
+      repository,
+      ["update-index", "--add", "--cacheinfo", `${mode},${blob},${path}`],
+      "",
+      env,
+    );
+  }
+  const tree = git(repository, ["write-tree"], "", env);
+  const candidate = git(repository, [
+    "commit-tree",
+    tree,
+    "-p",
+    c3,
+    "-m",
+    "unsafe links",
+  ]);
+  await rejects(integration.diff(c3, candidate), "invalid-candidate");
+});
+
 test("createCandidateTree rejects unsafe or invalid input", async (t) => {
   const { integration, repository, c3 } = await fixture(t);
   const file = (path: string) => ({

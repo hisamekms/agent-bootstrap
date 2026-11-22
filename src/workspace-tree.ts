@@ -161,12 +161,18 @@ export function isSafeSymlinkTarget(path: string, bytes: Uint8Array): boolean {
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_PATH_BYTES) return false;
   const target = Buffer.from(bytes).toString("latin1");
   if (win32.isAbsolute(target) || /[\0\r\n]/.test(target)) return false;
-  let depth = path.split("/").length - 1;
+  // Git tree entries have real parent directories, so leading ".." components
+  // can ascend at most to the root. Once the target descends it may encounter
+  // another symlink. If every link follows this rule, each expansion stays
+  // within the tree and no later ".." can ascend from the expanded location.
+  let remainingParents = path.split("/").length - 1;
+  let descended = false;
   for (const part of target.split("/")) {
+    if (part === "" || part === ".") continue;
     if (part === "..") {
-      if (--depth < 0) return false;
-    } else if (part !== "" && part !== ".") {
-      depth++;
+      if (descended || --remainingParents < 0) return false;
+    } else {
+      descended = true;
     }
   }
   return true;

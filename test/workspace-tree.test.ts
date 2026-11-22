@@ -185,13 +185,39 @@ test("symlinks must resolve within the repository and retargeting is protected",
   const result = diff(
     [
       dir("sub"),
-      { name: "sub/link", type: "2", link: "./../dir/../file" },
+      { name: "sub/link", type: "2", link: "./..//file" },
       { name: "same", type: "2", link: "file" },
     ],
     b,
   );
   assert.deepEqual(result.protected, ["sub/link"]);
   assert.deepEqual(result.deletions, ["gone"]);
+});
+
+test("symlinks may ascend only before descending and only to the root", () => {
+  const allowed: In[] = [
+    dir("sub"),
+    { name: "sub/l1", type: "2", link: ".." },
+    { name: "sub/a", type: "2", link: "../b" },
+    { name: "sub/z", type: "2", link: "./c" },
+  ];
+  assert.deepEqual(
+    diff(allowed, base({})).changes.map(({ path }) => path),
+    ["sub/a", "sub/l1", "sub/z"],
+  );
+  for (const [name, link] of [
+    ["sub/l2", "l1/../../.ssh"],
+    ["a", ".."],
+    ["sub/x", "../../y"],
+    ["sub/y", "c/../d"],
+    ["sub/abs", "/c"],
+  ] as const) {
+    assert.throws(
+      () => diff([...allowed, { name, type: "2", link }], base({})),
+      /Unsafe symlink target/,
+      name,
+    );
+  }
 });
 
 test("hardlinks take the target's data", () => {
