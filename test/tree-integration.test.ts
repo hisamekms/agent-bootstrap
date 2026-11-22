@@ -328,10 +328,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
     (event) => event.kind === "candidate.created",
   );
   // run.sh is protected; docs/ is untouched.
-  assert.equal(
-    (created as { protectedCount?: number } | undefined)?.protectedCount,
-    1,
-  );
+  assert.equal(created?.protectedCount, 1);
   // Worker got the repository and no loose files; Reviewer only the diff.
   assert.ok(f.specs[0]?.repository);
   assert.equal(f.specs[0]?.files, undefined);
@@ -343,7 +340,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
     f.specs[1]?.readOnlyFiles?.map((file) => file.path),
     ["candidate.diff"],
   );
-  await f.flow.decide(pin, "approve");
+  await f.flow.decide(pin, "approve", { acknowledgeProtected: ["run.sh"] });
   assert.equal(await f.flow.integrate(), "completed");
   assert.equal(await f.integration.head(), pin.candidate);
   // Verification got the whole candidate tree plus diff and suite.
@@ -357,7 +354,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
 });
 
 test("a change outside the scope is denied, and nothing is left behind", async (t) => {
-  const f = await fixture(t, { scope: ["src/"] });
+  const f = await fixture(t, { scope: ["SRC/"] });
   f.edits.push(async (dir) => {
     await writeFile(join(dir, "src/a.ts"), "ok\n");
     await writeFile(join(dir, "README.md"), "nope\n");
@@ -407,18 +404,67 @@ test("sparse scope: files outside it are absent in the VM but are not deletions"
   assert.equal(await f.leftovers(), 0);
 });
 
-test("protected paths are counted in the candidate event", async (t) => {
-  const f = await fixture(t, { protectedPaths: ["docs/", "README.md"] });
+test("tree approval requires acknowledgement of the pinned protected paths", async (t) => {
+  const f = await fixture(t, { protectedPaths: ["DOCS/", "readme.md"] });
   f.edits.push(async (dir) => {
     await writeFile(join(dir, "docs/d.md"), "d2\n");
     await writeFile(join(dir, "README.md"), "r2\n");
     await writeFile(join(dir, "src/a.ts"), "a2\n");
+    await rm(join(dir, "link"));
+    await symlink("docs/d.md", join(dir, "link"));
+    await symlink("../README.md", join(dir, "src/new-link"));
   });
-  await f.flow.prepareCandidate();
+  const pin = await f.flow.prepareCandidate();
+  const paths = ["README.md", "docs/d.md", "link", "src/new-link"];
+  assert.deepEqual(await f.flow.protectedPaths(pin), paths);
+  await assert.rejects(
+    f.flow.protectedPaths({ ...pin, digest: "a".repeat(64) }),
+    /durable pin/,
+  );
+  await f.flow.reviewCandidate();
   const created = (await f.journal.read()).find(
     (event) => event.kind === "candidate.created",
-  ) as { protectedCount?: number } | undefined;
-  assert.equal(created?.protectedCount, 2);
+  );
+  assert.equal(created?.protectedCount, paths.length);
+  const message = /Human decision does not match an eligible review/;
+  await assert.rejects(f.flow.decide(pin, "approve"), message);
+  await assert.rejects(
+    f.flow.decide(pin, "approve", { acknowledgeProtected: paths.slice(1) }),
+    message,
+  );
+  await assert.rejects(
+    f.flow.decide(pin, "approve", {
+      acknowledgeProtected: [...paths, "src/a.ts"],
+    }),
+    message,
+  );
+  assert.equal((await f.journal.read()).at(-1)?.kind, "review.submitted");
+  await f.flow.decide(pin, "approve", {
+    acknowledgeProtected: [...paths].reverse(),
+  });
+  assert.equal(await f.flow.integrate(), "completed");
+});
+
+test("a protected tree candidate can be rejected without acknowledgement", async (t) => {
+  const f = await fixture(t, { protectedPaths: ["README.md"] });
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const pin = await f.flow.prepare();
+  await f.flow.decide(pin, "reject");
+  assert.equal(await f.flow.integrate(), "denied");
+  assert.equal(await f.integration.head(), f.base);
+});
+
+test("a pre-existing approval without acknowledgement cannot integrate protected changes", async (t) => {
+  const f = await fixture(t, { protectedPaths: ["README.md"] });
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const { review: _, ...pin } = await f.flow.prepare();
+  await f.journal.append((await f.journal.read()).length, {
+    kind: "human.decided",
+    ...pin,
+    decision: "approve",
+  });
+  assert.equal(await f.flow.integrate(), "denied");
+  assert.equal(await f.integration.head(), f.base);
 });
 
 test("a revision starts from the previous candidate tree and stays relative to base", async (t) => {

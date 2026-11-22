@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { win32 } from "node:path";
 import { readTar } from "./oci-image.ts";
 
 /**
@@ -132,8 +133,15 @@ export function workspaceFiles(tar: Uint8Array): Map<string, WorkspaceFile> {
   return out;
 }
 
-function inList(path: string, list: readonly string[]): boolean {
-  return list.some((p) => (p.endsWith("/") ? path.startsWith(p) : path === p));
+export function matchesTreePaths(
+  path: string,
+  list: readonly string[],
+): boolean {
+  const key = foldTreePath(path);
+  return list.some((p) => {
+    const pattern = foldTreePath(p);
+    return pattern.endsWith("/") ? key.startsWith(pattern) : key === pattern;
+  });
 }
 
 function checkPath(path: string): void {
@@ -144,8 +152,42 @@ function checkPath(path: string): void {
   }
 }
 
-function collisionKey(path: string): string {
+export function foldTreePath(path: string): string {
   return path.normalize("NFC").toLowerCase();
+}
+
+export function isSafeSymlinkTarget(path: string, bytes: Uint8Array): boolean {
+  // Keep the blob bytes intact. Git and tar use '/' as the directory separator.
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_PATH_BYTES) return false;
+  const target = Buffer.from(bytes).toString("latin1");
+  if (win32.isAbsolute(target) || /[\0\r\n]/.test(target)) return false;
+  let depth = path.split("/").length - 1;
+  for (const part of target.split("/")) {
+    if (part === "..") {
+      if (--depth < 0) return false;
+    } else if (part !== "" && part !== ".") {
+      depth++;
+    }
+  }
+  return true;
+}
+
+export function checkTreeCollisions(paths: Iterable<string>): void {
+  const claimed = new Map<string, { path: string; directory: boolean }>();
+  const claim = (path: string, directory: boolean) => {
+    const key = foldTreePath(path);
+    const previous = claimed.get(key);
+    if (!previous) claimed.set(key, { path, directory });
+    else if (previous.path !== path)
+      fail("Paths collide on a case-insensitive checkout");
+    else if (previous.directory !== directory)
+      fail("Path is both a file and a directory");
+  };
+  for (const path of paths) {
+    claim(path, false);
+    for (let i = path.indexOf("/"); i >= 0; i = path.indexOf("/", i + 1))
+      claim(path.slice(0, i), true);
+  }
 }
 
 function byPath<T>(key: (v: T) => string) {
@@ -162,21 +204,17 @@ export function diffWorkspace(input: {
 }): WorkspaceDiff {
   const { base, workspace, scope, protectedPaths = [] } = input;
   const limits = { ...DEFAULT_LIMITS, ...input.limits };
-  const inScope = (p: string) => scope === undefined || inList(p, scope);
+  const inScope = (p: string) =>
+    scope === undefined || matchesTreePaths(p, scope);
 
   const changes: Change[] = [];
   const deletions: string[] = [];
-  const resulting = new Map<string, string>();
-  const claim = (path: string) => {
-    const key = collisionKey(path);
-    if (resulting.has(key))
-      fail("Paths collide on a case-insensitive checkout");
-    resulting.set(key, path);
-  };
+  const resulting = new Set(workspace.keys());
 
   for (const [path, file] of workspace) {
     checkPath(path);
-    claim(path);
+    if (file.mode === "120000" && !isSafeSymlinkTarget(path, file.bytes))
+      fail("Unsafe symlink target");
     const old = base.get(path);
     if (
       old !== undefined &&
@@ -192,19 +230,10 @@ export function diffWorkspace(input: {
   for (const path of base.keys()) {
     if (workspace.has(path)) continue;
     if (inScope(path)) deletions.push(path);
-    else claim(path); // sparse checkout: stays in the resulting tree
+    else resulting.add(path); // sparse checkout: stays in the resulting tree
   }
 
-  // A path that is a file must not also be a directory prefix of another.
-  const all = new Set<string>(workspace.keys());
-  for (const path of base.keys())
-    if (!inScope(path) && !workspace.has(path)) all.add(path);
-  for (const path of all) {
-    for (let i = path.indexOf("/"); i >= 0; i = path.indexOf("/", i + 1)) {
-      if (all.has(path.slice(0, i)))
-        fail("Path is both a file and a directory");
-    }
-  }
+  checkTreeCollisions(resulting);
 
   if (changes.length + deletions.length > limits.maxFiles) {
     fail("Too many changed files");
@@ -215,8 +244,13 @@ export function diffWorkspace(input: {
 
   changes.sort(byPath((c: Change) => c.path));
   deletions.sort(byPath((p: string) => p));
-  const flagged = [...changes.map((c) => c.path), ...deletions]
-    .filter((p) => inList(p, protectedPaths))
-    .sort(byPath((p: string) => p));
+  const flagged = [
+    ...changes
+      .filter(
+        (c) => c.mode === "120000" || matchesTreePaths(c.path, protectedPaths),
+      )
+      .map((c) => c.path),
+    ...deletions.filter((p) => matchesTreePaths(p, protectedPaths)),
+  ].sort(byPath((p: string) => p));
   return { changes, deletions, protected: flagged };
 }

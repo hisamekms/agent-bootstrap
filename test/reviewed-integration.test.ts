@@ -91,6 +91,7 @@ test("approval binds one candidate, the target and the verifier, and applies onc
     await fixture(t);
   const pin = await flow.prepare();
   assert.equal(pin.review, "pass");
+  assert.deepEqual(await flow.protectedPaths(pin), []);
   assert.equal(await git.head(), pin.base);
   await assert.rejects(
     flow.decide({ ...pin, digest: "a".repeat(64) }, "approve"),
@@ -124,6 +125,36 @@ test("approval binds one candidate, the target and the verifier, and applies onc
   assert.ok(recordedReview);
   assert.equal(audit.read(recordedReview.run).at(-1)?.role, "Reviewer");
   await assert.rejects(flow.integrate(), /already been attempted/);
+});
+
+test("single-file review refuses a multi-file candidate from the Git adapter", async (t) => {
+  const { config, host, journal, plan, git, calls } = await fixture(t);
+  class MultiFileGit extends LocalGitIntegration {
+    override createCandidate(base: string, path: string, bytes: Uint8Array) {
+      return this.createCandidateTree(
+        base,
+        [
+          { path, mode: "100644", bytes },
+          {
+            path: "unexpected.txt",
+            mode: "100644",
+            bytes: Buffer.from("extra\n"),
+          },
+        ],
+        "unexpected multi-file candidate",
+      );
+    }
+  }
+  const base = await git.head();
+  const flow = new ReviewedIntegration(
+    new MultiFileGit(config),
+    host,
+    journal,
+    plan,
+  );
+  await assert.rejects(flow.prepare(), /Could not create a review candidate/);
+  assert.deepEqual(calls, ["worker"]);
+  assert.equal(await git.head(), base);
 });
 
 test("a new base after approval is rejected without another ref update", async (t) => {

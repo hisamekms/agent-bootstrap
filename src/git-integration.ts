@@ -11,6 +11,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import {
+  checkTreeCollisions,
+  foldTreePath,
+  isSafeSymlinkTarget,
+  matchesTreePaths,
+} from "./workspace-tree.ts";
 
 export type GitIntegrationCode =
   | "invalid-input"
@@ -49,6 +55,8 @@ export interface LocalGitIntegrationConfig {
 const fileLimit = 256 * 1024;
 const outputLimit = 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}$/;
+const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+type FileExpectation = { readonly path: string };
 
 function oid(value: unknown): string {
   if (typeof value !== "string" || !oidPattern.test(value))
@@ -668,7 +676,7 @@ export class LocalGitIntegration {
           .toString("utf8")
           .trim(),
       );
-      await this.#candidate(base, candidate);
+      await this.#candidate(base, candidate, { path });
       await this.#pin(candidate);
     } catch (error) {
       failure =
@@ -707,9 +715,12 @@ export class LocalGitIntegration {
 
   /** A candidate is one commit whose only parent is `base`. Its changes are
    * additions, modifications, deletions and mode changes of regular files,
-   * executables and symlinks. Gitlinks and type changes are refused. Returns
-   * the changed paths. */
-  async #candidate(base: string, candidate: string): Promise<string[]> {
+   * executables and symlinks. Gitlinks and type changes are refused. */
+  async #candidate(
+    base: string,
+    candidate: string,
+    expectation?: FileExpectation,
+  ): Promise<{ path: string; newMode: string }[]> {
     oid(base);
     oid(candidate);
     await this.#commit(base);
@@ -740,11 +751,15 @@ export class LocalGitIntegration {
         timeout: 60_000,
       },
     );
-    const fields = raw.toString("utf8").split("\0");
+    const decoded = raw.toString("utf8");
+    if (!Buffer.from(decoded, "utf8").equals(raw))
+      throw new GitIntegrationError("invalid-candidate");
+    const fields = decoded.split("\0");
     if (fields.pop() !== "" || fields.length % 2 !== 0)
       throw new GitIntegrationError("invalid-candidate");
     const modes = new Set(["100644", "100755", "120000"]);
-    const paths: string[] = [];
+    const changes: { path: string; newMode: string }[] = [];
+    const symlinks: { path: string; oid: string }[] = [];
     const seen = new Set<string>();
     for (let i = 0; i < fields.length; i += 2) {
       const meta =
@@ -752,7 +767,9 @@ export class LocalGitIntegration {
           fields[i]!,
         );
       if (!meta) throw new GitIntegrationError("invalid-candidate");
-      const [, oldMode, newMode, , , status] = meta as unknown as string[];
+      const oldMode = meta[1]!;
+      const newMode = meta[2]!;
+      const status = meta[5];
       const added = status === "A";
       const deleted = status === "D";
       if (
@@ -772,14 +789,84 @@ export class LocalGitIntegration {
       } catch {
         throw new GitIntegrationError("invalid-candidate");
       }
+      if (
+        expectation &&
+        (fields.length !== 2 ||
+          status !== "M" ||
+          oldMode !== newMode ||
+          newMode === "120000" ||
+          path !== expectation.path)
+      )
+        throw new GitIntegrationError("invalid-candidate");
       if (seen.has(path)) throw new GitIntegrationError("invalid-candidate");
       seen.add(path);
-      paths.push(path);
-      if (paths.length > changeCountLimit)
+      changes.push({ path, newMode });
+      if (newMode === "120000") symlinks.push({ path, oid: meta[4]! });
+      if (changes.length > changeCountLimit)
         throw new GitIntegrationError("invalid-candidate");
     }
-    if (paths.length === 0) throw new GitIntegrationError("invalid-candidate");
-    return paths;
+    if (changes.length === 0)
+      throw new GitIntegrationError("invalid-candidate");
+    if (symlinks.length) await this.#checkCandidateSymlinks(symlinks);
+    if (!expectation) {
+      const entries = await this.#entries(
+        this.#config.repository,
+        this.#config.repository,
+        candidate,
+      );
+      try {
+        checkTreeCollisions(entries.map(({ path }) => path));
+      } catch {
+        throw new GitIntegrationError("invalid-candidate");
+      }
+    }
+    return changes;
+  }
+
+  async #checkCandidateSymlinks(
+    entries: readonly { path: string; oid: string }[],
+  ): Promise<void> {
+    // Recheck pinned commits, including candidates produced by older hosts.
+    const batch = await this.#run(["cat-file", "--batch"], {
+      gitDir: this.#config.repository,
+      cwd: this.#config.repository,
+      input: Buffer.from(entries.map((entry) => `${entry.oid}\n`).join("")),
+      maxBuffer: entries.length * (pathLimit + 64),
+      timeout: 60_000,
+    });
+    let offset = 0;
+    for (const entry of entries) {
+      const newline = batch.indexOf(10, offset);
+      if (newline < 0) throw new GitIntegrationError("invalid-candidate");
+      const header = batch.toString("latin1", offset, newline);
+      const match = /^([a-f0-9]{40}) blob (\d+)$/.exec(header);
+      const end = newline + 1 + Number(match?.[2]);
+      if (
+        match?.[1] !== entry.oid ||
+        batch[end] !== 10 ||
+        !isSafeSymlinkTarget(entry.path, batch.subarray(newline + 1, end))
+      )
+        throw new GitIntegrationError("invalid-candidate");
+      offset = end + 1;
+    }
+    if (offset !== batch.length)
+      throw new GitIntegrationError("invalid-candidate");
+  }
+
+  async protectedPaths(
+    base: string,
+    candidate: string,
+    protectedPaths: readonly string[],
+  ): Promise<string[]> {
+    await this.#repository();
+    const changes = await this.#candidate(base, candidate);
+    return changes
+      .filter(
+        ({ path, newMode }) =>
+          newMode === "120000" || matchesTreePaths(path, protectedPaths),
+      )
+      .map(({ path }) => path)
+      .sort();
   }
 
   /** `git ls-tree -r -z --full-tree <commit>`, for the strict ls-tree parser. */
@@ -795,18 +882,24 @@ export class LocalGitIntegration {
     });
   }
 
-  async diff(base: string, candidate: string): Promise<Uint8Array> {
+  async diff(
+    base: string,
+    candidate: string,
+    expectation?: FileExpectation,
+  ): Promise<Uint8Array> {
     oid(base);
     oid(candidate);
     await this.#repository();
-    await this.#candidate(base, candidate);
+    await this.#candidate(base, candidate, expectation);
     return this.#git([
+      "-c",
+      `attr.tree=${emptyTree}`,
       "diff",
       "--no-ext-diff",
       "--no-textconv",
       "--no-renames",
       "--no-color",
-      "--binary",
+      "--text",
       "--full-index",
       "--src-prefix=a/",
       "--dst-prefix=b/",
@@ -815,11 +908,15 @@ export class LocalGitIntegration {
     ]);
   }
 
-  async advance(base: string, candidate: string): Promise<void> {
+  async advance(
+    base: string,
+    candidate: string,
+    expectation?: FileExpectation,
+  ): Promise<void> {
     oid(base);
     oid(candidate);
     await this.#repository();
-    await this.#candidate(base, candidate);
+    await this.#candidate(base, candidate, expectation);
     if ((await this.head()) !== base)
       throw new GitIntegrationError("stale-base");
     try {
@@ -916,9 +1013,18 @@ export class LocalGitIntegration {
     gitDir: string,
     cwd: string,
     commit: string,
+    includeDirectories = false,
   ): Promise<TreeEntry[]> {
     const output = await this.#run(
-      ["ls-tree", "-r", "-l", "-z", "--full-tree", commit],
+      [
+        "ls-tree",
+        "-r",
+        "-l",
+        "-z",
+        "--full-tree",
+        ...(includeDirectories ? ["-t"] : []),
+        commit,
+      ],
       { gitDir, cwd, maxBuffer: 256 * 1024 * 1024, timeout: 60_000 },
     );
     const entries: TreeEntry[] = [];
@@ -929,7 +1035,7 @@ export class LocalGitIntegration {
       const record = output.subarray(start, end);
       start = end + 1;
       const tab = record.indexOf(9);
-      const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40}) +(\d+|-)$/.exec(
+      const match = /^(\d{6}) (blob|commit|tree) ([a-f0-9]{40}) +(\d+|-)$/.exec(
         record.subarray(0, Math.max(tab, 0)).toString("latin1"),
       );
       if (tab < 0 || !match) throw new GitIntegrationError("git-failed");
@@ -992,16 +1098,25 @@ export class LocalGitIntegration {
       if (ancestor !== base) throw new GitIntegrationError("invalid-input");
     }
     const kinds = new Map<string, "tree" | "blob">();
-    for (const path of sparse ?? []) {
-      const entry = (
-        await this.#git(["ls-tree", "-z", "--full-tree", head, "--", path])
-      ).toString("utf8");
-      const match = /^(\d{6}) (tree|blob) [a-f0-9]{40}\t([^\0]+)\0$/.exec(
-        entry,
-      );
-      if (!match || match[3] !== path || match[1] === "160000")
+    if (sparse !== undefined) {
+      const requested = new Set(sparse.map(foldTreePath));
+      const matched = new Set<string>();
+      for (const { path, mode } of await this.#entries(
+        this.#config.repository,
+        this.#config.repository,
+        head,
+        true,
+      )) {
+        const key = foldTreePath(path);
+        if (!requested.has(key)) continue;
+        if (matched.has(key) || mode === "160000")
+          throw new GitIntegrationError("invalid-input");
+        kinds.set(sparsePath(path), mode === "040000" ? "tree" : "blob");
+        matched.add(key);
+      }
+      if (matched.size !== requested.size)
         throw new GitIntegrationError("invalid-input");
-      kinds.set(path, match[2] as "tree" | "blob");
+      sparse = [...kinds.keys()];
     }
     const cone =
       sparse !== undefined && sparse.every((p) => kinds.get(p) === "tree");
@@ -1270,10 +1385,7 @@ export class LocalGitIntegration {
       total += bytes.byteLength;
       if (
         total > changeByteLimit ||
-        (change.mode === "120000" &&
-          (bytes.byteLength === 0 ||
-            bytes.byteLength > pathLimit ||
-            bytes.includes(0)))
+        (change.mode === "120000" && !isSafeSymlinkTarget(path, bytes))
       )
         throw new GitIntegrationError("invalid-input");
       updates.push({ path, mode: change.mode, bytes });
@@ -1294,22 +1406,10 @@ export class LocalGitIntegration {
     const final = new Set(existing);
     for (const path of deletions) final.delete(path);
     for (const update of updates) final.add(update.path);
-    const directories = new Set<string>();
-    for (const path of final) {
-      for (
-        let slash = path.lastIndexOf("/");
-        slash > 0;
-        slash = path.lastIndexOf("/", slash - 1)
-      )
-        directories.add(path.slice(0, slash));
-    }
-    for (const update of updates) {
-      const parts = update.path.split("/");
-      if (
-        directories.has(update.path) ||
-        parts.some((_, i) => i > 0 && final.has(parts.slice(0, i).join("/")))
-      )
-        throw new GitIntegrationError("invalid-input");
+    try {
+      checkTreeCollisions(final);
+    } catch {
+      throw new GitIntegrationError("invalid-input");
     }
     let directory: string | undefined;
     let candidate: string | undefined;

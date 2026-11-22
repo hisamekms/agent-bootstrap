@@ -54,7 +54,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSyn
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { truncateSync } from 'node:fs';
-const require_truncate = (p) => truncateSync(p, 1024 * 1024 * 1024 + 1);
+const require_truncate = (p) => truncateSync(p, 512 * 1024 * 1024 + 1);
 const guests = ${JSON.stringify(guests)};
 const mode = readFileSync(${JSON.stringify(mode)}, 'utf8');
 const args = process.argv.slice(2);

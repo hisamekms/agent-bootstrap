@@ -38,6 +38,7 @@ type IntegrationGit = Pick<
   | "cleanupWorkspace"
   | "createCandidateTree"
   | "listTree"
+  | "protectedPaths"
 >;
 
 /** Extra sandbox inputs for model-driven roles. Verification gets none. */
@@ -412,6 +413,11 @@ export class ReviewedIntegration {
     ];
   }
 
+  #fileExpectation() {
+    const { path } = this.#plan;
+    return path === undefined ? undefined : { path };
+  }
+
   #suiteFiles(): SandboxFile[] {
     return (this.#plan.verification.suite ?? []).map((file) => ({
       path: SUITE_PREFIX + file.path,
@@ -482,7 +488,7 @@ export class ReviewedIntegration {
     let diff: Uint8Array;
     try {
       candidate = await this.#git.createCandidate(base, path, workerBytes);
-      diff = await this.#git.diff(base, candidate);
+      diff = await this.#git.diff(base, candidate, { path });
     } catch (error) {
       const cleanup = (error as { cleanupFailed?: boolean } | null)
         ?.cleanupFailed
@@ -672,7 +678,11 @@ export class ReviewedIntegration {
     const pin = candidatePin(events, await this.#target());
     if (events.at(-1)?.kind !== "candidate.created")
       throw new Error("Candidate review has already been attempted");
-    const diff = await this.#git.diff(pin.base, pin.candidate);
+    const diff = await this.#git.diff(
+      pin.base,
+      pin.candidate,
+      this.#fileExpectation(),
+    );
     if (sha256(diff) !== pin.digest)
       throw new Error("Candidate evidence does not match its durable pin");
     const append = this.#writer(events.length);
@@ -709,7 +719,31 @@ export class ReviewedIntegration {
     return { ...pin, review };
   }
 
-  async decide(pin: PinnedCandidate, decision: Decision): Promise<void> {
+  #protectedPaths(pin: PinnedCandidate): Promise<string[]> {
+    return this.#git.protectedPaths(
+      pin.base,
+      pin.candidate,
+      this.#plan.tree?.protectedPaths ?? [],
+    );
+  }
+
+  /** Return the protected paths of the current pinned tree candidate. */
+  async protectedPaths(pin: PinnedCandidate): Promise<string[]> {
+    if (!this.#plan.tree) return [];
+    const expected = candidatePin(
+      await this.#journal.read(),
+      await this.#target(),
+    );
+    if (!samePin(pin, expected))
+      throw new Error("Candidate evidence does not match its durable pin");
+    return this.#protectedPaths(expected);
+  }
+
+  async decide(
+    pin: PinnedCandidate,
+    decision: Decision,
+    options?: { acknowledgeProtected?: readonly string[] },
+  ): Promise<void> {
     const events = await this.#journal.read();
     const expected = latestPin(events, await this.#target());
     if (
@@ -719,10 +753,30 @@ export class ReviewedIntegration {
       (decision === "approve" && expected.review !== "pass")
     )
       throw new Error("Human decision does not match an eligible review");
+    let protectedDigest: string | undefined;
+    if (decision === "approve" && this.#plan.tree) {
+      const paths = await this.#protectedPaths(expected.pin);
+      if (paths.length) {
+        const acknowledged = options?.acknowledgeProtected;
+        if (
+          !Array.isArray(acknowledged) ||
+          acknowledged.some((path) => typeof path !== "string")
+        )
+          throw new Error("Human decision does not match an eligible review");
+        const sorted = [...new Set(acknowledged)].sort();
+        if (
+          sorted.length !== paths.length ||
+          paths.some((path, i) => path !== sorted[i])
+        )
+          throw new Error("Human decision does not match an eligible review");
+        protectedDigest = sha256(JSON.stringify(paths));
+      }
+    }
     await this.#journal.append(events.length, {
       kind: "human.decided",
       ...expected.pin,
       decision,
+      ...(protectedDigest ? { protectedDigest } : {}),
     });
   }
 
@@ -746,7 +800,21 @@ export class ReviewedIntegration {
       await append({ kind: "denied", reason: "stale-base" });
       return "denied";
     }
-    const diff = await this.#git.diff(pin.base, pin.candidate);
+    if (this.#plan.tree) {
+      const paths = await this.#protectedPaths(pin);
+      if (
+        paths.length &&
+        last.protectedDigest !== sha256(JSON.stringify(paths))
+      ) {
+        await append({ kind: "denied", reason: "no-approval" });
+        return "denied";
+      }
+    }
+    const diff = await this.#git.diff(
+      pin.base,
+      pin.candidate,
+      this.#fileExpectation(),
+    );
     if (sha256(diff) !== pin.digest) {
       await append({ kind: "denied", reason: "evidence" });
       return "denied";
@@ -794,7 +862,7 @@ export class ReviewedIntegration {
     }
     await append({ kind: "integration.authorized", ...pin });
     try {
-      await this.#git.advance(pin.base, pin.candidate);
+      await this.#git.advance(pin.base, pin.candidate, this.#fileExpectation());
     } catch (error) {
       if ((error as { code?: string } | null)?.code === "stale-base") {
         await append({ kind: "denied", reason: "stale-base" });

@@ -65,6 +65,7 @@ export const MICROSANDBOX_LIMITS = {
   gitDirBytes: 2 * 1024 * 1024 * 1024,
   gitDirEntries: 200_000,
   treeBytes: 1024 * 1024 * 1024,
+  collectedTreeBytes: 512 * 1024 * 1024,
   treeStepTimeoutMs: 120_000,
 } as const;
 
@@ -850,9 +851,11 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       );
       if (copied.failure || copied.code !== 0)
         throw new SandboxRuntimeError(copied.failure ?? "collection-failed");
+      // msb copy writes the guest-controlled tar before this size check.
+      // Streaming the tar into the parser is future work.
       const info = await lstat(staging).catch(() => null);
       if (!info?.isFile()) throw new SandboxRuntimeError("collection-failed");
-      if (info.size > MICROSANDBOX_LIMITS.treeBytes)
+      if (info.size > MICROSANDBOX_LIMITS.collectedTreeBytes)
         throw new SandboxRuntimeError("output-limit");
       const tree = new Uint8Array(await readFile(staging));
       await rm(staging, { force: true });

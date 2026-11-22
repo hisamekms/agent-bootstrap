@@ -335,7 +335,11 @@ test("createCandidateTree builds add, modify, delete, mode and symlink changes",
       { path: "new/dir/file.txt", mode: "100644", bytes: Buffer.from("n\n") },
       { path: "README.md", mode: "100644", bytes: Buffer.from("changed\n") },
       { path: "run.sh", mode: "100644", bytes: Buffer.from("#!/bin/sh\n") },
-      { path: "ln", mode: "120000", bytes: Buffer.from("new/dir/file.txt") },
+      {
+        path: "new/ln",
+        mode: "120000",
+        bytes: Buffer.from("../new/./dir/file.txt"),
+      },
       { path: "docs/d.md", deleted: true },
     ],
     "Worker proposal ✓",
@@ -351,13 +355,13 @@ test("createCandidateTree builds add, modify, delete, mode and symlink changes",
   const entries = git(repository, ["ls-tree", "-r", candidate]);
   assert.match(entries, /^100644 blob \w+\tREADME\.md$/m);
   assert.match(entries, /^100644 blob \w+\trun\.sh$/m);
-  assert.match(entries, /^120000 blob \w+\tln$/m);
+  assert.match(entries, /^120000 blob \w+\tnew\/ln$/m);
   assert.match(entries, /^100644 blob \w+\tnew\/dir\/file\.txt$/m);
   assert.doesNotMatch(entries, /docs/);
   assert.equal(git(repository, ["show", `${candidate}:README.md`]), "changed");
   assert.equal(
-    git(repository, ["show", `${candidate}:ln`]),
-    "new/dir/file.txt",
+    git(repository, ["show", `${candidate}:new/ln`]),
+    "../new/./dir/file.txt",
   );
   assert.equal(
     git(repository, [
@@ -377,10 +381,16 @@ test("createCandidateTree single-file candidate works with diff and advance", as
     "m",
   );
   assert.match(
-    Buffer.from(await integration.diff(c3, candidate)).toString("utf8"),
+    Buffer.from(
+      await integration.diff(c3, candidate, { path: "README.md" }),
+    ).toString("utf8"),
     /\+x/,
   );
-  await integration.advance(c3, candidate);
+  await rejects(
+    integration.diff(c3, candidate, { path: "run.sh" }),
+    "invalid-candidate",
+  );
+  await integration.advance(c3, candidate, { path: "README.md" });
   assert.equal(git(repository, ["rev-parse", "main"]), candidate);
 });
 
@@ -441,12 +451,17 @@ test("createCandidateTree rejects unsafe or invalid input", async (t) => {
     ),
     "invalid-input",
   );
+  for (const target of ["", "/README.md", "../../README.md", "a\0b", "a\nb"])
+    await rejects(
+      integration.createCandidateTree(
+        c3,
+        [{ path: "src/l", mode: "120000", bytes: Buffer.from(target) }],
+        "m",
+      ),
+      "invalid-input",
+    );
   await rejects(
-    integration.createCandidateTree(
-      c3,
-      [{ path: "l", mode: "120000", bytes: new Uint8Array() }],
-      "m",
-    ),
+    integration.createCandidateTree(c3, [file("SRC/new.ts")], "m"),
     "invalid-input",
   );
   // D/F conflict fails closed in git.
@@ -499,11 +514,49 @@ test("diff and advance accept multi-file candidates and listTree lists the base"
   const listing = Buffer.from(await integration.listTree(c3)).toString();
   assert.match(listing, /^100644 blob [0-9a-f]{40}\tREADME\.md\0/);
   assert.match(listing, /\tsrc\/lib\/x\.ts\0/);
+  const expectation = { path: "README.md" };
+  await rejects(
+    integration.diff(c3, candidate, expectation),
+    "invalid-candidate",
+  );
+  await rejects(
+    integration.advance(c3, candidate, expectation),
+    "invalid-candidate",
+  );
+  assert.equal(await integration.head(), c3);
   await integration.advance(c3, candidate);
   assert.equal(git(repository, ["rev-parse", "main"]), candidate);
 });
 
-test("diff refuses gitlinks, type changes, extra parents and empty candidates", async (t) => {
+test("review diff shows text even when base attributes mark it binary", async (t) => {
+  const { integration, repository, c3 } = await fixture(t);
+  const base = await integration.createCandidateTree(
+    c3,
+    [
+      {
+        path: ".gitattributes",
+        mode: "100644",
+        bytes: Buffer.from("* -diff\n"),
+      },
+    ],
+    "base attributes",
+  );
+  const candidate = await integration.createCandidate(
+    base,
+    "README.md",
+    Buffer.from("review this change\n"),
+  );
+  assert.match(
+    git(repository, ["-c", `attr.tree=${base}`, "diff", base, candidate]),
+    /Binary files/,
+  );
+  const patch = Buffer.from(
+    await integration.diff(base, candidate, { path: "README.md" }),
+  ).toString();
+  assert.match(patch, /^-readme 3\n\+review this change$/m);
+});
+
+test("diff refuses unsafe tree entries, extra parents and empty candidates", async (t) => {
   const { integration, repository, c1, c3 } = await fixture(t);
   const commitWith = (path: string, entry: string, parents = [c3]) => {
     const index = join(repository, `idx-${path.replace(/\W/g, "")}`);
@@ -522,7 +575,14 @@ test("diff refuses gitlinks, type changes, extra parents and empty candidates", 
   const blob = git(repository, ["hash-object", "-w", "--stdin"], "z");
   const gitlink = commitWith("sub", `160000,${c1},sub`);
   const typeChange = commitWith("run.sh", `120000,${blob},run.sh`);
+  const absolute = git(
+    repository,
+    ["hash-object", "-w", "--stdin"],
+    "/README.md",
+  );
+  const unsafeSymlink = commitWith("new-link", `120000,${absolute},new-link`);
+  const collision = commitWith("SRC/n", `100644,${blob},SRC/n`);
   const merge = commitWith("n", `100644,${blob},n`, [c3, c1]);
-  for (const bad of [gitlink, typeChange, merge, c3])
+  for (const bad of [gitlink, typeChange, unsafeSymlink, collision, merge, c3])
     await assert.rejects(integration.diff(c3, bad), /invalid-candidate/);
 });

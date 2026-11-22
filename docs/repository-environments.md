@@ -27,8 +27,11 @@ Decided on 2026-11-22.
   added and deleted files, and mode changes) and creates the candidate commit
   itself, with the host as author. The Worker may propose a bounded commit
   message, which is treated as untrusted text. `.git` is never collected.
-  Path policy rejects changes outside the allowed paths and highlights
-  protected paths on the approval screen.
+  Path policy rejects changes outside the allowed paths. Scope and protected
+  paths match after NFC normalization and lowercasing, an approximation of
+  APFS case-insensitive folding. A trailing slash matches a directory prefix.
+  Files and directory prefixes in the resulting tree must have distinct folded
+  names wherever their original names differ.
 - **Git in the VM.** The workspace includes a git repository for the
   Worker's own use, for example `git diff`, `git log`, `git blame` and
   `git stash`. The host never reads it.
@@ -51,6 +54,20 @@ The result path and git in the VM are implemented. The pieces are
 collection in the adapter, `src/workspace-tree.ts`, and the `tree` plan in
 `src/reviewed-integration.ts`. The Worker's proposed commit message is not
 implemented yet; the host writes a fixed message.
+
+Before approval, the operator interface must show the exact paths returned
+by `ReviewedIntegration.protectedPaths(pin)` alongside the pinned review
+diff. The host recomputes the list from the pinned base and candidate. It
+includes changes covered by the plan's `protectedPaths` and all new or
+retargeted symlinks. Symlink targets must be relative and stay within the
+repository when resolved lexically from the link's directory. NUL and newline
+characters are forbidden in targets.
+
+When the list is non-empty, the operator must explicitly acknowledge the
+whole list. The interface passes those paths through
+`decide(pin, "approve", { acknowledgeProtected: paths })`. The host requires
+an exact match as a set and records a digest of the acknowledged paths.
+Rejection needs no acknowledgement.
 
 On 2026-11-23, `spike/workspace/tree-smoke.ts` ran in real VMs with the
 `browser` profile for Worker and verification:

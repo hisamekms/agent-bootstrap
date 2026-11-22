@@ -157,6 +157,41 @@ test("add, modify, delete, mode change, symlink", () => {
   );
   assert.equal(new TextDecoder().decode(d.changes[2]!.bytes), "a.txt");
   assert.deepEqual(d.deletions, ["gone.txt"]);
+  assert.deepEqual(d.protected, ["ln"]);
+});
+
+test("symlinks must resolve within the repository and retargeting is protected", () => {
+  const b = base(
+    { "sub/link": "old", same: "file", gone: "file" },
+    { "sub/link": "120000", same: "120000", gone: "120000" },
+  );
+  for (const target of [
+    "/file",
+    "../../file",
+    "../dir/../../file",
+    "bad\nfile",
+    "bad\0file",
+  ]) {
+    assert.throws(
+      () =>
+        diff([], b, {
+          workspace: new Map([
+            ["sub/link", { mode: "120000", bytes: enc.encode(target) }],
+          ]),
+        }),
+      /Unsafe symlink target/,
+    );
+  }
+  const result = diff(
+    [
+      dir("sub"),
+      { name: "sub/link", type: "2", link: "./../dir/../file" },
+      { name: "same", type: "2", link: "file" },
+    ],
+    b,
+  );
+  assert.deepEqual(result.protected, ["sub/link"]);
+  assert.deepEqual(result.deletions, ["gone"]);
 });
 
 test("hardlinks take the target's data", () => {
@@ -169,7 +204,7 @@ test("hardlinks take the target's data", () => {
 
 test("sparse scope semantics", () => {
   const b = base({ "in/a": "a", "in/del": "d", "out/x": "x" });
-  const ok = diff([dir("in"), file("in/a", "a2")], b, { scope: ["in/"] });
+  const ok = diff([dir("in"), file("in/a", "a2")], b, { scope: ["IN/"] });
   assert.deepEqual(
     ok.changes.map((c) => c.path),
     ["in/a"],
@@ -220,7 +255,27 @@ test("case-insensitive collisions are rejected", () => {
   );
   assert.throws(
     () =>
-      diff([file("readme", "a")], base({ README: "x" }), { scope: ["readme"] }),
+      diff([dir("SRC"), file("SRC/new.ts", "a")], base({ "src/old.ts": "x" }), {
+        scope: ["src/new.ts"],
+      }),
+    /collide/,
+  );
+  assert.throws(
+    () =>
+      diff(
+        [
+          dir("src"),
+          file("src/old.ts", "a"),
+          dir("SRC"),
+          file("SRC/new.ts", "b"),
+        ],
+        base({}),
+      ),
+    /collide/,
+  );
+  assert.throws(
+    () =>
+      diff([file("SRC", "a"), dir("src"), file("src/new.ts", "b")], base({})),
     /collide/,
   );
 });
@@ -233,11 +288,17 @@ test("protected paths are reported", () => {
       file("src/a", "a2"),
       file("package.json", "p2"),
       file("bun.lock", "l"),
+      file("café", "c"),
     ],
     b,
-    { protectedPaths: [".github/", "bun.lock", "package.json"] },
+    { protectedPaths: [".GITHUB/", "BUN.LOCK", "package.json", "CAFE\u0301"] },
   );
-  assert.deepEqual(d.protected, [".github/w.yml", "bun.lock", "package.json"]);
+  assert.deepEqual(d.protected, [
+    ".github/w.yml",
+    "bun.lock",
+    "café",
+    "package.json",
+  ]);
 });
 
 test("limits", () => {
