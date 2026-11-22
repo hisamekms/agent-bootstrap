@@ -23,6 +23,8 @@
   `src/model-coordinator.ts` owns the provider-neutral Coordinator model port,
   and `src/codex-app-server.ts` owns its first adapter.
   `src/task-trace.ts` joins one task's journal with the host audit.
+  `src/claude-code.ts` owns the official Claude Code CLI adapter (API-key mode
+  only; see `docs/claude-code-auth.md`).
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and
   milestone evidence. `.codex/` configures development roles and models.

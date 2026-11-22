@@ -602,3 +602,56 @@ test("provider egress passes the credential only to the create process", async (
     (error: SandboxRuntimeError) => error.code === "invalid-input",
   );
 });
+
+test("Anthropic-style provider egress uses x-api-key, a custom port and an upstream CA", async (t) => {
+  const f = await fixture(t);
+  const runtime = new MicrosandboxRuntime({
+    binary: join(f.home, "..", "fake-msb.mjs"),
+    home: f.home,
+    stagingRoot: f.stagingRoot,
+    image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}`,
+    providerHosts: ["host.microsandbox.internal"],
+    credentials: {
+      async withAccessToken(consume) {
+        return consume("fixture-anthropic-key");
+      },
+    },
+  });
+  const handle = await runtime.create({
+    provider: {
+      host: "host.microsandbox.internal",
+      secretEnv: "ANTHROPIC_API_KEY",
+      header: "x-api-key",
+      port: 8443,
+      upstreamCaCertPath: "/tmp/fixture-ca.pem",
+    },
+  });
+  const create = (await f.events()).find(({ args }) => args[0] === "create");
+  assert.ok(create);
+  assert.match(
+    create.args.join(" "),
+    /--net-rule allow@dns --net-rule allow@host:tcp:8443 --tls-intercept --tls-intercept-port 8443 --tls-upstream-ca-cert-for host\.microsandbox\.internal=\/tmp\/fixture-ca\.pem --secret ANTHROPIC_API_KEY:headers=x-api-key@host\.microsandbox\.internal --secret-violation-action block /,
+  );
+  assert.ok(create.envKeys.includes("ANTHROPIC_API_KEY"));
+  assert.doesNotMatch(
+    JSON.stringify(await f.events()),
+    /fixture-anthropic-key/,
+  );
+  await runtime.destroy(handle);
+  for (const provider of [
+    { header: "cookie" },
+    { port: 0 },
+    { upstreamCaCertPath: "relative.pem" },
+    { upstreamCaCertPath: "/tmp/a=b.pem" },
+  ])
+    await assert.rejects(
+      runtime.create({
+        provider: {
+          host: "host.microsandbox.internal",
+          secretEnv: "ANTHROPIC_API_KEY",
+          ...provider,
+        } as never,
+      }),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+});

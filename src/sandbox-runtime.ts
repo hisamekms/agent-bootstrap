@@ -16,6 +16,13 @@ export interface SandboxTool {
 export interface SandboxProvider {
   readonly host: string;
   readonly secretEnv: string;
+  /** Request header that receives the credential. Default: `authorization`. */
+  readonly header?: "authorization" | "x-api-key";
+  /** HTTPS port. Default: 443. */
+  readonly port?: number;
+  /** Extra upstream CA for this host, as an absolute host path. Intended for
+   * local verification fixtures that stand in for the provider. */
+  readonly upstreamCaCertPath?: string;
 }
 
 export interface SandboxSpec {
