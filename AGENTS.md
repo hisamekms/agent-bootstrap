@@ -8,7 +8,8 @@
   settings, and public repository creation to the human. Confirm the provisional
   name before remote creation.
 - Follow `CONTRIBUTING.md` for branches, commits, and merges. Treat `main`
-  as protected and commit only on a work branch.
+  as protected and commit only on a work branch. Push a work branch or open
+  a pull request only when the human asks.
 - Use Bun and the checked-in lockfile. Run `bun fmt` before review,
   `bun lint` (Oxlint), `bun typecheck`, `bun run build`, and `bun test`.
   `bun verify` runs acceptance checks without rewriting source. Tests use local
