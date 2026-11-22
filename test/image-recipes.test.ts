@@ -31,16 +31,23 @@ describe("image recipes", () => {
     const pkgs = profilePackages("db");
     const names = pkgs.map((p) => p.name);
     assert.deepEqual(names, [...new Set(names)].sort());
-    const total =
-      FEATURES.sqlite.packages.length + FEATURES.postgres.packages.length;
-    assert.equal(pkgs.length, total);
+    assert.deepEqual(
+      new Map(pkgs.map(({ name, sha256 }) => [name, sha256])),
+      new Map(
+        [
+          ...FEATURES.sqlite.packages,
+          ...FEATURES.postgres.packages,
+          ...FEATURES.git.packages,
+        ].map(({ name, sha256 }) => [name, sha256]),
+      ),
+    );
   });
 
   test("recipe digest is stable and sensitive", () => {
     const first = recipeDigest("db");
     assert.match(first, /^[0-9a-f]{64}$/);
     assert.equal(recipeDigest("db"), first);
-    const feature = FEATURES.sqlite.packages[0] as { sha256: string };
+    const feature = FEATURES.git.packages[0] as { sha256: string };
     const saved = feature.sha256;
     feature.sha256 = "0".repeat(64);
     try {
@@ -78,6 +85,15 @@ describe("image recipes", () => {
     assert.ok(!script.includes("--allow-untrusted"));
     assert.ok(script.includes("--no-network"));
     assert.ok(script.includes("agent-bootstrap-postgres"));
+  });
+
+  test("db smoke checks Git after SQLite and Postgres", () => {
+    const smoke = smokeTest("db");
+    assert.equal(
+      smoke.script.split("\n").at(-1),
+      "git --version >/dev/null && echo git-ok",
+    );
+    assert.deepEqual(smoke.expected, ["1", "1", "git-ok"]);
   });
 
   test("build script excludes runtime state and resets DNS config", () => {
@@ -149,9 +165,10 @@ describe("dedupe", () => {
       name: string;
       sha256: string;
     }[];
+    const packages = profilePackages("db");
     sqlite.push({ ...item });
     try {
-      assert.equal(profilePackages("db").length, 20);
+      assert.deepEqual(profilePackages("db"), packages);
     } finally {
       sqlite.pop();
     }
@@ -254,7 +271,6 @@ describe("browser recipe (Debian snapshot)", () => {
       "browser-ok",
       "git-ok",
     ]);
-    assert.deepEqual(smokeTest("db").expected, ["1", "1"]);
   });
 
   test("lock with and without packages", () => {

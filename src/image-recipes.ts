@@ -153,6 +153,50 @@ export const FEATURES = {
     ],
     setup: POSTGRES_SETUP,
   },
+  git: {
+    packages: [
+      pkg(
+        "git-2.52.1-r0.apk",
+        "b7f80755f78ab9b52f62e5bd3c9d75986e13fced5917ce5348eb9ecb2cad2ab2",
+      ),
+      pkg(
+        "libcurl-8.23.0-r0.apk",
+        "a7cf7d0813d3a96f2cb65fbf873e8a8661866a843f2b7769b629024d9e5809bc",
+      ),
+      pkg(
+        "brotli-libs-1.2.1-r0.apk",
+        "bec9ee522095e9fd01113d8732119847944e3152f228034246a33e2ab82e4195",
+      ),
+      pkg(
+        "c-ares-1.34.9-r0.apk",
+        "2af302c4a232fff2abeb56ec9f16edabdb06f0e5f8d040d6e466e91f1c473d00",
+      ),
+      pkg(
+        "libidn2-2.3.8-r0.apk",
+        "71db3591a2cb251aae463b966f9731c9ecae3bff4dccea552e0033002b92fd75",
+      ),
+      pkg(
+        "libunistring-1.4.1-r0.apk",
+        "03f26b1c897ad74af51b475d5f6cebad50efe90e4d42a0c38ffcb37859077481",
+      ),
+      pkg(
+        "nghttp2-libs-1.69.0-r0.apk",
+        "2e17aa1d7d4a37b2d029210d239b8b2e4ac40748d9a8c8912a6b607011034fd1",
+      ),
+      pkg(
+        "libpsl-0.21.5-r3.apk",
+        "3078398181f0955da453826965a9e184494e4d9dfd22391e28d72f7561a0ca2b",
+      ),
+      pkg(
+        "libexpat-2.10.0-r0.apk",
+        "f6483389ab602a351891337be7e9975106d0749d57aa5339b0725bb4051e4bc3",
+      ),
+      pkg(
+        "pcre2-10.49-r0.apk",
+        "a0af38fe98cb22c358aca1e1e504141c6673efef7635c539a914b83fb5c13b58",
+      ),
+    ],
+  },
 } as const satisfies Record<string, Feature>;
 
 export type FeatureName = keyof typeof FEATURES;
@@ -243,7 +287,7 @@ export const PROFILE_RECIPES: Readonly<
 > = {
   db: {
     base: ALPINE_3_23,
-    features: ["sqlite", "postgres"],
+    features: ["sqlite", "postgres", "git"],
     memoryMiB: 1024,
     cpus: 2,
   },
@@ -449,16 +493,21 @@ export function smokeTest(name: string): {
   script: string;
   expected: string[];
 } {
-  const recipe = recipeFor(name);
-  const db =
-    'sqlite3 :memory: "select 1;"; url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"';
-  if (!(recipe.features as readonly string[]).includes("chromium"))
-    return { script: db, expected: ["1", "1"] };
+  const features: readonly string[] = recipeFor(name).features;
   const script = [
-    db,
-    'out=$(agent-bootstrap-chromium --dump-dom "data:text/html,<p>browser-ok</p>" 2>/dev/null)',
-    'case "$out" in *browser-ok*) echo browser-ok ;; esac',
-    "git --version >/dev/null && echo git-ok",
-  ].join("\n");
-  return { script, expected: ["1", "1", "browser-ok", "git-ok"] };
+    'sqlite3 :memory: "select 1;"; url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"',
+  ];
+  const expected = ["1", "1"];
+  if (features.includes("chromium")) {
+    script.push(
+      'out=$(agent-bootstrap-chromium --dump-dom "data:text/html,<p>browser-ok</p>" 2>/dev/null)',
+      'case "$out" in *browser-ok*) echo browser-ok ;; esac',
+    );
+    expected.push("browser-ok");
+  }
+  if (features.includes("git")) {
+    script.push("git --version >/dev/null && echo git-ok");
+    expected.push("git-ok");
+  }
+  return { script: script.join("\n"), expected };
 }
