@@ -152,6 +152,77 @@ to the bound provider host with the substituted credential. The Codex Worker
 has the same property today. The value itself never enters the guest. This
 needs a security review.
 
+## Building profile images
+
+Each profile is a set of **features**, and composition happens when the image
+is built. A request still names one profile.
+
+| Profile   | Base           | Features                         |
+| --------- | -------------- | -------------------------------- |
+| `db`      | Alpine 3.23    | `sqlite`, `postgres`             |
+| `browser` | Debian (later) | `sqlite`, `postgres`, `chromium` |
+
+A feature recipe lists pinned packages (file name and SHA-256) and an
+optional setup script. The `browser` profile will need Debian variants of
+the `sqlite` and `postgres` recipes, because Playwright does not support
+Alpine.
+
+### Build steps (Alpine)
+
+1. **Check the packages.** The host verifies each package file against its
+   pinned SHA-256. Packages are fetched once from `dl-cdn.alpinelinux.org`
+   into `.local/alpine/v3.23/main/aarch64/`. Fetching needs operator approval.
+2. **Install in a build VM.** A build VM with no network starts from the
+   pinned base image, with the package files copied in. It runs
+   `apk add --no-network` without `--allow-untrusted`, so apk checks each
+   package signature against the Alpine keys in the base image. Then it runs
+   each feature's setup script.
+3. **Export the root filesystem.** The build VM writes the root filesystem as
+   a tar, excluding `/proc`, `/sys`, `/dev` and `/tmp` contents, and the host
+   copies it out with `msb copy`.
+4. **Normalize the layer.** The host rewrites the tar deterministically:
+   entries sorted by path, mtime 0, and ownership and mode kept. Builds of the
+   same inputs then tend to give the same digest. This is best effort: file
+   contents such as account dates may differ.
+5. **Assemble the image.** The host builds an OCI image layout:
+   - one squashed layer;
+   - a config derived from the base config (env, cmd and working directory),
+     with `created` fixed at the epoch;
+   - the manifest.
+
+   The image digest is the manifest digest.
+
+6. **Load the image.** `msb load -t localhost/agent-bootstrap/<profile>@sha256:<digest>`,
+   then `msb image inspect` must report that digest.
+7. **Record the result.** `images/profiles.lock.json` records the reference,
+   the memory and CPU limits, and the inputs (base reference, package
+   digests, recipe digest). The lock file is what a `ProfileCatalog` is built
+   from. Rebuilding is a deliberate lock update.
+
+### Image digest check at run time
+
+Microsandbox does not verify a digest-form local tag. Loading an image with
+`-t name@sha256:<anything>` succeeds, and that reference then boots it
+(observed with 0.7.16 on 2026-11-22). So before every `msb create` the adapter
+runs `msb image inspect --format json <reference>`, and refuses with
+`invalid-input` unless the reported `digest` equals the digest in the
+reference. This also covers registry images, where the reported digest is the
+reference digest.
+
+### PostgreSQL in the `db` image
+
+The `postgres` setup installs `/usr/local/bin/agent-bootstrap-postgres`. It
+does the following:
+
+- creates a fresh data directory with `initdb` (trust authentication, local
+  only);
+- starts the server on `127.0.0.1:5432` and the socket in `/run/postgresql`;
+- waits until the server accepts connections;
+- prints `postgresql://postgres@127.0.0.1:5432/postgres`.
+
+Verification and Worker commands call it when they need a database. The data
+is discarded with the VM.
+
 ## Evidence
 
 On 2026-11-22, `bun verify` passed 114 tests. Two M5 fixture runs in real
@@ -160,6 +231,38 @@ VMs completed with outcome `done`: `all=codex` and
 v4, and every `sandbox.create` request recorded profile `base` with the
 pinned Alpine image digest. Verification was recorded under its own role,
 `Verification`, with no `provider.egress` grant.
+
+On 2026-11-22 the `db` image was built from the pinned packages. Two
+consecutive builds gave the same digest, `45116dcf…` (after the review fixes). Two causes
+of differing digests were fixed first:
+
+- the backend writes the build VM's name into `/etc/hosts` and
+  `/etc/hostname`, and apk logs install times;
+- busybox tar picks which member of a hardlink group (tzdata) is the file by
+  traversal order. The normalized layer now makes the smallest path the
+  file.
+
+The builder also excludes the backend's runtime directories, `/.msb` and
+`/run/microsandbox`, and writes an empty `/etc/resolv.conf`. That file had
+held the backend's internal DNS addresses.
+
+The run-time digest check was confirmed against the real backend. An image
+loaded under a wrong `@sha256:ffff…` tag is still reported by
+`msb image inspect` with its true digest, so the check compares real
+digests.
+
+`spike/images/db-verification-smoke.ts` then ran in real VMs:
+
+- **Valid schema change:** the host-pinned suite applied the candidate to
+  PostgreSQL 18.7 and SQLite 3.53.4 and round-tripped a row in both, with 4
+  passed and 0 failed. The change was integrated.
+- **Broken schema:** verification answered `revise` with 4 failed, and
+  integration was denied.
+- **Audit:** in both runs, Worker and Verification recorded profile `db` with
+  the locked image digest, and the Reviewer recorded `base`.
+
+Toolchains, language packages, the preparer VM and dependency changes are
+planned in `docs/repository-environments.md`.
 
 ## Not in this step
 

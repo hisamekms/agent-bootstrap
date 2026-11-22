@@ -59,6 +59,17 @@ const log = () => appendFileSync(${JSON.stringify(log)}, JSON.stringify(event) +
 const fail = () => { process.stderr.write(${JSON.stringify(diagnostic)}); process.exit(2); };
 if (args[0] === '--version') {
   log(); console.log(mode === 'wrong-version' ? 'msb 0.0.0' : 'msb 0.7.16');
+} else if (args[0] === 'image') {
+  log();
+  const ref = args[args.length - 1];
+  const digest = 'sha256:' + ref.slice(-64);
+  if (mode === 'inspect-fail') fail();
+  else if (mode === 'inspect-mismatch') console.log(JSON.stringify({ digest: 'sha256:' + 'b'.repeat(64) }));
+  else if (mode === 'inspect-malformed') console.log('{not json');
+  else if (mode === 'inspect-missing') console.log(JSON.stringify({ architecture: 'arm64' }));
+  else if (mode === 'inspect-array') console.log(JSON.stringify([{ digest }]));
+  else if (mode === 'inspect-null') console.log('null');
+  else console.log(JSON.stringify({ digest, architecture: 'arm64', layers: [] }));
 } else if (args[0] === 'create') {
   const name = args[args.indexOf('--name') + 1];
   const copy = args[args.indexOf('--copy-dir') + 1];
@@ -754,3 +765,53 @@ test("profiles select the image and resources; unconfigured or malformed profile
   });
   await runtime.destroy(matched);
 });
+
+test("create inspects the image digest before create and rejects any mismatch", async (t) => {
+  const f = await fixture(t);
+  const handle = await f.runtime.create({});
+  const events = await f.events();
+  assert.deepEqual(
+    events.map(({ args }) => args[0]),
+    ["--version", "image", "create"],
+  );
+  assert.deepEqual(events[1]?.args, [
+    "image",
+    "inspect",
+    "--format",
+    "json",
+    image,
+  ]);
+  await f.runtime.destroy(handle);
+  // No caching: a second create inspects again.
+  const again = await f.runtime.create({});
+  await f.runtime.destroy(again);
+  assert.equal(
+    (await f.events()).filter(({ args }) => args[0] === "image").length,
+    2,
+  );
+});
+
+for (const mode of [
+  "inspect-mismatch",
+  "inspect-malformed",
+  "inspect-missing",
+  "inspect-array",
+  "inspect-null",
+  "inspect-fail",
+]) {
+  test(`create refuses before staging when ${mode}`, async (t) => {
+    const f = await fixture(t);
+    await f.setMode(mode);
+    await assert.rejects(
+      f.runtime.create({}),
+      (error: unknown) =>
+        error instanceof SandboxRuntimeError &&
+        error.code ===
+          (mode === "inspect-fail" ? "backend-failure" : "invalid-input") &&
+        !String(error.message).includes(diagnostic),
+    );
+    const events = await f.events();
+    assert.equal(events.filter(({ args }) => args[0] === "create").length, 0);
+    assert.deepEqual(await readdir(f.stagingRoot).catch(() => []), []);
+  });
+}
