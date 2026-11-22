@@ -17,6 +17,32 @@ host prepares everything they need before they run.
   digest-pinned directory mounted read-only, for example a Microsandbox
   volume or a `--mount-dir` mount.
 
+## Worker changes and git history
+
+Decided on 2026-11-22.
+
+- **Result path.** The host places the base tree in the workspace. After the
+  Worker run, the host exports the workspace as a tar and reads it with the
+  strict parser. It computes the changes against the base tree (changed,
+  added and deleted files, and mode changes) and creates the candidate commit
+  itself, with the host as author. The Worker may propose a bounded commit
+  message, which is treated as untrusted text. `.git` is never collected.
+  Path policy rejects changes outside the allowed paths and highlights
+  protected paths on the approval screen.
+- **Git in the VM.** The workspace includes a git repository for the
+  Worker's own use, for example `git diff`, `git log`, `git blame` and
+  `git stash`. The host never reads it.
+- **Full history.** agent-bootstrap provides a full clone of the target
+  branch, without other remotes, hooks or credentials. Shallow clones and
+  answering requests for more history are left to dagq-lite.
+- **Monorepo paths.** Restricting a Worker to some paths is for focus, not
+  confidentiality. The workspace uses sparse checkout for those paths, and
+  the history stays that of the whole repository. Collection still rejects
+  changes outside the allowed paths.
+- **Revisions.** A revision run starts from the previous candidate's tree.
+  The VM repository has the base and the previous candidate as commits, so
+  the Worker can see both what changed in this run and what changed overall.
+
 ## Toolchains as features
 
 - **Features.** A toolchain is a feature, such as `node22`, `bun1.3`,
