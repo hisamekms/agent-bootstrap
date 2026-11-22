@@ -96,17 +96,7 @@ export function canonicalizeIp(value: string): string | undefined {
 
   // WHATWG URL serializes a validated IPv6 literal in compressed hex form.
   const ip = new URL(`http://[${value}]`).hostname.slice(1, -1);
-  const [head = "", tail] = ip.split("::");
-  const leading = head ? head.split(":") : [];
-  const trailing = tail ? tail.split(":") : [];
-  const words =
-    tail === undefined
-      ? leading
-      : [
-          ...leading,
-          ...Array<string>(8 - leading.length - trailing.length).fill("0"),
-          ...trailing,
-        ];
+  const words = ipv6Words(ip);
   const prefix = words.slice(0, 6).join(":");
   if (prefix !== "0:0:0:0:0:ffff" && prefix !== "64:ff9b:0:0:0:0") return ip;
   const high = Number.parseInt(words[6] ?? "0", 16);
@@ -114,17 +104,34 @@ export function canonicalizeIp(value: string): string | undefined {
   return [high >>> 8, high & 255, low >>> 8, low & 255].join(".");
 }
 
+function ipv6Words(ip: string): string[] {
+  const [head = "", tail] = ip.split("::");
+  const leading = head ? head.split(":") : [];
+  const trailing = tail ? tail.split(":") : [];
+  return tail === undefined
+    ? leading
+    : [
+        ...leading,
+        ...Array<string>(8 - leading.length - trailing.length).fill("0"),
+        ...trailing,
+      ];
+}
+
 function isReserved(ip: string): boolean {
   if (ip.includes(":")) {
-    const first = Number.parseInt(ip.split(":", 1)[0] ?? "", 16);
+    const [head = "", second, third, fourth] = ipv6Words(ip);
+    const first = Number.parseInt(head, 16);
     return (
       // Unspecified, loopback and deprecated IPv4-compatible addresses.
       (ip.startsWith("::") && ip.slice(2).split(":").length <= 2) ||
       ip.startsWith("64:ff9b:1:") || // Local-use IPv4/IPv6 translation.
+      (first === 0x100 && second === "0" && third === "0" && fourth === "0") || // Discard-only prefix.
+      first === 0x2002 || // 6to4 can route to an embedded IPv4 endpoint.
+      (first === 0x2001 && second === "0") || // Teredo.
       first >= 0xfc00 // ULA (including the msb pool), link-local, site-local, multicast.
     );
   }
-  const [a = 0, b = 0] = ip.split(".").map(Number);
+  const [a = 0, b = 0, c = 0] = ip.split(".").map(Number);
   return (
     a === 0 ||
     a === 10 ||
@@ -132,9 +139,10 @@ function isReserved(ip: string): boolean {
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0 && c === 0) ||
     (a === 192 && b === 168) ||
-    (a >= 224 && a <= 239) ||
-    ip === "255.255.255.255"
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
   );
 }
 

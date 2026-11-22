@@ -224,6 +224,7 @@ const handshakeReasons = [
   "auth-failed",
   "udp-refused",
   "invalid-destination",
+  "capacity",
 ] as const;
 const dnsAllowReasons = ["allowlisted-host", "host-service"] as const;
 const dnsDenyReasons = ["dns-not-allowlisted", "dns-type-refused"] as const;
@@ -1120,6 +1121,7 @@ export class SqliteAudit implements AuditSink {
   readonly #readOnly: boolean;
   #closed = false;
   #writeFailed = false;
+  readonly #writabilityListeners = new Set<() => void>();
   readonly #version: AuditVersion;
 
   constructor(filename: string, options: { readonly readonly?: boolean } = {}) {
@@ -1196,16 +1198,18 @@ export class SqliteAudit implements AuditSink {
           "SELECT name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
         )
         .all();
-      const expectedSchema = versionSchemas[version];
-      if (
-        installed.length !== expectedSchema.length ||
-        !expectedSchema.every((expected) =>
+      const matchesSchema = (expectedSchema: typeof schemaV5) =>
+        installed.length === expectedSchema.length &&
+        expectedSchema.every((expected) =>
           installed.some((value) => {
             const actual = record(value);
             return actual.name === expected.name && actual.sql === expected.sql;
           }),
-        )
-      )
+        );
+      // v5 was never released without the capacity reason, so an earlier
+      // draft layout is refused by the exact check rather than rewritten:
+      // append-only tables are never rebuilt in place.
+      if (!matchesSchema(versionSchemas[version]))
         throw new AuditStoreError("invalid-database");
       if (
         record(database.query("PRAGMA quick_check").get()).quick_check !== "ok"
@@ -1289,6 +1293,25 @@ export class SqliteAudit implements AuditSink {
     );
   }
 
+  /** Notify subscribers when this store can no longer accept v5 writes. */
+  onV5Unwritable(listener: () => void): () => void {
+    if (!this.isV5Writable) listener();
+    else this.#writabilityListeners.add(listener);
+    return () => this.#writabilityListeners.delete(listener);
+  }
+
+  #notifyV5Unwritable(): void {
+    const listeners = [...this.#writabilityListeners];
+    this.#writabilityListeners.clear();
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch {
+        // A subscriber cannot mask the audit failure or skip other listeners.
+      }
+    }
+  }
+
   #requireWriter(): void {
     if (this.#closed) throw new AuditStoreError("closed");
     if (this.#readOnly) throw new AuditStoreError("read-only");
@@ -1313,6 +1336,7 @@ export class SqliteAudit implements AuditSink {
       } catch {
         /* Connection is quarantined for writes. */
       }
+      this.#notifyV5Unwritable();
       throw new AuditStoreError("append-failed");
     }
   }
@@ -1520,7 +1544,10 @@ export class SqliteAudit implements AuditSink {
       } catch {
         rollbackFailed = true;
       }
-      if (!conflict || rollbackFailed) this.#writeFailed = true;
+      if (!conflict || rollbackFailed) {
+        this.#writeFailed = true;
+        this.#notifyV5Unwritable();
+      }
       throw new AuditStoreError(
         conflict && !rollbackFailed ? "request-conflict" : "append-failed",
       );
@@ -1640,6 +1667,7 @@ export class SqliteAudit implements AuditSink {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#notifyV5Unwritable();
     try {
       this.#database.close();
     } catch {

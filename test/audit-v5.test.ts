@@ -461,6 +461,18 @@ test("a statement failure rolls back the whole network pair and quarantines all 
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
+  let notifications = 0;
+  audit.onV5Unwritable(() => {
+    throw new Error("fixture subscriber");
+  });
+  audit.onV5Unwritable(() => {
+    assert.equal(audit.isV5Writable, false);
+    notifications++;
+  });
+  const unsubscribe = audit.onV5Unwritable(() => {
+    notifications += 100;
+  });
+  unsubscribe();
   withDb(filename, (db) =>
     db.exec(
       "CREATE TRIGGER fail_decision BEFORE INSERT ON network_events WHEN NEW.phase = 'decided' BEGIN SELECT RAISE(ABORT, 'fixture'); END",
@@ -476,6 +488,47 @@ test("a statement failure rolls back the whole network pair and quarantines all 
   ])
     assert.throws(append, errorCode("append-failed"));
   assert.equal(audit.isV5Writable, false);
+  audit.close();
+  assert.equal(notifications, 1);
+  audit.onV5Unwritable(() => notifications++);
+  assert.equal(notifications, 2);
+});
+
+test("a draft v5 layout without the capacity reason is refused, never rebuilt", (t) => {
+  const filename = fixture(t);
+  new Database(filename, { create: true }).close();
+  withDb(filename, (db) => {
+    db.exec("PRAGMA journal_mode=WAL");
+    for (const sql of auditSchemaSql(5))
+      db.exec(sql.replace(",'capacity'", ""));
+    db.exec(`PRAGMA application_id=${0x41424731}; PRAGMA user_version=5`);
+  });
+  // Append-only tables are never rewritten in place: the exact schema check
+  // refuses the draft layout for both readers and writers.
+  assert.throws(() => new SqliteAudit(filename, { readonly: true }));
+  assert.throws(() => new SqliteAudit(filename));
+  withDb(filename, (db) => {
+    const trigger = db
+      .query("SELECT name FROM sqlite_schema WHERE name = ?")
+      .get("network_events_no_update");
+    const copy = db
+      .query("SELECT name FROM sqlite_schema WHERE name = ?")
+      .get("original_network_events");
+    assert.ok(trigger);
+    assert.equal(copy, null);
+  });
+});
+
+test("closing a writable store notifies its subscribers once", (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  let notifications = 0;
+  audit.onV5Unwritable(() => {
+    assert.equal(audit.isV5Writable, false);
+    notifications++;
+  });
+  audit.close();
+  audit.close();
+  assert.equal(notifications, 1);
 });
 
 test("denials remain distinct from missing allowed outcomes and cannot be finished", (t) => {

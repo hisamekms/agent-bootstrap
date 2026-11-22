@@ -143,12 +143,23 @@ describe("egress policy", () => {
     "127.255.255.254",
     "169.254.1.2",
     "172.31.255.255",
+    "192.0.0.0",
+    "192.0.0.255",
     "192.168.1.2",
+    "198.18.0.0",
+    "198.19.255.255",
     "224.0.0.1",
     "239.255.255.255",
+    "240.0.0.0",
     "255.255.255.255",
     "::",
     "::1",
+    "100::",
+    "100::ffff:ffff:ffff:ffff",
+    "2002:0808:0808::1",
+    "2002:7f00:0001::1",
+    "2001::ffff:f7f7:f7f7",
+    "2001:0:4136:e378:8000:63bf:3fff:fdd2",
     "fc00::1",
     "fd42:6d73:62:1::1",
     "fe80::1",
@@ -164,6 +175,8 @@ describe("egress policy", () => {
     "64:ff9b::1",
     "::ffff:1",
     "64:ff9b:1::a9fe:a9fe",
+    "::ffff:198.19.1.2",
+    "64:ff9b::192.0.0.9",
   ])
     test(`reserved ${ip} overrides both IP and hostname allowance`, () => {
       const policy = new EgressPolicy({
@@ -202,6 +215,18 @@ describe("egress policy", () => {
     test(`canonicalizes ${JSON.stringify(input)} without accepting ambiguous forms`, () => {
       assert.equal(canonicalizeIp(input), expected);
     });
+
+  test("does not treat the adjacent IPv6 prefix as discard-only", () => {
+    const ip = "100::1:1:1:1:1";
+    const policy = new EgressPolicy({
+      allow: [],
+      allowIps: [{ ip, port: 443 }],
+    });
+    assert.equal(
+      policy.decideConnect({ ip, port: 443, sandbox }).decision,
+      "allow",
+    );
+  });
 
   test("requires the same sandbox, exact hostname, port, and live TTL", () => {
     let now = 100;

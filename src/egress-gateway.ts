@@ -12,6 +12,7 @@ import type {
   DnsQueryInput,
   NetworkFinishedInput,
   NetworkInput,
+  ResourceEventInput,
 } from "./audit.ts";
 import {
   DNS_MAX_MESSAGE_BYTES,
@@ -49,11 +50,28 @@ const MAX_EARLY_DATA_BYTES = 65536;
 const MAX_ANSWER_TTL = 300;
 type EndReason = NetworkFinishedInput["endReason"];
 type Result = NetworkFinishedInput["result"];
+type QuarantineReason =
+  "audit-failure" | "listener-error" | "rate-limited" | "network-row-limit";
+
 interface AuditSink {
+  readonly isV5Writable?: boolean;
+  onV5Unwritable?(listener: () => void): () => void;
   appendNetwork(input: NetworkInput): void | Promise<void>;
   appendNetworkFinished(input: NetworkFinishedInput): void | Promise<void>;
   appendDnsQuery(input: DnsQueryInput): void | Promise<void>;
+  appendResourceEvent?(input: ResourceEventInput): void | Promise<void>;
 }
+
+const emptyRefusals = {
+  capacity: 0,
+  quarantined: 0,
+  "pre-decision-disconnect": 0,
+  "pre-decision-timeout": 0,
+  "dns-capacity": 0,
+  "dns-malformed": 0,
+  "dns-tcp-framing": 0,
+};
+type RefusalReason = keyof typeof emptyRefusals;
 
 export interface ResolvedAddress {
   readonly address: string;
@@ -77,6 +95,11 @@ export interface EgressGatewayOptions {
     readonly maxPendingHandshakes?: number;
     readonly idleTimeoutMs?: number;
     readonly handshakeTimeoutMs?: number;
+    /** Shared by SOCKS and DNS. Starts full and refills on a monotonic clock. */
+    readonly attemptBurst?: number;
+    readonly attemptsPerSecond?: number;
+    /** Includes requested, decided, finished and DNS rows. */
+    readonly maxNetworkRows?: number;
   };
 }
 
@@ -136,6 +159,11 @@ export class EgressGateway {
   readonly #resolver: NonNullable<EgressGatewayOptions["resolver"]>;
   readonly #defaultResolver: Resolver | undefined;
   readonly #connect: NonNullable<EgressGatewayOptions["connect"]>;
+  readonly #attemptBurst: number;
+  readonly #attemptsPerSecond: number;
+  #tokens: number;
+  #refillAt = performance.now();
+  #remainingRows: number;
 
   readonly #socks = createServer({ allowHalfOpen: true }, (socket) =>
     this.#acceptSocks(socket),
@@ -146,10 +174,12 @@ export class EgressGateway {
   readonly #dnsClients = new Set<Socket>();
   readonly #socksClients = new Set<Socket>();
   readonly #auditWork = new Set<Promise<unknown>>();
+  readonly #refusals = { ...emptyRefusals };
+  #unsubscribeAudit: (() => void) | undefined;
   #dnsQueries = 0;
   #pending = 0;
   #relays = 0;
-  #quarantined = false;
+  #quarantineReason: QuarantineReason | undefined;
   #ready = false;
   #closing: Promise<void> | undefined;
   #socksPort = 0;
@@ -169,6 +199,13 @@ export class EgressGateway {
     this.#handshakeMs = positiveLimit(
       options.limits?.handshakeTimeoutMs ?? 10_000,
     );
+    this.#attemptBurst = positiveLimit(options.limits?.attemptBurst ?? 32);
+    this.#attemptsPerSecond = positiveLimit(
+      options.limits?.attemptsPerSecond ?? 16,
+    );
+    this.#tokens = this.#attemptBurst;
+    // TrustedHost opens one gateway per execution.
+    this.#remainingRows = positiveLimit(options.limits?.maxNetworkRows ?? 4096);
     if (options.resolver) this.#resolver = options.resolver;
     else {
       const resolver = new Resolver({ timeout: DNS_TIMEOUT_MS, tries: 1 });
@@ -186,6 +223,12 @@ export class EgressGateway {
   static async open(options: EgressGatewayOptions): Promise<EgressGateway> {
     const gateway = new EgressGateway(options);
     try {
+      gateway.#unsubscribeAudit = options.audit.onV5Unwritable?.(() =>
+        gateway.#quarantine("audit-failure"),
+      );
+      if (gateway.quarantined) throw new Error("Egress audit is unwritable");
+      for (const listener of [gateway.#socks, gateway.#dnsTcp, gateway.#dnsUdp])
+        listener.on("error", () => gateway.#quarantine("listener-error"));
       gateway.#socksPort = await listen(gateway.#socks);
       gateway.#dnsPort = await listen(gateway.#dnsTcp);
       await new Promise<void>((resolve, reject) => {
@@ -196,10 +239,7 @@ export class EgressGateway {
           resolve();
         });
       });
-      for (const listener of [gateway.#socks, gateway.#dnsTcp, gateway.#dnsUdp])
-        listener.on("error", () => {
-          void gateway.close();
-        });
+      if (gateway.quarantined) throw new Error("Egress gateway quarantined");
       gateway.#dnsUdp.on("message", (message, remote) =>
         gateway.#acceptDnsUdp(message, remote),
       );
@@ -224,7 +264,17 @@ export class EgressGateway {
   }
 
   get quarantined(): boolean {
-    return this.#quarantined;
+    if (this.#options.audit.isV5Writable === false)
+      this.#quarantine("audit-failure");
+    return this.#quarantineReason !== undefined;
+  }
+
+  get quarantineReason(): QuarantineReason | undefined {
+    return this.quarantined ? this.#quarantineReason : undefined;
+  }
+
+  get refusalCounts(): Readonly<typeof emptyRefusals> {
+    return { ...this.#refusals };
   }
 
   #observe<K extends RuntimeEventType>(
@@ -259,28 +309,95 @@ export class EgressGateway {
     return work;
   }
 
-  #quarantine(): void {
-    if (this.#quarantined) return;
-    this.#quarantined = true;
-    this.#options.policy.dnsPins.clear(this.#pinScope);
-    this.#defaultResolver?.cancel();
-    for (const stop of this.#flows) stop("audit-failure");
+  #observeDenial(
+    reasonCode: RefusalReason | QuarantineReason,
+    refusalCount?: number,
+  ): void {
     this.#observe("policy.evaluated", {
       policyId: this.#options.policy.policyId,
       decision: "deny",
-      reasonCode: "audit-failure",
+      reasonCode,
+      ...(refusalCount === undefined ? {} : { refusalCount }),
     });
+  }
+
+  #refuse(reason: RefusalReason): void {
+    const count = this.#refusals[reason];
+    if (count === Number.MAX_SAFE_INTEGER) return;
+    this.#refusals[reason] = count + 1;
+    // Surface the first occurrence without letting a flood amplify telemetry.
+    if (count === 0) this.#observeDenial(reason, 1);
+  }
+
+  #quarantine(reason: QuarantineReason): void {
+    if (this.#quarantineReason) return;
+    this.#quarantineReason = reason;
+    this.#options.policy.dnsPins.clear(this.#pinScope);
+    this.#defaultResolver?.cancel();
+    for (const stop of this.#flows)
+      stop(reason === "audit-failure" ? reason : "error");
+    // Let a pending DNS write report SERVFAIL within its frame deadline.
+    if (reason !== "audit-failure")
+      for (const client of this.#dnsClients) client.destroy();
+    this.#observeDenial(reason);
+  }
+
+  #admit(rows: number): boolean {
+    if (this.quarantined || this.#closing) {
+      this.#refuse("quarantined");
+      return false;
+    }
+    const now = performance.now();
+    this.#tokens = Math.min(
+      this.#attemptBurst,
+      this.#tokens + ((now - this.#refillAt) * this.#attemptsPerSecond) / 1000,
+    );
+    this.#refillAt = now;
+    const reason =
+      this.#tokens < 1
+        ? "rate-limited"
+        : rows > this.#remainingRows
+          ? "network-row-limit"
+          : undefined;
+    if (reason) {
+      // Close flows immediately. Their finish rows were reserved at admission.
+      this.#quarantine(reason);
+      const audit = this.#options.audit;
+      if (audit.isV5Writable !== false && audit.appendResourceEvent)
+        void this.#audit(() =>
+          audit.appendResourceEvent?.({
+            ...this.#identity,
+            kind: "limit-exceeded",
+          }),
+        ).then(
+          () =>
+            this.#observe("resource.limit_exceeded", {
+              kind: "limit-exceeded",
+            }),
+          () => {},
+        );
+      return false;
+    }
+    this.#tokens--;
+    this.#remainingRows -= rows;
+    return true;
   }
 
   #acceptSocks(client: Socket): void {
     if (
       !this.#ready ||
-      this.#quarantined ||
+      this.quarantined ||
       this.#closing ||
       this.#pending >= this.#maxPending ||
       this.#socksClients.size >= this.#maxPending + this.#maxRelays
     ) {
+      client.on("error", () => {});
       client.destroy();
+      this.#refuse(
+        !this.#ready || this.#quarantineReason || this.#closing
+          ? "quarantined"
+          : "capacity",
+      );
       return;
     }
 
@@ -298,6 +415,7 @@ export class EgressGateway {
     let firstEnd: EndReason | undefined;
     let allowed = false;
     let decisionPending = false;
+    let decisionDurable = false;
     let recorded = false;
     let connected = false;
     let bytesSent = 0;
@@ -327,7 +445,7 @@ export class EgressGateway {
         },
         () => {
           releaseSlot();
-          this.#quarantine();
+          this.#quarantine("audit-failure");
         },
       );
     };
@@ -344,6 +462,15 @@ export class EgressGateway {
       result?: Result,
     ) => {
       if (outcome) return;
+      if (!decisionDurable) {
+        if (endReason === "idle-timeout") this.#refuse("pre-decision-timeout");
+        if (
+          !reply &&
+          !this.#quarantineReason &&
+          (endReason === "client-closed" || endReason === "error")
+        )
+          this.#refuse("pre-decision-disconnect");
+      }
       outcome = {
         endReason,
         result: result ?? (connected ? "connected" : "refused"),
@@ -361,7 +488,11 @@ export class EgressGateway {
       recordOutcome();
     };
 
-    const endFlow = (reason: EndReason) => stop(reason);
+    const endFlow = (reason: EndReason) => {
+      // A pending decision has no upstream. Its catch can return a failure
+      // reply, and the handshake deadline still bounds the socket lifetime.
+      if (reason !== "audit-failure" || !decisionPending) stop(reason);
+    };
     this.#flows.add(endFlow);
     const timeout = () =>
       stop(
@@ -378,11 +509,13 @@ export class EgressGateway {
     };
 
     const relay = (socket: Socket, earlyData: Uint8Array) => {
+      if (this.quarantined || this.#closing || outcome) return;
       connected = true;
       touch();
       const transfer = (source: Socket, target: Socket, chunk: Uint8Array) => {
         if (
           outcome ||
+          this.quarantined ||
           this.#closing ||
           target.destroyed ||
           target.writableEnded
@@ -394,6 +527,7 @@ export class EgressGateway {
         if (!target.write(chunk)) source.pause();
       };
       const forwardEnd = (target: Socket, reason: EndReason) => {
+        if (outcome || this.quarantined || this.#closing) return;
         firstEnd ??= reason;
         target.end();
       };
@@ -443,6 +577,7 @@ export class EgressGateway {
       destination?: IpPort,
       earlyData: Uint8Array = new Uint8Array(),
     ) => {
+      if (!this.#admit(decision.decision === "allow" ? 3 : 2)) return;
       client.pause();
       client.removeListener("data", handshake);
       reader.close();
@@ -463,11 +598,12 @@ export class EgressGateway {
         // Queue this refusal before closing the other flows.
         stop("audit-failure", encodeSocks5Failure(stage));
         recordOutcome();
-        this.#quarantine();
+        this.#quarantine("audit-failure");
         return;
       }
 
       decisionPending = false;
+      decisionDurable = true;
       allowed = decision.decision === "allow";
       const eventTarget =
         target.destinationIp === undefined
@@ -485,13 +621,23 @@ export class EgressGateway {
         ...eventTarget,
       };
       this.#observe("network.connect.requested", eventConnection);
-      this.#observe("network.connect.decided", {
-        ...eventConnection,
-        decision: decision.decision,
-        reasonCode: decision.reasonCode,
-        policyId,
-      } as RuntimeEventPayloads["network.connect.decided"]);
-      if (this.#closing && !outcome) stop("sandbox-destroyed");
+      if (decision.reasonCode === "capacity") this.#observeDenial("capacity");
+      else
+        this.#observe("network.connect.decided", {
+          ...eventConnection,
+          decision: decision.decision,
+          reasonCode: decision.reasonCode,
+          policyId,
+        } as RuntimeEventPayloads["network.connect.decided"]);
+      const quarantineReason = this.quarantineReason;
+      if (quarantineReason || this.#closing)
+        stop(
+          quarantineReason === "audit-failure"
+            ? quarantineReason
+            : quarantineReason
+              ? "error"
+              : "sandbox-destroyed",
+        );
       if (outcome) recordOutcome();
       else if (allowed && destination) {
         // An asynchronous audit may outlive the DNS authorization it records.
@@ -528,8 +674,7 @@ export class EgressGateway {
       if (
         message.command !== 1 ||
         !ip ||
-        earlyData.length > MAX_EARLY_DATA_BYTES ||
-        this.#relays >= this.#maxRelays
+        earlyData.length > MAX_EARLY_DATA_BYTES
       ) {
         const reasonCode =
           message.command === 3 ? "udp-refused" : "invalid-destination";
@@ -546,6 +691,14 @@ export class EgressGateway {
         sandbox: this.#pinScope,
       });
       if (decision.decision === "allow") {
+        if (this.#relays >= this.#maxRelays) {
+          void decide(
+            { decision: "deny", reasonCode: "capacity" },
+            target,
+            encodeSocks5Reply(2),
+          );
+          return;
+        }
         releaseSlot();
         slot = "relay";
         this.#relays++;
@@ -579,6 +732,7 @@ export class EgressGateway {
       );
     };
     function handshake(chunk: Uint8Array): void {
+      if (!canHandshake()) return;
       let tail = chunk;
       while (tail.length) {
         let read: ReturnType<Socks5HandshakeReader["read"]>;
@@ -622,6 +776,7 @@ export class EgressGateway {
     }
     const expectedUsername = this.#username;
     const expectedPassword = this.#password;
+    const canHandshake = () => !this.quarantined && !this.#closing;
     client.on("data", handshake);
     client.on("error", () => stop("error"));
     client.on("close", () => {
@@ -638,33 +793,81 @@ export class EgressGateway {
     if (
       !this.#ready ||
       this.#closing ||
-      this.#quarantined ||
+      this.quarantined ||
       this.#dnsClients.size >= this.#maxPending
     ) {
+      this.#refuse(
+        !this.#ready || this.#closing || this.#quarantineReason
+          ? "quarantined"
+          : "capacity",
+      );
       client.destroy();
       return;
     }
     this.#dnsClients.add(client);
-    client.once("close", () => this.#dnsClients.delete(client));
-    client.setTimeout(this.#handshakeMs, () => client.destroy());
+    let awaitingDecision = true;
+    let deadline: number;
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = () => {
+      if (awaitingDecision) this.#refuse("pre-decision-timeout");
+      awaitingDecision = false;
+      client.destroy();
+    };
+    const startFrame = () => {
+      deadline = performance.now() + this.#handshakeMs;
+      timer = setTimeout(timeout, this.#handshakeMs);
+    };
+    const available = () => {
+      if (client.destroyed) return false;
+      if (performance.now() < deadline) return true;
+      timeout();
+      return false;
+    };
+    startFrame();
+    client.once("close", () => {
+      clearTimeout(timer);
+      this.#dnsClients.delete(client);
+      if (awaitingDecision && !this.#closing && !this.#quarantineReason)
+        this.#refuse("pre-decision-disconnect");
+    });
     const reader = new DnsTcpFrameReader();
     const consume = async (chunk: Uint8Array) => {
       client.pause();
       try {
         let tail = chunk;
-        while (tail.length && !client.destroyed && !this.#closing) {
-          if (this.#quarantined) break;
-          const { bytesRead, message } = reader.read(tail);
+        while (
+          tail.length &&
+          available() &&
+          !this.#closing &&
+          !this.quarantined
+        ) {
+          awaitingDecision = true;
+          let frame: ReturnType<DnsTcpFrameReader["read"]>;
+          try {
+            frame = reader.read(tail);
+          } catch {
+            awaitingDecision = false;
+            this.#refuse("dns-tcp-framing");
+            client.destroy();
+            return;
+          }
+          const { bytesRead, message } = frame;
           tail = tail.subarray(bytesRead);
           if (!message) break;
           await this.#answerDns(
             message,
             "tcp",
-            () => !client.destroyed,
+            available,
             (reply) => sendDnsTcp(client, reply),
+            () => {
+              awaitingDecision = false;
+            },
           );
+          clearTimeout(timer);
+          if (client.destroyed) return;
+          startFrame();
         }
-        if (this.#quarantined) client.destroy();
+        if (this.quarantined) client.destroy();
         else client.resume();
       } catch {
         client.destroy();
@@ -694,14 +897,26 @@ export class EgressGateway {
     protocol: "tcp" | "udp",
     clientAvailable: () => boolean,
     send: (reply: Uint8Array) => Promise<boolean>,
+    settled?: () => void,
   ): Promise<void> {
-    if (
-      this.#closing ||
-      this.#quarantined ||
-      this.#dnsQueries >= this.#maxPending
-    )
+    if (this.#closing || this.quarantined) {
+      this.#refuse("quarantined");
       return;
-    const question = parseDnsQuestion(bytes);
+    }
+    if (this.#dnsQueries >= this.#maxPending) {
+      this.#refuse("dns-capacity");
+      settled?.();
+      return;
+    }
+    let question: DnsQuestion;
+    try {
+      question = parseDnsQuestion(bytes);
+    } catch (error) {
+      this.#refuse("dns-malformed");
+      settled?.();
+      if (protocol === "tcp") throw error;
+      return;
+    }
     const qname = question.qname.toLowerCase();
     // Match the durable audit's hostname schema. Drop queries it cannot store.
     if (
@@ -709,8 +924,13 @@ export class EgressGateway {
       !qname
         .split(".")
         .every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
-    )
+    ) {
+      this.#refuse("dns-malformed");
+      settled?.();
+      if (protocol === "tcp") throw new Error("Invalid DNS hostname");
       return;
+    }
+    if (!this.#admit(1)) return;
 
     this.#dnsQueries++;
     try {
@@ -727,7 +947,7 @@ export class EgressGateway {
               maxBytes,
             )
           : { code: decision.response };
-      if (this.#closing || this.#quarantined || !clientAvailable()) return;
+      if (this.#closing || this.quarantined || !clientAvailable()) return;
       const reply = encodeDnsResponse(question, response, maxBytes);
       const answerIps =
         response.code === "NOERROR"
@@ -756,20 +976,21 @@ export class EgressGateway {
           this.#options.audit.appendDnsQuery({ ...this.#identity, ...query }),
         );
       } catch {
-        this.#quarantine();
+        this.#quarantine("audit-failure");
         if (!this.#closing && clientAvailable())
           await send(
             encodeDnsResponse(question, { code: "SERVFAIL" }, maxBytes),
           );
         return;
       }
+      settled?.();
       this.#observe("network.dns.query", query);
-      if (this.#closing || this.#quarantined || !clientAvailable()) return;
+      if (this.#closing || this.quarantined || !clientAvailable()) return;
       const sent = await send(reply);
       if (
         sent &&
         !this.#closing &&
-        !this.#quarantined &&
+        !this.quarantined &&
         response.code === "NOERROR" &&
         decision.decision === "allow"
       ) {
@@ -855,6 +1076,11 @@ export class EgressGateway {
         }),
       ]);
       while (this.#auditWork.size) await Promise.allSettled(this.#auditWork);
+      this.#unsubscribeAudit?.();
+      for (const reason of Object.keys(emptyRefusals) as RefusalReason[]) {
+        const count = this.#refusals[reason];
+        if (count > 1) this.#observeDenial(reason, count);
+      }
     }));
   }
 }

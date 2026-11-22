@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   type DnsQueryInput,
   type NetworkFinishedInput,
   type NetworkInput,
+  type ResourceEventInput,
 } from "../src/audit.ts";
 import { encodeDnsTcpFrame } from "../src/dns-wire.ts";
 import {
@@ -44,9 +46,11 @@ async function until(condition: () => boolean): Promise<void> {
 }
 
 class FakeAudit {
+  isV5Writable = true;
   readonly decisions: NetworkInput[] = [];
   readonly outcomes: NetworkFinishedInput[] = [];
   readonly queries: DnsQueryInput[] = [];
+  readonly resources: ResourceEventInput[] = [];
   decide?: () => void | Promise<void>;
   finish?: () => void | Promise<void>;
   dns?: () => void | Promise<void>;
@@ -64,6 +68,10 @@ class FakeAudit {
   appendDnsQuery(input: DnsQueryInput) {
     this.queries.push(input);
     return this.dns?.();
+  }
+
+  appendResourceEvent(input: ResourceEventInput) {
+    this.resources.push(input);
   }
 }
 
@@ -568,14 +576,207 @@ test("enforces handshake and relay limits and records idle timeout", async (t) =
   const first = await authenticate(t, proxy);
   const extra = socketClient(t, proxy.socksPort);
   await until(() => extra.closed);
+  assert.equal(proxy.refusalCounts.capacity, 1);
   first.socket.write(request(ipv4));
   assert.equal((await first.read(10))[1], 0);
   const over = await authenticate(t, proxy);
   over.socket.write(request(ipv4));
   assert.equal((await over.read(10))[1], 2);
+  assert.equal(audit.decisions[1]?.reasonCode, "capacity");
   await until(() => first.closed && audit.outcomes.length === 1);
   assert.equal(audit.outcomes[0]?.result, "timeout");
   assert.equal(audit.outcomes[0]?.endReason, "idle-timeout");
+});
+
+test("a shared SQLite write failure stops relays in both gateways", async (t) => {
+  const port = await echo(t);
+  const directory = mkdtempSync(join(tmpdir(), "bootstrap-gateway-shared-"));
+  const filename = join(directory, "audit.sqlite");
+  const audit = new SqliteAudit(filename);
+  t.after(() => {
+    audit.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const clients: TcpClient[] = [];
+  const proxies: EgressGateway[] = [];
+  for (const _ of [0, 1]) {
+    const { proxy } = await gateway(t, {
+      audit,
+      policy: ipPolicy(),
+      connect: () => connect(port, loopback),
+    });
+    proxies.push(proxy);
+    const client = await authenticate(t, proxy);
+    client.socket.write(request(ipv4));
+    assert.equal((await client.read(10))[1], 0);
+    clients.push(client);
+  }
+  const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
+    Database: new (path: string) => { exec(sql: string): void; close(): void };
+  };
+  const fault = new Database(filename);
+  try {
+    fault.exec(
+      "CREATE TRIGGER fail_decision BEFORE INSERT ON network_events WHEN NEW.phase = 'decided' BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+    );
+  } finally {
+    fault.close();
+  }
+  const trigger = await authenticate(t, proxies[0]!);
+  trigger.socket.write(request(ipv4));
+  assert.equal((await trigger.read(10))[1], 1);
+  await until(() => clients.every((client) => client.closed));
+  assert.deepEqual(
+    proxies.map((proxy) => proxy.quarantineReason),
+    ["audit-failure", "audit-failure"],
+  );
+});
+
+test("DNS TCP reports an audit failure with SERVFAIL and closes", async (t) => {
+  const { proxy, audit } = await gateway(t);
+  audit.dns = failWrite;
+  const client = socketClient(t, proxy.dnsPort);
+  client.socket.write(encodeDnsTcpFrame(question(hostname)));
+  const length = (await client.read(2)).readUInt16BE();
+  const reply = await client.read(length);
+  assert.equal(reply[3]! & 15, 2);
+  assert.equal(reply.readUInt16BE(6), 0);
+  await until(() => client.closed);
+});
+
+test("counts TCP clients disconnecting before their first decision", async (t) => {
+  const { proxy } = await gateway(t);
+  for (const port of [proxy.socksPort, proxy.dnsPort]) {
+    const client = socketClient(t, port);
+    await once(client.socket, "connect");
+    client.socket.end();
+    await until(() => client.closed);
+  }
+  assert.equal(proxy.refusalCounts["pre-decision-disconnect"], 2);
+});
+
+test("relay transfer checks writability even without a notification", async (t) => {
+  const port = await echo(t);
+  const { proxy, audit } = await gateway(t, {
+    policy: ipPolicy(),
+    connect: () => connect(port, loopback),
+  });
+  const client = await authenticate(t, proxy);
+  client.socket.write(request(ipv4));
+  assert.equal((await client.read(10))[1], 0);
+  audit.isV5Writable = false;
+  client.socket.write("must not be relayed");
+  await until(() => client.closed && audit.outcomes.length === 1);
+  assert.equal(audit.outcomes[0]?.endReason, "audit-failure");
+  assert.equal(audit.outcomes[0]?.bytesSent, 0);
+  assert.equal(client.buffer.length, 0);
+});
+
+test("SOCKS and DNS share one rate budget and log a single limit marker", async (t) => {
+  const port = await echo(t);
+  const { proxy, audit, events } = await gateway(t, {
+    policy: ipPolicy(),
+    connect: () => connect(port, loopback),
+    limits: { attemptBurst: 2, attemptsPerSecond: 1 },
+  });
+  const client = await authenticate(t, proxy);
+  client.socket.write(request(ipv4));
+  assert.equal((await client.read(10))[1], 0);
+  await dnsUdp(t, proxy, question("denied.example")).read();
+  dnsUdp(t, proxy, question("denied.example"));
+  await until(() => client.closed && audit.resources.length === 1);
+  const refused = socketClient(t, proxy.socksPort);
+  await until(() => refused.closed && proxy.refusalCounts.quarantined === 1);
+  assert.equal(proxy.quarantineReason, "rate-limited");
+  assert.equal(audit.queries.length, 1);
+  assert.equal(audit.resources.length, 1);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.eventType === "policy.evaluated" &&
+        event.payload.reasonCode === "rate-limited",
+    ),
+  );
+});
+
+test("the row cap reserves an allowed relay's finish even during quarantine", async (t) => {
+  const port = await echo(t);
+  const { proxy, audit } = await gateway(t, {
+    policy: ipPolicy(),
+    connect: () => connect(port, loopback),
+    limits: { maxNetworkRows: 4 },
+  });
+  const relay = await authenticate(t, proxy);
+  relay.socket.write(request(ipv4));
+  assert.equal((await relay.read(10))[1], 0);
+  await dnsUdp(t, proxy, question("denied.example")).read();
+  const over = await authenticate(t, proxy);
+  over.socket.write(request(ipv4));
+  await until(
+    () => relay.closed && over.closed && audit.resources.length === 1,
+  );
+  assert.equal(proxy.quarantineReason, "network-row-limit");
+  assert.equal(audit.decisions.length, 1);
+  assert.equal(audit.queries.length, 1);
+  assert.equal(audit.outcomes.length, 1);
+});
+
+test("counts DNS capacity, malformed names and TCP framing refusals", async (t) => {
+  const hold = Promise.withResolvers<[]>();
+  const resolving = Promise.withResolvers<void>();
+  const { proxy, audit, events } = await gateway(t, {
+    resolver: () => {
+      resolving.resolve();
+      return hold.promise;
+    },
+    limits: { maxPendingHandshakes: 1 },
+  });
+  const first = dnsUdp(t, proxy, question(hostname));
+  try {
+    await resolving.promise;
+    const over = dnsUdp(t, proxy, question(hostname));
+    await until(() => proxy.refusalCounts["dns-capacity"] === 1);
+    assert.equal(over.messages.length, 0);
+  } finally {
+    hold.resolve([]);
+  }
+  await first.read();
+  dnsUdp(t, proxy, question("bad_label.example"));
+  dnsUdp(t, proxy, question("-bad.example"));
+  await until(() => proxy.refusalCounts["dns-malformed"] === 2);
+  const badFrame = socketClient(t, proxy.dnsPort);
+  badFrame.socket.write(Buffer.from([0, 1]));
+  await until(() => badFrame.closed);
+  assert.equal(proxy.refusalCounts["dns-tcp-framing"], 1);
+  assert.equal(audit.queries.length, 1);
+  await proxy.close();
+  assert.ok(
+    events.some(
+      (event) =>
+        event.eventType === "policy.evaluated" &&
+        event.payload.reasonCode === "dns-malformed" &&
+        "refusalCount" in event.payload &&
+        event.payload.refusalCount === 2,
+    ),
+  );
+});
+
+test("DNS TCP trickling cannot extend the frame deadline", async (t) => {
+  const { proxy, audit } = await gateway(t, {
+    limits: { handshakeTimeoutMs: 350 },
+  });
+  const client = socketClient(t, proxy.dnsPort);
+  await once(client.socket, "connect");
+  client.socket.write(Buffer.from([1, 0])); // A 256-byte frame.
+  const trickle = setInterval(() => client.socket.write(Buffer.from([0])), 40);
+  try {
+    await until(() => client.closed);
+  } finally {
+    clearInterval(trickle);
+  }
+  assert.equal(proxy.refusalCounts["pre-decision-timeout"], 1);
+  assert.equal(audit.queries.length, 0);
+  assert.equal(client.buffer.length, 0);
 });
 
 test("close stops an in-flight dial decision and waits for the allowed outcome", async (t) => {
