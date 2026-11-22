@@ -23,7 +23,7 @@ export function isSafeCredentialVariable(name: unknown): name is string {
     return false;
   if (!/_(TOKEN|KEY|SECRET)$/.test(name)) return false;
   if (
-    /^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_|RUST_|CARGO_|XDG_|LC_|BUN_|OTEL_|MCP_|ENABLE_|DISABLE_|DOCKER_|AWS_|GOOGLE_|AZURE_)/.test(
+    /^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_|RUST_|CARGO_|XDG_|LC_|BUN_|OTEL_|MCP_|ENABLE_|DISABLE_|DOCKER_|AWS_|GOOGLE_|AZURE_|CLAUDE_CODE_CLIENT_)/.test(
       name,
     )
   )

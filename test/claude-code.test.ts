@@ -197,6 +197,7 @@ test("credential variables must be credential-shaped and fit their fixed header"
     "HTTPS_PROXY",
     "XDG_RUNTIME_KEY",
     "TOKEN_FILE",
+    "CLAUDE_CODE_CLIENT_KEY",
   ])
     assert.ok(!isSafeCredentialVariable(name), name);
   assert.throws(() =>
@@ -214,7 +215,20 @@ test("credential variables must be credential-shaped and fit their fixed header"
     }),
   );
   const script = claudeCodeCommand(task).argv[2]!;
-  assert.match(script, /test ! -e \/etc\/claude-code/);
+  // Each guard is a whole line, so sh -e stops on its failure.
+  for (const line of [
+    "test ! -e /root/.claude",
+    "test ! -e /etc/claude-code",
+    "claude_home=$(mktemp -d)",
+    "claude_config=$(mktemp -d)",
+    'test -z "$(ls -A "$claude_home")"',
+    'test -z "$(ls -A "$claude_config")"',
+  ])
+    assert.ok(
+      script.split("\n").some((entry) => entry.trim() === line),
+      line,
+    );
+  assert.doesNotMatch(script, /&& test|mktemp -d\) &&/);
   assert.match(script, /claude_config=\$\(mktemp -d\)/);
   assert.match(script, /ENABLE_TOOL_SEARCH=false/);
 });

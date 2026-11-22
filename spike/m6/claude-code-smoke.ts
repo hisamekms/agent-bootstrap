@@ -756,7 +756,10 @@ async function main() {
     const placeholderResult = reviewRequests
       .flatMap((entry) => entry.toolResults)
       .join(" ");
-    assert.match(placeholderResult, /error|not available|No such tool/i);
+    assert.match(
+      placeholderResult,
+      /<tool_use_error>Error: No such tool available: DeferredToolPlaceholder<\/tool_use_error>/,
+    );
     assert.equal(operatorWorker.outcome, "ok");
     assert.equal(report.operator.edited, "Good day from Claude Code.\n");
     assert.ok(operatorRequests.length >= 3);

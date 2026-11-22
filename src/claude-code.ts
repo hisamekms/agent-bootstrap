@@ -210,9 +210,14 @@ export function claudeCodeCommand(
     # The guest holds only the backend placeholder, never the credential.
     test "$${credential.variable}" = '$MSB_${credential.variable}'
     # No managed policy or pre-seeded CLI state: config and home are fresh.
-    test ! -e /root/.claude && test ! -e /etc/claude-code
-    claude_home=$(mktemp -d) && claude_config=$(mktemp -d)
-    test -z "$(ls -A "$claude_home")" && test -z "$(ls -A "$claude_config")"
+    # One check per line: under sh -e, a failure inside an && list does not
+    # stop the script.
+    test ! -e /root/.claude
+    test ! -e /etc/claude-code
+    claude_home=$(mktemp -d)
+    claude_config=$(mktemp -d)
+    test -z "$(ls -A "$claude_home")"
+    test -z "$(ls -A "$claude_config")"
     cd ${cwd}
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
