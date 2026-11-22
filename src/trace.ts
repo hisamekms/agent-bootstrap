@@ -1,7 +1,11 @@
 import { resolve } from "node:path";
 import { SqliteAudit } from "./audit.ts";
 import { CoordinatorTask, type CoordinatorDriver } from "./coordinator.ts";
-import { taskTrace } from "./task-trace.ts";
+import {
+  escapeControls,
+  readInvocationTrace,
+  taskTrace,
+} from "./task-trace.ts";
 
 const usage = `Usage:
   bun src/trace.ts <audit.sqlite> <invocation-id>
@@ -21,12 +25,13 @@ const readOnlyDriver: CoordinatorDriver = {
 async function invocation(filename: string, invocationId: string) {
   const audit = new SqliteAudit(filename, { readonly: true });
   try {
-    const events = audit.read(invocationId);
-    if (!events.length) {
+    const trace = readInvocationTrace(audit, invocationId);
+    if (!trace) {
       console.error("Invocation was not found");
       process.exitCode = 1;
       return;
     }
+    const { id, events, ...evidence } = trace;
     const result = events.at(-1);
     const outcome =
       result?.kind === "invocation.finished" ? result.outcome : "incomplete";
@@ -37,10 +42,12 @@ async function invocation(filename: string, invocationId: string) {
           ? { operation: result.operation, effect: "unknown" }
           : undefined;
     console.log(
-      JSON.stringify(
-        { invocationId, outcome, pendingOperation, events },
-        null,
-        2,
+      escapeControls(
+        JSON.stringify(
+          { invocationId: id, outcome, pendingOperation, events, ...evidence },
+          null,
+          2,
+        ),
       ),
     );
   } finally {
@@ -60,7 +67,7 @@ async function task(filename: string, root: string, taskId: string) {
       process.exitCode = 1;
       return;
     }
-    console.log(JSON.stringify({ taskId, ...trace }, null, 2));
+    console.log(escapeControls(JSON.stringify({ taskId, ...trace }, null, 2)));
   } finally {
     audit.close();
   }
