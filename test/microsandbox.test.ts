@@ -676,3 +676,24 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
 });
+
+test("one runtime binds its single credential to at most one provider", () => {
+  const provider = {
+    host: "api.anthropic.com",
+    secretEnv: "ANTHROPIC_API_KEY",
+  };
+  assert.throws(
+    () =>
+      new MicrosandboxRuntime({
+        binary: "/fixture/msb",
+        home: "/fixture/home",
+        stagingRoot: "/fixture/staging",
+        image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}`,
+        providers: [
+          provider,
+          { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
+        ],
+      }),
+    (error: SandboxRuntimeError) => error.code === "invalid-input",
+  );
+});

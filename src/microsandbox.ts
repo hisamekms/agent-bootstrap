@@ -34,9 +34,10 @@ export interface MicrosandboxConfig {
   /** Required only for specs with `provider`. Used on the host to pass the
    * credential to the backend's TLS substitution at create time. */
   readonly credentials?: CredentialProvider;
-  /** The provider egress bindings that specs may request, each binding the
-   * credential to one host, header, variable, port and upstream CA. A spec's
-   * `provider` must equal one entry exactly. Default: none. */
+  /** The provider egress binding that specs may request: the credential's
+   * host, header, variable, port and upstream CA. A spec's `provider` must
+   * equal it exactly. At most one entry, because `credentials` is a single
+   * credential. Default: none. */
   readonly providers?: readonly SandboxProvider[];
 }
 
@@ -180,6 +181,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       !/^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[a-f0-9]{64}$/.test(config.image)
     )
       invalid();
+    if (config.providers && config.providers.length > 1) invalid();
     this.#config = {
       ...config,
       ...(config.providers

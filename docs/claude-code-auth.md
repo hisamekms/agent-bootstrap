@@ -113,7 +113,9 @@ this traffic.
    - `providers: [claudeCodeProvider({ mode: "api-key", credential: "host-secret" })]`.
      This binds the credential to that host, the `x-api-key` header, the
      `ANTHROPIC_API_KEY` variable, port 443 and no extra CA. A sandbox spec
-     whose `provider` differs in any field is refused.
+     whose `provider` differs in any field is refused. A runtime holds one
+     credential, so it accepts at most one entry; use a separate runtime per
+     provider credential.
    - a `CredentialProvider` that returns the API key from the host's own
      secret store.
 
