@@ -409,11 +409,19 @@ test("a native approval request or a turn without a tool call is denied", async 
 });
 
 test("a stalled model turn times out and is never retried automatically", async (t) => {
-  const { task, reopen } = await fixture(t, [[{ hang: true }]], 50);
+  const { task, reopen, audit } = await fixture(t, [[{ hang: true }]], 50);
   await assert.rejects(task.run(), /Codex app-server: timed-out/);
   assert.equal(await reopen().run(), "uncertain");
   const tail = (await task.trace()).at(-1);
   assert.equal(tail?.kind === "turn.failed" && tail.code, "timed-out");
+  // The host audit labels the same turn as a timeout, and teardown finished.
+  const [session] = (await taskTrace(task, audit)).invocations;
+  assert.deepEqual(
+    session?.events
+      .filter((event) => event.kind === "operation.finished")
+      .map((event) => `${event.operation} ${event.outcome}`),
+    ["sandbox.create ok", "sandbox.exec timed-out", "sandbox.destroy ok"],
+  );
 });
 
 test("encoding keeps the router as the only authority", () => {

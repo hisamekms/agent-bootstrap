@@ -277,6 +277,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       for (const [index, tool] of tools.entries()) {
         const info = await lstat(tool.hostPath).catch(() => null);
         if (!info?.isFile()) throw new SandboxRuntimeError("tool-digest");
+        if (info.size > MICROSANDBOX_LIMITS.toolBytes) invalid();
         const copy = join(directory, "tools", String(index));
         await copyFile(tool.hostPath, copy);
         if ((await sha256File(copy)) !== tool.sha256)
@@ -473,12 +474,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       if (child.exitCode === null && child.signalCode === null)
         child.kill("SIGKILL");
       // A descendant holding stdout can delay "close" indefinitely.
+      if (settledFlag) return;
       forced ??= setTimeout(() => {
         stdout.destroy();
         settle();
       }, MICROSANDBOX_LIMITS.sessionStopMs);
     };
     let forced: ReturnType<typeof setTimeout> | undefined;
+    let settledFlag = false;
     let settle: () => void = () => {};
     const cancel = () => kill("cancelled");
     const timer = setTimeout(() => kill("timed-out"), duration);
@@ -486,10 +489,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     stdin.on("error", () => {});
     child.stderr?.resume();
     const finished = new Promise<ExecResult["status"]>((resolve) => {
-      let settled = false;
       settle = () => {
-        if (settled) return;
-        settled = true;
+        if (settledFlag) return;
+        settledFlag = true;
         clearTimeout(timer);
         clearTimeout(forced);
         command.signal?.removeEventListener("abort", cancel);

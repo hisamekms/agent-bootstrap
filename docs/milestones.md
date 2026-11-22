@@ -428,7 +428,8 @@ role. The `SandboxRuntime` port gains an optional streamed session, and the
 Microsandbox adapter implements it with `msb exec --stream`. A session has
 bounded lines, a bounded byte total and a deadline, and it holds the handle
 busy until the command stops. After a kill, the session is treated as
-stopped within 5 seconds even if the backend never reports `close`. Sandbox specs can now name host tools and one
+stopped within 5 seconds even if the backend never reports `close`, and
+destroy then proceeds. Sandbox specs can now name host tools and one
 host TCP port:
 
 - **Tools.** Each tool is a regular host file, not a symbolic link, copied
@@ -454,7 +455,8 @@ The router journal adds three events:
 A voided turn leaves the task denied. A failed turn reopens as uncertain
 and is not retried. When a timed-out turn also loses a host audit write,
 the journal records `host-audit`. A timed-out turn waits at most 30 seconds
-for host teardown before reporting. Because a turn now has one more event,
+for host teardown before reporting. If teardown takes longer, the host
+finishes it and its audit after the router has recorded `turn.failed`. Because a turn now has one more event,
 a task reaches its event limit after 31 status turns instead of 41.
 
 `src/task-trace.ts` joins one task's journal with the host audit. Turn run
@@ -484,9 +486,10 @@ Known gaps:
   be running when the turn is voided. The Coordinator VM, its audit and the
   voiding reason now make this traceable, but nothing records what the item
   did inside the guest.
-- **Session timeouts are labelled differently.** When the session's own
-  timer stops the command, the host audit records `timed-out`, but the
-  router records the adapter's `closed`.
+- **Session timeouts are labelled differently.** An adapter timeout is
+  `timed-out` in both records. When the session's own timer stops the
+  command first, the host audit records `timed-out`, but the router records
+  the adapter's `closed`.
 - **Usage is not collected.** Usage notifications are ignored. M5 will
   collect them.
 - **Reviewed-integration records are not joined.** The task trace does not

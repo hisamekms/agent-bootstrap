@@ -197,7 +197,10 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
         if (expired) throw new CodexAppServerError("timed-out");
         return await this.#converse(opened, input);
       } catch (error) {
-        throw transportError(error, "closed");
+        // A stream ended by the deadline is a timeout, not a closed channel.
+        throw expired
+          ? new CodexAppServerError("timed-out")
+          : transportError(error, "closed");
       } finally {
         opened.close();
       }
