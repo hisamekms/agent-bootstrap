@@ -36,9 +36,9 @@ The results were verified on 2026-11-22.
 The Claude Code facts come from the official docs, read on 2026-11-22:
 
 - [Authentication](https://code.claude.com/docs/en/authentication.md):
-  - The CLI checks credentials in this order: `ANTHROPIC_AUTH_TOKEN`, then
-    `ANTHROPIC_API_KEY`, then `apiKeyHelper`, then
-    `CLAUDE_CODE_OAUTH_TOKEN`, then a subscription session.
+  - The CLI checks credentials in a documented order. `ANTHROPIC_AUTH_TOKEN`
+    and `ANTHROPIC_API_KEY` come before `apiKeyHelper` and before CLI-managed
+    credentials.
   - `ANTHROPIC_API_KEY` is sent as `X-Api-Key`.
   - In `-p` mode the key is used without an approval prompt.
 - [Headless mode](https://code.claude.com/docs/en/headless.md): `--bare`
@@ -92,6 +92,39 @@ On 2026-11-22 it passed in about 23 seconds:
   run directory or `MSB_HOME`.
 - **Audit.** Each role VM recorded the `provider.egress` grant as requested,
   allowed and finished `ok`.
+
+## Operator credential variable
+
+The smoke also runs a Worker in `operator-credential` mode. By default it
+substitutes `ANTHROPIC_AUTH_TOKEN` into `authorization`, without `--bare`,
+using a separate runtime bound to that provider entry.
+`M6_OPERATOR_VARIABLE` selects another variable without changing any
+assertion. Its inputs include the planted settings and a planted `CLAUDE.md`.
+
+On 2026-11-22 the run passed:
+
+- **Requests.** Every Messages request was streamed and carried `Bearer`
+  with the synthetic credential. None had an `x-api-key` header.
+- **Tools.** The offered tools were exactly the pinned Read, Glob, Grep,
+  Edit and Write, plus the CLI's internal `DeferredToolPlaceholder`.
+- **Planted content.** The planted text never appeared in a request, and
+  the edit was not tampered with.
+- **Audit.** The `provider.egress` grant was recorded and closed `ok`.
+
+A separate offline experiment ran the non-bare CLI against a plain HTTP
+stand-in, with planted hooks, `env`, `CLAUDE.md`, a skill, an agent and
+`.mcp.json` in the working directory:
+
+- **Isolation flags.** With `--setting-sources '' --strict-mcp-config
+--disable-slash-commands`, none of the planted files took effect or
+  appeared in the request. This held whether the working directory was the
+  repository or a separate directory with the repository passed through
+  `--add-dir`.
+- **Without `--tools`.** The CLI offered `Workflow`, `ScheduleWakeup`,
+  `ToolSearch`, `ListAgents` and `ReportFindings`.
+- **With a denylist instead.** Denying those tools exposed further deferred
+  tools: `CronCreate`, `EnterWorktree` and `TaskStop`. Only `--tools` pins
+  the set.
 
 ## Failures found on the way
 

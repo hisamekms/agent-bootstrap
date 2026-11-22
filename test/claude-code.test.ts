@@ -27,15 +27,14 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
   const script = command.argv[2]!;
   // The prompt never appears in the script, which is built only from constants.
   assert.ok(!script.includes("pwned") && !script.includes("Edit hello.txt"));
-  assert.match(
-    script,
-    /-p --bare --strict-mcp-config --setting-sources '' --output-format json/,
-  );
+  assert.match(script, /-p --bare --strict-mcp-config --setting-sources ''/);
+  assert.match(script, /--disable-slash-commands --no-session-persistence/);
   assert.match(script, /--permission-mode acceptEdits/);
   assert.match(
     script,
-    /--allowedTools 'Read,Glob,Grep,Edit,Write' --disallowedTools 'Bash'/,
+    /--tools 'Read,Glob,Grep,Edit,Write' --allowedTools 'Read,Glob,Grep,Edit,Write'/,
   );
+  assert.doesNotMatch(script, /Bash'/);
   assert.match(script, /-- "\$1" <\/dev\/null/);
   assert.match(
     script,
@@ -48,10 +47,12 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
     assert.ok(script.includes(item.sha256));
   const reviewer = claudeCodeCommand({ ...task, role: "Reviewer" }).argv[2]!;
   assert.match(reviewer, /cd \/review/);
-  assert.match(reviewer, /--allowedTools 'Read,Glob,Grep'/);
+  assert.match(
+    reviewer,
+    /--tools 'Read,Glob,Grep' --allowedTools 'Read,Glob,Grep'/,
+  );
   assert.match(reviewer, /head -c 65536 \/tmp\/claude-out\.json/);
-  assert.match(reviewer, /--disallowedTools 'Bash,Edit,Write'/);
-  assert.doesNotMatch(reviewer, /--allowedTools '[^']*(Edit|Write)|collect/);
+  assert.doesNotMatch(reviewer, /Edit|Write|collect/);
   const fixture = claudeCodeCommand({
     ...task,
     baseUrl: "https://host.microsandbox.internal:8443",
@@ -129,5 +130,44 @@ test("the JSON result is parsed defensively", () => {
       Buffer.from(JSON.stringify({ result: "x", usage: { input_tokens: -1 } })),
     )?.inputTokens,
     null,
+  );
+});
+
+test("an operator-chosen credential variable runs without bare mode and keeps isolation flags", () => {
+  const auth = {
+    mode: "operator-credential" as const,
+    variable: "ANTHROPIC_AUTH_TOKEN",
+    header: "authorization" as const,
+  };
+  assert.deepEqual(claudeCodeProvider(auth), {
+    host: "api.anthropic.com",
+    secretEnv: "ANTHROPIC_AUTH_TOKEN",
+    header: "authorization",
+  });
+  const script = claudeCodeCommand(task, auth).argv[2]!;
+  assert.doesNotMatch(script, /--bare/);
+  assert.match(script, /--strict-mcp-config --setting-sources ''/);
+  assert.match(script, /--disable-slash-commands --no-session-persistence/);
+  assert.match(script, /--tools 'Read,Glob,Grep,Edit,Write'/);
+  assert.match(
+    script,
+    /test "\$ANTHROPIC_AUTH_TOKEN" = '\$MSB_ANTHROPIC_AUTH_TOKEN'/,
+  );
+  assert.match(script, /ANTHROPIC_AUTH_TOKEN="\$ANTHROPIC_AUTH_TOKEN"/);
+  assert.doesNotMatch(script, /ANTHROPIC_API_KEY/);
+  for (const variable of [
+    "PATH",
+    "ANTHROPIC_BASE_URL",
+    "NODE_EXTRA_CA_CERTS",
+    "MSB_TOKEN",
+    "HTTPS_PROXY",
+    "LD_PRELOAD",
+    "lower_case",
+    "A$(id)",
+    "",
+  ])
+    assert.throws(() => claudeCodeCommand(task, { ...auth, variable }));
+  assert.throws(() =>
+    claudeCodeProvider({ ...auth, header: "cookie" as never }),
   );
 });

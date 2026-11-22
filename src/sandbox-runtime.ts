@@ -13,6 +13,33 @@ export interface SandboxTool {
   readonly sha256: string;
 }
 
+/** A guest variable name that may carry a credential placeholder. Names the
+ * backend, loader, TLS stack, proxies or the CLI's own configuration read
+ * are refused, so a credential cannot change how the guest runs. */
+export function isSafeCredentialVariable(name: unknown): name is string {
+  if (typeof name !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(name))
+    return false;
+  if (/^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_)/.test(name)) return false;
+  if (/_PROXY$/.test(name)) return false;
+  return ![
+    "PATH",
+    "HOME",
+    "SHELL",
+    "USER",
+    "TMPDIR",
+    "ENV",
+    "IFS",
+    "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_BASE_URL",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "DISABLE_TELEMETRY",
+    "DISABLE_ERROR_REPORTING",
+    "DISABLE_AUTOUPDATER",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  ].includes(name);
+}
+
 export interface SandboxProvider {
   readonly host: string;
   readonly secretEnv: string;
