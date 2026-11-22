@@ -157,15 +157,15 @@ needs a security review.
 Each profile is a set of **features**, and composition happens when the image
 is built. A request still names one profile.
 
-| Profile   | Base           | Features                         |
-| --------- | -------------- | -------------------------------- |
-| `db`      | Alpine 3.23    | `sqlite`, `postgres`             |
-| `browser` | Debian (later) | `sqlite`, `postgres`, `chromium` |
+| Profile   | Base           | Features                                |
+| --------- | -------------- | --------------------------------------- |
+| `db`      | Alpine 3.23    | `sqlite`, `postgres`                    |
+| `browser` | Debian 13 slim | `sqlite`, `postgres`, `chromium`, `git` |
 
 A feature recipe lists pinned packages (file name and SHA-256) and an
-optional setup script. The `browser` profile will need Debian variants of
-the `sqlite` and `postgres` recipes, because Playwright does not support
-Alpine.
+optional setup script. The `browser` profile has Debian variants of the
+`sqlite` and `postgres` recipes, because Playwright does not support Alpine.
+The `db` profile has no `git` yet (no pinned apk); that is a follow-up.
 
 ### Build steps (Alpine)
 
@@ -198,6 +198,48 @@ Alpine.
    the memory and CPU limits, and the inputs (base reference, package
    digests, recipe digest). The lock file is what a `ProfileCatalog` is built
    from. Rebuilding is a deliberate lock update.
+
+### Debian build (`browser`)
+
+A recipe has a base kind. `alpine` is the flow above. `debian-snapshot`
+installs with apt from a fixed `snapshot.debian.org` timestamp
+(`20261120T000000Z`) instead of host-pinned files. Features list apt package
+names only. The recipe digest covers the base reference, the timestamp, the
+sorted apt names, the setup scripts and the limits.
+
+1. **Build VM.** Started from the pinned
+   `debian@sha256:24a01011…` with `--no-net`, `allow@dns`,
+   `allow@snapshot.debian.org:tcp:80`, 2048 MiB and 2 CPUs. No other egress.
+2. **Sources.** The script removes the stock `debian.sources`, writes a
+   deb822 `snapshot.sources` (`debian` suites `trixie trixie-updates` and
+   `debian-security` suite `trixie-security`, both at the timestamp) with
+   `Signed-By` set to the Debian archive keyring in the base image, and sets
+   `Acquire::Check-Valid-Until "false"`, since snapshot Release files have
+   expired. Signatures are still checked: never `[trusted=yes]` or
+   `--allow-unauthenticated`.
+3. **Install.** `apt-get install --no-install-recommends` of the feature
+   packages plus `ca-certificates`. Then the setup scripts: the Debian
+   `agent-bootstrap-postgres` (binaries in `/usr/lib/postgresql/17/bin`; the
+   random cluster the package creates is dropped), and
+   `agent-bootstrap-chromium` (`chromium --headless --no-sandbox
+--disable-gpu`) with `/etc/profile.d/agent-bootstrap-browser.sh` setting
+   `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` and `CHROMIUM_PATH=/usr/bin/chromium`.
+   Callers pass `executablePath` to Playwright.
+4. **Cleanup for determinism.** `apt-get clean`; apt lists, caches, logs and
+   `*-old` files removed; empty `/etc/machine-id`, fixed hostname and hosts,
+   empty `resolv.conf`; shadow change dates zeroed; snakeoil TLS key removed.
+   The snapshot sources stay, to document the origin (task VMs have no
+   network).
+5. **Package list.** `dpkg-query` writes `name=version` lines to
+   `/etc/agent-bootstrap-packages.txt`. The builder copies it out and stores
+   it, sorted, in the lock entry as `packages` (strictly validated; allowed
+   only for Debian profiles).
+6. **Export.** GNU tar with `--format=gnu --numeric-owner`; the host
+   normalizer handles GNU long names. The builder's size cap is 4 GiB (the
+   root filesystem is about 1 GiB) and `normalizeLayer` holds the whole
+   archive in memory; acceptable for now.
+7. **Smoke test** (no network): SQLite and PostgreSQL as for `db`, headless
+   Chromium dumping a `data:` page, and `git --version`.
 
 ### Image digest check at run time
 

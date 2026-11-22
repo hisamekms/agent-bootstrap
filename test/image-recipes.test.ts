@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   BUILD_SCRIPT,
+  DEBIAN_FEATURES,
+  DEBIAN_TRIXIE,
   FEATURES,
+  aptPackages,
+  buildNetRules,
+  smokeTest,
   profilePackages,
   recipeDigest,
 } from "../src/image-recipes.ts";
@@ -150,5 +155,141 @@ describe("dedupe", () => {
     } finally {
       sqlite.pop();
     }
+  });
+});
+
+const PACKAGES = ["git=1:2.47.3-0+deb13u1", "sqlite3=3.46.1-7+deb13u2"];
+
+function browserLock(
+  patch: (e: Record<string, unknown>) => void = () => {},
+  packages: readonly string[] | null = PACKAGES,
+) {
+  const entry: Record<string, unknown> = {
+    ...lockEntry("browser", DIGEST, packages ?? undefined),
+  };
+  patch(entry);
+  return JSON.stringify({ version: 1, profiles: { browser: entry } });
+}
+
+describe("browser recipe (Debian snapshot)", () => {
+  test("digests differ per profile and react to snapshot and apt names", () => {
+    const first = recipeDigest("browser");
+    assert.match(first, /^[0-9a-f]{64}$/);
+    assert.notEqual(first, recipeDigest("db"));
+    const base = DEBIAN_TRIXIE as { snapshot: string };
+    const saved = base.snapshot;
+    base.snapshot = "20260101T000000Z";
+    try {
+      assert.notEqual(recipeDigest("browser"), first);
+    } finally {
+      base.snapshot = saved;
+    }
+    const git = DEBIAN_FEATURES.git as unknown as { apt: string[] };
+    git.apt.push("tig");
+    try {
+      assert.notEqual(recipeDigest("browser"), first);
+    } finally {
+      git.apt.pop();
+    }
+    assert.equal(recipeDigest("browser"), first);
+    assert.deepEqual(aptPackages("browser"), [
+      "chromium",
+      "fonts-liberation",
+      "git",
+      "postgresql",
+      "sqlite3",
+    ]);
+  });
+
+  test("build script pins the snapshot and installs signed packages", () => {
+    const script = BUILD_SCRIPT("browser");
+    const ts = DEBIAN_TRIXIE.snapshot;
+    assert.ok(
+      script.includes(`URIs: http://snapshot.debian.org/archive/debian/${ts}/`),
+    );
+    assert.ok(
+      script.includes(
+        `URIs: http://snapshot.debian.org/archive/debian-security/${ts}/`,
+      ),
+    );
+    assert.ok(script.includes("Suites: trixie trixie-updates"));
+    assert.ok(script.includes("Suites: trixie-security"));
+    assert.ok(
+      script.includes(
+        "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg",
+      ),
+    );
+    assert.ok(script.includes("Check-Valid-Until"));
+    assert.ok(script.includes("--no-install-recommends"));
+    assert.ok(script.includes("apt-get clean"));
+    assert.ok(script.includes("rm -rf /var/lib/apt/lists/*"));
+    assert.ok(script.includes(": > /etc/machine-id"));
+    assert.ok(script.includes(": > /etc/resolv.conf"));
+    assert.ok(script.includes("/etc/agent-bootstrap-packages.txt"));
+    assert.ok(script.includes("--exclude run/microsandbox"));
+    assert.ok(!script.includes("trusted=yes"));
+    assert.ok(!script.includes("--allow-unauthenticated"));
+    assert.ok(!script.includes("apk "));
+  });
+
+  test("egress is limited to DNS and the snapshot host", () => {
+    assert.deepEqual(buildNetRules("browser"), [
+      "allow@dns",
+      "allow@snapshot.debian.org:tcp:80",
+    ]);
+    assert.deepEqual(buildNetRules("db"), []);
+    assert.throws(() => profilePackages("browser"), /not an Alpine/);
+    assert.throws(() => aptPackages("db"), /not a Debian/);
+  });
+
+  test("chromium and postgres helpers are installed", () => {
+    const script = BUILD_SCRIPT("browser");
+    assert.ok(script.includes("/usr/local/bin/agent-bootstrap-chromium"));
+    assert.ok(script.includes("--no-sandbox"));
+    assert.ok(script.includes("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"));
+    assert.ok(script.includes("/usr/lib/postgresql/17/bin"));
+    assert.deepEqual(smokeTest("browser").expected, [
+      "1",
+      "1",
+      "browser-ok",
+      "git-ok",
+    ]);
+    assert.deepEqual(smokeTest("db").expected, ["1", "1"]);
+  });
+
+  test("lock with and without packages", () => {
+    const withList = parseProfileLock(browserLock());
+    assert.deepEqual(withList.profiles["browser"]?.packages, PACKAGES);
+    const catalog = profileCatalog(BASE, withList);
+    assert.equal(catalog.get("browser").memoryMiB, 2048);
+    const without = parseProfileLock(browserLock(() => {}, null));
+    assert.equal(without.profiles["browser"]?.packages, undefined);
+  });
+
+  test("bad package lists are rejected", () => {
+    const bad = (list: unknown) =>
+      assert.throws(() =>
+        parseProfileLock(browserLock((e) => (e["packages"] = list))),
+      );
+    bad("git=1");
+    bad([]);
+    bad(["Git=1"]);
+    bad(["git"]);
+    bad(["git=1 2"]);
+    bad([PACKAGES[1], PACKAGES[0]]);
+    bad([PACKAGES[0], PACKAGES[0]]);
+    bad(
+      Array.from(
+        { length: 2001 },
+        (_, i) => `p${String(i).padStart(5, "0")}=1`,
+      ),
+    );
+  });
+
+  test("packages are refused on Alpine profiles", () => {
+    assert.throws(() => lockEntry("db", DIGEST, PACKAGES), /not allowed/);
+    assert.throws(() =>
+      parseProfileLock(lockText((e) => (e["packages"] = PACKAGES))),
+    );
   });
 });

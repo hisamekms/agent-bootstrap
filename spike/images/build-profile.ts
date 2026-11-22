@@ -13,11 +13,12 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BUILD_SCRIPT,
+  buildNetRules,
   profilePackages,
   recipeFor,
+  smokeTest,
 } from "../../src/image-recipes.ts";
 import {
-  MAX_INPUT_BYTES,
   layoutTar,
   normalizeLayer,
   ociImage,
@@ -58,6 +59,9 @@ function run(args: string[], timeoutMs: number): Promise<string> {
 }
 
 const MINUTE = 60_000;
+// The Debian root filesystem is about 1 GiB; normalizeLayer holds the whole
+// archive in memory (a few GiB peak), which is acceptable for a spike.
+const MAX_ROOTFS_BYTES = 4 * 1024 ** 3;
 
 /** Create a no-network sandbox, run `use`, and always remove it. */
 async function withSandbox<T>(
@@ -132,15 +136,20 @@ async function main(): Promise<void> {
   await mkdir(join(root, ".local"), { recursive: true });
   const work = await mkdtemp(join(root, ".local", "images-"));
   try {
-    stage = "package verification";
-    await mkdir(join(work, "pkgs"), { mode: 0o700 });
-    for (const item of profilePackages(profile)) {
-      const source = join(root, recipe.base.packageDir, item.name);
-      const target = join(work, "pkgs", item.name);
-      await copyFile(source, target);
-      if (sha256(await readFile(target)) !== item.sha256)
-        throw new Error(`digest mismatch for ${item.name}`);
+    const copyArgs: string[] = [];
+    if (recipe.base.kind === "alpine") {
+      stage = "package verification";
+      await mkdir(join(work, "pkgs"), { mode: 0o700 });
+      for (const item of profilePackages(profile)) {
+        const source = join(root, recipe.base.packageDir, item.name);
+        const target = join(work, "pkgs", item.name);
+        await copyFile(source, target);
+        if (sha256(await readFile(target)) !== item.sha256)
+          throw new Error(`digest mismatch for ${item.name}`);
+      }
+      copyArgs.push("--copy-dir", `${join(work, "pkgs")}:/tmp/pkgs`);
     }
+    let packages: string[] | undefined;
 
     stage = "base image";
     await run(
@@ -160,7 +169,12 @@ async function main(): Promise<void> {
     await withSandbox(
       recipe.base.reference,
       recipe.memoryMiB,
-      ["--copy-dir", `${join(work, "pkgs")}:/tmp/pkgs`],
+      [
+        "--cpus",
+        String(recipe.cpus),
+        ...copyArgs,
+        ...buildNetRules(profile).flatMap((rule) => ["--net-rule", rule]),
+      ],
       async (name) => {
         await guestExec(name, BUILD_SCRIPT(profile), 10 * MINUTE);
         stage = "root filesystem export";
@@ -168,15 +182,27 @@ async function main(): Promise<void> {
           ["copy", `${name}:/tmp/rootfs.tar`, join(work, "rootfs.tar")],
           5 * MINUTE,
         );
+        if (recipe.base.kind === "debian-snapshot") {
+          stage = "package list export";
+          const listPath = join(work, "packages.txt");
+          await run(
+            ["copy", `${name}:/etc/agent-bootstrap-packages.txt`, listPath],
+            MINUTE,
+          );
+          packages = (await readFile(listPath, "utf8"))
+            .split("\n")
+            .filter((l) => l !== "")
+            .sort();
+        }
       },
     );
 
     stage = "image assembly";
     const rootfsPath = join(work, "rootfs.tar");
-    if ((await stat(rootfsPath)).size > MAX_INPUT_BYTES) {
+    if ((await stat(rootfsPath)).size > MAX_ROOTFS_BYTES) {
       throw new Error("rootfs.tar exceeds the maximum input size");
     }
-    const layer = normalizeLayer(await readFile(rootfsPath));
+    const layer = normalizeLayer(await readFile(rootfsPath), MAX_ROOTFS_BYTES);
     const image = ociImage({
       baseConfig: base.config,
       layer,
@@ -198,15 +224,12 @@ async function main(): Promise<void> {
       throw new Error("loaded image digest differs");
 
     stage = "smoke test";
+    const smoke = smokeTest(profile);
     const output = await withSandbox(reference, recipe.memoryMiB, [], (name) =>
-      guestExec(
-        name,
-        `sqlite3 :memory: "select 1;"; url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"`,
-        5 * MINUTE,
-      ),
+      guestExec(name, smoke.script, 5 * MINUTE),
     );
     const lines = output.split("\n").filter((l) => l !== "");
-    if (lines.length !== 2 || lines[0] !== "1" || lines[1] !== "1")
+    if (lines.join("\n") !== smoke.expected.join("\n"))
       throw new Error("smoke test output differs");
 
     stage = "lock update";
@@ -235,7 +258,7 @@ async function main(): Promise<void> {
       delete others.profiles[profile];
       existing = parseProfileLock(JSON.stringify(others));
     }
-    const entry = lockEntry(profile, digest);
+    const entry = lockEntry(profile, digest, packages);
     const lock = {
       version: 1,
       profiles: { ...existing.profiles, [profile]: entry },

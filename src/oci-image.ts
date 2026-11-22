@@ -142,8 +142,11 @@ function normalizePath(raw: string): string {
   return parts.join("/");
 }
 
-function parseTar(tar: Uint8Array): TarEntry[] {
-  if (tar.length > MAX_INPUT_BYTES) fail("tar: input too large");
+function parseTar(
+  tar: Uint8Array,
+  maxBytes: number = MAX_INPUT_BYTES,
+): TarEntry[] {
+  if (tar.length > maxBytes) fail("tar: input too large");
   const entries: TarEntry[] = [];
   let pos = 0;
   let longName: string | undefined;
@@ -356,8 +359,11 @@ function byPath(a: TarEntry, b: TarEntry): number {
  * The root directory entry is dropped. mtime, uname and gname are cleared.
  * PAX extended attributes (xattrs, e.g. file capabilities) are dropped.
  */
-export function normalizeLayer(tar: Uint8Array): Uint8Array {
-  const entries = parseTar(tar);
+export function normalizeLayer(
+  tar: Uint8Array,
+  maxBytes: number = MAX_INPUT_BYTES,
+): Uint8Array {
+  const entries = parseTar(tar, maxBytes);
   const byName = new Map<string, TarEntry>();
   for (const e of entries) {
     if (byName.has(e.path)) fail("tar: duplicate path");
