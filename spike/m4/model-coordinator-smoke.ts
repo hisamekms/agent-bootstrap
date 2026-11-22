@@ -9,6 +9,7 @@ import { SqliteAudit } from "../../src/audit.ts";
 import { CodexAppServerCoordinator } from "../../src/codex-app-server.ts";
 import { CoordinatorTask } from "../../src/coordinator.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { modelStep } from "../../src/model-coordinator.ts";
 import { taskTrace } from "../../src/task-trace.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
@@ -175,7 +176,7 @@ try {
     new MicrosandboxRuntime({
       binary: msbPath,
       home: msbHome,
-      image,
+      profiles: new ProfileCatalog({ base: { image } }),
       stagingRoot: join(root, "sandboxes"),
     }),
   );

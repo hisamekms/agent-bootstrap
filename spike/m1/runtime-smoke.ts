@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import type { SandboxHandle } from "../../src/sandbox-runtime.ts";
 
 const binary = process.argv[2];
@@ -135,8 +136,12 @@ try {
     binary,
     home,
     stagingRoot,
-    image:
-      "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
+    profiles: new ProfileCatalog({
+      base: {
+        image:
+          "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
+      },
+    }),
   });
   const worker = await runtime.create({
     files: [{ path: "input.txt", bytes: new TextEncoder().encode("fixture") }],

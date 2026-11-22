@@ -21,6 +21,7 @@ import {
   parseClaudeCodeResult,
 } from "../../src/claude-code.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
 
 // Offline Claude Code smoke on Microsandbox. A loopback HTTPS server with a
@@ -319,7 +320,7 @@ async function main() {
   const runtime = new MicrosandboxRuntime({
     binary: msb,
     home,
-    image,
+    profiles: new ProfileCatalog({ base: { image } }),
     stagingRoot: join(root, "sandboxes"),
     providers: [provider],
     credentials: {
@@ -467,7 +468,7 @@ async function main() {
       new MicrosandboxRuntime({
         binary: msb,
         home,
-        image,
+        profiles: new ProfileCatalog({ base: { image } }),
         stagingRoot: join(root, "sandboxes-operator"),
         providers: [operatorProvider],
         credentials: {

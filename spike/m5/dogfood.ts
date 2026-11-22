@@ -48,6 +48,7 @@ import type { CredentialProvider } from "../../src/credentials.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import {
   modelStep,
   type CoordinatorModel,
@@ -572,7 +573,7 @@ async function main() {
     new MicrosandboxRuntime({
       binary: msb,
       home,
-      image,
+      profiles: new ProfileCatalog({ base: { image } }),
       stagingRoot: join(root, `sandboxes-${name}`),
       ...(provider && value
         ? { providers: [provider], credentials: credential(value) }

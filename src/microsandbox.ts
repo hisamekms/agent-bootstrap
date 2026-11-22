@@ -12,6 +12,7 @@ import {
 import { isAbsolute, join } from "node:path";
 import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
+import { PROFILE_NAMES, ProfileCatalog } from "./sandbox-profiles.ts";
 import {
   isSafeCredentialVariable,
   sameProvider,
@@ -32,7 +33,7 @@ export interface MicrosandboxConfig {
   readonly binary: string;
   readonly home: string;
   readonly stagingRoot: string;
-  readonly image: string;
+  readonly profiles: ProfileCatalog;
   /** Required only for specs with `provider`. Used on the host to pass the
    * credential to the backend's TLS substitution at create time. */
   readonly credentials?: CredentialProvider;
@@ -168,10 +169,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       )
         invalid();
     }
-    if (
-      !/^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[a-f0-9]{64}$/.test(config.image)
-    )
-      invalid();
+    if (!(config.profiles instanceof ProfileCatalog)) invalid();
     if (config.providers && config.providers.length > 1) invalid();
     this.#config = {
       ...config,
@@ -296,6 +294,15 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ))
     )
       invalid();
+    const profileName: unknown =
+      spec.profile === undefined ? "base" : spec.profile;
+    if (
+      typeof profileName !== "string" ||
+      !(PROFILE_NAMES as readonly string[]).includes(profileName) ||
+      !this.#config.profiles.has(profileName)
+    )
+      invalid();
+    const profile = this.#config.profiles.get(profileName);
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     boundedInteger(lifetime, MICROSANDBOX_LIMITS.maxLifetimeMs);
@@ -408,6 +415,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(provider ? providerArgs(provider) : []),
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
+        ...(profile.memoryMiB !== undefined
+          ? ["--memory", `${profile.memoryMiB}M`]
+          : []),
+        ...(profile.cpus !== undefined ? ["--cpus", String(profile.cpus)] : []),
         "--copy-dir",
         `${workspace}:/workspace`,
         ...(readOnly.length ? ["--mount-dir", `${review}:/review:ro`] : []),
@@ -415,7 +426,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           "--copy-file",
           `${staged[index]}:${tool.guestPath}`,
         ]),
-        this.#config.image,
+        profile.image,
       ];
       // The credential reaches only the backend process environment.
       const credentials = this.#config.credentials;

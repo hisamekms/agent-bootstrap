@@ -9,6 +9,7 @@ import { SqliteAudit } from "../../src/audit.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { ReviewedIntegration } from "../../src/reviewed-integration.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
 
@@ -96,7 +97,7 @@ async function main() {
     const runtime = new MicrosandboxRuntime({
       binary,
       home,
-      image,
+      profiles: new ProfileCatalog({ base: { image } }),
       stagingRoot: join(root, "sandboxes"),
     });
     const integration = new ReviewedIntegration(

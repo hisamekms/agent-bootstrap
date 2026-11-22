@@ -14,6 +14,7 @@ import {
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
 import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { uuidPattern } from "../../src/private-journal.ts";
 import { ReviewedIntegration } from "../../src/reviewed-integration.ts";
 import { TrustedHost } from "../../src/trusted-host.ts";
@@ -115,7 +116,7 @@ async function main() {
     const runtime = new MicrosandboxRuntime({
       binary,
       home,
-      image,
+      profiles: new ProfileCatalog({ base: { image } }),
       stagingRoot: join(root, "sandboxes"),
     });
     const host = new TrustedHost(audit, runtime);

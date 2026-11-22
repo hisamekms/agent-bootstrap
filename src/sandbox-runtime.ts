@@ -1,4 +1,6 @@
 /** Provider-neutral, host-owned sandbox lifecycle. No credential or integration API. */
+import type { ProfileName } from "./sandbox-profiles.ts";
+
 export interface SandboxFile {
   readonly path: string;
   readonly bytes: Uint8Array;
@@ -61,6 +63,8 @@ export function sameProvider(
 }
 
 export interface SandboxSpec {
+  /** Named VM environment. Default: `base`. */
+  readonly profile?: ProfileName;
   readonly files?: readonly SandboxFile[];
   readonly tools?: readonly SandboxTool[];
   /** The only network egress: TCP to this port on the host. Default: none. */
