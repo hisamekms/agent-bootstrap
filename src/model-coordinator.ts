@@ -17,11 +17,16 @@ export interface CoordinatorTurnInput {
   readonly tools: readonly ModelToolSpec[];
 }
 
+/** The first proposed call, or a fixed-shape reason why the turn has none,
+ * such as `no-call`, `extra-call` or `native-item/commandExecution`. */
+export type CoordinatorTurnResult =
+  | { readonly call: ModelToolCall }
+  | { readonly call: null; readonly reason: string };
+
 /** Provider-neutral model port for one bounded Coordinator turn. Adapters
- * return the first proposed tool call, or null when the model proposed none or
- * broke the turn contract. They must not execute any proposed call. */
+ * must not execute any proposed call. */
 export interface CoordinatorModel {
-  turn(input: CoordinatorTurnInput, id: string): Promise<ModelToolCall | null>;
+  turn(input: CoordinatorTurnInput, id: string): Promise<CoordinatorTurnResult>;
 }
 
 export const FINISH_TOOL = "finish";
@@ -105,11 +110,12 @@ export function encodeToolCall(
 /** CoordinatorDriver.step backed by a model adapter. */
 export function modelStep(model: CoordinatorModel): CoordinatorDriver["step"] {
   return async (control, id) => {
-    const call = await model.turn(
+    const result = await model.turn(
       { prompt: coordinatorPrompt(control), tools: COORDINATOR_TOOLS },
       id,
     );
-    const response = encodeToolCall(call);
+    if (!result.call) return { id, reason: result.reason };
+    const response = encodeToolCall(result.call);
     return response ? { id, response } : { id };
   };
 }

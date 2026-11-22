@@ -1,7 +1,9 @@
-import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { boundedLines } from "./lines.ts";
 import {
   SandboxRuntimeError,
   type CollectedArtifacts,
@@ -10,7 +12,9 @@ import {
   type SandboxCommand,
   type SandboxHandle,
   type SandboxRuntime,
+  type SandboxSession,
   type SandboxSpec,
+  type SandboxTool,
 } from "./sandbox-runtime.ts";
 
 export interface MicrosandboxConfig {
@@ -30,6 +34,10 @@ export const MICROSANDBOX_LIMITS = {
   defaultLifetimeMs: 120_000,
   maxLifetimeMs: 300_000,
   backendTimeoutMs: 15_000,
+  tools: 4,
+  toolBytes: 512 * 1024 * 1024,
+  sessionLineBytes: 1024 * 1024,
+  sessionBytes: 16 * 1024 * 1024,
 } as const;
 
 type ProcessResult = {
@@ -67,6 +75,38 @@ function relativePath(path: string): void {
   if (path.split("/").some((part) => part === "." || part === "..")) invalid();
 }
 
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  let size = 0;
+  for await (const chunk of createReadStream(path)) {
+    size += (chunk as Buffer).length;
+    if (size > MICROSANDBOX_LIMITS.toolBytes) invalid();
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest("hex");
+}
+
+function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
+  if (tools.length > MICROSANDBOX_LIMITS.tools) invalid();
+  const guests = new Set<string>();
+  return tools.map((tool) => {
+    if (
+      typeof tool.hostPath !== "string" ||
+      !isAbsolute(tool.hostPath) ||
+      /[\0:\r\n]/.test(tool.hostPath) ||
+      typeof tool.guestPath !== "string" ||
+      !/^\/tmp\/[a-zA-Z0-9._-]{1,64}$/.test(tool.guestPath) ||
+      tool.guestPath.split("/").some((part) => part === "." || part === "..") ||
+      guests.has(tool.guestPath) ||
+      typeof tool.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(tool.sha256)
+    )
+      invalid();
+    guests.add(tool.guestPath);
+    return { ...tool };
+  });
+}
+
 /** Host-only adapter. Callers must supply dedicated trusted host directories and
  * a cached digest-pinned image containing /bin/sh, base64, wc and test. */
 export class MicrosandboxRuntime implements SandboxRuntime {
@@ -87,6 +127,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     )
       invalid();
     this.#config = { ...config };
+  }
+
+  #env() {
+    return {
+      PATH: "/usr/bin:/bin",
+      MSB_HOME: this.#config.home,
+      MSB_BACKEND: "local",
+    };
   }
 
   #run(
@@ -116,11 +164,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         this.#config.binary,
         [...args],
         {
-          env: {
-            PATH: "/usr/bin:/bin",
-            MSB_HOME: this.#config.home,
-            MSB_BACKEND: "local",
-          },
+          env: this.#env(),
           cwd: this.#config.home,
           encoding: "buffer",
           killSignal: "SIGKILL",
@@ -187,6 +231,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     boundedInteger(lifetime, MICROSANDBOX_LIMITS.maxLifetimeMs);
+    const tools = checkTools(spec.tools ?? []);
+    const port = spec.hostTcpPort;
+    if (port !== undefined) boundedInteger(port, 65_535);
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
     if (fileGroups.flat().length > MICROSANDBOX_LIMITS.files) invalid();
     let total = 0;
@@ -213,6 +260,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       const version = await this.#checked(["--version"]);
       if (version.stdout.toString("utf8").trim() !== "msb 0.7.16")
         throw new SandboxRuntimeError("unsupported-version");
+      for (const tool of tools)
+        if ((await sha256File(tool.hostPath)) !== tool.sha256)
+          throw new SandboxRuntimeError("tool-digest");
       await mkdir(this.#config.stagingRoot, { recursive: true, mode: 0o700 });
       directory = await mkdtemp(join(this.#config.stagingRoot, "msb-"));
       const workspace = join(directory, "workspace");
@@ -248,11 +298,16 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         "--pull",
         "never",
         "--no-net",
+        ...(port !== undefined ? ["--net-rule", `allow@host:tcp:${port}`] : []),
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
         "--copy-dir",
         `${workspace}:/workspace`,
         ...(readOnly.length ? ["--mount-dir", `${review}:/review:ro`] : []),
+        ...tools.flatMap((tool) => [
+          "--copy-file",
+          `${tool.hostPath}:${tool.guestPath}`,
+        ]),
         this.#config.image,
       ]);
       const handle = Object.freeze({ id: state.id });
@@ -345,6 +400,98 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     } finally {
       state.busy = false;
     }
+  }
+
+  /** One streamed guest command. The handle stays busy until it stops; then
+   * the caller destroys it. */
+  async openSession(
+    handle: SandboxHandle,
+    command: SandboxCommand,
+  ): Promise<SandboxSession> {
+    const state = this.#state(handle);
+    boundedInteger(command.timeoutMs, MICROSANDBOX_LIMITS.commandTimeoutMs);
+    if (
+      !command.argv.length ||
+      command.argv.length > 128 ||
+      command.argv.some(
+        (arg) =>
+          typeof arg !== "string" || arg.length > 8192 || arg.includes("\0"),
+      )
+    )
+      invalid();
+    if (command.signal?.aborted) throw new SandboxRuntimeError("cancelled");
+    const remaining = state.deadline - performance.now();
+    if (remaining <= 0) throw new SandboxRuntimeError("lifetime-expired");
+    const duration = Math.min(command.timeoutMs, remaining);
+    state.busy = true;
+    const child = spawn(
+      this.#config.binary,
+      [
+        "exec",
+        "--stream",
+        "--timeout",
+        `${Math.ceil(duration / 1000) + 2}s`,
+        state.id,
+        "--",
+        ...command.argv,
+      ],
+      {
+        env: this.#env(),
+        cwd: this.#config.home,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let stop: ExecResult["status"] | undefined;
+    const kill = (reason: ExecResult["status"]) => {
+      stop ??= reason;
+      child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill("SIGKILL");
+    };
+    const cancel = () => kill("cancelled");
+    const timer = setTimeout(() => kill("timed-out"), duration);
+    command.signal?.addEventListener("abort", cancel, { once: true });
+    child.stdin.on("error", () => {});
+    child.stderr.resume();
+    const finished = new Promise<ExecResult["status"]>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        command.signal?.removeEventListener("abort", cancel);
+        state.busy = false;
+        resolve(stop ?? "exited");
+      };
+      child.once("close", done);
+      child.once("error", () => {
+        stop ??= "cancelled";
+        child.stdout.destroy();
+        done();
+      });
+    });
+    async function* capped(): AsyncGenerator<Buffer> {
+      let total = 0;
+      try {
+        for await (const chunk of child.stdout) {
+          total += (chunk as Buffer).length;
+          if (total > MICROSANDBOX_LIMITS.sessionBytes) {
+            kill("cancelled");
+            throw new SandboxRuntimeError("output-limit");
+          }
+          yield chunk as Buffer;
+        }
+      } catch (error) {
+        if (error instanceof SandboxRuntimeError) throw error;
+        // A destroyed stream after close or spawn failure simply ends.
+      }
+    }
+    return {
+      send(line) {
+        if (stop === undefined && child.stdin.writable)
+          child.stdin.write(`${line}\n`);
+      },
+      lines: boundedLines(capped(), MICROSANDBOX_LIMITS.sessionLineBytes),
+      close: () => kill("cancelled"),
+      finished,
+    };
   }
 
   async collect(

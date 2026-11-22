@@ -5,6 +5,7 @@ import type {
   SandboxCommand,
   SandboxHandle,
   SandboxRuntime,
+  SandboxSession,
   SandboxSpec,
 } from "./sandbox-runtime.ts";
 
@@ -32,6 +33,14 @@ export interface ReviewerRun {
   readonly id: string;
   readonly outcome: Outcome;
   readonly response?: Uint8Array;
+}
+
+export interface CoordinatorSessionPlan {
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "tools" | "hostTcpPort" | "maxLifetimeMs"
+  >;
+  readonly command: SandboxCommand;
 }
 
 export class HostAuditError extends Error {
@@ -80,6 +89,120 @@ export class TrustedHost {
         "Coordinator requires one host-prepared control.json file",
       );
     return this.#readOnly("Coordinator", plan, id);
+  }
+
+  /** A streamed Coordinator turn. The sandbox receives no files; the host
+   * passes the prompt over the session and treats all output as data. The
+   * create, exec and destroy operations are audited like any invocation. */
+  async runCoordinatorSession<T>(
+    plan: CoordinatorSessionPlan,
+    id: string,
+    use: (session: SandboxSession) => Promise<T>,
+  ): Promise<{ id: string; outcome: Outcome; value?: T }> {
+    const open = this.#sandbox.openSession?.bind(this.#sandbox);
+    if (
+      !open ||
+      Object.keys(plan.sandbox).some(
+        (key) =>
+          key !== "tools" && key !== "hostTcpPort" && key !== "maxLifetimeMs",
+      )
+    )
+      throw new Error("Coordinator session requires a streaming sandbox");
+    const sandbox: SandboxSpec = {
+      ...(plan.sandbox.tools
+        ? { tools: plan.sandbox.tools.map((tool) => ({ ...tool })) }
+        : {}),
+      ...(plan.sandbox.hostTcpPort !== undefined
+        ? { hostTcpPort: plan.sandbox.hostTcpPort }
+        : {}),
+      ...(plan.sandbox.maxLifetimeMs !== undefined
+        ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
+        : {}),
+    };
+    const command = { ...plan.command, argv: [...plan.command.argv] };
+    const append = async (event: Omit<AuditInput, "invocationId" | "role">) => {
+      try {
+        await this.#audit.append({
+          ...event,
+          invocationId: id,
+          role: "Coordinator",
+        });
+      } catch {
+        throw new HostAuditError(id);
+      }
+    };
+    const allow = async (operation: Operation) => {
+      await append({ kind: "operation.requested", operation });
+      await append({ kind: "operation.allowed", operation });
+    };
+    await append({ kind: "invocation.started" });
+    let outcome: Outcome = "failed";
+    let handle: SandboxHandle | undefined;
+    let failure: { error: unknown } | undefined;
+    let value: T | undefined;
+    try {
+      await allow("sandbox.create");
+      try {
+        handle = await this.#sandbox.create({ ...sandbox, invocationId: id });
+      } catch (error) {
+        await append({
+          kind: "operation.finished",
+          operation: "sandbox.create",
+          outcome: "failed",
+        });
+        throw error;
+      }
+      await append({
+        kind: "operation.finished",
+        operation: "sandbox.create",
+        outcome: "ok",
+      });
+      await allow("sandbox.exec");
+      let session: SandboxSession | undefined;
+      let status: Outcome = "failed";
+      try {
+        session = await open(handle, command);
+        value = await use(session);
+        status = "ok";
+      } catch (error) {
+        failure = { error };
+      } finally {
+        session?.close();
+      }
+      const stopped = session ? await session.finished : undefined;
+      if (status !== "ok" && stopped === "timed-out") status = "timed-out";
+      await append({
+        kind: "operation.finished",
+        operation: "sandbox.exec",
+        outcome: status,
+      });
+      outcome = status;
+    } catch (error) {
+      if (error instanceof HostAuditError) throw error;
+      failure ??= { error };
+      outcome = "failed";
+    }
+    if (handle) {
+      const current = handle;
+      await allow("sandbox.destroy");
+      let destroyed: Outcome = "ok";
+      try {
+        await this.#sandbox.destroy(current);
+      } catch {
+        destroyed = "failed";
+        if (outcome === "ok") outcome = "failed";
+      }
+      await append({
+        kind: "operation.finished",
+        operation: "sandbox.destroy",
+        outcome: destroyed,
+      });
+    }
+    await append({ kind: "invocation.finished", outcome });
+    if (failure) throw failure.error;
+    return outcome === "ok"
+      ? { id, outcome, value: value as T }
+      : { id, outcome };
   }
 
   #readOnly(

@@ -248,3 +248,106 @@ test("delegate and integration receipts replay across restart and reject conflic
     reopened.close();
   }
 });
+
+test("a Coordinator session is audited, fails closed and always tears down", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const calls: string[] = [];
+  const runtime: SandboxRuntime = {
+    async create(spec) {
+      calls.push(
+        `create ${spec.hostTcpPort ?? "-"} ${spec.tools?.length ?? 0}`,
+      );
+      return { id: "fixture" };
+    },
+    async exec() {
+      throw new Error("not used");
+    },
+    async collect() {
+      throw new Error("not used");
+    },
+    async destroy() {
+      calls.push("destroy");
+    },
+    async openSession() {
+      calls.push("open");
+      return {
+        send() {},
+        lines: (async function* () {})(),
+        close() {
+          calls.push("close");
+        },
+        finished: Promise.resolve("cancelled" as const),
+      };
+    },
+  };
+  const host = new TrustedHost(audit, runtime);
+  const plan = {
+    sandbox: { hostTcpPort: 4242, maxLifetimeMs: 10_000 },
+    command: { argv: ["/fixture"], timeoutMs: 500 },
+  };
+  const ok = await host.runCoordinatorSession(
+    plan,
+    randomUUID(),
+    async () => 7,
+  );
+  assert.deepEqual(ok.value, 7);
+  assert.deepEqual(calls.splice(0), [
+    "create 4242 0",
+    "open",
+    "close",
+    "destroy",
+  ]);
+  const operations = (id: string) =>
+    audit
+      .read(id)
+      .filter((event) => event.kind === "operation.finished")
+      .map((event) => `${event.operation} ${event.outcome}`);
+  assert.deepEqual(operations(ok.id), [
+    "sandbox.create ok",
+    "sandbox.exec ok",
+    "sandbox.destroy ok",
+  ]);
+  const failing = randomUUID();
+  await assert.rejects(
+    host.runCoordinatorSession(plan, failing, async () => {
+      throw new Error("fixture model failure");
+    }),
+    /fixture model failure/,
+  );
+  assert.deepEqual(calls.splice(0), [
+    "create 4242 0",
+    "open",
+    "close",
+    "destroy",
+  ]);
+  assert.deepEqual(operations(failing), [
+    "sandbox.create ok",
+    "sandbox.exec failed",
+    "sandbox.destroy ok",
+  ]);
+  assert.equal(audit.read(failing).at(-1)?.outcome, "failed");
+  // Files and other sandbox fields are not accepted for a Coordinator session.
+  await assert.rejects(
+    host.runCoordinatorSession(
+      { ...plan, sandbox: { ...plan.sandbox, files: [] } as never },
+      randomUUID(),
+      async () => 1,
+    ),
+    /streaming sandbox/,
+  );
+  // A failed audit write stops before any sandbox effect.
+  const broken = new TrustedHost(
+    {
+      append() {
+        throw new Error("fixture audit failure");
+      },
+    },
+    runtime,
+  );
+  await assert.rejects(
+    broken.runCoordinatorSession(plan, randomUUID(), async () => 1),
+    HostAuditError,
+  );
+  assert.deepEqual(calls, []);
+});

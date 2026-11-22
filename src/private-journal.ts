@@ -28,7 +28,7 @@ export async function checkPrivateDirectory(root: string): Promise<void> {
 export async function publishPrivateFile(
   root: string,
   file: string,
-  data: string,
+  data: string | Uint8Array,
 ): Promise<void> {
   const temporary = join(root, `.event-${randomUUID()}`);
   try {

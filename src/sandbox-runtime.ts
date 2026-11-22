@@ -4,8 +4,20 @@ export interface SandboxFile {
   readonly bytes: Uint8Array;
 }
 
+/** A host executable copied into the guest. The adapter verifies the digest
+ * on the host before copying; the guest command should verify it again. */
+export interface SandboxTool {
+  readonly hostPath: string;
+  /** Absolute guest path directly under /tmp. */
+  readonly guestPath: string;
+  readonly sha256: string;
+}
+
 export interface SandboxSpec {
   readonly files?: readonly SandboxFile[];
+  readonly tools?: readonly SandboxTool[];
+  /** The only network egress: TCP to this port on the host. Default: none. */
+  readonly hostTcpPort?: number;
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
   readonly maxLifetimeMs?: number;
@@ -38,9 +50,25 @@ export interface CollectedArtifacts {
   readonly files: readonly SandboxFile[];
 }
 
+/** A long-running guest command with line-delimited stdin and stdout. */
+export interface SandboxSession {
+  send(line: string): void;
+  /** Bounded stdout lines. Ends when the command ends or the session closes. */
+  readonly lines: AsyncIterable<string>;
+  /** Stop the command. Idempotent. */
+  close(): void;
+  /** Settles once the command has stopped and the handle can be destroyed. */
+  readonly finished: Promise<ExecResult["status"]>;
+}
+
 export interface SandboxRuntime {
   create(spec: SandboxSpec): Promise<SandboxHandle>;
   exec(handle: SandboxHandle, command: SandboxCommand): Promise<ExecResult>;
+  /** Optional: adapters without streaming do not support sessions. */
+  openSession?(
+    handle: SandboxHandle,
+    command: SandboxCommand,
+  ): Promise<SandboxSession>;
   collect(
     handle: SandboxHandle,
     spec: CollectSpec,

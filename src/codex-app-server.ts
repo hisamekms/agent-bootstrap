@@ -1,8 +1,12 @@
+import { LineStreamError } from "./lines.ts";
 import type {
   CoordinatorModel,
   CoordinatorTurnInput,
+  CoordinatorTurnResult,
   ModelToolCall,
 } from "./model-coordinator.ts";
+import { SandboxRuntimeError } from "./sandbox-runtime.ts";
+import { HostAuditError } from "./trusted-host.ts";
 
 /** One line-delimited JSON-RPC connection to a Codex app-server process. The
  * trusted host owns the process and its sandbox. Implementations must bound
@@ -14,9 +18,10 @@ export interface JsonlChannel {
 }
 
 export interface CodexCoordinatorOptions {
-  /** Open a fresh app-server for this invocation identity. */
-  connect(id: string): Promise<JsonlChannel>;
-  /** Covers connecting and the whole turn. */
+  /** Run `use` against a fresh app-server for this invocation identity, for
+   * example inside TrustedHost.runCoordinatorSession, and return its value. */
+  open<T>(id: string, use: (channel: JsonlChannel) => Promise<T>): Promise<T>;
+  /** Covers opening and the whole turn. */
   readonly timeoutMs: number;
 }
 
@@ -31,48 +36,18 @@ export class CodexAppServerError extends Error {
   readonly code: string;
   constructor(
     code:
-      "timed-out" | "connect" | "protocol" | "rpc-error" | "closed" | "limit",
+      | "timed-out"
+      | "connect"
+      | "encoding"
+      | "protocol"
+      | "rpc-error"
+      | "closed"
+      | "limit",
   ) {
     super(`Codex app-server: ${code}`);
     this.name = "CodexAppServerError";
     this.code = code;
   }
-}
-
-/** Split a byte stream into UTF-8 lines, failing before a line exceeds the
- * limit rather than after buffering it. */
-export async function* boundedLines(
-  chunks: AsyncIterable<Uint8Array | string>,
-  maxBytes: number = CODEX_LIMITS.lineBytes,
-): AsyncGenerator<string> {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let parts: Buffer[] = [];
-  let size = 0;
-  const take = () => {
-    const line = Buffer.concat(parts);
-    parts = [];
-    size = 0;
-    try {
-      return decoder.decode(line);
-    } catch {
-      throw new CodexAppServerError("protocol");
-    }
-  };
-  for await (const chunk of chunks) {
-    let data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-    for (;;) {
-      const end = data.indexOf(0x0a);
-      const piece = end < 0 ? data : data.subarray(0, end);
-      size += piece.length;
-      if (size > maxBytes) throw new CodexAppServerError("limit");
-      parts.push(Buffer.from(piece));
-      if (end < 0) break;
-      const line = take();
-      yield line.endsWith("\r") ? line.slice(0, -1) : line;
-      data = data.subarray(end + 1);
-    }
-  }
-  if (size > 0) yield take();
 }
 
 type Message = {
@@ -130,6 +105,29 @@ const allowedItems = new Set([
   "contextCompaction",
 ]);
 
+/** A fixed-shape label for an untrusted protocol name. */
+function label(value: unknown): string {
+  return typeof value === "string" && /^[a-zA-Z0-9/]{1,48}$/.test(value)
+    ? value
+    : "unknown";
+}
+
+/** Keep host and adapter errors, which carry fixed diagnostics; replace
+ * anything else with a fixed code. */
+function transportError(error: unknown, fallback: "closed" | "connect"): Error {
+  if (
+    error instanceof CodexAppServerError ||
+    error instanceof HostAuditError ||
+    error instanceof SandboxRuntimeError
+  )
+    return error;
+  if (error instanceof LineStreamError)
+    return new CodexAppServerError(
+      error.code === "limit" ? "limit" : "encoding",
+    );
+  return new CodexAppServerError(fallback);
+}
+
 const submitted =
   "Submitted to the trusted host. Its outcome arrives in the next turn.";
 const refused = "Only one host request is accepted per turn.";
@@ -150,55 +148,59 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
   async turn(
     input: CoordinatorTurnInput,
     id: string,
-  ): Promise<ModelToolCall | null> {
+  ): Promise<CoordinatorTurnResult> {
     let channel: JsonlChannel | undefined;
-    let expiredFlag = false;
+    let expired = false;
+    let entered = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        expiredFlag = true;
-        channel?.close();
-        reject(new CodexAppServerError("timed-out"));
-      }, this.#options.timeoutMs);
-    });
-    const run = (async () => {
-      let opened: JsonlChannel;
-      try {
-        opened = await this.#options.connect(id);
-      } catch {
-        throw new CodexAppServerError("connect");
-      }
+    const run = this.#options.open(id, async (opened) => {
+      entered = true;
       channel = opened;
-      if (expiredFlag) {
-        opened.close();
-        throw new CodexAppServerError("timed-out");
-      }
       try {
+        if (expired) throw new CodexAppServerError("timed-out");
         return await this.#converse(opened, input);
       } catch (error) {
-        // Transport errors carry no adapter meaning; report a fixed code.
-        if (error instanceof CodexAppServerError) throw error;
-        throw new CodexAppServerError("closed");
+        throw transportError(error, "closed");
+      } finally {
+        opened.close();
       }
-    })();
-    run.catch(() => {});
+    });
+    const deadline = new Promise<"expired">((resolve) => {
+      timer = setTimeout(() => resolve("expired"), this.#options.timeoutMs);
+    });
     try {
-      return await Promise.race([run, expired]);
+      const first = await Promise.race([
+        run.then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        ),
+        deadline,
+      ]);
+      if (first === "expired") {
+        expired = true;
+        channel?.close();
+        // Let the host finish teardown and audit before reporting.
+        await run.catch(() => {});
+        throw new CodexAppServerError("timed-out");
+      }
+      if ("error" in first)
+        throw transportError(first.error, entered ? "closed" : "connect");
+      if (!first.value) throw new CodexAppServerError("closed");
+      return first.value;
     } finally {
       clearTimeout(timer);
-      channel?.close();
     }
   }
 
   async #converse(
     channel: JsonlChannel,
     input: CoordinatorTurnInput,
-  ): Promise<ModelToolCall | null> {
+  ): Promise<CoordinatorTurnResult> {
     const send = (message: object) => channel.send(JSON.stringify(message));
     let threadId: string | undefined;
     let turnId: string | undefined;
     let call: ModelToolCall | null = null;
-    let voided = false;
+    let voided: string | undefined;
     let interrupted = false;
     let bytes = 0;
     let requests = 0;
@@ -208,8 +210,8 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
       interrupted = true;
       send({ id: 3, method: "turn/interrupt", params: { threadId, turnId } });
     };
-    const voidTurn = () => {
-      voided = true;
+    const voidTurn = (reason: string) => {
+      voided ??= reason;
       interrupt();
     };
     send({
@@ -318,17 +320,19 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
               contentItems: [{ type: "inputText", text: refused }],
             },
           });
-          if (!usable || !call) voidTurn();
+          if (!usable) voidTurn("foreign-call");
+          else if (!call) voidTurn("extra-call");
           else interrupt();
         } else {
           send({ id, error: { code: -32601, message: "Declined by host" } });
-          voidTurn();
+          voidTurn(`server-request/${label(method)}`);
         }
         continue;
       }
       if (method === "item/started" || method === "item/completed") {
         const type = field(params, "item", "type");
-        if (typeof type !== "string" || !allowedItems.has(type)) voidTurn();
+        if (typeof type !== "string" || !allowedItems.has(type))
+          voidTurn(`native-item/${label(type)}`);
         continue;
       }
       if (
@@ -336,7 +340,11 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
         turnId !== undefined &&
         field(params, "turn", "id") === turnId
       )
-        return voided ? null : call;
+        return voided
+          ? { call: null, reason: voided }
+          : call
+            ? { call }
+            : { call: null, reason: "no-call" };
     }
     throw new CodexAppServerError("closed");
   }

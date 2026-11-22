@@ -419,18 +419,67 @@ The interrupts reached Codex before it returned any tool output to the
 provider. The smoke asserts that no shell tool is offered. No sandbox
 remained after the run.
 
+### Coordinator trace
+
+On 2026-11-22, the trace work closed the gaps that the first model turn
+left in the evidence. Each Coordinator turn now runs through
+`TrustedHost.runCoordinatorSession`, which audits the session like any other
+role. The `SandboxRuntime` port gains an optional streamed session, and the
+Microsandbox adapter implements it with `msb exec --stream`. A session has
+bounded lines, a bounded byte total and a deadline, and it holds the handle
+busy until the command stops. Sandbox specs can now name host tools and one
+host TCP port:
+
+- **Tools.** Each tool is a host file copied to `/tmp/<name>`. The adapter
+  checks its SHA-256 on the host before creating the sandbox, and the guest
+  command checks it again.
+- **Host port.** This is the only egress. It is applied as
+  `--no-net --net-rule allow@host:tcp:<port>`.
+
+A Coordinator session accepts only those fields and a lifetime, and it
+receives no files.
+
+The router journal adds three events:
+
+| Event           | Records                                                                                                                                            |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turn.proposed` | The SHA-256 of the model's raw proposal. Proposals up to 16 KiB are also kept as a private file.                                                   |
+| `turn.voided`   | A fixed-shape reason when the adapter voided the turn: `no-call`, `extra-call`, `foreign-call`, `server-request/<method>` or `native-item/<type>`. |
+| `turn.failed`   | A fixed failure code when a turn throws, such as `timed-out`, `connect`, `limit` or `host-audit`.                                                  |
+
+The task then reopens as uncertain and is not retried. Because a turn now
+has one more event, a task reaches its event limit after 31 status turns
+instead of 41.
+
+`src/task-trace.ts` joins one task's journal with the host audit. Turn run
+IDs are the Coordinator invocation IDs, and delegation attempt IDs are the
+delegated role invocation IDs. From the command line:
+
+```sh
+bun src/trace.ts task /path/to/audit.sqlite /path/to/task-journal-root <task-id>
+```
+
+The output lists the journal, each stored proposal as untrusted text, and
+the audit of every Coordinator turn and delegated role.
+
+The smoke now uses this product path and no direct `msb` calls. On
+2026-11-22, it finished in about 10 seconds. The trace for the first task
+showed two Coordinator invocations and one Worker invocation. Each one had
+`sandbox.create`, `sandbox.exec` and `sandbox.destroy` finished `ok`. The two
+stored proposals were the `delegate` and `requestIntegration` actions. The
+second task recorded `turn.voided native-item/sleep` and one audited
+Coordinator invocation. No sandbox remained.
+
 Known gaps:
 
-- **Coordinator VMs are not in the SQLite sandbox audit.** They use a
-  spike-only streamed `msb exec` transport because the product
-  `SandboxRuntime` port has no streaming exec. The router journal still
-  records `turn.started` before each model call.
-- **Failed turns become uncertain.** A provider or transport failure leaves
-  `turn.started` as the last event. The task then reopens as uncertain and
-  is not retried, although no host effect occurred.
-- **Denials record no proposal digest.** Denial events do not record a
-  digest of the model's proposed action.
-- **Usage is not collected.** Usage notifications are ignored.
+- **Native tools are detected, not prevented.** A native item may already
+  be running when the turn is voided. The Coordinator VM, its audit and the
+  voiding reason now make this traceable, but nothing records what the item
+  did inside the guest.
+- **Usage is not collected.** Usage notifications are ignored. M5 will
+  collect them.
+- **Reviewed-integration records are not joined.** The task trace does not
+  join the reviewed-integration journal used by the M4 smoke.
 
 ## Later acceptance checks
 
