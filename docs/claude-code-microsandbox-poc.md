@@ -36,9 +36,9 @@ The results were verified on 2026-11-22.
 The Claude Code facts come from the official docs, read on 2026-11-22:
 
 - [Authentication](https://code.claude.com/docs/en/authentication.md):
-  - The CLI checks credentials in this order: `ANTHROPIC_AUTH_TOKEN`, then
-    `ANTHROPIC_API_KEY`, then `apiKeyHelper`, then
-    `CLAUDE_CODE_OAUTH_TOKEN`, then a subscription session.
+  - The CLI checks credentials in a documented order. `ANTHROPIC_AUTH_TOKEN`
+    and `ANTHROPIC_API_KEY` come before `apiKeyHelper` and before CLI-managed
+    credentials.
   - `ANTHROPIC_API_KEY` is sent as `X-Api-Key`.
   - In `-p` mode the key is used without an approval prompt.
 - [Headless mode](https://code.claude.com/docs/en/headless.md): `--bare`
@@ -92,6 +92,51 @@ On 2026-11-22 it passed in about 23 seconds:
   run directory or `MSB_HOME`.
 - **Audit.** Each role VM recorded the `provider.egress` grant as requested,
   allowed and finished `ok`.
+
+## Operator credential variable
+
+The smoke also runs a Worker and a Reviewer in `operator-credential` mode.
+By default it substitutes `ANTHROPIC_AUTH_TOKEN` into `authorization`,
+without `--bare`, using a separate runtime bound to that provider entry.
+`M6_OPERATOR_VARIABLE` selects another variable without changing any
+assertion. The inputs are:
+
+- **Worker (`/workspace`).** Planted settings and a planted `CLAUDE.md`.
+- **Reviewer (`/review`, read-only).** Planted copies of every
+  project-level surface:
+  - `CLAUDE.md`, `CLAUDE.local.md` and `.claude/CLAUDE.md`;
+  - settings;
+  - skills, agents, commands, output styles and rules;
+  - `.mcp.json`.
+
+  The stand-in also makes the model call `DeferredToolPlaceholder`.
+
+On 2026-11-22 the run passed:
+
+- **Requests.** Every Messages request was streamed and carried `Bearer`
+  with the synthetic credential. None had an `x-api-key` header.
+- **Tools.** The offered tools were exactly the pinned set, plus the CLI's
+  internal `DeferredToolPlaceholder`: Read, Glob, Grep, Edit and Write for
+  Worker, and Read, Glob and Grep for Reviewer.
+- **Placeholder call.** It was refused with "No such tool available".
+- **Planted content.** No planted text appeared in any request. The edit
+  was not tampered with, and the Reviewer returned its pass result.
+- **Audit.** The `provider.egress` grant was recorded and closed `ok`.
+
+An earlier ad hoc experiment is not in the repository and cannot be
+re-run from it. It used a plain HTTP stand-in and showed why the tool set
+is pinned:
+
+- **Without `--tools`.** The non-bare CLI offered `Workflow`,
+  `ScheduleWakeup`, `ToolSearch`, `ListAgents` and `ReportFindings`.
+- **With a denylist instead.** Denying those tools exposed further deferred
+  tools: `CronCreate`, `EnterWorktree` and `TaskStop`.
+
+Not covered by any test:
+
+- **Plugins.** No plugin was planted.
+- **Managed policy.** The guest script refuses `/etc/claude-code`, but no
+  test plants one.
 
 ## Failures found on the way
 

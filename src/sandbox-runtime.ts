@@ -13,6 +13,24 @@ export interface SandboxTool {
   readonly sha256: string;
 }
 
+/** A guest variable name that may carry a credential placeholder. The host
+ * passes the real value to the backend under the same name, and the guest
+ * sees the placeholder under it, so the name must be credential-shaped
+ * (`*_TOKEN`, `*_KEY` or `*_SECRET`) and must not be read as configuration by
+ * the backend, the loader, the TLS stack, proxies, the runtime or the CLI. */
+export function isSafeCredentialVariable(name: unknown): name is string {
+  if (typeof name !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(name))
+    return false;
+  if (!/_(TOKEN|KEY|SECRET)$/.test(name)) return false;
+  if (
+    /^(MSB_|LD_|DYLD_|SSL_|NODE_|GIT_|BASH_|RUST_|CARGO_|XDG_|LC_|BUN_|OTEL_|MCP_|ENABLE_|DISABLE_|DOCKER_|AWS_|GOOGLE_|AZURE_|CLAUDE_CODE_CLIENT_)/.test(
+      name,
+    )
+  )
+    return false;
+  return !/_PROXY$/.test(name);
+}
+
 export interface SandboxProvider {
   readonly host: string;
   readonly secretEnv: string;

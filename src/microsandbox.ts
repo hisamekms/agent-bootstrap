@@ -13,6 +13,7 @@ import { isAbsolute, join } from "node:path";
 import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
 import {
+  isSafeCredentialVariable,
   SandboxRuntimeError,
   type CollectedArtifacts,
   type CollectSpec,
@@ -324,9 +325,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           provider.host,
         ) ||
         typeof provider.secretEnv !== "string" ||
-        !/^(AGENT_BOOTSTRAP_[A-Z0-9_]{1,48}|ANTHROPIC_API_KEY)$/.test(
-          provider.secretEnv,
-        ) ||
+        !isSafeCredentialVariable(provider.secretEnv) ||
         (provider.header !== undefined &&
           provider.header !== "authorization" &&
           provider.header !== "x-api-key") ||

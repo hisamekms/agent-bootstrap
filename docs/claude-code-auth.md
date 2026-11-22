@@ -6,15 +6,16 @@ mode exposes, and which modes are deliberately left out.
 
 ## Modes
 
-| Mode                            | Status                                                                                                                        | What the guest sees                                                        |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `api-key` with `host-secret`    | Implemented. Verified offline against a loopback stand-in for the API; see [the PoC record](claude-code-microsandbox-poc.md). | A placeholder in `ANTHROPIC_API_KEY`. The real key never enters the guest. |
-| `api-key` with direct injection | Not implemented.                                                                                                              | —                                                                          |
-| `native-cli`                    | Refused (`ClaudeCodeUnsupportedError`).                                                                                       | —                                                                          |
-| Claude subscription tokens      | Not supported, and not planned.                                                                                               | —                                                                          |
+| Mode                         | Status                                                                                                                        | What the guest sees                                                                                |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `api-key` with `host-secret` | Implemented. Verified offline against a loopback stand-in for the API; see [the PoC record](claude-code-microsandbox-poc.md). | A placeholder in `ANTHROPIC_API_KEY`. The real key never enters the guest.                         |
+| `operator-credential`        | Implemented. Verified offline against the same stand-in.                                                                      | A placeholder in a variable that the operator chooses. The real credential never enters the guest. |
+| Direct injection             | Not implemented.                                                                                                              | —                                                                                                  |
+| `native-cli`                 | Refused (`ClaudeCodeUnsupportedError`).                                                                                       | —                                                                                                  |
 
-Choose `api-key` with `host-secret`. It is the only mode the public package
-implements.
+Choose `api-key` with `host-secret` for Anthropic API keys. Use
+`operator-credential` when the official CLI must read a credential from a
+different variable or header.
 
 ### Host-held API key
 
@@ -43,11 +44,12 @@ Without the backend, the guest has no way to recover the key. A guest
 process can still use the key while the VM lives, by sending the
 placeholder to `api.anthropic.com`. See the risks below.
 
-The CLI always runs with `--bare --strict-mcp-config --setting-sources ''`.
+In API-key mode the CLI runs with `--bare --strict-mcp-config
+--setting-sources ''`. The operator-credential mode below drops `--bare`.
 According to the Claude Code documentation, bare mode never reads OAuth
 credentials or the system keychain. Together with a clean environment
 (`env -i`) and a fresh `CLAUDE_CONFIG_DIR`, this keeps API-key mode from
-picking up a pre-existing subscription session or host profile. No host
+picking up a pre-existing CLI session or host profile. No host
 home, `~/.claude`, SSH agent, Docker socket or cloud credential directory is
 mounted.
 
@@ -79,17 +81,71 @@ CLI-managed login needs a session inside the guest. A disposable VM has
 none, and the bootstrap never copies host profiles into sandboxes, so this
 mode is refused rather than enabled through a silent mount.
 
-### Subscription tokens
+### Operator credential variable
 
-Agent Bootstrap has no code path for `claude setup-token`,
-`CLAUDE_CODE_OAUTH_TOKEN`, OAuth refresh, or a subscription proxy. Anthropic's
+`{ mode: "operator-credential", variable, header }` passes a credential that
+the operator chooses to the official CLI. The trusted host still holds the
+value; the guest variable contains only the backend placeholder, and the
+backend substitutes the real value into the chosen header (`authorization`
+or `x-api-key`) on requests to the provider host. For example, the
+documented gateway variable `ANTHROPIC_AUTH_TOKEN` uses the `authorization`
+header.
+
+The variable name must pass `isSafeCredentialVariable`:
+
+- It must be credential-shaped, ending in `_TOKEN`, `_KEY` or `_SECRET`.
+- It must not use a prefix that the backend, the loader, the TLS stack, the
+  runtime, telemetry or tool configuration reads: `MSB_`, `LD_`, `NODE_`,
+  `RUST_`, `XDG_`, `LC_`, `BUN_`, `OTEL_`, `MCP_`, `ENABLE_`, `DISABLE_` and
+  similar.
+- It must not be a proxy variable.
+
+The host passes the real value to the backend under this name, and the
+guest sees the placeholder under it, so a configuration name could change
+how either side runs. `ANTHROPIC_API_KEY` must use `x-api-key` and
+`ANTHROPIC_AUTH_TOKEN` must use `authorization`, because the CLI reads them
+into those fixed headers.
+
+Only the chosen variable is passed through `env -i`, so a higher-precedence
+credential such as `ANTHROPIC_API_KEY` is never present at the same time.
+The guest script also checks that no managed policy (`/etc/claude-code`)
+exists and starts from empty, freshly created home and configuration
+directories.
+
+Bare mode reads only API keys, so this mode runs without `--bare`. Instead,
+the adapter passes explicit isolation flags:
+
+- `--setting-sources ''`
+- `--strict-mcp-config`
+- `--disable-slash-commands`
+- `--no-session-persistence`
+- `--tools`, which pins the exact tool set
+- `ENABLE_TOOL_SEARCH=false`
+
+The smoke checks the following, in the PoC:
+
+- **Worker in `/workspace`.** The CLI ignored planted `.claude` settings
+  (hooks, `env`, `apiKeyHelper`) and a planted `CLAUDE.md`.
+- **Reviewer in `/review`.** The read-only mount held the CLI ignored all
+  of the following:
+  - planted `CLAUDE.md`, `CLAUDE.local.md` and `.claude/CLAUDE.md`;
+  - settings;
+  - skills, agents, commands, output styles and rules;
+  - `.mcp.json`.
+- **Pinned tools.** The model saw only the pinned tools.
+- **Placeholder call.** A call to the internal `DeferredToolPlaceholder`
+  was refused as an unknown tool.
+
+Plugins and a managed policy file are not covered by a test. The image has
+no managed policy, and the guest script refuses one if present.
+
+The repository supplies, stores, collects and refreshes no credential. The
+operator decides which credential to configure and is responsible for being
+permitted to use it this way. See Anthropic's
 [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance.md#authentication-and-credential-use)
-says that third-party developers may not offer Claude.ai login, route
-requests through Free, Pro, Max or Ultra plan credentials on behalf of their
-users, or collect, store or intermediate Claude.ai credentials or session
-tokens. The provider-egress mechanism is generic, but this page does not
-describe it as a way to use subscription credentials, and doing so would not
-make such use acceptable.
+on authentication and credential use. Exposure is the same as in the
+host-held API-key mode: the credential cannot be read from the guest, but
+guest code can use it on the provider host while the VM is alive.
 
 ## Billing
 
@@ -132,13 +188,14 @@ Do not put keys in repository files, CLI flags or shell history.
 values only. The untrusted prompt is a single argv entry (`$1`), passed after
 `--`. An agent's text cannot choose host commands or CLI flags.
 
-| Item        | How it is set                                                                                                                                                                                                                             |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Flags       | Always `-p --bare --strict-mcp-config --setting-sources '' --output-format json --max-turns N --model M --permission-mode ... --allowedTools ... --disallowedTools ...`.                                                                  |
-| Environment | Only `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, the placeholder key, the backend CA path (`NODE_EXTRA_CA_CERTS`) and the variables that disable nonessential traffic, telemetry, error reporting and auto-update.                               |
-| Tools       | Bash is removed for every role. Planner and Reviewer are allowed Read, Glob and Grep, with Edit and Write removed; in bare mode CLI 2.1.330 then offers only Read. Worker is also allowed Edit and Write; bare mode offers Read and Edit. |
-| Output      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                        |
-| Limits      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                             |
+| Item                        | How it is set                                                                                                                                                                                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flags (API key)             | `-p --bare --strict-mcp-config --setting-sources '' --disable-slash-commands --no-session-persistence --output-format json --model M --max-turns N --permission-mode ... --tools ... --allowedTools ...`                                                                |
+| Flags (operator credential) | The same flags without `--bare`.                                                                                                                                                                                                                                        |
+| Environment                 | Only `PATH`, a fresh `HOME` and `CLAUDE_CONFIG_DIR`, the one placeholder credential variable, the backend CA path (`NODE_EXTRA_CA_CERTS`), `ENABLE_TOOL_SEARCH=false`, and the variables that disable nonessential traffic, telemetry, error reporting and auto-update. |
+| Tools                       | `--tools` pins the exact set; Bash is never included. Planner and Reviewer get Read, Glob and Grep, and Worker also gets Edit and Write. In bare mode, CLI 2.1.330 still offers fewer: Read for Planner and Reviewer, Read and Edit for Worker.                         |
+| Output                      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                                                      |
+| Limits                      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                                                           |
 
 ## Trust boundaries and risks
 
