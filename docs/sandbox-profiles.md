@@ -232,6 +232,28 @@ v4, and every `sandbox.create` request recorded profile `base` with the
 pinned Alpine image digest. Verification was recorded under its own role,
 `Verification`, with no `provider.egress` grant.
 
+On 2026-11-22 the `db` image was built from the pinned packages. Two
+consecutive builds gave the same digest, `cc1367fd…` (46.6 MiB). Two causes
+of differing digests were fixed first:
+
+- the backend writes the build VM's name into `/etc/hosts` and
+  `/etc/hostname`, and apk logs install times;
+- busybox tar picks which member of a hardlink group (tzdata) is the file by
+  traversal order. The normalized layer now makes the smallest path the
+  file.
+
+The builder also excludes the backend's runtime directory `/.msb`.
+
+`spike/images/db-verification-smoke.ts` then ran in real VMs:
+
+- **Valid schema change:** the host-pinned suite applied the candidate to
+  PostgreSQL 18.7 and SQLite 3.53.4 and round-tripped a row in both, with 4
+  passed and 0 failed. The change was integrated.
+- **Broken schema:** verification answered `revise` with 4 failed, and
+  integration was denied.
+- **Audit:** in both runs, Worker and Verification recorded profile `db` with
+  the locked image digest, and the Reviewer recorded `base`.
+
 Toolchains, language packages, the preparer VM and dependency changes are
 planned in `docs/repository-environments.md`.
 
