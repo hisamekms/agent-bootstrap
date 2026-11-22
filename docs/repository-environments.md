@@ -43,6 +43,31 @@ Decided on 2026-11-22.
   The VM repository has the base and the previous candidate as commits, so
   the Worker can see both what changed in this run and what changed overall.
 
+### Implementation status
+
+The result path and git in the VM are implemented. The pieces are
+`prepareWorkspace`, `createCandidateTree` and the multi-file `diff` and
+`advance` in `src/git-integration.ts`, the `repository` and `{ tree: true }`
+collection in the adapter, `src/workspace-tree.ts`, and the `tree` plan in
+`src/reviewed-integration.ts`. The Worker's proposed commit message is not
+implemented yet; the host writes a fixed message.
+
+On 2026-11-23, `spike/workspace/tree-smoke.ts` ran in real VMs with the
+`browser` profile for Worker and verification:
+
+- **Unscoped run.** The Worker saw the full history and a clean
+  `git status`. Its four changes became a host-authored commit whose only
+  parent is the old head, with the exact modes: a modified file, a deleted
+  file, an added executable and an executable bit removed. Verification
+  checked the candidate tree with 4 tests passing, and the commit was
+  integrated.
+- **Scope `app/`, a new file outside it.** No candidate was created.
+- **Scope `app/`, an edit inside it.** Paths left out by sparse checkout were
+  absent in the VM but were not treated as deletions. The candidate changed
+  only `app/lib/util.sh`.
+- **Audit.** The Worker and verification VMs used `browser` with the locked
+  digest, and the Reviewer used `base`.
+
 ## Toolchains as features
 
 - **Features.** A toolchain is a feature, such as `node22`, `bun1.3`,
