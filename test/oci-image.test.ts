@@ -202,8 +202,10 @@ test("mtime and names are stripped, metadata preserved", () => {
   assert.equal(by["etc/passwd"]!.data, "root\n");
   assert.equal(by["bin/sh"]!.type, "2");
   assert.equal(by["bin/sh"]!.link, "busybox");
-  assert.equal(by["bin/ash"]!.type, "1");
-  assert.equal(by["bin/ash"]!.link, "bin/busybox");
+  // The group's smallest path holds the data; the other member links to it.
+  assert.equal(by["bin/ash"]!.type, "0");
+  assert.equal(by["bin/busybox"]!.type, "1");
+  assert.equal(by["bin/busybox"]!.link, "bin/ash");
   assert.equal(by["dev/null"]!.type, "3");
   assert.equal(by["dev/null"]!.major, 1);
   assert.equal(by["dev/null"]!.minor, 3);
@@ -213,8 +215,8 @@ test("mtime and names are stripped, metadata preserved", () => {
 
 test("entries sorted and hardlinks follow their targets", () => {
   const names = read(normalizeLayer(tar(sample))).map((e) => e.name);
-  assert.ok(names.indexOf("bin/busybox") < names.indexOf("bin/ash"));
-  assert.equal(names.at(-1), "bin/ash");
+  assert.ok(names.indexOf("bin/ash") < names.indexOf("bin/busybox"));
+  assert.equal(names.at(-1), "bin/busybox");
   const rest = names.slice(0, -1);
   assert.deepEqual(rest, [...rest].sort());
 });
@@ -403,4 +405,38 @@ test("readOciLayout round-trips layoutTar output", () => {
     assert.equal(e.mtime, 0);
     assert.equal(e.mode, e.type === "5" ? 0o755 : 0o644);
   }
+});
+
+test("hardlink groups are canonical whichever member the archiver wrote first", async () => {
+  const { normalizeLayer } = await import("../src/oci-image.ts");
+  const header = (name: string, type: string, size: number, link = "") => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0);
+    h.write("0000644\0", 100);
+    h.write("0000000\0", 108);
+    h.write("0000000\0", 116);
+    h.write(size.toString(8).padStart(11, "0") + "\0", 124);
+    h.write("00000000000\0", 136);
+    h.write(type, 156);
+    h.write(link, 157);
+    h.write("ustar\0", 257);
+    h.write("00", 263);
+    h.fill(" ", 148, 156);
+    let sum = 0;
+    for (const byte of h) sum += byte;
+    h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+    return h;
+  };
+  const body = Buffer.alloc(512);
+  body.write("zone");
+  const archive = (file: string, link: string) =>
+    Buffer.concat([
+      header(file, "0", 4),
+      body,
+      header(link, "1", 0, file),
+      Buffer.alloc(1024),
+    ]);
+  const first = normalizeLayer(archive("zone/Bissau", "zone/Asmara"));
+  const second = normalizeLayer(archive("zone/Asmara", "zone/Bissau"));
+  assert.deepEqual(Buffer.from(first), Buffer.from(second));
 });

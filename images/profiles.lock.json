@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "profiles": {
+    "db": {
+      "image": "localhost/agent-bootstrap/db@sha256:cc1367fd27af2876f72299abdb18d65ebc1e1b354cdd4fff40fa81b892b72850",
+      "recipeDigest": "fe2ce2c915f57866f4ad9c9d7c6932c6998be33701fbf5b00cd93007cd1b94d8",
+      "memoryMiB": 1024,
+      "cpus": 2
+    }
+  }
+}

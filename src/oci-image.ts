@@ -329,6 +329,8 @@ function byPath(a: TarEntry, b: TarEntry): number {
  * Rewrite a tar deterministically. Entries are sorted by normalized path
  * (bytewise); non-hardlink entries come first, then all hardlinks (sorted), so
  * every hardlink follows its target. Hardlinks to hardlinks are rejected.
+ * In each hardlink group the bytewise-smallest path becomes the file, so the
+ * output does not depend on which member the archiver saw first.
  * The root directory entry is dropped. mtime, uname and gname are cleared.
  * PAX extended attributes (xattrs, e.g. file capabilities) are dropped.
  */
@@ -345,8 +347,34 @@ export function normalizeLayer(tar: Uint8Array): Uint8Array {
     if (target === undefined) fail("tar: hardlink target missing");
     if (target.type === "1") fail("tar: hardlink to hardlink");
   }
-  const regular = entries.filter((e) => e.type !== "1").sort(byPath);
-  const links = entries.filter((e) => e.type === "1").sort(byPath);
+  // Which member of a hardlink group the archiver wrote as the file depends
+  // on its traversal order. Canonicalize: the bytewise-smallest path holds
+  // the data and every other member links to it.
+  const groups = new Map<string, TarEntry[]>();
+  for (const e of entries)
+    if (e.type === "1") {
+      const group = groups.get(e.linkname) ?? [byName.get(e.linkname)!];
+      group.push(e);
+      groups.set(e.linkname, group);
+    }
+  const rewritten = new Map<string, TarEntry>();
+  for (const group of groups.values()) {
+    const file = group.find((e) => e.type !== "1")!;
+    const members = [...group].sort(byPath);
+    const owner = members[0]!;
+    rewritten.set(owner.path, { ...file, path: owner.path });
+    for (const member of members.slice(1))
+      rewritten.set(member.path, {
+        ...file,
+        path: member.path,
+        type: "1",
+        linkname: owner.path,
+        data: new Uint8Array(0),
+      });
+  }
+  const all = entries.map((e) => rewritten.get(e.path) ?? e);
+  const regular = all.filter((e) => e.type !== "1").sort(byPath);
+  const links = all.filter((e) => e.type === "1").sort(byPath);
   return writeTar([...regular, ...links]);
 }
 
