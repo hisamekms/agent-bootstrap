@@ -19,6 +19,7 @@ import {
   type ExecResult,
   type SandboxCommand,
   type SandboxHandle,
+  type SandboxProvider,
   type SandboxRuntime,
   type SandboxSession,
   type SandboxSpec,
@@ -33,8 +34,22 @@ export interface MicrosandboxConfig {
   /** Required only for specs with `provider`. Used on the host to pass the
    * credential to the backend's TLS substitution at create time. */
   readonly credentials?: CredentialProvider;
-  /** Exact provider hosts that specs may name. Default: none. */
-  readonly providerHosts?: readonly string[];
+  /** The provider egress binding that specs may request: the credential's
+   * host, header, variable, port and upstream CA. A spec's `provider` must
+   * equal it exactly. At most one entry, because `credentials` is a single
+   * credential. Default: none. */
+  readonly providers?: readonly SandboxProvider[];
+}
+
+/** A provider binding with defaults filled in, for exact comparison. */
+function providerKey(provider: SandboxProvider): string {
+  return JSON.stringify([
+    provider.host,
+    provider.secretEnv,
+    provider.header ?? "authorization",
+    provider.port ?? 443,
+    provider.upstreamCaCertPath ?? null,
+  ]);
 }
 
 /** Conservative fixed bounds for this initial offline adapter. */
@@ -47,7 +62,7 @@ export const MICROSANDBOX_LIMITS = {
   defaultLifetimeMs: 120_000,
   maxLifetimeMs: 300_000,
   backendTimeoutMs: 15_000,
-  tools: 4,
+  tools: 8,
   toolBytes: 512 * 1024 * 1024,
   sessionLineBytes: 1024 * 1024,
   sessionBytes: 16 * 1024 * 1024,
@@ -121,6 +136,32 @@ function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
   });
 }
 
+/** Backend arguments for credentialed provider egress. The host-gateway
+ * name maps to the backend's `host` target; other names are domain rules. */
+function providerArgs(provider: SandboxProvider): string[] {
+  const port = provider.port ?? 443;
+  const target =
+    provider.host === "host.microsandbox.internal" ? "host" : provider.host;
+  return [
+    "--net-rule",
+    "allow@dns",
+    "--net-rule",
+    `allow@${target}:tcp:${port}`,
+    "--tls-intercept",
+    ...(port !== 443 ? ["--tls-intercept-port", String(port)] : []),
+    ...(provider.upstreamCaCertPath
+      ? [
+          "--tls-upstream-ca-cert-for",
+          `${provider.host}=${provider.upstreamCaCertPath}`,
+        ]
+      : []),
+    "--secret",
+    `${provider.secretEnv}:headers=${provider.header ?? "authorization"}@${provider.host}`,
+    "--secret-violation-action",
+    "block",
+  ];
+}
+
 /** Host-only adapter. Callers must supply dedicated trusted host directories and
  * a cached digest-pinned image containing /bin/sh, base64, wc and test. */
 export class MicrosandboxRuntime implements SandboxRuntime {
@@ -140,10 +181,17 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       !/^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[a-f0-9]{64}$/.test(config.image)
     )
       invalid();
+    if (config.providers && config.providers.length > 1) invalid();
     this.#config = {
       ...config,
-      ...(config.providerHosts
-        ? { providerHosts: Object.freeze([...config.providerHosts]) }
+      ...(config.providers
+        ? {
+            providers: Object.freeze(
+              config.providers.map((provider) =>
+                Object.freeze({ ...provider }),
+              ),
+            ),
+          }
         : {}),
     };
   }
@@ -269,12 +317,27 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       (port !== undefined ||
         !this.#config.credentials ||
         typeof provider.host !== "string" ||
-        !this.#config.providerHosts?.includes(provider.host) ||
+        !this.#config.providers?.some(
+          (allowed) => providerKey(allowed) === providerKey(provider),
+        ) ||
         !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
           provider.host,
         ) ||
         typeof provider.secretEnv !== "string" ||
-        !/^AGENT_BOOTSTRAP_[A-Z0-9_]{1,48}$/.test(provider.secretEnv))
+        !/^(AGENT_BOOTSTRAP_[A-Z0-9_]{1,48}|ANTHROPIC_API_KEY)$/.test(
+          provider.secretEnv,
+        ) ||
+        (provider.header !== undefined &&
+          provider.header !== "authorization" &&
+          provider.header !== "x-api-key") ||
+        (provider.port !== undefined &&
+          (!Number.isSafeInteger(provider.port) ||
+            provider.port < 1 ||
+            provider.port > 65_535)) ||
+        (provider.upstreamCaCertPath !== undefined &&
+          (typeof provider.upstreamCaCertPath !== "string" ||
+            !isAbsolute(provider.upstreamCaCertPath) ||
+            /[\0:=,\r\n]/.test(provider.upstreamCaCertPath))))
     )
       invalid();
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
@@ -353,19 +416,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         "never",
         "--no-net",
         ...(port !== undefined ? ["--net-rule", `allow@host:tcp:${port}`] : []),
-        ...(provider
-          ? [
-              "--net-rule",
-              "allow@dns",
-              "--net-rule",
-              `allow@${provider.host}:tcp:443`,
-              "--tls-intercept",
-              "--secret",
-              `${provider.secretEnv}:headers=authorization@${provider.host}`,
-              "--secret-violation-action",
-              "block",
-            ]
-          : []),
+        ...(provider ? providerArgs(provider) : []),
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
         "--copy-dir",
