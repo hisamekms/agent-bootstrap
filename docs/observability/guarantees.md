@@ -100,14 +100,29 @@ observability-disabled run, so there is no measured whole-run overhead.
   `allowUnauditedRun: true`. Disabling telemetry leaves audit enabled in
   required mode.
 
-## Pending verification by the coordinator
+## Verified after the final security review (SEC-2)
 
-- Bound the telemetry queues and account for dropped data under pressure.
-- Enforce a telemetry disk budget.
-- Expose gateway limits through `ObservabilityConfig`.
-- Close refused SOCKS and DNS TCP accepts promptly.
-- Run the DuckDB CLI with a minimal subprocess environment.
-- Expose resource sampling status in DuckDB's `obs_spans` view.
+These changes were made after SEC-2. On 2026-11-23 the coordinator verified
+them with `bun verify` (441 tests, default timeout). The run included the
+gateway socket tests outside any sandbox, and the regression test that a
+stalled telemetry exporter does not delay a gateway decision. The same day it
+re-ran on real VMs the OBS-10 `provider`, `fault`, `limits` and `bypass`
+cases (all pass) and one M5 configuration (tree mode, `browser`, Claude
+Coordinator and Reviewer, Codex Worker: `done`).
+
+- Telemetry is written through bounded queues and drained asynchronously.
+  Overflow is dropped and counted in `obs.telemetry.dropped`, and the queues
+  are flushed at shutdown.
+- Telemetry has a disk budget, `telemetry.maxTotalBytes`, which defaults to
+  1 GiB. The audit export is not capped and shares the volume.
+- The gateway limits are configurable through `audit.network`:
+  `attemptBurst`, `attemptsPerSecond`, `maxNetworkRows` and `maxRelays`. The
+  defaults are unchanged.
+- Refused SOCKS accepts are closed promptly. The refusal reply has up to
+  250 ms to drain.
+- The DuckDB CLI runs with a minimal environment: `PATH`, `HOME` and
+  `MISE_OFFLINE`.
+- The `obs_spans` view exposes `resource_sampling_status`.
 
 ## dagq-lite follow-ups
 
