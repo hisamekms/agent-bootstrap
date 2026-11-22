@@ -397,8 +397,14 @@ function debianBuildScript(recipe: DebianRecipe, name: string): string {
     "rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/* /var/cache/debconf/*-old /var/lib/dpkg/*-old /var/cache/ldconfig/aux-cache /tmp/*",
     "find / -xdev -name '__pycache__' -prune -exec rm -rf {} + || true",
     // Account change dates are install-day numbers; fix them.
-    "sed -i -E 's/^([^:]*:[^:]*):[0-9]*:/\\1:0:/' /etc/shadow",
+    // An empty last-change field disables password aging and carries no date.
+    // (0 would mean "change the password now", which makes su refuse.)
+    "sed -i -E 's/^([^:]*:[^:]*):[0-9]*:/\\1::/' /etc/shadow",
     ": > /etc/machine-id",
+    // Random per install: an empty machine id, and font caches that fontconfig
+    // regenerates on demand (they embed build-time data).
+    "if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then : > /var/lib/dbus/machine-id; fi",
+    "rm -rf /var/cache/fontconfig/*",
     ...archiveLines(),
     "dpkg-query -W -f='${Package}=${Version}\\n' | sort > /etc/agent-bootstrap-packages.txt",
     ...TOP_LEVEL_LOOP,

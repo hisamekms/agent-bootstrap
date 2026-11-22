@@ -227,7 +227,7 @@ sorted apt names, the setup scripts and the limits.
    Callers pass `executablePath` to Playwright.
 4. **Cleanup for determinism.** `apt-get clean`; apt lists, caches, logs and
    `*-old` files removed; empty `/etc/machine-id`, fixed hostname and hosts,
-   empty `resolv.conf`; shadow change dates zeroed; snakeoil TLS key removed.
+   empty `resolv.conf`; shadow last-change dates emptied (aging off; 0 would force a password change and break `su`); snakeoil TLS key removed.
    The snapshot sources stay, to document the origin (task VMs have no
    network).
 5. **Package list.** `dpkg-query` writes `name=version` lines to
@@ -302,6 +302,21 @@ digests.
   integration was denied.
 - **Audit:** in both runs, Worker and Verification recorded profile `db` with
   the locked image digest, and the Reviewer recorded `base`.
+
+On 2026-11-23 the `browser` image (Debian 13 slim, about 979 MiB) was built
+twice with the same digest, `4ad2da06…`. Its packages came from the
+snapshot.debian.org archive at a fixed timestamp, and the build VM could
+reach only DNS and snapshot.debian.org. The lock records 292 packages. The
+smoke test passed in a VM with no network: SQLite, PostgreSQL 17, headless
+Chromium 156 and git. Three causes of differing digests or a broken image
+were fixed first:
+
+- **Shadow change dates.** Zeroing them meant "change the password now",
+  so `su postgres` failed. They are emptied instead, which turns password
+  aging off.
+- **fontconfig caches.** They embed build-time data, so they are removed;
+  fontconfig regenerates them on demand.
+- **D-Bus machine ID.** It is random per install, so it is emptied.
 
 Toolchains, language packages, the preparer VM and dependency changes are
 planned in `docs/repository-environments.md`.
