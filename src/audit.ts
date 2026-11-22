@@ -20,7 +20,12 @@ export type AuditInput = {
     | "unknown";
   readonly outcome?:
     "ok" | "denied" | "failed" | "timed-out" | "cancelled" | "interrupted";
-  readonly role?: "Worker" | "Planner" | "Reviewer" | "Coordinator";
+  readonly role?:
+    "Worker" | "Planner" | "Reviewer" | "Coordinator" | "Verification";
+  /** Schema v4. Only on `sandbox.create` requests, together with `image`. */
+  readonly profile?: "base" | "db" | "browser";
+  /** Schema v4. Lowercase hex SHA-256 digest of the sandbox image. */
+  readonly image?: string;
 };
 
 export interface AuditSink {
@@ -111,8 +116,18 @@ const outcomes = [
   "cancelled",
   "interrupted",
 ];
-const roles = ["Worker", "Planner", "Reviewer", "Coordinator"];
-const inputKeys = ["invocationId", "kind", "operation", "outcome", "role"];
+const roles = ["Worker", "Planner", "Reviewer", "Coordinator", "Verification"];
+const profiles = ["base", "db", "browser"];
+const imageDigest = /^[0-9a-f]{64}$/;
+const inputKeys = [
+  "invocationId",
+  "kind",
+  "operation",
+  "outcome",
+  "role",
+  "profile",
+  "image",
+];
 
 const auditSchema = [
   {
@@ -176,6 +191,32 @@ const schemaV3 = [
   ...claimSchema,
 ];
 
+// Version 4 adds the `Verification` role and the nullable `profile` and
+// `image` columns, recorded on `sandbox.create` requests. Older databases are
+// not altered: writing those fields to them fails closed in `append`.
+const auditTableV4 = auditTableV3.replace(
+  "'Coordinator'))",
+  "'Coordinator','Verification')),\n      profile TEXT CHECK (profile IS NULL OR profile IN ('base','db','browser')),\n      image TEXT CHECK (image IS NULL OR (length(image) = 64 AND image NOT GLOB '*[^0-9a-f]*'))",
+);
+const schemaV4 = [
+  { name: "audit_events", sql: auditTableV4 },
+  ...auditSchema.slice(1),
+  ...claimSchema,
+];
+
+/** The exact expected schema SQL for a database version (for fixtures). */
+export function auditSchemaSql(version: 1 | 2 | 3 | 4): string[] {
+  const entries =
+    version === 1
+      ? auditSchema
+      : version === 2
+        ? schema
+        : version === 3
+          ? schemaV3
+          : schemaV4;
+  return entries.map((entry) => entry.sql);
+}
+
 function record(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     throw new AuditStoreError("invalid-event");
@@ -209,11 +250,14 @@ function parseInput(value: unknown): AuditInput {
     operation?: string;
     outcome?: string;
     role?: string;
+    profile?: string;
+    image?: string;
   } = { invocationId: id, kind };
   for (const [key, allowed] of [
     ["operation", operations],
     ["outcome", outcomes],
     ["role", roles],
+    ["profile", profiles],
   ] as const) {
     if (Object.hasOwn(descriptors, key)) {
       const field: unknown = descriptors[key]?.value;
@@ -222,6 +266,18 @@ function parseInput(value: unknown): AuditInput {
       result[key] = field;
     }
   }
+  if (Object.hasOwn(descriptors, "image")) {
+    const field: unknown = descriptors.image?.value;
+    if (typeof field !== "string" || !imageDigest.test(field))
+      throw new AuditStoreError("invalid-event");
+    result.image = field;
+  }
+  if (
+    (result.profile === undefined) !== (result.image === undefined) ||
+    (result.profile !== undefined &&
+      (kind !== "operation.requested" || result.operation !== "sandbox.create"))
+  )
+    throw new AuditStoreError("invalid-event");
   const invocation = kind.startsWith("invocation.");
   if (
     (invocation && result.operation !== undefined) ||
@@ -310,6 +366,9 @@ function parseRow(value: unknown): AuditEvent {
     ...(row.operation === null ? {} : { operation: row.operation }),
     ...(row.outcome === null ? {} : { outcome: row.outcome }),
     ...(row.role === null ? {} : { role: row.role }),
+    // Absent on version 1-3 rows.
+    ...(row.profile == null ? {} : { profile: row.profile }),
+    ...(row.image == null ? {} : { image: row.image }),
   });
   return { ...input, ...rowMetadata(row) };
 }
@@ -326,6 +385,7 @@ export class SqliteAudit implements AuditSink {
   readonly #readOnly: boolean;
   #closed = false;
   #writeFailed = false;
+  readonly #version: number;
 
   constructor(filename: string, options: { readonly readonly?: boolean } = {}) {
     if (
@@ -370,11 +430,11 @@ export class SqliteAudit implements AuditSink {
         database.exec("PRAGMA journal_mode=WAL");
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of schemaV3) database.exec(entry.sql);
+          for (const entry of schemaV4) database.exec(entry.sql);
           database.exec(
-            `PRAGMA application_id=${applicationId}; PRAGMA user_version=3; COMMIT`,
+            `PRAGMA application_id=${applicationId}; PRAGMA user_version=4; COMMIT`,
           );
-          version = 3;
+          version = 4;
         } catch {
           try {
             database.exec("ROLLBACK");
@@ -385,7 +445,7 @@ export class SqliteAudit implements AuditSink {
         }
       } else if (
         app !== applicationId ||
-        (version !== 1 && version !== 2 && version !== 3)
+        (version !== 1 && version !== 2 && version !== 3 && version !== 4)
       )
         throw new AuditStoreError("invalid-database");
       const installed = database
@@ -394,7 +454,13 @@ export class SqliteAudit implements AuditSink {
         )
         .all();
       const expectedSchema =
-        version === 1 ? auditSchema : version === 2 ? schema : schemaV3;
+        version === 1
+          ? auditSchema
+          : version === 2
+            ? schema
+            : version === 3
+              ? schemaV3
+              : schemaV4;
       if (
         installed.length !== expectedSchema.length ||
         !expectedSchema.every((expected) =>
@@ -419,7 +485,7 @@ export class SqliteAudit implements AuditSink {
           throw new AuditStoreError("invalid-database");
         previous = event.sequence;
       }
-      if (version === 2) {
+      if (version === 2 || version === 3 || version === 4) {
         for (const raw of database
           .query("SELECT * FROM request_claims ORDER BY sequence")
           .all())
@@ -449,6 +515,7 @@ export class SqliteAudit implements AuditSink {
       )
         throw new AuditStoreError("invalid-database");
       this.#database = database;
+      this.#version = version === 1 ? 2 : (version as number);
     } catch {
       try {
         database?.close();
@@ -464,20 +531,36 @@ export class SqliteAudit implements AuditSink {
     if (this.#readOnly) throw new AuditStoreError("read-only");
     if (this.#writeFailed) throw new AuditStoreError("append-failed");
     const input = parseInput(event);
+    // Older traces must never silently lose profile or verification evidence.
+    if (
+      this.#version < 4 &&
+      (input.profile !== undefined ||
+        input.image !== undefined ||
+        input.role === "Verification")
+    )
+      throw new AuditStoreError("invalid-event");
     try {
       this.#database.exec("BEGIN IMMEDIATE");
-      this.#database
-        .query(
-          "INSERT INTO audit_events (recorded_at, invocation_id, kind, operation, outcome, role) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .run(
-          new Date().toISOString(),
-          input.invocationId,
-          input.kind,
-          input.operation ?? null,
-          input.outcome ?? null,
-          input.role ?? null,
-        );
+      const common = [
+        new Date().toISOString(),
+        input.invocationId,
+        input.kind,
+        input.operation ?? null,
+        input.outcome ?? null,
+        input.role ?? null,
+      ];
+      if (this.#version >= 4)
+        this.#database
+          .query(
+            "INSERT INTO audit_events (recorded_at, invocation_id, kind, operation, outcome, role, profile, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .run(...common, input.profile ?? null, input.image ?? null);
+      else
+        this.#database
+          .query(
+            "INSERT INTO audit_events (recorded_at, invocation_id, kind, operation, outcome, role) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .run(...common);
       if (
         record(this.#database.query("SELECT changes() AS count").get())
           .count !== 1
