@@ -197,7 +197,6 @@ test("a concern can be revised without notes, and revisions are capped", async (
 test("malformed or oversized review notes are a concern without notes", async (t) => {
   for (const response of [
     JSON.stringify({ review: "revise", notes: "x".repeat(3000) }),
-    JSON.stringify({ review: "revise", notes: "" }),
     JSON.stringify({ review: "revise", notes: 7 }),
     JSON.stringify({ review: "pass", notes, extra: true }),
   ]) {
@@ -260,4 +259,15 @@ test("verification keeps its strict response format", async (t) => {
     "concern",
   );
   assert.ok(!events.some((event) => event.kind === "review.noted"));
+});
+
+test("blank review notes mean a review without notes", async (t) => {
+  const { flow, journal } = await fixture(t, [
+    JSON.stringify({ review: "revise", notes: "  " }),
+  ]);
+  await flow.prepareCandidate();
+  assert.equal((await flow.reviewCandidate()).review, "revise");
+  assert.ok(
+    !(await journal.read()).some((event) => event.kind === "review.noted"),
+  );
 });

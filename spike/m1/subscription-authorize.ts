@@ -27,9 +27,15 @@ const dynamicClient = "dynamic_agent_client";
 const statePath = fileURLToPath(
   new URL("../../.local/siwc-smoke/", import.meta.url),
 );
-const smoke = fileURLToPath(
-  new URL("./subscription-smoke.ts", import.meta.url),
-);
+// The operator chooses which live runner receives the single-run token.
+const runners: Record<string, string> = {
+  "--authorize-and-run": fileURLToPath(
+    new URL("./subscription-smoke.ts", import.meta.url),
+  ),
+  "--authorize-and-run-m5": fileURLToPath(
+    new URL("../m5/dogfood.ts", import.meta.url),
+  ),
+};
 const validId = (value: unknown) =>
   typeof value === "string" && /^[a-zA-Z0-9_-]{1,256}$/.test(value);
 const random = () => randomBytes(32).toString("base64url");
@@ -231,6 +237,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
 }
 
 async function runSmoke(
+  smoke: string,
   msb: string,
   codex: string,
   home: string,
@@ -261,7 +268,8 @@ async function runSmoke(
 async function main() {
   const [optIn, msb, codex] = process.argv.slice(2);
   const home = process.env.MSB_HOME;
-  assert.equal(optIn, "--authorize-and-run");
+  assert.ok(optIn && Object.hasOwn(runners, optIn));
+  const runner = runners[optIn]!;
   assert.ok(process.stdin.isTTY && process.stdout.isTTY);
   assert.ok(msb && msb.startsWith("/") && !/[\0:\r\n]/.test(msb));
   assert.ok(codex && codex.startsWith("/"));
@@ -333,7 +341,14 @@ async function main() {
     );
     await saveRegistration(file, { ...registration, clientId, subjectHash });
     stage = "subscription smoke";
-    await runSmoke(msb, codex, home, tokens.access_token, controller.signal);
+    await runSmoke(
+      runner,
+      msb,
+      codex,
+      home,
+      tokens.access_token,
+      controller.signal,
+    );
   } finally {
     try {
       if (exchangeClientId) {

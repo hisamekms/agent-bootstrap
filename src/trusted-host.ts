@@ -25,7 +25,10 @@ export interface WorkerRun {
 }
 
 export interface ReviewerPlan {
-  readonly sandbox: Pick<SandboxSpec, "readOnlyFiles" | "maxLifetimeMs">;
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "readOnlyFiles" | "maxLifetimeMs" | "tools" | "provider" | "hostTcpPort"
+  >;
   readonly command: SandboxCommand;
 }
 
@@ -38,7 +41,7 @@ export interface ReviewerRun {
 export interface CoordinatorSessionPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "tools" | "hostTcpPort" | "maxLifetimeMs"
+    "tools" | "hostTcpPort" | "provider" | "maxLifetimeMs"
   >;
   readonly command: SandboxCommand;
 }
@@ -106,7 +109,10 @@ export class TrustedHost {
       !open ||
       Object.keys(plan.sandbox).some(
         (key) =>
-          key !== "tools" && key !== "hostTcpPort" && key !== "maxLifetimeMs",
+          key !== "tools" &&
+          key !== "hostTcpPort" &&
+          key !== "provider" &&
+          key !== "maxLifetimeMs",
       )
     )
       throw new Error("Coordinator session requires a streaming sandbox");
@@ -116,6 +122,9 @@ export class TrustedHost {
         : {}),
       ...(plan.sandbox.hostTcpPort !== undefined
         ? { hostTcpPort: plan.sandbox.hostTcpPort }
+        : {}),
+      ...(plan.sandbox.provider
+        ? { provider: { ...plan.sandbox.provider } }
         : {}),
       ...(plan.sandbox.maxLifetimeMs !== undefined
         ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
@@ -227,6 +236,15 @@ export class TrustedHost {
         : {}),
       ...(plan.sandbox.maxLifetimeMs !== undefined
         ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
+        : {}),
+      ...(plan.sandbox.tools
+        ? { tools: plan.sandbox.tools.map((tool) => ({ ...tool })) }
+        : {}),
+      ...(plan.sandbox.provider
+        ? { provider: { ...plan.sandbox.provider } }
+        : {}),
+      ...(plan.sandbox.hostTcpPort !== undefined
+        ? { hostTcpPort: plan.sandbox.hostTcpPort }
         : {}),
     };
     return this.#run(

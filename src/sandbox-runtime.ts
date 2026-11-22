@@ -13,11 +13,20 @@ export interface SandboxTool {
   readonly sha256: string;
 }
 
+export interface SandboxProvider {
+  readonly host: string;
+  readonly secretEnv: string;
+}
+
 export interface SandboxSpec {
   readonly files?: readonly SandboxFile[];
   readonly tools?: readonly SandboxTool[];
   /** The only network egress: TCP to this port on the host. Default: none. */
   readonly hostTcpPort?: number;
+  /** HTTPS egress to one model provider host, with the trusted host's
+   * credential substituted for a guest placeholder in the Authorization
+   * header. The guest sees only `$<secretEnv>`, set to a placeholder. */
+  readonly provider?: SandboxProvider;
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
   readonly maxLifetimeMs?: number;

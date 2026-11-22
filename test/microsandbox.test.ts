@@ -104,6 +104,18 @@ if (args[0] === '--version') {
   const runtime = new MicrosandboxRuntime({ binary, home, stagingRoot, image });
   return {
     runtime,
+    withCredentials: (token: string) =>
+      new MicrosandboxRuntime({
+        binary,
+        home,
+        stagingRoot,
+        image,
+        credentials: {
+          async withAccessToken(consume) {
+            return consume(token);
+          },
+        },
+      }),
     home,
     stagingRoot,
     guests,
@@ -532,4 +544,47 @@ test("a session streams bounded lines, holds the handle busy and stops on close"
   flood.close();
   await flood.finished;
   await f.runtime.destroy(long);
+});
+
+test("provider egress passes the credential only to the create process", async (t) => {
+  const f = await fixture(t);
+  const token = "fixture-provider-token-value";
+  const runtime = f.withCredentials(token);
+  const provider = { host: "api.openai.com", secretEnv: "AGENT_TOKEN" };
+  const handle = await runtime.create({ provider });
+  await runtime
+    .exec(handle, { argv: ["fixture-cat", "missing"], timeoutMs: 1000 })
+    .catch(() => {});
+  const events = await f.events();
+  const create = events.find(({ args }) => args[0] === "create");
+  assert.ok(create);
+  assert.match(
+    create.args.join(" "),
+    /--no-net --net-rule allow@dns --net-rule allow@api\.openai\.com:tcp:443 --tls-intercept --secret AGENT_TOKEN:headers=authorization@api\.openai\.com --secret-violation-action block /,
+  );
+  assert.ok(create.envKeys.includes("AGENT_TOKEN"));
+  for (const event of events.filter(({ args }) => args[0] !== "create"))
+    assert.ok(!event.envKeys.includes("AGENT_TOKEN"));
+  assert.doesNotMatch(JSON.stringify(events), /fixture-provider-token-value/);
+  await runtime.destroy(handle).catch(() => {});
+  for (const spec of [{ provider }, { provider, hostTcpPort: 4242 }])
+    await assert.rejects(
+      (spec === undefined ? runtime : f.runtime).create(spec),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  for (const bad of [
+    { host: "api.openai.com:443", secretEnv: "AGENT_TOKEN" },
+    { host: "localhost", secretEnv: "AGENT_TOKEN" },
+    { host: "api.openai.com", secretEnv: "PATH" },
+    { host: "api.openai.com", secretEnv: "MSB_HOME" },
+    { host: "api.openai.com", secretEnv: "lower" },
+  ])
+    await assert.rejects(
+      runtime.create({ provider: bad }),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  await assert.rejects(
+    runtime.create({ provider, hostTcpPort: 4242 }),
+    (error: SandboxRuntimeError) => error.code === "invalid-input",
+  );
 });

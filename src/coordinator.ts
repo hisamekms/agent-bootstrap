@@ -453,7 +453,13 @@ export class CoordinatorTask {
         (event) => event.kind === "tool.authorized" && event.key === key,
       );
       if (previous?.kind === "tool.authorized") {
-        const replay = previous.fingerprint === fingerprint;
+        // A key may be replayed once. A model that keeps repeating a request
+        // is stopped instead of spending turns until the event limit.
+        const replay =
+          previous.fingerprint === fingerprint &&
+          !events.some(
+            (event) => event.kind === "tool.replayed" && event.key === key,
+          );
         await this.#append(
           next,
           replay

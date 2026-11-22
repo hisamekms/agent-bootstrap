@@ -23,6 +23,39 @@ export interface CodexCoordinatorOptions {
   open<T>(id: string, use: (channel: JsonlChannel) => Promise<T>): Promise<T>;
   /** Covers opening and the whole turn. */
   readonly timeoutMs: number;
+  /** Model slug for the thread. Default: the app-server's configured model. */
+  readonly model?: string;
+  /** Called with the thread's cumulative token totals, as validated integers. Each turn uses a fresh thread, so the last call per turn is that turn's usage. */
+  onUsage?(usage: TokenUsage): void;
+}
+
+export interface TokenUsage {
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+  readonly totalTokens: number;
+}
+
+function tokenUsage(params: unknown): TokenUsage | null {
+  const keys = [
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+  ] as const;
+  const values = keys.map((key) => field(params, "tokenUsage", "total", key));
+  if (
+    values.some(
+      (value) =>
+        typeof value !== "number" || !Number.isSafeInteger(value) || value < 0,
+    )
+  )
+    return null;
+  return Object.fromEntries(
+    keys.map((key, index) => [key, values[index]]),
+  ) as unknown as TokenUsage;
 }
 
 export const CODEX_LIMITS = {
@@ -179,6 +212,11 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
   constructor(options: CodexCoordinatorOptions) {
     if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)
       throw new Error("Invalid Codex app-server timeout");
+    if (
+      options.model !== undefined &&
+      !/^[a-z0-9][a-z0-9._-]{0,80}$/.test(options.model)
+    )
+      throw new Error("Invalid Codex model");
     this.#options = options;
   }
 
@@ -304,6 +342,7 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
             id: 1,
             method: "thread/start",
             params: {
+              ...(this.#options.model ? { model: this.#options.model } : {}),
               cwd: "/tmp",
               ephemeral: true,
               sandbox: "read-only",
@@ -379,6 +418,14 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
           send({ id, error: { code: -32601, message: "Declined by host" } });
           voidTurn(`server-request/${label(method, knownRequests)}`);
         }
+        continue;
+      }
+      if (
+        method === "thread/tokenUsage/updated" &&
+        field(params, "threadId") === threadId
+      ) {
+        const usage = tokenUsage(params);
+        if (usage) this.#options.onUsage?.(usage);
         continue;
       }
       if (method === "item/started" || method === "item/completed") {

@@ -587,6 +587,121 @@ Known gaps:
   them.
 - **Note files are kept forever.** There is no retention rule yet.
 
+## M5 dogfood
+
+### Preparation
+
+[`spike/m5/dogfood.ts`](../spike/m5/dogfood.ts) runs one small local change
+with model-driven roles, all using `gpt-5.5`:
+
+- **Coordinator** runs on the Codex app-server.
+- **Planner, Worker and Reviewer** run `codex exec` in their own VMs.
+- **Verification** is a fixed shell check.
+
+The task works on a disposable repository. It asks for the greeting in
+`hello.txt` to become a polite, formal English greeting on one line. The
+pieces are wired as follows:
+
+- **Worker.** It may run shell commands inside its VM
+  (`--dangerously-bypass-approvals-and-sandbox`, because the VM is the
+  sandbox), and must only edit `/workspace/hello.txt`.
+- **Reviewer.** It runs read-only with an output schema that requires
+  `review` and `notes`. Blank notes mean none.
+- **Human input.** Questions and approval go through `/dev/tty`. Approval
+  shows the pinned diff and requires typing the full candidate ID.
+- **Report.** At the end the run writes `report.json` with:
+  - elapsed time and Coordinator turns;
+  - delegations per role;
+  - replayed requests, failed turns and voided turns;
+  - reviews and revisions;
+  - human answers and decisions;
+  - Coordinator token usage from `thread/tokenUsage/updated`;
+  - the integration journal, per-invocation durations, the result and
+    known audit gaps.
+
+The run uses `gpt-5.5` because it is the only model in the Codex 0.170.0
+catalog without `tool_mode: code_mode_only`. Code mode needs a
+`codex-code-mode-host` that the guest does not have, so it fails closed. A
+code-mode Worker therefore could not edit files. With `gpt-5.5` and
+`CODEX_COORDINATOR_CONFIG`, the mock provider recorded these tools:
+
+- **Coordinator** saw only `request_user_input`, `apply_patch` and
+  `view_image` besides its own tools, with no code mode, collaboration or
+  shell tools.
+- **Worker** saw `exec_command`, `write_stdin`, `request_user_input`,
+  `apply_patch`, `view_image`, the goal tools and `tool_search`.
+
+A live provider may serve a different catalog, so the live run records
+what it actually saw.
+
+The product gains these pieces for it:
+
+- **Provider egress.** `SandboxSpec.provider` sets the host and the guest
+  placeholder variable. The Microsandbox adapter applies:
+  - `allow@dns` and `allow@<host>:tcp:443`;
+  - `--tls-intercept`;
+  - `--secret <ENV>:headers=authorization@<host>`;
+  - `--secret-violation-action block`.
+
+  The adapter's `CredentialProvider` puts the token only into the `msb
+create` process environment. It is never in argv, in other backend
+  commands or in the guest.
+
+- **Per-role sandbox options.** `ReviewedIntegration` passes tools and
+  egress to Worker and Reviewer VMs, but not to verification. Model-driven
+  roles get a 300-second VM lifetime and a 240-second command limit.
+- **Adapter options.** The Codex adapter accepts a model and reports token
+  usage.
+- **Replay limit.** The router now allows one replay per request key and
+  denies a repeat. A fixture run showed why: a model that kept resending
+  the same delegation key had used about 40 turns before the event limit
+  stopped it.
+
+On 2026-11-22, `--fixture` mode ran the whole flow with a loopback mock
+provider, real Codex and real VMs in about 18 seconds:
+
+- **Coordinator:** three turns: delegate Worker, delegate Reviewer, then
+  request integration.
+- **Worker:** `codex exec` changed the file through `exec_command`.
+- **Reviewer:** `codex exec` returned `pass` through the output schema.
+- **Approval:** one automatic approval in fixture mode.
+- **Integration:** verification passed and integration completed. The
+  repository head contains the changed file.
+
+All six VM invocations finished `ok` in the audit. In the report,
+verification appears with the Reviewer role because it uses the same host
+entry point.
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  bun spike/m5/dogfood.ts --fixture /absolute/path/to/msb /absolute/path/to/codex
+```
+
+The live run needs explicit operator opt-in and the browser consent flow.
+Run it from a terminal; the launcher passes the single-run token on stdin:
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 \
+  /absolute/path/to/msb /absolute/path/to/codex
+```
+
+Known risks and gaps before the live run:
+
+- **The token is a bearer credential that the guest can use.** Every
+  model-driven VM can reach `api.openai.com:443`, and the backend
+  substitutes the token into any request to that host. A Worker shell
+  command or a prompt-injected model could therefore make other API
+  requests with the run's credential. Method, path and request count are
+  not enforced, and provider requests are not audited one by one.
+- **The token is not refreshed.** It must stay valid for at least 20
+  minutes when the run starts.
+- **Some usage is not collected.** Planner, Worker and Reviewer token usage
+  are missing; only the Coordinator reports usage.
+- **Native tools are detected, not prevented.** Native tools in the
+  Coordinator are still only detected, and Worker tool calls inside its VM
+  are not audited individually.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |

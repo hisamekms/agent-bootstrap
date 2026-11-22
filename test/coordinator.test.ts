@@ -287,3 +287,12 @@ test("failed Worker runs also count toward the revision cap", async (t) => {
   assert.equal(await task.run(), "denied");
   assert.equal(started, 1 + MAX_REVISIONS);
 });
+
+test("a repeated request key is replayed once and then denied", async (t) => {
+  const { task, roles } = await fixture(t, [worker, worker, worker, review]);
+  assert.equal(await task.run(), "denied");
+  assert.deepEqual(roles, ["Worker"]);
+  const kinds = (await task.trace()).map((event) => event.kind);
+  assert.equal(kinds.filter((kind) => kind === "tool.replayed").length, 1);
+  assert.equal(kinds.at(-1), "tool.denied");
+});
