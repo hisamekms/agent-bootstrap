@@ -10,11 +10,22 @@ import { type AuditSink, SqliteAudit, auditSchemaSql } from "../src/audit.ts";
 import { HostRequests } from "../src/host-requests.ts";
 import type {
   ExecResult,
+  SandboxEgressGateway,
   SandboxRuntime,
   SandboxSpec,
 } from "../src/sandbox-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
-import { HostAuditError, TrustedHost } from "../src/trusted-host.ts";
+import { HOST_SERVICE_NAME } from "../src/egress-policy.ts";
+import type { RuntimeEvent } from "../src/runtime-events.ts";
+import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
+import {
+  HostAuditError,
+  TrustedHost,
+  type BoundSandboxRuntime,
+  type HostObservabilityAudit,
+  type TrustedHostOptions,
+} from "../src/trusted-host.ts";
+import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
@@ -301,7 +312,7 @@ test("a Coordinator session is audited, fails closed and always tears down", asy
   };
   const host = new TrustedHost(audit, runtime, profiles);
   const plan = {
-    sandbox: { hostTcpPort: 4242, maxLifetimeMs: 10_000 },
+    sandbox: { maxLifetimeMs: 10_000 },
     command: { argv: ["/fixture"], timeoutMs: 500 },
   };
   const ok = await host.runCoordinatorSession(
@@ -310,12 +321,7 @@ test("a Coordinator session is audited, fails closed and always tears down", asy
     async () => 7,
   );
   assert.deepEqual(ok.value, 7);
-  assert.deepEqual(calls.splice(0), [
-    "create 4242 0",
-    "open",
-    "close",
-    "destroy",
-  ]);
+  assert.deepEqual(calls.splice(0), ["create - 0", "open", "close", "destroy"]);
   const operations = (id: string) =>
     audit
       .read(id)
@@ -333,12 +339,7 @@ test("a Coordinator session is audited, fails closed and always tears down", asy
     }),
     /fixture model failure/,
   );
-  assert.deepEqual(calls.splice(0), [
-    "create 4242 0",
-    "open",
-    "close",
-    "destroy",
-  ]);
+  assert.deepEqual(calls.splice(0), ["create - 0", "open", "close", "destroy"]);
   assert.deepEqual(operations(failing), [
     "sandbox.create ok",
     "sandbox.exec failed",
@@ -944,4 +945,654 @@ test("Verification may carry a host-prepared repository but never collects or ge
       /only/i,
     );
   assert.equal(created.length, 1);
+});
+
+const requiredConfig = {
+  audit: { mode: "required" },
+  telemetry: {
+    enabled: true,
+    resourceSamplingIntervalMs: 1000,
+    traceSamplingRatio: 1,
+  },
+} as const;
+const provider = {
+  host: "provider.example",
+  secretEnv: "AGENT_BOOTSTRAP_GATEWAY_SECRET",
+};
+const providerPlan = { ...plan, sandbox: { ...plan.sandbox, provider } };
+const ruleDigest = "b".repeat(64);
+
+function observedFixture(
+  t: { after(fn: () => void): void },
+  overrides?: Partial<BoundSandboxRuntime>,
+  failWrite?: string,
+  options?: Partial<TrustedHostOptions>,
+) {
+  const db = new SqliteAudit(fixture(t));
+  t.after(() => db.close());
+  const calls: string[] = [];
+  const fake = fakeGateway(calls);
+  function write(label: string, action: () => void) {
+    calls.push(label);
+    if (label === failWrite)
+      return Promise.reject(new Error("fixture append failure"));
+    action();
+  }
+  const audit: HostObservabilityAudit = {
+    get isV5Writable() {
+      return db.isV5Writable;
+    },
+    append: (event) =>
+      write([event.kind, event.operation].filter(Boolean).join(" "), () =>
+        db.append(event),
+      ),
+    appendExecutionContext: (context) =>
+      write("execution_contexts", () => db.appendExecutionContext(context)),
+    appendSandboxBinding: (input) =>
+      write("sandbox_bindings", () => db.appendSandboxBinding(input)),
+    appendProcessResult: (input) =>
+      write("process_results", () => db.appendProcessResult(input)),
+    appendResourceEvent: (input) =>
+      write("resource_events", () => db.appendResourceEvent(input)),
+    appendNetwork: db.appendNetwork.bind(db),
+    appendNetworkFinished: db.appendNetworkFinished.bind(db),
+    appendDnsQuery: db.appendDnsQuery.bind(db),
+  };
+  let binding: SandboxEgressGateway | undefined;
+  const runtime: BoundSandboxRuntime = {
+    netRuleDigest() {
+      return ruleDigest;
+    },
+    async create() {
+      throw new Error("Required mode used an unbound create");
+    },
+    async createBound(spec, id) {
+      calls.push("create");
+      assert.equal(spec.expectedNetRuleDigest, ruleDigest);
+      assert.equal(spec.hostTcpPort, undefined);
+      const row = db.readExecution(spec.invocationId!).sandboxBindings[0];
+      assert.equal(row?.sandboxId, id);
+      assert.equal(row?.netRuleDigest, ruleDigest);
+      if (spec.egressGateway) {
+        binding = spec.egressGateway;
+        assert.equal(
+          host.gatewayPassword({ ...spec.egressGateway }),
+          fake.gateway.password,
+        );
+        assert.throws(() =>
+          host.gatewayPassword({ ...spec.egressGateway!, dnsPort: 12345 }),
+        );
+        assert.equal("password" in spec.egressGateway, false);
+        assert.notEqual(
+          spec.egressGateway.passwordEnv,
+          spec.provider?.secretEnv,
+        );
+        assert.equal(row.egressMode, "gateway");
+        assert.equal(row.gatewayPolicyId, fake.opened?.policy.policyId);
+        assert.equal(row.gatewayPolicyDigest, fake.opened?.policy.policyId);
+        assert.equal(fake.opened?.sandboxLabel, id);
+      } else {
+        assert.equal(row.egressMode, "none");
+      }
+      return { id, netRuleDigest: ruleDigest };
+    },
+    async exec() {
+      calls.push("exec");
+      return {
+        status: "exited",
+        exitCode: 0,
+        stdout: Buffer.from('{"tool":"collect"}'),
+        stderr: Buffer.from("fixture-private-data"),
+      };
+    },
+    async collect() {
+      calls.push("collect");
+      return { files: [] };
+    },
+    async destroy() {
+      calls.push("destroy");
+    },
+    finalResourceSample() {
+      calls.push("final-sample");
+      return { memoryBytes: 42 };
+    },
+    ...overrides,
+  };
+  const host = new TrustedHost(audit, runtime, profiles, {
+    config: requiredConfig,
+    gatewayFactory: fake.open,
+    ...options,
+  });
+  return {
+    host,
+    db,
+    audit,
+    calls,
+    fake,
+    runtime,
+    get binding() {
+      return binding;
+    },
+  };
+}
+
+test("required host durably binds the actual sandbox before create and audits the result", async (t) => {
+  const events: RuntimeEvent[] = [];
+  const samples: unknown[] = [];
+  const observed = observedFixture(t, {}, undefined, {
+    observers: [
+      {
+        observe() {
+          throw new Error("fixture observer");
+        },
+      },
+      {
+        observe: (event) => events.push(event),
+        observeFinalResourceSample: (...sample) => samples.push(sample),
+      },
+    ],
+  });
+  const { host, db, calls, fake } = observed;
+  const context = {
+    executionId: randomUUID(),
+    correlationId: randomUUID(),
+    attributes: { fixture: true },
+  };
+  const result = await host.runWorker(providerPlan, undefined, context);
+  assert.equal(result.id, context.executionId);
+  assert.equal(result.outcome, "ok");
+  assert.deepEqual(calls, [
+    "invocation.started",
+    "execution_contexts",
+    "gateway.open",
+    "operation.requested provider.egress",
+    "operation.allowed provider.egress",
+    "operation.requested sandbox.create",
+    "operation.allowed sandbox.create",
+    "sandbox_bindings",
+    "create",
+    "operation.finished sandbox.create",
+    "operation.requested sandbox.exec",
+    "operation.allowed sandbox.exec",
+    "exec",
+    "process_results",
+    "operation.finished sandbox.exec",
+    "operation.requested sandbox.collect",
+    "operation.allowed sandbox.collect",
+    "collect",
+    "operation.finished sandbox.collect",
+    "gateway.close",
+    "operation.requested sandbox.destroy",
+    "operation.allowed sandbox.destroy",
+    "destroy",
+    "operation.finished sandbox.destroy",
+    "final-sample",
+    "operation.finished provider.egress",
+    "invocation.finished",
+  ]);
+  const { executionContexts, sandboxBindings, processResults } =
+    db.readExecution(result.id);
+  assert.deepEqual(executionContexts[0]?.attributes, context.attributes);
+  assert.equal(processResults[0]?.exitCode, 0);
+  assert.equal(processResults[0]?.guestReported, true);
+  assert.equal(fake.opened?.audit !== undefined, true);
+  assert.deepEqual(fake.opened?.policy.providerBinding, {
+    hostname: provider.host,
+    port: 443,
+  });
+  const sandboxId = sandboxBindings[0]?.sandboxId;
+  assert.deepEqual(samples, [[result.id, sandboxId, { memoryBytes: 42 }]]);
+  assert.ok(observed.binding);
+  assert.throws(() => host.gatewayPassword(observed.binding!));
+  assert.deepEqual(
+    events.map((event) => event.eventType),
+    [
+      "execution.started",
+      "sandbox.created",
+      "process.started",
+      "process.exited",
+      "sandbox.destroyed",
+      "execution.finished",
+    ],
+  );
+  assert.ok(
+    events.every(
+      (event) =>
+        event.executionId === result.id &&
+        event.correlationId === context.correlationId,
+    ),
+  );
+  assert.equal(events[1]?.sandboxId, sandboxId);
+  assert.deepEqual(
+    events.map((event) => event.source.sequence),
+    [1, 2, 3, 4, 5, 6],
+  );
+  assert.equal(host.observerFailures, events.length);
+  assert.doesNotMatch(
+    JSON.stringify({ events, rows: db.readExecution(result.id) }),
+    /fixture-private-data|AGENT_BOOTSTRAP_GATEWAY_SECRET|abababababab/,
+  );
+});
+
+test("required host stops at every new mandatory append failure and closes an open gateway", async (t) => {
+  for (const [write, effects] of [
+    ["execution_contexts", []],
+    ["sandbox_bindings", ["gateway.open", "gateway.close"]],
+    ["process_results", ["gateway.open", "create", "exec", "gateway.close"]],
+    ["resource_events", ["gateway.open", "create", "exec", "gateway.close"]],
+  ] as const) {
+    const { host, calls } = observedFixture(
+      t,
+      {
+        async exec() {
+          calls.push("exec");
+          return {
+            status: "timed-out",
+            exitCode: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0),
+          };
+        },
+      },
+      write,
+    );
+    const id = randomUUID();
+    await assert.rejects(
+      host.runWorker(providerPlan, id),
+      (error) => error instanceof HostAuditError && error.invocationId === id,
+    );
+    assert.deepEqual(
+      calls.filter((call) =>
+        /^(create|exec|collect|destroy|gateway\..*)$/.test(call),
+      ),
+      effects,
+    );
+    assert.ok(calls.includes(write));
+    assert.ok(!calls.includes("invocation.finished"));
+  }
+});
+
+test("gateway quarantine halts the host after exec, including when exec also throws", async (t) => {
+  for (const throws of [false, true]) {
+    const { host, calls, fake } = observedFixture(t, {
+      async exec() {
+        calls.push("exec");
+        fake.quarantine();
+        if (throws) throw new Error("fixture exec failure");
+        return {
+          status: "exited",
+          exitCode: 0,
+          stdout: Buffer.from('{"tool":"collect"}'),
+          stderr: Buffer.alloc(0),
+        };
+      },
+    });
+    await assert.rejects(host.runWorker(providerPlan), HostAuditError);
+    assert.deepEqual(calls.slice(-3), [
+      "operation.allowed sandbox.exec",
+      "exec",
+      "gateway.close",
+    ]);
+  }
+});
+
+test("gateway audit failure while draining relays prevents sandbox destroy", async (t) => {
+  const { host, calls, fake } = observedFixture(t);
+  fake.failAuditOnClose();
+  await assert.rejects(host.runWorker(providerPlan), HostAuditError);
+  assert.equal(calls.at(-1), "gateway.close");
+  assert.ok(!calls.includes("operation.requested sandbox.destroy"));
+});
+
+test("required host refuses invalid setup, mismatched context and direct host ports", async (t) => {
+  const { host, db, runtime, calls, fake } = observedFixture(t);
+  assert.throws(
+    () =>
+      new TrustedHost(db, runtime, profiles, {
+        config: requiredConfig,
+      }),
+    /factory/,
+  );
+  assert.throws(
+    () =>
+      new TrustedHost(db, adapter("").runtime, profiles, {
+        config: requiredConfig,
+        gatewayFactory: fake.open,
+      }),
+    /gateway support/,
+  );
+  const path = fixture(t);
+  const writable = new SqliteAudit(path);
+  writable.close();
+  const readOnly = new SqliteAudit(path, { readonly: true });
+  t.after(() => readOnly.close());
+  assert.throws(
+    () =>
+      new TrustedHost(readOnly, runtime, profiles, {
+        config: requiredConfig,
+        gatewayFactory: fake.open,
+      }),
+    /Writable v5/,
+  );
+  await assert.rejects(
+    host.runWorker({
+      ...plan,
+      sandbox: { ...plan.sandbox, hostTcpPort: 4242 },
+    }),
+    /hostTcpPort/,
+  );
+  await assert.rejects(
+    host.runWorker(plan, randomUUID(), {
+      executionId: randomUUID(),
+    }),
+    /context ID/,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("disabled mode requires per-run agent opt-in and makes no audit writes", async () => {
+  const { runtime, calls } = adapter("");
+  let writes = 0;
+  const host = new TrustedHost(
+    {
+      append() {
+        writes++;
+      },
+    },
+    runtime,
+    profiles,
+    {
+      config: { ...requiredConfig, audit: { mode: "disabled" } },
+    },
+  );
+  await assert.rejects(
+    host.runWorker(providerPlan),
+    /explicit allowUnauditedRun/,
+  );
+  assert.deepEqual(calls, []);
+  const result = await host.runWorker(
+    {
+      ...providerPlan,
+      sandbox: { ...providerPlan.sandbox, hostTcpPort: 4242 },
+    },
+    undefined,
+    undefined,
+    { allowUnauditedRun: true },
+  );
+  assert.equal(result.outcome, "ok");
+  assert.deepEqual(calls, ["create", "exec", "destroy"]);
+  assert.equal(writes, 0);
+});
+
+test("required host maps host services through the gateway and isolates DNS observer data", async (t) => {
+  const received: string[][] = [];
+  const { host, fake } = observedFixture(
+    t,
+    {
+      async exec() {
+        const opened = fake.opened!;
+        const answerIps = ["192.0.2.2"];
+        opened.observer!.observe({
+          eventId: randomUUID(),
+          eventType: "network.dns.query",
+          schemaVersion: 1,
+          occurredAt: new Date().toISOString(),
+          recordedAt: new Date().toISOString(),
+          source: {
+            component: "fixture",
+            instanceId: randomUUID(),
+            sequence: 1,
+          },
+          payload: {
+            queryId: randomUUID(),
+            protocol: "udp",
+            qname: HOST_SERVICE_NAME,
+            qtype: 1,
+            decision: "allow",
+            reasonCode: "host-service",
+            policyId: opened.policy.policyId,
+            answerIps,
+          },
+        });
+        assert.deepEqual(answerIps, ["192.0.2.2"]);
+        return {
+          status: "exited",
+          exitCode: 0,
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.alloc(0),
+        };
+      },
+    },
+    undefined,
+    {
+      observers: [
+        {
+          observe(event) {
+            if (event.eventType === "network.dns.query")
+              (event.payload.answerIps as string[]).push("8.8.8.8");
+          },
+        },
+        {
+          observe(event) {
+            if (event.eventType === "network.dns.query")
+              received.push([...event.payload.answerIps]);
+          },
+        },
+      ],
+    },
+  );
+  const result = await host.runWorker(plan, undefined, undefined, {
+    hostServices: [
+      {
+        hostname: HOST_SERVICE_NAME,
+        ip: "192.0.2.2",
+        port: 8080,
+        loopbackPort: 4242,
+      },
+    ],
+  });
+  assert.equal(result.outcome, "ok");
+  assert.deepEqual(received, [["192.0.2.2"]]);
+  assert.deepEqual(
+    fake.opened?.policy.decideConnect({
+      ip: "192.0.2.2",
+      port: 8080,
+      sandbox: "fixture",
+    }),
+    {
+      decision: "allow",
+      reasonCode: "host-service",
+      channel: "host-service",
+      upstream: { ip: "127.0.0.1", port: 4242 },
+    },
+  );
+});
+
+test("timeout, cancellation and explicit lifetime expiry get distinct resource evidence", async (t) => {
+  for (const [status, kind, expected] of [
+    ["timed-out", "timed-out", "timed-out"],
+    ["cancelled", "forced-termination", "cancelled"],
+    ["lifetime-expired", "lifetime-expired", "timed-out"],
+  ] as const) {
+    const { host, db, calls } = observedFixture(
+      t,
+      {
+        async exec() {
+          if (status === "lifetime-expired")
+            throw new SandboxRuntimeError(status);
+          return {
+            status,
+            exitCode: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0),
+          };
+        },
+      },
+      undefined,
+      {
+        config: {
+          ...requiredConfig,
+          telemetry: { ...requiredConfig.telemetry, enabled: false },
+        },
+        observers: [
+          {
+            observe() {
+              assert.fail("disabled telemetry");
+            },
+          },
+        ],
+      },
+    );
+    const result = await host.runWorker(plan);
+    assert.equal(result.outcome, expected);
+    const rows = db.readExecution(result.id);
+    assert.deepEqual(
+      rows.resourceEvents.map((row) => row.kind),
+      [kind],
+    );
+    assert.equal(rows.processResults[0]?.guestReported, false);
+    assert.equal(rows.processResults[0]?.exitCode, null);
+    assert.ok(!calls.includes("final-sample"));
+    assert.equal(host.observerFailures, 0);
+  }
+});
+
+test("required Coordinator sessions use the same binding, process and shutdown barriers", async (t) => {
+  const { host, db, calls, fake } = observedFixture(t, {
+    async openSession() {
+      calls.push("session.open");
+      return {
+        send() {},
+        lines: (async function* () {})(),
+        close() {
+          calls.push("session.close");
+        },
+        finished: Promise.resolve("cancelled" as const),
+      };
+    },
+  });
+  const id = randomUUID();
+  const result = await host.runCoordinatorSession(
+    providerPlan,
+    id,
+    async () => {
+      calls.push("session.use");
+      return 42;
+    },
+    { executionId: id, attributes: { streamed: true } },
+  );
+  assert.deepEqual(result, { id, outcome: "ok", value: 42 });
+  const rows = db.readExecution(id);
+  assert.equal(rows.sandboxBindings[0]?.sandboxId, fake.opened?.sandboxLabel);
+  assert.equal(rows.processResults[0]?.exitCode, null);
+  assert.equal(rows.processResults[0]?.guestReported, false);
+  assert.deepEqual(
+    calls.filter((call) =>
+      /^(session\.|process_results|gateway.close|destroy)/.test(call),
+    ),
+    [
+      "session.open",
+      "session.use",
+      "session.close",
+      "process_results",
+      "gateway.close",
+      "destroy",
+    ],
+  );
+});
+
+test("a runtime that returns a different sandbox ID or network digest is quarantined", async (t) => {
+  for (const field of ["id", "netRuleDigest"] as const) {
+    const { host, db, calls } = observedFixture(t, {
+      async createBound(_spec, id) {
+        calls.push("create");
+        return { id, netRuleDigest: ruleDigest, [field]: "mismatch" };
+      },
+    });
+    const id = randomUUID();
+    await assert.rejects(host.runWorker(providerPlan, id), HostAuditError);
+    assert.equal(db.readExecution(id).sandboxBindings.length, 1);
+    assert.equal(calls.at(-1), "gateway.close");
+    assert.ok(!calls.includes("operation.finished sandbox.create"));
+    assert.ok(!calls.includes("exec") && !calls.includes("destroy"));
+  }
+});
+
+test("gateway bind failure refuses required egress before any provider grant or VM operation", async (t) => {
+  const { host, calls } = observedFixture(t, {}, undefined, {
+    async gatewayFactory() {
+      throw new Error("fixture listener unavailable");
+    },
+  });
+  const result = await host.runWorker(providerPlan);
+  assert.equal(result.outcome, "failed");
+  assert.deepEqual(calls, [
+    "invocation.started",
+    "execution_contexts",
+    "invocation.finished",
+  ]);
+});
+
+test("the legacy audit path refuses egress without an explicit mode", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { runtime, calls } = adapter("");
+  const host = new TrustedHost(audit, runtime, profiles);
+  await assert.rejects(host.runWorker(providerPlan), /configured audit/);
+  await assert.rejects(
+    host.runWorker({
+      ...plan,
+      sandbox: { hostTcpPort: 4242 },
+    }),
+    /hostTcpPort/,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("asynchronous telemetry rejections are counted without affecting the run", async (t) => {
+  const { host } = observedFixture(t, undefined, undefined, {
+    observers: [
+      {
+        async observe() {
+          throw new Error("fixture exporter");
+        },
+        async observeFinalResourceSample() {
+          throw new Error("fixture sampler");
+        },
+      },
+    ],
+  });
+  assert.equal((await host.runWorker(plan)).outcome, "ok");
+  assert.equal(host.observerFailures, 7);
+});
+
+test("Coordinator session send refuses further guest work after gateway quarantine", async (t) => {
+  const { host, calls, fake } = observedFixture(t, {
+    async openSession() {
+      return {
+        send(line) {
+          calls.push(line);
+        },
+        lines: (async function* () {})(),
+        close() {
+          calls.push("session.close");
+        },
+        finished: Promise.resolve("cancelled" as const),
+      };
+    },
+  });
+  const id = randomUUID();
+  await assert.rejects(
+    host.runCoordinatorSession(providerPlan, id, async (session) => {
+      session.send("first message");
+      fake.quarantine();
+      session.send("blocked message");
+    }),
+    HostAuditError,
+  );
+  assert.deepEqual(calls.slice(-3), [
+    "first message",
+    "session.close",
+    "gateway.close",
+  ]);
 });
