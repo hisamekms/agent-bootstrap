@@ -846,7 +846,10 @@ run live.
 - **Codex sandbox restored.** Planner and Reviewer are back in Codex's
   read-only sandbox. Their full inputs are inlined, so they need no shell.
   Because that sandbox cannot start in the guest, any shell command the
-  model tries fails closed.
+  model tries fails closed. This was observed with the pinned image and
+  Codex 0.170.0, where Codex's bundled bubblewrap cannot start. The guest
+  script checks that no `bwrap` is on the image's `PATH`, so a different
+  image or Codex version needs this claim checked again.
   - Only Worker can still run shell commands in a VM that has credentialed
     egress.
   - Reviewer still reads untrusted candidate text, so its verdict can be
@@ -863,7 +866,8 @@ run live.
 - **Bounded, marked inputs.**
   - Reviewer inputs over the inline limits, 6,000 bytes of diff or 2,000
     bytes of source, are not reviewed partially; they become a concern.
-  - Data blocks are delimited with a random marker for each run.
+  - Data blocks are delimited with a random marker for each invocation.
+    The script stops if the marker is not 24 hexadecimal characters.
 
 ## Later acceptance checks
 
