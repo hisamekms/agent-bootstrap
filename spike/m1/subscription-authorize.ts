@@ -238,7 +238,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
       });
       prompt.question("Press Enter to open it in your browser. ").then(
         () => {
-          assert.equal(url.origin, issuer);
+          if (url.origin !== issuer) return;
           spawn("/usr/bin/open", [url.href], { stdio: "ignore" }).on(
             "error",
             () =>

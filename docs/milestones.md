@@ -756,10 +756,9 @@ The fixes are as follows:
 
 - **Planner and Reviewer prompts.** The guest shell inlines bounded file
   contents into these prompts, between data markers.
-- **No Codex sandbox.** Planner and Reviewer also run without Codex's own
-  sandbox, like Worker. The VM and the read-only `/review` mount are the
-  sandbox. This means every model-driven role can now run shell commands
-  in a VM that has credentialed egress.
+- **No Codex sandbox (later reverted).** In the live run below, Planner and
+  Reviewer ran without Codex's own sandbox, as Worker does. The later
+  review changes put them back in Codex's read-only sandbox (see below).
 - **Coordinator instructions.** They now explain invocation outcomes, the
   revision step and that queries add nothing.
 
@@ -832,10 +831,39 @@ Audit gaps and open points from this run:
 - **Some activity is not audited in detail.** Provider requests are not
   audited one by one, and native tool calls inside the Worker VM are not
   audited individually.
-- **Native tools stay visible.** The Coordinator could still see the
-  `collaboration` and `clock` tools; none were used.
+- **Native tools were visible.** The Coordinator could see the
+  `collaboration` and `clock` tools, which the catalog override had
+  enabled; none were used.
 - **The revision path is untested live.** It has not yet run in a live
   attempt.
+
+### Changes after the live run review
+
+A security review of the changes made during the live attempts led to
+these follow-up changes. They were checked in fixture mode but have not
+run live.
+
+- **Codex sandbox restored.** Planner and Reviewer are back in Codex's
+  read-only sandbox. Their full inputs are inlined, so they need no shell.
+  Because that sandbox cannot start in the guest, any shell command the
+  model tries fails closed.
+  - Only Worker can still run shell commands in a VM that has credentialed
+    egress.
+  - Reviewer still reads untrusted candidate text, so its verdict can be
+    steered by prompt injection. The operator's own review of the full
+    diff remains the independent check.
+- **Narrower catalog override.**
+  - The derived catalog entry now also clears
+    `experimental_supported_tools` and `multi_agent_version`.
+  - In fixture mode the Coordinator then sees only its own tools plus
+    `request_user_input`, `apply_patch` and `view_image`. This is the same
+    as the `gpt-5.5` layout, with no `collaboration` or `clock` tools.
+  - The derived catalog is pinned to SHA-256
+    `9a6ef910866167ed194b1374ff346256fa813fb46d768b9683d1ce61d60419b9`.
+- **Bounded, marked inputs.**
+  - Reviewer inputs over the inline limits, 6,000 bytes of diff or 2,000
+    bytes of source, are not reviewed partially; they become a concern.
+  - Data blocks are delimited with a random marker for each run.
 
 ## Later acceptance checks
 
