@@ -938,6 +938,21 @@ MSB_HOME="$MSB_HOME" M5_TREE=0 M5_PROFILE=db M5_ACTORS=all=codex \
   bun spike/m5/dogfood.ts --fixture "$MSB" "$CODEX_BINARY"
 ```
 
+### OBS-11b gateway migration
+
+The M4 Coordinator model smoke now maps its HTTP fixture through an audited
+host service. The M6 Claude Code smoke uses a DNS-pinned TEST-NET provider
+binding and relays TLS to its loopback fixture. Both enable telemetry at
+1,000 ms and export audit JSONL under the run's `observability/` directory.
+VM verification is pending, including end-to-end secret substitution.
+
+M5 still needs a composition root that routes multiple provider bindings to
+their credential-specific runtimes under one trusted host and audit writer.
+Its HTTP Codex fixture needs a Codex endpoint that targets the gateway's
+host-service name and `ReviewedIntegration` support for passing
+`hostServices` to Worker and Reviewer runs. The M5 report and export are
+pending with that migration.
+
 ## Planned: credential fallback per actor
 
 Status: planned, not implemented (recorded on 2026-11-22).

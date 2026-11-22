@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -10,19 +10,23 @@ import {
 } from "node:fs/promises";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { connect } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SqliteAudit } from "../../src/audit.ts";
+import { exportAudit } from "../../src/audit-export.ts";
 import {
   claudeCodeCommand,
   claudeCodeProvider,
   claudeCodeTools,
   parseClaudeCodeResult,
 } from "../../src/claude-code.ts";
-import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { EgressGateway } from "../../src/egress-gateway.ts";
+import { createObservedHost } from "../../src/observed-host.ts";
 import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
-import { TrustedHost } from "../../src/trusted-host.ts";
+import type { SandboxProvider } from "../../src/sandbox-runtime.ts";
+import { createTelemetry } from "../../src/telemetry.ts";
 
 // Offline Claude Code smoke on Microsandbox. A loopback HTTPS server with a
 // disposable CA stands in for the Anthropic API. The trusted host holds a
@@ -31,7 +35,9 @@ import { TrustedHost } from "../../src/trusted-host.ts";
 const local = fileURLToPath(new URL("../../.local/", import.meta.url));
 const image =
   "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd";
-const hostname = "host.microsandbox.internal";
+const hostname = "anthropic.fixture.invalid";
+const fixtureIp = "192.0.2.22";
+const providerPort = 443;
 const model = "claude-opus-5-5";
 const run = promisify(execFile);
 let stage = "prerequisites";
@@ -313,25 +319,76 @@ async function main() {
   });
   const unapprovedPort = await listen(unapproved);
 
+  const binding = {
+    host: hostname,
+    port: providerPort,
+    upstreamCaCertPath: join(tls, "ca.pem"),
+  };
   const provider = claudeCodeProvider(
     { mode: "api-key", credential: "host-secret" },
-    { host: hostname, port, upstreamCaCertPath: join(tls, "ca.pem") },
+    binding,
   );
   const profiles = new ProfileCatalog({ base: { image } });
-  const runtime = new MicrosandboxRuntime({
-    binary: msb,
-    home,
-    profiles,
-    stagingRoot: join(root, "sandboxes"),
-    providers: [provider],
-    credentials: {
-      async withAccessToken(consume) {
-        return consume(syntheticKey);
+  const auditPath = join(root, "audit.sqlite");
+  const directory = join(root, "observability");
+  const telemetryConfig = {
+    enabled: true,
+    resourceSamplingIntervalMs: 1000,
+    traceSamplingRatio: 1,
+  };
+  const telemetry = createTelemetry(telemetryConfig, directory);
+  const openHost = (provider: SandboxProvider, stagingRoot: string) =>
+    createObservedHost({
+      config: {
+        directory,
+        audit: { mode: "required" },
+        telemetry: telemetryConfig,
       },
-    },
-  });
-  const audit = new SqliteAudit(join(root, "audit.sqlite"));
-  const host = new TrustedHost(audit, runtime, profiles);
+      auditPath,
+      msb: { binary: msb, home, stagingRoot },
+      profiles,
+      observers: [telemetry],
+      providers: [provider],
+      credentials: {
+        async withAccessToken(consume) {
+          return consume(syntheticKey);
+        },
+      },
+      // The provider policy still requires a DNS pin and audits the
+      // connection before this fixture-only dialer maps it to loopback.
+      openGateway: (options) =>
+        EgressGateway.open({
+          ...options,
+          async resolver(name, qtype) {
+            return name === hostname && qtype === 1
+              ? [{ address: fixtureIp, ttl: 300 }]
+              : [];
+          },
+          connect(destination) {
+            assert.equal(destination.ip, fixtureIp);
+            assert.equal(destination.port, providerPort);
+            return connect(port, "127.0.0.1");
+          },
+        }),
+    });
+  let observed: Awaited<ReturnType<typeof openHost>> | undefined;
+  let auditOpened = false;
+  let finishing: Promise<void> | undefined;
+  const finishObservability = () =>
+    (finishing ??= (async () => {
+      try {
+        await observed?.close();
+      } finally {
+        await telemetry.shutdown();
+        if (auditOpened) {
+          try {
+            exportAudit(auditPath, directory);
+          } catch {
+            console.error("M6 audit JSONL export failed.");
+          }
+        }
+      }
+    })());
   // Untrusted repository content may carry Claude Code project settings.
   // These must all be ignored: a hook that tampers with hello.txt, an env
   // override that redirects the API, and a key helper.
@@ -382,9 +439,13 @@ async function main() {
   );
   const debugTimeout = Number(process.env.M6_TIMEOUT ?? 180_000);
   const tools = claudeCodeTools({ binary, packageDir });
-  const baseUrl = `https://${hostname}:${port}`;
+  const baseUrl = `https://${hostname}`;
   const started = performance.now();
   try {
+    stage = "audited host startup";
+    observed = await openHost(provider, join(root, "sandboxes"));
+    auditOpened = true;
+    const { host } = observed;
     stage = "Planner (read-only)";
     const planner = () =>
       host.runPlanner({
@@ -408,7 +469,14 @@ async function main() {
         }),
       });
     // Two concurrent sandboxes: separate VMs, separate config, one key.
-    const [first, second] = await Promise.all([planner(), planner()]);
+    const [firstResult, secondResult] = await Promise.allSettled([
+      planner(),
+      planner(),
+    ]);
+    if (firstResult.status === "rejected") throw firstResult.reason;
+    if (secondResult.status === "rejected") throw secondResult.reason;
+    const first = firstResult.value;
+    const second = secondResult.value;
     if (process.env.M6_ONLY_PLANNER === "1") {
       console.log(
         JSON.stringify({
@@ -448,6 +516,69 @@ async function main() {
     });
     const edited = worker.artifacts?.files[0]?.bytes;
 
+    stage = "guest exposure and egress";
+    // Run the CLI and inspect its leftover files in one audited invocation.
+    const probeCommand = claudeCodeCommand({
+      role: "Planner",
+      prompt: "M6 ROLE: Planner\nProbe run.",
+      model,
+      maxTurns: 2,
+      timeoutMs: 180_000,
+      baseUrl,
+    });
+    const probe = await host.runPlanner({
+      sandbox: {
+        tools,
+        provider,
+        readOnlyFiles: [
+          { path: "hello.txt", bytes: Buffer.from("hello from base\n") },
+        ],
+        maxLifetimeMs: 240_000,
+      },
+      command: {
+        argv: [
+          "/bin/sh",
+          "-ec",
+          `
+          keyHash=$1
+          otherPort=$2
+          shift 2
+          "$@" 2>&1
+          printf '\\n'
+          printf 'placeholder=%s\\n' "$( [ "$ANTHROPIC_API_KEY" = '$MSB_ANTHROPIC_API_KEY' ] && echo yes || echo no)"
+          # Compare digests of candidate tokens without supplying the key.
+          tokenPattern='sk-ant-synthetic-[0-9a-f]{36}'
+          testToken="sk-ant-synthetic-$(printf '%036d' 0)"
+          matches=$(
+            {
+              cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline || :
+              find /tmp /root /etc /.msb -type f -exec cat {} + || :
+              printf '\\000%s\\000' "$testToken"
+            } 2>/dev/null |
+            LC_ALL=C tr -c '[:print:]' '\\n' |
+            grep -o -E "$tokenPattern" |
+            while IFS= read -r candidate; do
+              if [ "$candidate" = "$testToken" ]; then echo control; fi
+              digest=$(printf '%s' "$candidate" | sha256sum)
+              if [ "\${digest%% *}" = "$keyHash" ]; then echo match; fi
+            done
+          )
+          printf '%s\\n' "$matches" | grep -qx control
+          hits=$(printf '%s\\n' "$matches" | grep -cx match || :)
+          printf 'key-hits=%s\\n' "$hits"
+          if wget -q -T 3 -O /dev/null "http://${hostname}:$otherPort/" 2>/dev/null; then echo unapproved=reached; else echo unapproved=blocked; fi
+          `,
+          "probe",
+          createHash("sha256").update(syntheticKey).digest("hex"),
+          String(unapprovedPort),
+          ...probeCommand.argv,
+        ],
+        timeoutMs: 210_000,
+      },
+    });
+    assert.equal(probe.outcome, "ok");
+    const probeOutput = Buffer.from(probe.response ?? []).toString("latin1");
+
     stage = "Worker (operator credential variable)";
     // The same task through the generic operator-credential mode: an
     // operator-chosen variable substituted into Authorization, without
@@ -459,27 +590,13 @@ async function main() {
       variable: process.env.M6_OPERATOR_VARIABLE ?? "ANTHROPIC_AUTH_TOKEN",
       header: "authorization" as const,
     };
-    const operatorProvider = claudeCodeProvider(operatorAuth, {
-      host: hostname,
-      port,
-      upstreamCaCertPath: join(tls, "ca.pem"),
-    });
-    const operatorHost = new TrustedHost(
-      audit,
-      new MicrosandboxRuntime({
-        binary: msb,
-        home,
-        profiles,
-        stagingRoot: join(root, "sandboxes-operator"),
-        providers: [operatorProvider],
-        credentials: {
-          async withAccessToken(consume) {
-            return consume(syntheticKey);
-          },
-        },
-      }),
-      profiles,
+    const operatorProvider = claudeCodeProvider(operatorAuth, binding);
+    await observed.close();
+    observed = await openHost(
+      operatorProvider,
+      join(root, "sandboxes-operator"),
     );
+    const { host: operatorHost } = observed;
     const before = seen.length;
     const operatorWorker = await operatorHost.runWorker({
       sandbox: {
@@ -576,66 +693,10 @@ async function main() {
     const reviewRequests = seen.slice(reviewBefore);
     const review = parseClaudeCodeResult(operatorReviewer.response);
 
-    stage = "guest exposure and egress";
-    // A separate VM with the same egress: search the guest for the key and
-    // try an unapproved destination.
-    // The probe first runs the CLI in the same VM, then searches for the
-    // whole key, so files and processes the CLI left behind are covered.
-    const probe = await runtime.create({
-      tools,
-      provider,
-      readOnlyFiles: [
-        { path: "hello.txt", bytes: Buffer.from("hello from base\n") },
-      ],
-      maxLifetimeMs: 240_000,
-    });
-    let probeOut = "";
-    let probeStderr = "";
-    try {
-      const cli = await runtime.exec(
-        probe,
-        claudeCodeCommand({
-          role: "Planner",
-          prompt: "M6 ROLE: Planner\nProbe run.",
-          model,
-          maxTurns: 2,
-          timeoutMs: 180_000,
-          baseUrl,
-        }),
-      );
-      probeStderr =
-        Buffer.from(cli.stderr).toString("latin1") +
-        Buffer.from(cli.stdout).toString("latin1");
-      const result = await runtime.exec(probe, {
-        argv: [
-          "/bin/sh",
-          "-c",
-          `
-          printf 'placeholder=%s\\n' "$( [ "$ANTHROPIC_API_KEY" = '$MSB_ANTHROPIC_API_KEY' ] && echo yes || echo no)"
-          # The pattern is split across argv and joined by the shell builtin
-          # into a file outside the searched paths, so no command line
-          # contains the searched string.
-          mkdir -p /var/probe && printf '%s%s' "$1" "$3" > /var/probe/pattern
-          hits=$(grep -r -l -a -F -f /var/probe/pattern /proc/[0-9]*/environ /proc/[0-9]*/cmdline /tmp /root /etc /.msb 2>/dev/null | wc -l)
-          printf 'key-hits=%s\\n' "$hits"
-          if wget -q -T 3 -O /dev/null "http://${hostname}:$2/" 2>/dev/null; then echo unapproved=reached; else echo unapproved=blocked; fi
-          `,
-          "probe",
-          syntheticKey.slice(0, 20),
-          String(unapprovedPort),
-          syntheticKey.slice(20),
-        ],
-        timeoutMs: 30_000,
-      });
-      probeOut = Buffer.from(result.stdout).toString();
-    } finally {
-      await runtime.destroy(probe).catch(() => {});
-    }
-
     stage = "host-side exposure";
     // The key must not be written anywhere on the host either: the run's
     // directory (audit database, staging, journals) and MSB_HOME.
-    audit.close();
+    await finishObservability();
     const hostHits: string[] = [];
     const scan = async (directory: string) => {
       const { readdir, lstat } = await import("node:fs/promises");
@@ -661,17 +722,19 @@ async function main() {
               new Uint8Array(),
           ).toString("latin1"),
         )
-        .join("\n") + probeStderr;
-    const reopened = new SqliteAudit(join(root, "audit.sqlite"), {
+        .join("\n") + probeOutput;
+    const reopened = new SqliteAudit(auditPath, {
       readonly: true,
     });
-    const egress = [
-      first.id,
-      second.id,
-      worker.id,
-      operatorWorker.id,
-      operatorReviewer.id,
-    ].map((id) =>
+    const runs = [
+      first,
+      second,
+      worker,
+      operatorWorker,
+      operatorReviewer,
+      probe,
+    ];
+    const egress = runs.map(({ id }) =>
       reopened
         .read(id)
         .filter((event) => event.operation === "provider.egress")
@@ -679,6 +742,26 @@ async function main() {
           (event) => `${event.kind}${event.outcome ? ` ${event.outcome}` : ""}`,
         ),
     );
+    const providerAudited = runs.every(({ id }) =>
+      reopened
+        .readExecution(id)
+        .networkEvents.some(
+          (event) =>
+            event.phase === "decided" &&
+            event.channel === "provider-egress" &&
+            event.hostname === hostname &&
+            event.decision === "allow",
+        ),
+    );
+    const unapprovedAudited = reopened
+      .readExecution(probe.id)
+      .networkEvents.some(
+        (event) =>
+          event.phase === "decided" &&
+          event.destinationIp === fixtureIp &&
+          event.destinationPort === unapprovedPort &&
+          event.decision === "deny",
+      );
     const report = {
       claudeCode: "2.1.330 linux-arm64-musl",
       seconds: Math.round((performance.now() - started) / 100) / 10,
@@ -716,7 +799,8 @@ async function main() {
         substituted: entry.key === syntheticKey,
         authorization: entry.authorization,
       })),
-      probe: probeOut.trim().split("\n"),
+      probe: probeOutput.trimEnd().split("\n").slice(-3),
+      observability: directory,
       unapprovedHits,
       keyInCapturedOutput: captured.includes(syntheticKey),
       hostHits,
@@ -779,6 +863,11 @@ async function main() {
       "key-hits=0",
       "unapproved=blocked",
     ]);
+    assert.ok(
+      providerAudited,
+      "Every fixture run must have audited provider egress",
+    );
+    assert.ok(unapprovedAudited, "The gateway must deny the unapproved port");
     assert.equal(unapprovedHits, 0);
     assert.equal(report.keyInCapturedOutput, false);
     assert.deepEqual(hostHits, []);
@@ -792,11 +881,11 @@ async function main() {
       "Claude Code ran in Microsandbox with host-held credentials: substituted only upstream (x-api-key, or Authorization for the operator variable), absent from the guest, outputs and host files; planted project settings and CLAUDE.md were ignored.",
     );
   } finally {
-    try {
-      audit.close();
-    } catch {}
+    anthropic.closeAllConnections();
     anthropic.close();
+    unapproved.closeAllConnections();
     unapproved.close();
+    await finishObservability();
   }
 }
 

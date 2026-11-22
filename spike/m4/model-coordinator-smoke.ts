@@ -5,14 +5,15 @@ import { mkdir, mkdtemp, readFile, realpath } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SqliteAudit } from "../../src/audit.ts";
+import { exportAudit } from "../../src/audit-export.ts";
 import { CodexAppServerCoordinator } from "../../src/codex-app-server.ts";
 import { CoordinatorTask } from "../../src/coordinator.ts";
-import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
+import { HOST_SERVICE_NAME } from "../../src/egress-policy.ts";
+import { createObservedHost } from "../../src/observed-host.ts";
 import { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 import { modelStep } from "../../src/model-coordinator.ts";
 import { taskTrace } from "../../src/task-trace.ts";
-import { TrustedHost } from "../../src/trusted-host.ts";
+import { createTelemetry } from "../../src/telemetry.ts";
 
 // Real Codex app-server in a disposable VM, driven by a local mock Responses
 // provider. No provider credential exists in the host process or the guest.
@@ -140,7 +141,12 @@ await new Promise<void>((resolve, reject) => {
 });
 const address = server.address();
 assert.ok(address && typeof address !== "string");
-const port = String(address.port);
+const hostService = {
+  hostname: HOST_SERVICE_NAME,
+  ip: "192.0.2.2",
+  port: address.port,
+  loopbackPort: address.port,
+};
 
 // The guest checks the copied binary again before running it.
 const coordinatorCommand = {
@@ -148,40 +154,50 @@ const coordinatorCommand = {
     "/bin/sh",
     "-ec",
     `
-      gateway=$(ip -4 route show default | awk '$1 == "default" && $2 == "via" { print $3; exit }')
-      test -n "$gateway"
       printf '%s  /tmp/codex\\n' '${codexDigest}' | sha256sum -c - >/dev/null
       chmod 700 /tmp/codex
       exec /tmp/codex app-server --listen stdio:// \\
         -c 'model_provider="fixture"' \\
         -c 'model_providers.fixture.name="Coordinator fixture"' \\
-        -c 'model_providers.fixture.base_url="http://'"$gateway:$1"'/v1"' \\
+        -c 'model_providers.fixture.base_url="http://${hostService.hostname}:${hostService.port}/v1"' \\
         -c 'model_providers.fixture.wire_api="responses"' \\
         -c 'model_providers.fixture.request_max_retries=0' \\
         -c 'model_providers.fixture.stream_max_retries=0'
     `,
-    "sh",
-    port,
   ],
   timeoutMs: 50_000,
 };
 
 await mkdir(local, { recursive: true, mode: 0o700 });
 const root = await realpath(await mkdtemp(join(local, "m4-model-")));
-const audit = new SqliteAudit(join(root, "audit.sqlite"));
+const auditPath = join(root, "audit.sqlite");
+const directory = join(root, "observability");
+const telemetryConfig = {
+  enabled: true,
+  resourceSamplingIntervalMs: 1000,
+  traceSamplingRatio: 1,
+};
+const telemetry = createTelemetry(telemetryConfig, directory);
+let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
 try {
   await mkdir(join(root, "tasks"), { mode: 0o700 });
   const profiles = new ProfileCatalog({ base: { image } });
-  const host = new TrustedHost(
-    audit,
-    new MicrosandboxRuntime({
+  observed = await createObservedHost({
+    config: {
+      directory,
+      audit: { mode: "required" },
+      telemetry: telemetryConfig,
+    },
+    auditPath,
+    msb: {
       binary: msbPath,
       home: msbHome,
-      profiles,
       stagingRoot: join(root, "sandboxes"),
-    }),
+    },
     profiles,
-  );
+    observers: [telemetry],
+  });
+  const { host, audit } = observed;
   const model = new CodexAppServerCoordinator({
     async open(id, use) {
       const result = await host.runCoordinatorSession(
@@ -194,14 +210,28 @@ try {
                 sha256: codexDigest,
               },
             ],
-            hostTcpPort: Number(port),
             maxLifetimeMs: 60_000,
           },
           command: coordinatorCommand,
         },
         id,
         use,
+        undefined,
+        { hostServices: [hostService] },
       );
+      if (result.outcome === "ok")
+        assert.ok(
+          audit
+            .readExecution(id)
+            .networkEvents.some(
+              (event) =>
+                event.phase === "decided" &&
+                event.channel === "host-service" &&
+                event.hostname === hostService.hostname &&
+                event.decision === "allow",
+            ),
+          "Coordinator fixture connection must be audited by the gateway",
+        );
       return result.value as never;
     },
     timeoutMs: 90_000,
@@ -283,7 +313,8 @@ try {
     JSON.stringify(
       {
         journalRoot: join(root, "tasks"),
-        audit: join(root, "audit.sqlite"),
+        audit: auditPath,
+        observability: directory,
         router: { outcome, ...first },
         native: { outcome: nativeOutcome, ...second },
         provider,
@@ -327,7 +358,18 @@ try {
     "Every Coordinator turn ran as an audited host session. One delegation was authorized, one integration request was denied, and a native clock.sleep call voided its turn.",
   );
 } finally {
-  audit.close();
   server.closeAllConnections();
   server.close();
+  try {
+    await observed?.close();
+  } finally {
+    await telemetry.shutdown();
+    if (observed) {
+      try {
+        exportAudit(auditPath, directory);
+      } catch {
+        console.error("M4 audit JSONL export failed.");
+      }
+    }
+  }
 }
