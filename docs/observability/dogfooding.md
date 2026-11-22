@@ -110,8 +110,11 @@ digest-pinned images. Set `MSB` and `CODEX_BINARY` to absolute paths.
 The live runner uses the synthetic `hello.txt` task and creates a temporary
 repository under `.local`. Review the candidate at the approval prompt.
 
-1. For a Codex Worker, opt in via the existing launcher and complete the
-   browser consent flow. The launcher passes the single-run token over stdin.
+1. For a Codex Worker, opt in via the launcher. On macOS, optionally add
+   `--keychain` after `--authorize-and-run-m5` to reuse browser consent on later
+   runs. The launcher passes the access token over stdin. Set `MSB_HOME` to a
+   short absolute path outside the repository. A path under this repository is
+   too long for macOS's 104-byte Unix socket path limit.
    Follow the [subscription credential procedure](../codex-subscription-credential-poc.md).
 
    ```sh

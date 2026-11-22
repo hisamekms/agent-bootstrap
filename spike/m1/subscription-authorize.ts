@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import {
+  execFile,
+  spawn,
+  type ChildProcess,
+  type ExecFileException,
+} from "node:child_process";
 import {
   createHash,
   createPublicKey,
@@ -17,7 +22,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { userInfo } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
@@ -25,10 +31,16 @@ const issuer = "https://auth.openai.com";
 const resource = "https://api.openai.com/v1";
 const scope = "chatgpt.tokens.use.direct";
 const dynamicClient = "dynamic_agent_client";
+const keychainService = "agent-bootstrap.siwc.refresh";
+const maxKeychainOutput = 16 * 1024;
+const revocationWarning =
+  "OAuth revocation could not be confirmed. Disconnect Agent Bootstrap in ChatGPT settings.";
+const rejectedGrantWarning =
+  "The saved ChatGPT grant was rejected. If you did not expect this, disconnect Agent Bootstrap in ChatGPT settings.";
 const statePath = fileURLToPath(
   new URL("../../.local/siwc-smoke/", import.meta.url),
 );
-// The operator chooses which live runner receives the single-run token.
+// The operator chooses which live runner receives the access token.
 const runners: Record<string, string> = {
   "--authorize-and-run": fileURLToPath(
     new URL("./subscription-smoke.ts", import.meta.url),
@@ -39,6 +51,8 @@ const runners: Record<string, string> = {
 };
 const validId = (value: unknown) =>
   typeof value === "string" && /^[a-zA-Z0-9_-]{1,256}$/.test(value);
+const isIssuedClientId = (value: unknown): value is string =>
+  validId(value) && value !== dynamicClient;
 const random = () => randomBytes(32).toString("base64url");
 const sha256 = (value: string) =>
   createHash("sha256").update(value).digest("base64url");
@@ -46,6 +60,105 @@ let stage = "operator opt-in and prerequisites";
 
 type Registration = { hostId: string; clientId?: string; subjectHash?: string };
 type Callback = { code: string; clientId: string };
+type Consent = Callback & {
+  nonce: string;
+  verifier: string;
+  redirectUri: string;
+};
+type Request = (url: string, body?: URLSearchParams) => Promise<Response>;
+type IdentityCheck = { nonce: string } | { refresh: true };
+type Keychain = {
+  read(): Promise<string | null>;
+  write(token: string): Promise<void>;
+  delete(): Promise<void>;
+};
+type StartSecurity = (
+  file: string,
+  args: string[],
+  options: {
+    env: { PATH: string; HOME: string };
+    maxBuffer: number;
+    timeout: number;
+  },
+  callback: (error: ExecFileException | null, stdout: string) => void,
+) => Pick<ChildProcess, "stdin">;
+
+export function makeKeychain(
+  account: string | undefined,
+  hostId: string,
+  start: StartSecurity = execFile,
+): Keychain {
+  assert.ok(
+    account && /^[A-Za-z0-9._-]+$/.test(account),
+    "invalid Keychain account",
+  );
+  const home = userInfo().homedir;
+  assert.ok(isAbsolute(home), "invalid Keychain home directory");
+  const suffix = createHash("sha256").update(hostId).digest("hex").slice(0, 16);
+  const item = ["-a", account, "-s", `${keychainService}.${suffix}`];
+
+  function security(args: string[], input?: string): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      let inputFailed = false;
+      const child = start(
+        "/usr/bin/security",
+        args,
+        {
+          env: { PATH: "/usr/bin:/bin", HOME: home },
+          maxBuffer: maxKeychainOutput,
+          timeout: 30_000,
+        },
+        (error, stdout) => {
+          if (
+            inputFailed ||
+            (error && (input !== undefined || error.code !== 44))
+          ) {
+            reject(new Error("Keychain command failed"));
+          } else {
+            resolve(error ? null : stdout);
+          }
+        },
+      );
+      child.stdin?.on("error", () => {
+        // Wait for the command to exit before the caller can delete the item.
+        inputFailed = true;
+      });
+      child.stdin?.end(input);
+    });
+  }
+
+  function findPassword() {
+    return security(["find-generic-password", ...item, "-w"]);
+  }
+
+  return {
+    async read() {
+      return (await findPassword())?.trim() ?? null;
+    },
+    async write(token) {
+      assert.ok(
+        /^[A-Za-z0-9._~+/=-]{20,8192}$/.test(token),
+        "invalid Keychain token format",
+      );
+      await security(
+        ["-i"],
+        `add-generic-password -U ${item.join(" ")} -w ${token}\n`,
+      );
+      const stored = (await findPassword())?.replace(/\r?\n$/, "");
+      assert.ok(
+        stored !== undefined &&
+          timingSafeEqual(
+            Buffer.from(sha256(stored)),
+            Buffer.from(sha256(token)),
+          ),
+        "Keychain read-back failed",
+      );
+    },
+    async delete() {
+      await security(["delete-generic-password", ...item]);
+    },
+  };
+}
 
 async function saveRegistration(file: string, registration: Registration) {
   const temporary = `${file}.${randomUUID()}`;
@@ -80,9 +193,7 @@ export function acceptCallback(
   assert.ok(query.getAll("client_id").length <= 1);
   const code = query.get("code");
   const clientId = query.get("client_id") ?? issued;
-  assert.ok(
-    code && validId(clientId) && clientId && clientId !== dynamicClient,
-  );
+  assert.ok(code && isIssuedClientId(clientId));
   assert.ok(issued === undefined || clientId === issued);
   return { code, clientId };
 }
@@ -91,7 +202,7 @@ export function verifyIdentity(
   idToken: string,
   keys: readonly Record<string, unknown>[],
   clientId: string,
-  nonce: string,
+  check: IdentityCheck,
 ): string {
   // assert.ok, not assert.match: a failed match would quote the token.
   assert.ok(
@@ -103,7 +214,7 @@ export function verifyIdentity(
   const protectedHeader = JSON.parse(
     Buffer.from(header, "base64url").toString("utf8"),
   );
-  assert.equal(protectedHeader.alg, "RS256");
+  assert.ok(protectedHeader.alg === "RS256");
   assert.ok(typeof protectedHeader.kid === "string" && protectedHeader.kid);
   const matches = keys.filter(
     (key) =>
@@ -130,7 +241,7 @@ export function verifyIdentity(
     ),
   );
   const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-  assert.equal(claims.iss, issuer);
+  assert.ok(claims.iss === issuer);
   assert.ok(
     claims.aud === clientId ||
       (Array.isArray(claims.aud) &&
@@ -138,7 +249,7 @@ export function verifyIdentity(
         (claims.aud.length === 1 || claims.azp === clientId)),
   );
   assert.ok(claims.azp === undefined || claims.azp === clientId);
-  assert.equal(claims.nonce, nonce);
+  if ("nonce" in check) assert.ok(claims.nonce === check.nonce);
   const now = Date.now() / 1000;
   assert.ok(Number.isSafeInteger(claims.exp) && claims.exp > now);
   assert.ok(
@@ -150,16 +261,18 @@ export function verifyIdentity(
 }
 
 async function request(url: string, body?: URLSearchParams): Promise<Response> {
-  const response = await fetch(url, {
+  return fetch(url, {
     ...(body ? { method: "POST", body } : {}),
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
-  assert.ok(response.ok);
-  return response;
 }
 
-async function waitForConsent(registration: Registration, signal: AbortSignal) {
+async function waitForConsent(
+  hostId: string,
+  clientId: string | undefined,
+  signal: AbortSignal,
+) {
   const state = random(),
     nonce = random(),
     verifier = random();
@@ -187,7 +300,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
       const result = acceptCallback(
         new URL(req.url, "http://127.0.0.1"),
         state,
-        registration.clientId,
+        clientId,
       );
       if (!result) {
         res.writeHead(400).end("Wrong authorization state.");
@@ -219,9 +332,9 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
     const redirectUri = `http://127.0.0.1:${address.port}/auth/callback`;
     const url = new URL(issuer + "/api/accounts/authorize");
     url.search = new URLSearchParams({
-      client_id: registration.clientId ?? dynamicClient,
-      ...(registration.clientId ? {} : { agent_name_hint: "agent-bootstrap" }),
-      ext_agent_host_id: registration.hostId,
+      client_id: clientId ?? dynamicClient,
+      ...(clientId ? {} : { agent_name_hint: "agent-bootstrap" }),
+      ext_agent_host_id: hostId,
       response_type: "code",
       redirect_uri: redirectUri,
       resource,
@@ -304,15 +417,321 @@ async function runSmoke(
   }
 }
 
-async function main() {
-  const [optIn, msb, codex] = process.argv.slice(2);
-  const home = process.env.MSB_HOME;
+async function revoke(request: Request, clientId: string, token: string) {
+  try {
+    return (
+      await request(
+        issuer + "/api/accounts/oauth/revoke",
+        new URLSearchParams({
+          token,
+          token_type_hint: "refresh_token",
+          client_id: clientId,
+        }),
+      )
+    ).ok;
+  } catch {
+    return false;
+  }
+}
+
+function parseOAuthJson(body: string): Record<string, unknown> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    throw new Error("Invalid OAuth response");
+  }
+  assert.ok(payload && typeof payload === "object" && !Array.isArray(payload));
+  return payload as Record<string, unknown>;
+}
+
+async function readOAuthBody(response: Response): Promise<string> {
+  assert.ok(response.ok, "OAuth request failed");
+  return response.text().catch(() => {
+    throw new Error("Could not read OAuth response");
+  });
+}
+
+async function verifiedSubjectHash(
+  idToken: string,
+  clientId: string,
+  request: Request,
+  check: IdentityCheck,
+) {
+  const jwks = parseOAuthJson(
+    await readOAuthBody(await request(issuer + "/.well-known/jwks.json")),
+  );
+  assert.ok(Array.isArray(jwks.keys));
+  try {
+    return sha256(verifyIdentity(idToken, jwks.keys, clientId, check));
+  } catch {
+    throw new Error("OAuth identity validation failed");
+  }
+}
+
+export async function runSubscription(
+  registration: Registration,
+  {
+    request,
+    keychain,
+    consent,
+    save,
+    run,
+    report,
+    warn,
+    onUnconfirmedRevocation,
+  }: {
+    request: Request;
+    keychain: Keychain | undefined;
+    consent(clientId: string | undefined): Promise<Consent>;
+    save(registration: Registration): Promise<void>;
+    run(accessToken: string): Promise<void>;
+    report(message: string): void;
+    warn(message: string): void;
+    onUnconfirmedRevocation(): void;
+  },
+) {
+  let refresh: string | undefined;
+  let exchangeClientId: string | undefined;
+  let kept = false;
+  try {
+    const { clientId, subjectHash } = registration;
+    assert.ok(clientId === undefined || isIssuedClientId(clientId));
+    assert.ok(
+      subjectHash === undefined ||
+        (typeof subjectHash === "string" && subjectHash.length > 0),
+    );
+    let accessToken: string | undefined;
+    if (keychain) {
+      stage = "Keychain lookup and OAuth refresh";
+      const saved = await keychain.read();
+      if (saved !== null && clientId && subjectHash) {
+        const response = await request(
+          issuer + "/api/accounts/oauth/token",
+          new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: clientId,
+            refresh_token: saved,
+            resource,
+          }),
+        );
+        if (response.status === 400 || response.status === 401) {
+          await revoke(request, clientId, saved);
+          await keychain.delete();
+          warn(rejectedGrantWarning);
+        } else {
+          assert.ok(response.status === 200, "OAuth refresh failed");
+          // A transport failure while reading the body also leaves the item alone.
+          const body = await readOAuthBody(response);
+          exchangeClientId = clientId;
+          // If the response omits the replacement, attempt to revoke the saved token.
+          refresh = saved;
+          const tokens = parseOAuthJson(body);
+          if (typeof tokens.refresh_token === "string" && tokens.refresh_token)
+            refresh = tokens.refresh_token;
+          assert.ok(
+            refresh !== saved,
+            "OAuth refresh did not rotate the token",
+          );
+          assert.ok(
+            typeof tokens.token_type === "string" &&
+              tokens.token_type.toLowerCase() === "bearer" &&
+              typeof tokens.access_token === "string" &&
+              tokens.access_token !== saved,
+          );
+          assert.ok(
+            tokens.scope === undefined ||
+              (typeof tokens.scope === "string" &&
+                tokens.scope.split(/\s+/).includes(scope)),
+          );
+          assert.ok(
+            tokens.expires_in === undefined ||
+              (typeof tokens.expires_in === "number" &&
+                Number.isFinite(tokens.expires_in) &&
+                tokens.expires_in >= 1200),
+          );
+          if (tokens.id_token !== undefined) {
+            assert.ok(typeof tokens.id_token === "string");
+            assert.ok(
+              (await verifiedSubjectHash(tokens.id_token, clientId, request, {
+                refresh: true,
+              })) === subjectHash,
+            );
+          }
+          accessToken = tokens.access_token;
+        }
+      } else if (saved !== null) {
+        if (clientId) await revoke(request, clientId, saved);
+        await keychain.delete();
+        warn(
+          "The saved ChatGPT grant could not be matched to this checkout's registration. If you did not expect this, disconnect Agent Bootstrap in ChatGPT settings.",
+        );
+      }
+    }
+
+    if (accessToken === undefined) {
+      stage = "browser consent";
+      const authorization = await consent(clientId);
+      stage = "OAuth exchange and identity validation";
+      exchangeClientId = authorization.clientId;
+      const response = await request(
+        issuer + "/api/accounts/oauth/token",
+        new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: exchangeClientId,
+          code: authorization.code,
+          code_verifier: authorization.verifier,
+          redirect_uri: authorization.redirectUri,
+          resource,
+        }),
+      );
+      const tokens = parseOAuthJson(await readOAuthBody(response));
+      if (typeof tokens.refresh_token === "string" && tokens.refresh_token)
+        refresh = tokens.refresh_token;
+      assert.ok(refresh);
+      assert.ok(
+        typeof tokens.token_type === "string" &&
+          tokens.token_type.toLowerCase() === "bearer" &&
+          typeof tokens.access_token === "string" &&
+          typeof tokens.id_token === "string",
+      );
+      assert.ok(
+        typeof tokens.scope === "string" &&
+          tokens.scope.split(/\s+/).includes(scope),
+      );
+      const verifiedHash = await verifiedSubjectHash(
+        tokens.id_token,
+        exchangeClientId,
+        request,
+        { nonce: authorization.nonce },
+      );
+      assert.ok(!subjectHash || subjectHash === verifiedHash);
+      await save({
+        ...registration,
+        clientId: exchangeClientId,
+        subjectHash: verifiedHash,
+      });
+      accessToken = tokens.access_token;
+    }
+    assert.ok(refresh && /^\S+$/.test(accessToken) && accessToken !== refresh);
+    if (keychain) {
+      stage = "Keychain persistence";
+      await keychain.write(refresh);
+      kept = true;
+    }
+    stage = "subscription smoke";
+    await run(accessToken);
+  } finally {
+    if (kept) {
+      report(
+        "Refresh token kept in the macOS Keychain. Run with --forget to remove it.",
+      );
+    } else if (exchangeClientId) {
+      try {
+        if (!refresh || !(await revoke(request, exchangeClientId, refresh))) {
+          onUnconfirmedRevocation();
+        }
+      } finally {
+        if (refresh !== undefined) await keychain?.delete();
+      }
+    }
+  }
+}
+
+export async function forgetRefreshToken(
+  loadRegistration: () => Promise<Registration | null>,
+  keychainForHost: (hostId: string) => Keychain,
+  request: Request,
+  report: (message: string) => void,
+  warn: (message: string) => void,
+): Promise<number> {
+  let registration: Registration | null;
+  try {
+    registration = await loadRegistration();
+  } catch {
+    warn(
+      `The registration is unreadable, so this checkout's Keychain item cannot be located. Disconnect Agent Bootstrap in ChatGPT settings and remove any leftover ${keychainService}.* items by hand.`,
+    );
+    return 1;
+  }
+  if (registration === null) {
+    report(
+      "No registration found. There is nothing to forget for this checkout.",
+    );
+    return 0;
+  }
+  const keychain = keychainForHost(registration.hostId);
+  const token = await keychain.read().catch(() => undefined);
+  if (token === null) {
+    report("No refresh token found in the macOS Keychain.");
+    return 0;
+  }
+
+  let revoked = false;
+  try {
+    if (token !== undefined) {
+      const { clientId } = registration;
+      if (isIssuedClientId(clientId)) {
+        revoked = await revoke(request, clientId, token);
+      }
+    }
+    if (!revoked) warn(revocationWarning);
+  } finally {
+    await keychain.delete();
+  }
+  report("Removed the refresh token from the macOS Keychain.");
+  return revoked ? 0 : 1;
+}
+
+export async function loadRegistration(
+  file: string,
+): Promise<Registration | null> {
+  try {
+    const registration: Registration = JSON.parse(await readFile(file, "utf8"));
+    assert.ok(
+      typeof registration.hostId === "string" &&
+        /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+          registration.hostId,
+        ),
+    );
+    const { clientId, subjectHash } = registration;
+    assert.ok(clientId === undefined || isIssuedClientId(clientId));
+    assert.ok(
+      subjectHash === undefined ||
+        (typeof subjectHash === "string" && subjectHash.length > 0),
+    );
+    return registration;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return null;
+  }
+}
+
+export function parseArgs(argv: readonly string[]) {
+  const [optIn, ...args] = argv;
+  if (optIn === "--forget") {
+    assert.ok(args.length === 0);
+    return { forget: true } as const;
+  }
   assert.ok(optIn && Object.hasOwn(runners, optIn));
   const runner = runners[optIn]!;
-  assert.ok(process.stdin.isTTY && process.stdout.isTTY);
+  const useKeychain = args[0] === "--keychain";
+  const positional = useKeychain ? args.slice(1) : args;
+  assert.ok(positional.length === 2);
+  const [msb, codex] = positional;
   assert.ok(msb && msb.startsWith("/") && !/[\0:\r\n]/.test(msb));
   assert.ok(codex && codex.startsWith("/"));
-  assert.ok(home && home.startsWith("/"));
+  return { forget: false, useKeychain, runner, msb, codex } as const;
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const home = process.env.MSB_HOME;
+  assert.ok(process.stdin.isTTY && process.stdout.isTTY);
+  if (!options.forget) assert.ok(home && home.startsWith("/"));
+  if (options.forget || options.useKeychain) {
+    assert.ok(process.platform === "darwin");
+  }
   await mkdir(statePath, { recursive: true, mode: 0o700 });
   const lockPath = join(statePath, "run.lock");
   const lock = await open(lockPath, "wx", 0o600);
@@ -320,103 +739,63 @@ async function main() {
   const cancel = () => controller.abort();
   process.on("SIGINT", cancel);
   process.on("SIGTERM", cancel);
-  let refresh: string | undefined;
-  let exchangeClientId: string | undefined;
   try {
     const file = join(statePath, "registration.json");
-    let registration: Registration;
-    try {
-      registration = JSON.parse(await readFile(file, "utf8"));
-      assert.match(registration.hostId, /^urn:uuid:[0-9a-f-]{36}$/);
-      assert.ok(
-        registration.clientId === undefined || validId(registration.clientId),
+    const keychainForHost = (hostId: string) =>
+      makeKeychain(process.env.USER, hostId);
+    if (options.forget) {
+      stage = "Keychain removal";
+      process.exitCode = await forgetRefreshToken(
+        () => loadRegistration(file),
+        keychainForHost,
+        request,
+        console.log,
+        console.error,
       );
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return;
+    }
+
+    let registration = await loadRegistration(file);
+    if (registration === null) {
       registration = { hostId: `urn:uuid:${randomUUID()}` };
       await saveRegistration(file, registration);
     }
-    stage = "browser consent";
-    const authorization = await waitForConsent(registration, controller.signal);
-    controller.signal.throwIfAborted();
-    stage = "OAuth exchange and identity validation";
-    const clientId = authorization.clientId;
-    exchangeClientId = clientId;
-    const tokens = await (
-      await request(
-        issuer + "/api/accounts/oauth/token",
-        new URLSearchParams({
-          grant_type: "authorization_code",
-          client_id: clientId,
-          code: authorization.code,
-          code_verifier: authorization.verifier,
-          redirect_uri: authorization.redirectUri,
-          resource,
-        }),
-      )
-    ).json();
-    if (typeof tokens.refresh_token === "string" && tokens.refresh_token)
-      refresh = tokens.refresh_token;
-    assert.ok(refresh);
-    assert.ok(
-      typeof tokens.token_type === "string" &&
-        tokens.token_type.toLowerCase() === "bearer" &&
-        typeof tokens.access_token === "string" &&
-        typeof tokens.id_token === "string",
-    );
-    assert.ok(
-      typeof tokens.scope === "string" &&
-        tokens.scope.split(/\s+/).includes(scope),
-    );
-    const jwks = await (
-      await request(issuer + "/.well-known/jwks.json")
-    ).json();
-    assert.ok(Array.isArray(jwks.keys));
-    const subjectHash = sha256(
-      verifyIdentity(tokens.id_token, jwks.keys, clientId, authorization.nonce),
-    );
-    assert.ok(
-      !registration.subjectHash || registration.subjectHash === subjectHash,
-    );
-    await saveRegistration(file, { ...registration, clientId, subjectHash });
-    stage = "subscription smoke";
-    await runSmoke(
-      runner,
-      msb,
-      codex,
-      home,
-      tokens.access_token,
-      controller.signal,
-    );
+    await runSubscription(registration, {
+      request,
+      keychain: options.useKeychain
+        ? keychainForHost(registration.hostId)
+        : undefined,
+      async consent(clientId) {
+        const authorization = await waitForConsent(
+          registration.hostId,
+          clientId,
+          controller.signal,
+        );
+        controller.signal.throwIfAborted();
+        return authorization;
+      },
+      save: (updated) => saveRegistration(file, updated),
+      run: (token) =>
+        runSmoke(
+          options.runner,
+          options.msb,
+          options.codex,
+          home!,
+          token,
+          controller.signal,
+        ),
+      report: console.log,
+      warn: console.error,
+      onUnconfirmedRevocation() {
+        console.error(revocationWarning);
+        process.exitCode = 1;
+      },
+    });
   } finally {
-    try {
-      if (exchangeClientId) {
-        const revoked = refresh
-          ? await request(
-              issuer + "/api/accounts/oauth/revoke",
-              new URLSearchParams({
-                token: refresh,
-                token_type_hint: "refresh_token",
-                client_id: exchangeClientId,
-              }),
-            ).then(
-              () => true,
-              () => false,
-            )
-          : false;
-        if (!revoked) {
-          console.error(
-            "OAuth revocation could not be confirmed. Disconnect Agent Bootstrap in ChatGPT settings.",
-          );
-          process.exitCode = 1;
-        }
-      }
-    } finally {
-      await lock.close();
-      await unlink(lockPath);
-      process.off("SIGINT", cancel);
-      process.off("SIGTERM", cancel);
-    }
+    await lock.close();
+    await unlink(lockPath);
+    process.off("SIGINT", cancel);
+    process.off("SIGTERM", cancel);
   }
 }
 
