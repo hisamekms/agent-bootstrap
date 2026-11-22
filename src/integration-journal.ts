@@ -58,6 +58,11 @@ type Event =
   | Base
   | (Extract<Base, { kind: "verification.finished" }> & {
       readonly tests?: { readonly passed: number; readonly failed: number };
+    })
+  | (Extract<Base, { kind: "candidate.created" }> & {
+      /** Tree mode only: how many changed paths are protected paths. The
+       * paths themselves are recomputed from the pinned diff, not stored. */
+      readonly protectedCount?: number;
     });
 
 export type IntegrationEvent = Event & { readonly at: string };
@@ -85,10 +90,25 @@ function decode(value: unknown): IntegrationEvent {
   if (typeof kind !== "string" || !Object.hasOwn(eventFields, kind))
     throw new Error("Invalid integration event kind");
   const expected = eventFields[kind as Kind];
-  // Only verification.finished may carry the optional `tests` counts.
+  // Only verification.finished may carry the optional `tests` counts and
+  // only candidate.created the optional `protectedCount`.
   const optional =
-    kind === "verification.finished" && Object.hasOwn(data, "tests") ? 1 : 0;
+    (kind === "verification.finished" && Object.hasOwn(data, "tests")) ||
+    (kind === "candidate.created" && Object.hasOwn(data, "protectedCount"))
+      ? 1
+      : 0;
   if (
+    kind === "candidate.created" &&
+    optional &&
+    !(
+      Number.isSafeInteger(data.protectedCount) &&
+      (data.protectedCount as number) >= 0 &&
+      (data.protectedCount as number) <= 10_000
+    )
+  )
+    throw new Error("Invalid integration event fields");
+  if (
+    kind === "verification.finished" &&
     optional &&
     (!validTests(data.tests) ||
       (data.review === "pass" && (data.tests as { failed: number }).failed > 0))

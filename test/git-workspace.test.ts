@@ -11,7 +11,12 @@ import {
 
 const gitBinary = "/usr/bin/git";
 
-function git(directory: string, args: string[], input = ""): string {
+function git(
+  directory: string,
+  args: string[],
+  input = "",
+  extraEnv: Record<string, string> = {},
+): string {
   const result = spawnSync(gitBinary, args, {
     cwd: directory,
     input,
@@ -24,6 +29,7 @@ function git(directory: string, args: string[], input = ""): string {
       GIT_AUTHOR_EMAIL: "f@example.invalid",
       GIT_COMMITTER_NAME: "Fixture",
       GIT_COMMITTER_EMAIL: "f@example.invalid",
+      ...extraEnv,
     },
   });
   assert.equal(result.status, 0, result.stderr);
@@ -472,4 +478,51 @@ test("createCandidateTree rejects unsafe or invalid input", async (t) => {
       .length,
     1,
   );
+});
+
+test("diff and advance accept multi-file candidates and listTree lists the base", async (t) => {
+  const { integration, repository, c3 } = await fixture(t);
+  const candidate = await integration.createCandidateTree(
+    c3,
+    [
+      { path: "README.md", mode: "100644", bytes: Buffer.from("x\n") },
+      { path: "src/new/n.ts", mode: "100755", bytes: Buffer.from("n\n") },
+      { path: "src/a.ts", deleted: true },
+      { path: "run.sh", mode: "100644", bytes: Buffer.from("#!/bin/sh\n") },
+    ],
+    "m",
+  );
+  const text = Buffer.from(await integration.diff(c3, candidate)).toString();
+  assert.match(text, /src\/new\/n\.ts/);
+  assert.match(text, /deleted file mode[^]*src\/a\.ts/);
+  assert.match(text, /old mode 100755\nnew mode 100644/);
+  const listing = Buffer.from(await integration.listTree(c3)).toString();
+  assert.match(listing, /^100644 blob [0-9a-f]{40}\tREADME\.md\0/);
+  assert.match(listing, /\tsrc\/lib\/x\.ts\0/);
+  await integration.advance(c3, candidate);
+  assert.equal(git(repository, ["rev-parse", "main"]), candidate);
+});
+
+test("diff refuses gitlinks, type changes, extra parents and empty candidates", async (t) => {
+  const { integration, repository, c1, c3 } = await fixture(t);
+  const commitWith = (path: string, entry: string, parents = [c3]) => {
+    const index = join(repository, `idx-${path.replace(/\W/g, "")}`);
+    const env = { GIT_INDEX_FILE: index };
+    git(repository, ["read-tree", c3], "", env);
+    git(repository, ["update-index", "--add", "--cacheinfo", entry], "", env);
+    const tree = git(repository, ["write-tree"], "", env);
+    return git(repository, [
+      "commit-tree",
+      tree,
+      ...parents.flatMap((p) => ["-p", p]),
+      "-m",
+      "x",
+    ]);
+  };
+  const blob = git(repository, ["hash-object", "-w", "--stdin"], "z");
+  const gitlink = commitWith("sub", `160000,${c1},sub`);
+  const typeChange = commitWith("run.sh", `120000,${blob},run.sh`);
+  const merge = commitWith("n", `100644,${blob},n`, [c3, c1]);
+  for (const bad of [gitlink, typeChange, merge, c3])
+    await assert.rejects(integration.diff(c3, bad), /invalid-candidate/);
 });

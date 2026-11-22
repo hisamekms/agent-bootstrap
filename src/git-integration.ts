@@ -705,7 +705,11 @@ export class LocalGitIntegration {
     return candidate;
   }
 
-  async #candidate(base: string, candidate: string): Promise<string> {
+  /** A candidate is one commit whose only parent is `base`. Its changes are
+   * additions, modifications, deletions and mode changes of regular files,
+   * executables and symlinks. Gitlinks and type changes are refused. Returns
+   * the changed paths. */
+  async #candidate(base: string, candidate: string): Promise<string[]> {
     oid(base);
     oid(candidate);
     await this.#commit(base);
@@ -717,35 +721,85 @@ export class LocalGitIntegration {
       .trim();
     if (parents !== `${candidate} ${base}`)
       throw new GitIntegrationError("invalid-candidate");
-    const changed = (
-      await this.#git([
+    const raw = await this.#run(
+      [
         "diff-tree",
         "--no-commit-id",
-        "--name-status",
+        "--raw",
         "-r",
         "-z",
         "--no-renames",
+        "--full-index",
         base,
         candidate,
-      ])
-    )
-      .toString("utf8")
-      .split("\0");
-    if (changed.length !== 3 || changed[0] !== "M" || changed[2] !== "")
+      ],
+      {
+        gitDir: this.#config.repository,
+        cwd: this.#config.repository,
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: 60_000,
+      },
+    );
+    const fields = raw.toString("utf8").split("\0");
+    if (fields.pop() !== "" || fields.length % 2 !== 0)
       throw new GitIntegrationError("invalid-candidate");
-    const path = filePath(changed[1]);
-    const original = await this.#file(base, path);
-    const updated = await this.#file(candidate, path);
-    if (original.mode !== updated.mode)
-      throw new GitIntegrationError("invalid-candidate");
-    return path;
+    const modes = new Set(["100644", "100755", "120000"]);
+    const paths: string[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < fields.length; i += 2) {
+      const meta =
+        /^:(\d{6}) (\d{6}) ([a-f0-9]{40}) ([a-f0-9]{40}) ([AMD])$/.exec(
+          fields[i]!,
+        );
+      if (!meta) throw new GitIntegrationError("invalid-candidate");
+      const [, oldMode, newMode, , , status] = meta as unknown as string[];
+      const added = status === "A";
+      const deleted = status === "D";
+      if (
+        (!added && !modes.has(oldMode!)) ||
+        (!deleted && !modes.has(newMode!)) ||
+        (added && oldMode !== "000000") ||
+        (deleted && newMode !== "000000") ||
+        // blob <-> symlink is a type change, not a modification
+        (!added &&
+          !deleted &&
+          (oldMode === "120000") !== (newMode === "120000"))
+      )
+        throw new GitIntegrationError("invalid-candidate");
+      const path = fields[i + 1]!;
+      try {
+        treePath(path);
+      } catch {
+        throw new GitIntegrationError("invalid-candidate");
+      }
+      if (seen.has(path)) throw new GitIntegrationError("invalid-candidate");
+      seen.add(path);
+      paths.push(path);
+      if (paths.length > changeCountLimit)
+        throw new GitIntegrationError("invalid-candidate");
+    }
+    if (paths.length === 0) throw new GitIntegrationError("invalid-candidate");
+    return paths;
+  }
+
+  /** `git ls-tree -r -z --full-tree <commit>`, for the strict ls-tree parser. */
+  async listTree(commit: string): Promise<Uint8Array> {
+    oid(commit);
+    await this.#repository();
+    await this.#commit(commit);
+    return this.#run(["ls-tree", "-r", "-z", "--full-tree", commit], {
+      gitDir: this.#config.repository,
+      cwd: this.#config.repository,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 60_000,
+    });
   }
 
   async diff(base: string, candidate: string): Promise<Uint8Array> {
     oid(base);
     oid(candidate);
     await this.#repository();
-    const path = await this.#candidate(base, candidate);
+    await this.#candidate(base, candidate);
     return this.#git([
       "diff",
       "--no-ext-diff",
@@ -758,8 +812,6 @@ export class LocalGitIntegration {
       "--dst-prefix=b/",
       base,
       candidate,
-      "--",
-      path,
     ]);
   }
 
@@ -1181,7 +1233,6 @@ export class LocalGitIntegration {
    * change is either `{ path, mode, bytes }` (add or replace; symlink bytes are
    * the target) or `{ path, deleted: true }` (the path must exist as a file or
    * symlink in base). Paths must be unique. The host is author and committer.
-   * Note: diff() and advance() still only accept single top-level file edits.
    */
   async createCandidateTree(
     base: string,

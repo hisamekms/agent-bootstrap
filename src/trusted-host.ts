@@ -59,7 +59,7 @@ export interface CoordinatorSessionPlan {
 export interface VerificationPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "readOnlyFiles" | "maxLifetimeMs" | "profile"
+    "readOnlyFiles" | "maxLifetimeMs" | "profile" | "repository"
   >;
   readonly command: SandboxCommand;
 }
@@ -105,7 +105,8 @@ export class TrustedHost {
   }
 
   /** Read-only verification under its own role. It accepts only files,
-   * lifetime and profile: never a provider, tools or a host port. */
+   * lifetime, profile and a host-prepared repository (never collected):
+   * never a provider, tools or a host port. */
   async runVerification(
     plan: VerificationPlan,
     id?: string,
@@ -115,10 +116,13 @@ export class TrustedHost {
         (key) =>
           key !== "readOnlyFiles" &&
           key !== "maxLifetimeMs" &&
-          key !== "profile",
+          key !== "profile" &&
+          key !== "repository",
       )
     )
-      throw new Error("Verification accepts only files, lifetime and profile");
+      throw new Error(
+        "Verification accepts only files, lifetime, profile and repository",
+      );
     return this.#readOnly("Verification", plan, id);
   }
 
@@ -311,11 +315,15 @@ export class TrustedHost {
   ): Promise<ReviewerRun> {
     // Verification never copies egress or tools, even from a non-enumerable
     // property that the key check in runVerification cannot see.
-    if ("repository" in plan.sandbox)
+    if ("repository" in plan.sandbox && role !== "Verification")
       throw new Error("Only Worker may use a repository");
     const wide: ReviewerPlan["sandbox"] =
       role === "Verification" ? {} : (plan.sandbox as ReviewerPlan["sandbox"]);
-    const sandbox: ReviewerPlan["sandbox"] = {
+    const repository =
+      role === "Verification"
+        ? (plan.sandbox as VerificationPlan["sandbox"]).repository
+        : undefined;
+    const sandbox: ReviewerPlan["sandbox"] & Pick<SandboxSpec, "repository"> = {
       ...(plan.sandbox.readOnlyFiles
         ? {
             readOnlyFiles: plan.sandbox.readOnlyFiles.map((file) => ({
@@ -336,6 +344,9 @@ export class TrustedHost {
         : {}),
       ...(plan.sandbox.profile !== undefined
         ? { profile: plan.sandbox.profile }
+        : {}),
+      ...(repository !== undefined
+        ? { repository: { gitDir: repository.gitDir, tree: repository.tree } }
         : {}),
     };
     return this.#run(
@@ -358,7 +369,8 @@ export class TrustedHost {
     // any audit write.
     if (
       role !== "Worker" &&
-      (plan.sandbox.repository !== undefined || plan.collectTree !== undefined)
+      ((plan.sandbox.repository !== undefined && role !== "Verification") ||
+        plan.collectTree !== undefined)
     )
       throw new Error("Only Worker may use a repository");
     if (
