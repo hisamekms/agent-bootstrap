@@ -15,19 +15,20 @@ await mkdir(local, { recursive: true });
 const work = await mkdtemp(join(local, "m2-smoke-"));
 const filename = join(work, "audit.sqlite");
 const audit = new SqliteAudit(filename);
+const profiles = new ProfileCatalog({
+  base: {
+    image:
+      "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
+  },
+});
 const runtime = new MicrosandboxRuntime({
   binary,
   home,
   stagingRoot: join(work, "staging"),
-  profiles: new ProfileCatalog({
-    base: {
-      image:
-        "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
-    },
-  }),
+  profiles,
 });
 try {
-  const host = new TrustedHost(audit, runtime);
+  const host = new TrustedHost(audit, runtime, profiles);
   const first = await host.runWorker({
     sandbox: { maxLifetimeMs: 20_000 },
     command: {

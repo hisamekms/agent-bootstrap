@@ -94,15 +94,16 @@ async function main() {
   });
   const audit = new SqliteAudit(auditFile);
   try {
+    const profiles = new ProfileCatalog({ base: { image } });
     const runtime = new MicrosandboxRuntime({
       binary,
       home,
-      profiles: new ProfileCatalog({ base: { image } }),
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     });
     const integration = new ReviewedIntegration(
       git,
-      new TrustedHost(audit, runtime),
+      new TrustedHost(audit, runtime, profiles),
       journal,
       {
         path,

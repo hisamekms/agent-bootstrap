@@ -8,6 +8,8 @@ import type {
   SandboxSession,
   SandboxSpec,
 } from "./sandbox-runtime.ts";
+import { ProfileCatalog, ROLE_PROFILES } from "./sandbox-profiles.ts";
+import type { ProfileName, ProfileRole } from "./sandbox-profiles.ts";
 
 type Operation = NonNullable<AuditInput["operation"]>;
 type Outcome = NonNullable<AuditInput["outcome"]>;
@@ -27,7 +29,12 @@ export interface WorkerRun {
 export interface ReviewerPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "readOnlyFiles" | "maxLifetimeMs" | "tools" | "provider" | "hostTcpPort"
+    | "readOnlyFiles"
+    | "maxLifetimeMs"
+    | "tools"
+    | "provider"
+    | "hostTcpPort"
+    | "profile"
   >;
   readonly command: SandboxCommand;
 }
@@ -41,7 +48,15 @@ export interface ReviewerRun {
 export interface CoordinatorSessionPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "tools" | "hostTcpPort" | "provider" | "maxLifetimeMs"
+    "tools" | "hostTcpPort" | "provider" | "maxLifetimeMs" | "profile"
+  >;
+  readonly command: SandboxCommand;
+}
+
+export interface VerificationPlan {
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "readOnlyFiles" | "maxLifetimeMs" | "profile"
   >;
   readonly command: SandboxCommand;
 }
@@ -60,14 +75,48 @@ export class HostAuditError extends Error {
 export class TrustedHost {
   readonly #audit: AuditSink;
   readonly #sandbox: SandboxRuntime;
+  readonly #profiles: ProfileCatalog;
 
-  constructor(audit: AuditSink, sandbox: SandboxRuntime) {
+  constructor(
+    audit: AuditSink,
+    sandbox: SandboxRuntime,
+    profiles: ProfileCatalog,
+  ) {
+    if (!(profiles instanceof ProfileCatalog))
+      throw new Error("Profile catalog required");
     this.#audit = audit;
     this.#sandbox = sandbox;
+    this.#profiles = profiles;
+  }
+
+  /** Resolves the requested profile before any audit write. */
+  #profileFor(role: ProfileRole, requested: unknown): ProfileName {
+    const profile = requested ?? "base";
+    if (!this.#profiles.has(profile) || !ROLE_PROFILES[role].includes(profile))
+      throw new Error("Sandbox profile not allowed");
+    return profile;
   }
 
   async runWorker(plan: WorkerPlan, id?: string): Promise<WorkerRun> {
     return this.#run("Worker", plan, id);
+  }
+
+  /** Read-only verification under its own role. It accepts only files,
+   * lifetime and profile: never a provider, tools or a host port. */
+  async runVerification(
+    plan: VerificationPlan,
+    id?: string,
+  ): Promise<ReviewerRun> {
+    if (
+      Object.keys(plan.sandbox).some(
+        (key) =>
+          key !== "readOnlyFiles" &&
+          key !== "maxLifetimeMs" &&
+          key !== "profile",
+      )
+    )
+      throw new Error("Verification accepts only files, lifetime and profile");
+    return this.#readOnly("Verification", plan, id);
   }
 
   async runReviewer(plan: ReviewerPlan, id?: string): Promise<ReviewerRun> {
@@ -88,7 +137,8 @@ export class TrustedHost {
           key !== "maxLifetimeMs" &&
           key !== "tools" &&
           key !== "provider" &&
-          key !== "hostTcpPort",
+          key !== "hostTcpPort" &&
+          key !== "profile",
       ) ||
       plan.sandbox.readOnlyFiles?.length !== 1 ||
       plan.sandbox.readOnlyFiles[0]?.path !== "control.json"
@@ -117,10 +167,13 @@ export class TrustedHost {
           key !== "tools" &&
           key !== "hostTcpPort" &&
           key !== "provider" &&
-          key !== "maxLifetimeMs",
+          key !== "maxLifetimeMs" &&
+          key !== "profile",
       )
     )
       throw new Error("Coordinator session requires a streaming sandbox");
+    const profile = this.#profileFor("Coordinator", plan.sandbox.profile);
+    const image = this.#profiles.imageDigest(profile);
     const sandbox: SandboxSpec = {
       ...(plan.sandbox.tools
         ? { tools: plan.sandbox.tools.map((tool) => ({ ...tool })) }
@@ -160,9 +213,19 @@ export class TrustedHost {
     let destroyedOk = false;
     try {
       if (egress) await allow("provider.egress");
-      await allow("sandbox.create");
+      await append({
+        kind: "operation.requested",
+        operation: "sandbox.create",
+        profile,
+        image,
+      });
+      await append({ kind: "operation.allowed", operation: "sandbox.create" });
       try {
-        handle = await this.#sandbox.create({ ...sandbox, invocationId: id });
+        handle = await this.#sandbox.create({
+          ...sandbox,
+          profile,
+          invocationId: id,
+        });
       } catch (error) {
         await append({
           kind: "operation.finished",
@@ -237,10 +300,14 @@ export class TrustedHost {
   }
 
   #readOnly(
-    role: "Reviewer" | "Planner" | "Coordinator",
-    plan: ReviewerPlan,
+    role: "Reviewer" | "Planner" | "Coordinator" | "Verification",
+    plan: ReviewerPlan | VerificationPlan,
     id?: string,
   ): Promise<ReviewerRun> {
+    // Verification never copies egress or tools, even from a non-enumerable
+    // property that the key check in runVerification cannot see.
+    const wide: ReviewerPlan["sandbox"] =
+      role === "Verification" ? {} : (plan.sandbox as ReviewerPlan["sandbox"]);
     const sandbox: ReviewerPlan["sandbox"] = {
       ...(plan.sandbox.readOnlyFiles
         ? {
@@ -255,14 +322,13 @@ export class TrustedHost {
       ...(plan.sandbox.maxLifetimeMs !== undefined
         ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
         : {}),
-      ...(plan.sandbox.tools
-        ? { tools: plan.sandbox.tools.map((tool) => ({ ...tool })) }
+      ...(wide.tools ? { tools: wide.tools.map((tool) => ({ ...tool })) } : {}),
+      ...(wide.provider ? { provider: { ...wide.provider } } : {}),
+      ...(wide.hostTcpPort !== undefined
+        ? { hostTcpPort: wide.hostTcpPort }
         : {}),
-      ...(plan.sandbox.provider
-        ? { provider: { ...plan.sandbox.provider } }
-        : {}),
-      ...(plan.sandbox.hostTcpPort !== undefined
-        ? { hostTcpPort: plan.sandbox.hostTcpPort }
+      ...(plan.sandbox.profile !== undefined
+        ? { profile: plan.sandbox.profile }
         : {}),
     };
     return this.#run(
@@ -277,10 +343,12 @@ export class TrustedHost {
   }
 
   async #run(
-    role: "Worker" | "Reviewer" | "Planner" | "Coordinator",
+    role: "Worker" | "Reviewer" | "Planner" | "Coordinator" | "Verification",
     plan: WorkerPlan,
     id: string = randomUUID(),
   ): Promise<WorkerRun & ReviewerRun> {
+    const profile = this.#profileFor(role, plan.sandbox.profile);
+    const image = this.#profiles.imageDigest(profile);
     const append = async (event: Omit<AuditInput, "invocationId" | "role">) => {
       try {
         await this.#audit.append({
@@ -293,7 +361,11 @@ export class TrustedHost {
       }
     };
     const authorize = async (operation: Operation, allowed: boolean) => {
-      await append({ kind: "operation.requested", operation });
+      await append({
+        kind: "operation.requested",
+        operation,
+        ...(operation === "sandbox.create" ? { profile, image } : {}),
+      });
       if (allowed) await append({ kind: "operation.allowed", operation });
       else
         await append({
@@ -339,7 +411,7 @@ export class TrustedHost {
     if (egress) await authorize("provider.egress", true);
     try {
       const created = await execute("sandbox.create", () =>
-        this.#sandbox.create({ ...plan.sandbox, invocationId: id }),
+        this.#sandbox.create({ ...plan.sandbox, profile, invocationId: id }),
       );
       if (created) {
         handle = created.value;

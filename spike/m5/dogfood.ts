@@ -564,6 +564,7 @@ async function main() {
     });
   }
 
+  const profiles = new ProfileCatalog({ base: { image } });
   // One runtime adapter per credential. Each VM still lives for one run.
   const adapter = (
     name: string,
@@ -573,7 +574,7 @@ async function main() {
     new MicrosandboxRuntime({
       binary: msb,
       home,
-      profiles: new ProfileCatalog({ base: { image } }),
+      profiles,
       stagingRoot: join(root, `sandboxes-${name}`),
       ...(provider && value
         ? { providers: [provider], credentials: credential(value) }
@@ -610,7 +611,11 @@ async function main() {
   const harnessFor = (actor: "Planner" | "Worker" | "Reviewer") =>
     (actors[actor] === "codex" ? codexHarness : claudeHarness)!;
   try {
-    const host = new TrustedHost(audit, new RoutingSandboxRuntime(routes));
+    const host = new TrustedHost(
+      audit,
+      new RoutingSandboxRuntime(routes),
+      profiles,
+    );
     const journal = new IntegrationJournal(reviewDir, randomUUID());
     const flow = (control?: CoordinatorControl) => {
       const worker = harnessFor("Worker");

@@ -317,10 +317,11 @@ async function main() {
     { mode: "api-key", credential: "host-secret" },
     { host: hostname, port, upstreamCaCertPath: join(tls, "ca.pem") },
   );
+  const profiles = new ProfileCatalog({ base: { image } });
   const runtime = new MicrosandboxRuntime({
     binary: msb,
     home,
-    profiles: new ProfileCatalog({ base: { image } }),
+    profiles,
     stagingRoot: join(root, "sandboxes"),
     providers: [provider],
     credentials: {
@@ -330,7 +331,7 @@ async function main() {
     },
   });
   const audit = new SqliteAudit(join(root, "audit.sqlite"));
-  const host = new TrustedHost(audit, runtime);
+  const host = new TrustedHost(audit, runtime, profiles);
   // Untrusted repository content may carry Claude Code project settings.
   // These must all be ignored: a hook that tampers with hello.txt, an env
   // override that redirects the API, and a key helper.
@@ -468,7 +469,7 @@ async function main() {
       new MicrosandboxRuntime({
         binary: msb,
         home,
-        profiles: new ProfileCatalog({ base: { image } }),
+        profiles,
         stagingRoot: join(root, "sandboxes-operator"),
         providers: [operatorProvider],
         credentials: {
@@ -477,6 +478,7 @@ async function main() {
           },
         },
       }),
+      profiles,
     );
     const before = seen.length;
     const operatorWorker = await operatorHost.runWorker({

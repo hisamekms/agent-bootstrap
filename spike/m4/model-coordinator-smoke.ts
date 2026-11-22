@@ -171,14 +171,16 @@ const root = await realpath(await mkdtemp(join(local, "m4-model-")));
 const audit = new SqliteAudit(join(root, "audit.sqlite"));
 try {
   await mkdir(join(root, "tasks"), { mode: 0o700 });
+  const profiles = new ProfileCatalog({ base: { image } });
   const host = new TrustedHost(
     audit,
     new MicrosandboxRuntime({
       binary: msbPath,
       home: msbHome,
-      profiles: new ProfileCatalog({ base: { image } }),
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     }),
+    profiles,
   );
   const model = new CodexAppServerCoordinator({
     async open(id, use) {

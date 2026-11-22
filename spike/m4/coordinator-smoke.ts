@@ -113,13 +113,14 @@ async function main() {
     readonly: mode === "trace" || mode === "status",
   });
   try {
+    const profiles = new ProfileCatalog({ base: { image } });
     const runtime = new MicrosandboxRuntime({
       binary,
       home,
-      profiles: new ProfileCatalog({ base: { image } }),
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     });
-    const host = new TrustedHost(audit, runtime);
+    const host = new TrustedHost(audit, runtime, profiles);
     const reviewJournal = new IntegrationJournal(reviewDir, taskId);
     const flow = (control?: CoordinatorControl) =>
       new ReviewedIntegration(git, host, reviewJournal, {

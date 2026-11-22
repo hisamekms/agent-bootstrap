@@ -46,14 +46,16 @@ const git = new LocalGitIntegration({
 });
 const audit = new SqliteAudit(join(root, "audit.sqlite"));
 try {
+  const profiles = new ProfileCatalog({ base: { image } });
   const host = new TrustedHost(
     audit,
     new MicrosandboxRuntime({
       binary,
       home,
-      profiles: new ProfileCatalog({ base: { image } }),
+      profiles,
       stagingRoot: join(root, "sandboxes"),
     }),
+    profiles,
   );
   const journal = new IntegrationJournal(journalDir, randomUUID());
   const flow = new ReviewedIntegration(git, host, journal, {

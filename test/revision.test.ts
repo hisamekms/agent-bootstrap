@@ -20,7 +20,12 @@ import {
 } from "../src/integration-journal.ts";
 import { ReviewedIntegration } from "../src/reviewed-integration.ts";
 import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
+import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+
+const profiles = new ProfileCatalog({
+  base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+});
 
 const notes = "Use a formal greeting. fixture-private-note";
 const sha256 = (data: string | Uint8Array) =>
@@ -97,7 +102,7 @@ async function fixture(
   const journal = new IntegrationJournal(journalDir, randomUUID());
   const flow = new ReviewedIntegration(
     git,
-    new TrustedHost(audit, runtime),
+    new TrustedHost(audit, runtime, profiles),
     journal,
     {
       path: "hello.txt",
