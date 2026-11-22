@@ -916,6 +916,42 @@ For a live run, `M5_CLAUDE_AUTH` selects `api-key` or
 service that holds the Claude credential. The launcher forwards only these
 non-secret `M5_*` settings and `USER`. Codex tokens still arrive on stdin.
 
+## Planned: credential fallback per actor
+
+Status: planned, not implemented (recorded on 2026-11-22).
+
+An actor may need an ordered list of credentials, for example a
+subscription credential, then API key A, then API key B. When a run fails
+because one credential is exhausted, the host moves to the next one.
+
+- **Switch only between invocations.** Each VM lives for one invocation, so
+  the host picks the credential when it creates the VM. A failed invocation is
+  retried with the next credential in a new VM, and never switches inside a
+  running request. Retrying is safe because Planner and Reviewer are read-only,
+  a failed Worker change is never collected, and a Coordinator turn only
+  proposes.
+- **Fallback triggers.** Only two kinds of failure move to the next
+  credential: an exhausted usage quota (for example Codex
+  `usageLimitExceeded`), and an authentication failure (HTTP 401, such as an
+  expired or revoked credential). A temporary rate limit or overload (429, 529) does not, because it usually recovers and switching would spend
+  another billing account early. Any other failure stays an ordinary failure.
+- **Shape.** Credentials of different shapes (variable, header, bare mode)
+  are separate provider bindings, so each one gets its own runtime adapter.
+  Credentials of the same shape (API key A and B) share a binding, and the
+  adapter's credential provider tries its candidates in order.
+- **Classification.** Each harness maps its failure to a fixed category: Codex
+  from `CodexErrorInfo`, Claude Code from its result object. These categories
+  are the only thing that decides a switch. The Claude Code CLI's output when
+  a subscription limit is reached is not verified yet. A fixture that returns
+  401 and 429 will check the mapping first; the real limit behavior can only
+  be confirmed live.
+- **Audit.** The audit records a label for the credential, never its value
+  (for example `subscription`, `api-a`), together with the reason for each
+  switch. This keeps billing changes between accounts traceable.
+- **Storage.** Credentials stay outside the repository, in the host keychain
+  or on stdin. The repository holds only the generic ordered-candidates
+  mechanism and the fixed trigger categories.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |
