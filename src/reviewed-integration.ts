@@ -88,9 +88,13 @@ function workerCommitMessage(run: string, proposal?: Uint8Array): string {
   }
   const [subject = "", ...body] = text
     .replace(/[^\P{Cc}\n\t]/gu, "")
+    .replace(/[\p{Cf}\p{Zl}\p{Zp}]/gu, "")
     .trim()
     .split("\n");
-  const shortened = [[...subject].slice(0, 72).join(""), ...body].join("\n");
+  const shortened = [
+    [...subject].slice(0, 72).join(""),
+    ...body.filter((line) => !/^Agent-Bootstrap-/i.test(line)),
+  ].join("\n");
   const available = CANDIDATE_MESSAGE_BYTES - Buffer.byteLength(trailer);
   let end = 0;
   let size = 0;

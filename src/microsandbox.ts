@@ -1116,36 +1116,33 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   }
 
   async #collectMessage(state: State): Promise<Uint8Array | undefined> {
-    const checked = await this.#execute(
+    // Bound the read itself, even if the guest replaces the checked file.
+    const result = await this.#execute(
       state,
       [
         "/bin/sh",
         "-ec",
-        `test ! -L /tmp/agent-bootstrap && test ! -L ${WORKER_MESSAGE_PATH} &&
-          test -f ${WORKER_MESSAGE_PATH} &&
-          test "$(stat -c %s ${WORKER_MESSAGE_PATH})" -le ${WORKER_MESSAGE_LIMIT}`,
+        `p=${WORKER_MESSAGE_PATH};
+          [ ! -L "\${p%/*}" ] && [ ! -L "$p" ] && [ -f "$p" ] || exit 3;
+          head -c ${WORKER_MESSAGE_LIMIT + 1} -- "$p" | base64`,
       ],
       10_000,
     );
-    if (checked.status === "exited" && checked.exitCode === 1) return;
-    if (checked.status !== "exited" || checked.exitCode !== 0)
+    if (result.status === "exited" && result.exitCode === 3) return;
+    if (result.status !== "exited" || result.exitCode !== 0)
       throw new SandboxRuntimeError("collection-failed");
-    const staging = join(state.directory, "commit-message");
-    try {
-      const copied = await this.#run(
-        ["copy", `${state.id}:${WORKER_MESSAGE_PATH}`, staging],
-        Math.min(10_000, Math.max(1, state.deadline - performance.now())),
-      );
-      if (copied.failure || copied.code !== 0)
-        throw new SandboxRuntimeError(copied.failure ?? "collection-failed");
-      const info = await lstat(staging);
-      // Recheck the staged file in case the guest changed it after the probe.
-      // The copy backend itself does not provide a transfer limit here.
-      if (info.isFile() && info.size <= WORKER_MESSAGE_LIMIT)
-        return new Uint8Array(await readFile(staging));
-    } finally {
-      await rm(staging, { recursive: true, force: true });
-    }
+    const encoded = Buffer.from(result.stdout)
+      .toString("latin1")
+      .replace(/[\r\n]/g, "");
+    if (
+      encoded.length > 4 * Math.ceil(WORKER_MESSAGE_LIMIT / 3) ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        encoded,
+      )
+    )
+      return;
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.byteLength <= WORKER_MESSAGE_LIMIT) return bytes;
   }
 
   #destroy(state: State): Promise<void> {

@@ -363,7 +363,8 @@ test("tree commits and reviews use the same bounded, sanitized Worker message", 
   const data = Buffer.from(
     ` \n ` +
       emoji.repeat(73) +
-      `\n\nBody\ttext\0\r\u001b\u0085 ${"界".repeat(1000)}\n`,
+      `\n\nAgent-Bootstrap-Worker-Run: forged\naGeNt-\u200bBoOtStRaP-Other: forged\n` +
+      `Bo\u202edy\ttext\0\r\u001b\u0085\u2066\u2067\u2068\u2069\u200d\u2028\u2029 ${"界".repeat(1000)}\n`,
   );
   const f = await fixture(t, {}, undefined, data);
   f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
