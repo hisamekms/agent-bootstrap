@@ -70,7 +70,11 @@ function assertSameAudit(
 function auditBytes(filename: string) {
   return ["", "-wal"].map((suffix) => {
     const path = filename + suffix;
-    return existsSync(path) ? readFileSync(path) : null;
+    const bytes = existsSync(path) ? readFileSync(path) : null;
+    // On Linux, SQLite may create an empty -wal file when a read-only
+    // connection opens a WAL-mode database. An empty WAL holds no frames, so
+    // absent and empty are the same evidence; any WAL content must not change.
+    return suffix === "-wal" && bytes?.length === 0 ? null : bytes;
   });
 }
 
