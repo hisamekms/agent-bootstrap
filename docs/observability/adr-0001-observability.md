@@ -70,8 +70,11 @@ bypass `--proxy` (matrix N-11, N-12, N-16, N-17).
 
 - If an outcome write fails after an allowed effect, the audit quarantines
   itself (`#writeFailed`). The gateway refuses new flows for that sandbox and
-  closes its active relays. `TrustedHost` throws `HostAuditError` and does no
-  further effect for that invocation.
+  closes its active relays. `TrustedHost` cancels an in-flight non-session
+  exec, stops normal workflow, and attempts emergency sandbox removal.
+  It throws `HostAuditError` and reports an unknown outcome to telemetry.
+  Emergency removal has no durable audit record. The sandbox lifetime
+  remains the backstop if removal fails.
 - Never recorded: credentials, environment values, Authorization or other
   headers, request or response bodies, URLs or paths, guest stdout and
   stderr, raw `msb` diagnostics.
@@ -216,7 +219,7 @@ telemetry: {
 }
 ```
 
-- Coding-agent runs (any spec with `provider`, `tools` or a repository)
+- Runs with `provider`, `tools`, a repository, or `hostTcpPort`
   refuse `audit.mode: "disabled"` unless the caller passes an explicit
   `allowUnauditedRun: true`.
 - Required mode refuses to start if the audit cannot open for writing at v5,
@@ -239,27 +242,32 @@ netstack and `--proxy` implementation. Both are in the TCB.
 
 The guarantees are:
 
-- Every TCP connection attempt that leaves the VM toward a non-host
-  destination is decided by the gateway and durably recorded before any
-  upstream connect. The record has the sandbox and execution IDs, the
-  destination IP and port, the hostname if it was DNS-pinned, the decision,
-  the policy ID and the reason. Its outcome is recorded, or derived as
-  unknown.
-- Every DNS query through the gateway resolver is recorded before it is
-  answered. Only allowlisted names resolve.
+- Before any upstream TCP connect, the gateway durably records its
+  decision. The record has the sandbox and execution IDs, the destination
+  IP and port, the hostname if it was DNS-pinned, the decision, the policy
+  ID and the reason. Its outcome is recorded, or derived as unknown.
+- The gateway durably records DNS decisions before sending policy replies.
+  Only allowlisted names resolve. G1 lists early drops and refusals.
 - Every other egress method is blocked by configuration. The per-sandbox
   rule-set digest is recorded before create.
-- On an audit write failure, no new outbound flow or DNS answer for that
-  sandbox, and no further privileged operation for that invocation.
+- On an audit write failure, the gateway blocks new outbound flows and
+  DNS policy replies for that sandbox. The host stops normal invocation
+  operations and attempts emergency teardown.
 - Lifecycle, process outcome, exit code (guest-reported) and resource limit
   events are recorded per execution.
 
 ## Explicit non-guarantees
 
-- **G1.** There is no per-attempt record for attempts that Microsandbox
-  refuses before the gateway: host group, other resolvers, DoT, UDP, ICMP,
-  raw IP. They are blocked, not individually audited. This needs a
-  Microsandbox change: a synchronous, structured deny-event stream.
+- **G1.** Microsandbox refusals before the gateway (host group, other
+  resolvers, DoT, UDP, ICMP, and raw IP) have no per-attempt record.
+  Recording them requires a synchronous, structured deny-event stream
+  from Microsandbox. The gateway can also refuse or drop traffic before
+  writing a per-attempt record. This includes accept refusals at capacity
+  or during quarantine, client disconnects before a decision is recorded,
+  DNS queries over the in-flight cap, malformed queries or qnames that
+  fail letter/digit/hyphen hostname validation, and DNS-over-TCP framing
+  errors. A parallel task adds aggregate counts for these gateway cases.
+  Those counts provide visibility into volume only.
 - There is no visibility inside allowed connections: TLS bodies, HTTP
   methods and paths, headers, or DoH inside an allowed host. Exfiltration to
   an allowlisted destination is possible.

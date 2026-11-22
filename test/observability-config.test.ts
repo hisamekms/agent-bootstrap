@@ -192,6 +192,7 @@ test("requires an explicit opt-in for each unaudited agent spec", () => {
     { provider: { host: "provider.example", secretEnv: "MODEL_API_KEY" } },
     { tools: [] },
     { repository: { gitDir: "/fixture/repo", tree: "/fixture/tree.tar" } },
+    { hostTcpPort: 4242 },
   ];
   for (const spec of agentSpecs) {
     assert.doesNotThrow(() => requireAudited(spec, required));

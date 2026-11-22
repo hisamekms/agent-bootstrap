@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,7 +154,7 @@ test("an audit write failure stops the pending operation and later operations", 
       return true;
     },
   );
-  assert.deepEqual(calls, ["create"]);
+  assert.deepEqual(calls, ["create", "destroy"]);
   assert.ok(traceId);
   assert.deepEqual(
     audit
@@ -479,7 +479,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
     assert.equal(audit.read(id).at(-1)?.kind, "invocation.finished");
     assert.deepEqual(seen, calls);
   }
-  // An audit failure after create stops before any further effect.
+  // An audit failure after create permits only emergency teardown.
   let writes = 0;
   const calls: string[] = [];
   const host = new TrustedHost(
@@ -513,7 +513,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
     host.runCoordinatorSession(plan, randomUUID(), async () => 1),
     HostAuditError,
   );
-  assert.deepEqual(calls, ["create"]);
+  assert.deepEqual(calls, ["create", "destroy"]);
 });
 
 test("a new audit database uses schema 5 and records provider egress", async (t) => {
@@ -972,6 +972,7 @@ function observedFixture(
   t.after(() => db.close());
   const calls: string[] = [];
   const fake = fakeGateway(calls);
+  let auditAvailable = true;
   function write(label: string, action: () => void) {
     calls.push(label);
     if (label === failWrite)
@@ -980,7 +981,7 @@ function observedFixture(
   }
   const audit: HostObservabilityAudit = {
     get isV5Writable() {
-      return db.isV5Writable;
+      return auditAvailable && db.isV5Writable;
     },
     append: (event) =>
       write([event.kind, event.operation].filter(Boolean).join(" "), () =>
@@ -1028,8 +1029,21 @@ function observedFixture(
           spec.provider?.secretEnv,
         );
         assert.equal(row.egressMode, "gateway");
-        assert.equal(row.gatewayPolicyId, fake.opened?.policy.policyId);
-        assert.equal(row.gatewayPolicyDigest, fake.opened?.policy.policyId);
+        const policy = fake.opened!.policy;
+        assert.equal(row.gatewayPolicyId, policy.policyId);
+        const policyDigest = createHash("sha256")
+          .update(
+            JSON.stringify({
+              version: 1,
+              allow: policy.allow,
+              allowIps: policy.allowIps,
+              hostServices: policy.hostServices,
+              providerBinding: policy.providerBinding ?? null,
+            }),
+          )
+          .digest("hex");
+        assert.equal(row.gatewayPolicyDigest, policyDigest);
+        assert.notEqual(row.gatewayPolicyDigest, row.gatewayPolicyId);
         assert.equal(fake.opened?.sandboxLabel, id);
       } else {
         assert.equal(row.egressMode, "none");
@@ -1070,6 +1084,9 @@ function observedFixture(
     calls,
     fake,
     runtime,
+    failAuditStore() {
+      auditAvailable = false;
+    },
     get binding() {
       return binding;
     },
@@ -1178,8 +1195,14 @@ test("required host stops at every new mandatory append failure and closes an op
   for (const [write, effects] of [
     ["execution_contexts", []],
     ["sandbox_bindings", ["gateway.open", "gateway.close"]],
-    ["process_results", ["gateway.open", "create", "exec", "gateway.close"]],
-    ["resource_events", ["gateway.open", "create", "exec", "gateway.close"]],
+    [
+      "process_results",
+      ["gateway.open", "create", "exec", "gateway.close", "destroy"],
+    ],
+    [
+      "resource_events",
+      ["gateway.open", "create", "exec", "gateway.close", "destroy"],
+    ],
   ] as const) {
     const { host, calls } = observedFixture(
       t,
@@ -1212,7 +1235,7 @@ test("required host stops at every new mandatory append failure and closes an op
   }
 });
 
-test("gateway quarantine halts the host after exec, including when exec also throws", async (t) => {
+test("gateway quarantine halts the host when exec exits or throws first", async (t) => {
   for (const throws of [false, true]) {
     const { host, calls, fake } = observedFixture(t, {
       async exec() {
@@ -1228,20 +1251,82 @@ test("gateway quarantine halts the host after exec, including when exec also thr
       },
     });
     await assert.rejects(host.runWorker(providerPlan), HostAuditError);
-    assert.deepEqual(calls.slice(-3), [
+    assert.deepEqual(calls.slice(-4), [
       "operation.allowed sandbox.exec",
       "exec",
       "gateway.close",
+      "destroy",
     ]);
   }
 });
 
-test("gateway audit failure while draining relays prevents sandbox destroy", async (t) => {
+test("gateway audit failure while draining relays triggers unaudited sandbox teardown", async (t) => {
   const { host, calls, fake } = observedFixture(t);
   fake.failAuditOnClose();
   await assert.rejects(host.runWorker(providerPlan), HostAuditError);
-  assert.equal(calls.at(-1), "gateway.close");
+  assert.deepEqual(calls.slice(-2), ["gateway.close", "destroy"]);
   assert.ok(!calls.includes("operation.requested sandbox.destroy"));
+});
+
+test("gateway quarantine and shared audit failure abort an in-flight exec", async (t) => {
+  for (const failure of ["gateway", "audit-store"] as const) {
+    const events: RuntimeEvent[] = [];
+    const caller = new AbortController();
+    const observed = observedFixture(
+      t,
+      {
+        async exec(_handle, { signal }) {
+          assert.ok(signal);
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(
+              () => reject(new Error("No abort")),
+              500,
+            );
+            signal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timeout);
+                observed.calls.push("abort");
+                resolve();
+              },
+              { once: true },
+            );
+            if (failure === "gateway") observed.fake.quarantine();
+            else observed.failAuditStore();
+          });
+          return {
+            status: "cancelled",
+            exitCode: null,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.alloc(0),
+          };
+        },
+      },
+      undefined,
+      { observers: [{ observe: (event) => void events.push(event) }] },
+    );
+    const id = randomUUID();
+    const work = failure === "gateway" ? providerPlan : plan;
+    await assert.rejects(
+      observed.host.runWorker(
+        { ...work, command: { ...work.command, signal: caller.signal } },
+        id,
+      ),
+      HostAuditError,
+    );
+    assert.equal(caller.signal.aborted, false);
+    assert.deepEqual(
+      observed.calls.slice(failure === "gateway" ? -3 : -2),
+      failure === "gateway"
+        ? ["abort", "gateway.close", "destroy"]
+        : ["abort", "destroy"],
+    );
+    assert.equal(observed.db.readExecution(id).processResults.length, 0);
+    assert.equal(observed.db.read(id).at(-1)?.kind, "operation.allowed");
+    const finished = events.at(-1);
+    assert.equal(finished?.eventType, "execution.finished");
+    assert.equal(finished.payload.outcome, "unknown");
+  }
 });
 
 test("required host refuses invalid setup, mismatched context and direct host ports", async (t) => {
@@ -1290,7 +1375,7 @@ test("required host refuses invalid setup, mismatched context and direct host po
   assert.deepEqual(calls, []);
 });
 
-test("disabled mode requires per-run agent opt-in and makes no audit writes", async () => {
+test("disabled mode requires per-run agent and host-port opt-in and makes no audit writes", async () => {
   const { runtime, calls } = adapter("");
   let writes = 0;
   const host = new TrustedHost(
@@ -1309,16 +1394,12 @@ test("disabled mode requires per-run agent opt-in and makes no audit writes", as
     host.runWorker(providerPlan),
     /explicit allowUnauditedRun/,
   );
+  const direct = { ...plan, sandbox: { ...plan.sandbox, hostTcpPort: 4242 } };
+  await assert.rejects(host.runWorker(direct), /explicit allowUnauditedRun/);
   assert.deepEqual(calls, []);
-  const result = await host.runWorker(
-    {
-      ...providerPlan,
-      sandbox: { ...providerPlan.sandbox, hostTcpPort: 4242 },
-    },
-    undefined,
-    undefined,
-    { allowUnauditedRun: true },
-  );
+  const result = await host.runWorker(direct, undefined, undefined, {
+    allowUnauditedRun: true,
+  });
   assert.equal(result.outcome, "ok");
   assert.deepEqual(calls, ["create", "exec", "destroy"]);
   assert.equal(writes, 0);
@@ -1512,9 +1593,10 @@ test("a runtime that returns a different sandbox ID or network digest is quarant
     const id = randomUUID();
     await assert.rejects(host.runWorker(providerPlan, id), HostAuditError);
     assert.equal(db.readExecution(id).sandboxBindings.length, 1);
-    assert.equal(calls.at(-1), "gateway.close");
+    assert.deepEqual(calls.slice(-2), ["gateway.close", "destroy"]);
     assert.ok(!calls.includes("operation.finished sandbox.create"));
-    assert.ok(!calls.includes("exec") && !calls.includes("destroy"));
+    assert.ok(!calls.includes("exec"));
+    assert.ok(!calls.includes("operation.requested sandbox.destroy"));
   }
 });
 
@@ -1590,9 +1672,10 @@ test("Coordinator session send refuses further guest work after gateway quaranti
     }),
     HostAuditError,
   );
-  assert.deepEqual(calls.slice(-3), [
+  assert.deepEqual(calls.slice(-4), [
     "first message",
     "session.close",
     "gateway.close",
+    "destroy",
   ]);
 });

@@ -410,6 +410,7 @@ test("missing, invalid UTF-8, empty and oversized Worker proposals get a host su
     undefined,
     Buffer.from([0xff]),
     Buffer.from(" \t\n\0"),
+    Buffer.from("  aGeNt-\u200bBoOtStRaP-Worker-Run: forged"),
     Buffer.alloc(4097, "a"),
   ]) {
     const f = await fixture(t, {}, undefined, data);

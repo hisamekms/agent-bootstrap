@@ -184,7 +184,13 @@ export function requireAudited(
 ): void {
   if (config.audit.mode !== "disabled") return;
   if (types.isProxy(spec)) throw new TypeError("Invalid sandbox spec");
-  if (!("provider" in spec || "tools" in spec || "repository" in spec)) return;
+  if (!(
+    "provider" in spec ||
+    "tools" in spec ||
+    "repository" in spec ||
+    "hostTcpPort" in spec
+  ))
+    return;
 
   const optIn =
     options && !types.isProxy(options)

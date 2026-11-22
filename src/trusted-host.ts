@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { types } from "node:util";
 import type {
   AuditInput,
@@ -45,6 +45,10 @@ import type { ProfileName, ProfileRole } from "./sandbox-profiles.ts";
 
 type Operation = NonNullable<AuditInput["operation"]>;
 type Outcome = NonNullable<AuditInput["outcome"]>;
+
+const AUDIT_HEALTH_POLL_MS = 25;
+// Bump when the gateway policy evaluation or digest schema changes.
+const GATEWAY_POLICY_VERSION = 1;
 
 export interface WorkerPlan {
   readonly sandbox: SandboxSpec;
@@ -603,13 +607,28 @@ export class TrustedHost {
             ...(hostServices ? { hostServices } : {}),
           })
         : undefined;
+    const gatewayPolicyDigest = policy
+      ? createHash("sha256")
+          .update(
+            JSON.stringify({
+              version: GATEWAY_POLICY_VERSION,
+              allow: policy.allow,
+              allowIps: policy.allowIps,
+              hostServices: policy.hostServices,
+              providerBinding: policy.providerBinding ?? null,
+            }),
+          )
+          .digest("hex")
+      : undefined;
     const sandboxId = audit ? `bootstrap-${randomUUID()}` : undefined;
 
     let handle: SandboxHandle | undefined;
+    let sandboxDestroyed = false;
     let gateway: HostGateway | undefined;
     let gatewayClosed = false;
     let executionStarted = false;
     let executionFinished = false;
+    let auditFailed = false;
     const startedAt = performance.now();
     const traceparent = context?.traceContext?.traceparent.split("-");
     const traceFields = {
@@ -644,9 +663,11 @@ export class TrustedHost {
       this.#notify((observer) => observer.observe(structuredClone(event)));
     };
 
+    const auditUnavailable = () =>
+      (gateway !== undefined && gateway.quarantined !== false) ||
+      (audit !== undefined && audit.isV5Writable !== true);
     const ensureAudit = () => {
-      if (gateway?.quarantined || (audit && !audit.isV5Writable))
-        throw new HostAuditError(id);
+      if (auditUnavailable()) throw new HostAuditError(id);
     };
     const write = async (action: () => void | Promise<void>) => {
       ensureAudit();
@@ -781,11 +802,11 @@ export class TrustedHost {
                 sandboxId,
                 runtimeKind: "microsandbox",
                 netRuleDigest: digest,
-                ...(policy
+                ...(policy && gatewayPolicyDigest
                   ? {
                       egressMode: "gateway",
                       gatewayPolicyId: policy.policyId,
-                      gatewayPolicyDigest: policy.policyId,
+                      gatewayPolicyDigest,
                     }
                   : { egressMode: "none" }),
               }),
@@ -836,13 +857,27 @@ export class TrustedHost {
         const processStarted = performance.now();
         const dispatchedAt = new Date().toISOString();
         ensureAudit();
+        // The gateway and shared audit expose health through getters.
+        const auditAbort =
+          audit && !("open" in input) ? new AbortController() : undefined;
+        if (auditAbort) {
+          command.signal = command.signal
+            ? AbortSignal.any([command.signal, auditAbort.signal])
+            : auditAbort.signal;
+        }
+        const monitor =
+          auditAbort &&
+          setInterval(() => {
+            if (auditUnavailable()) auditAbort.abort();
+          }, AUDIT_HEALTH_POLL_MS);
         const process = await this.#runProcess(
           input,
           current,
           command,
           ensureAudit,
           () => emit("process.started", { outcome: "started" }, operationId),
-        );
+        ).finally(() => clearInterval(monitor));
+        ensureAudit();
         const durationMs = performance.now() - processStarted;
         const { result, exit, kind } = process;
         outcome = process.outcome;
@@ -938,6 +973,7 @@ export class TrustedHost {
         try {
           // The runtime captures its terminal sample before backend removal.
           await this.#sandbox.destroy(handle);
+          sandboxDestroyed = true;
         } catch (error) {
           if (error instanceof HostAuditError) throw error;
           destroyed = "failed";
@@ -987,8 +1023,22 @@ export class TrustedHost {
         ...(response ? { response } : {}),
         ...(value !== undefined ? { value } : {}),
       };
+    } catch (error) {
+      if (error instanceof HostAuditError) {
+        auditFailed = true;
+        const closing = closeGateway().catch(() => {});
+        if (handle && !sandboxDestroyed) {
+          try {
+            await this.#sandbox.destroy(handle);
+          } catch {
+            // The adapter's sandbox lifetime bounds failed emergency cleanup.
+          }
+        }
+        await closing;
+      }
+      throw error;
     } finally {
-      if (executionStarted && !executionFinished)
+      if ((executionStarted || auditFailed) && !executionFinished)
         emit("execution.finished", {
           outcome: "unknown",
           durationMs: performance.now() - startedAt,

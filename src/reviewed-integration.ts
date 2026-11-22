@@ -78,6 +78,7 @@ const CANDIDATE_MESSAGE_BYTES = 2048;
 
 function workerCommitMessage(run: string, proposal?: Uint8Array): string {
   const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+  const defaultSubject = `Candidate from Worker run ${run}`;
   let text = "";
   if (proposal) {
     try {
@@ -92,7 +93,9 @@ function workerCommitMessage(run: string, proposal?: Uint8Array): string {
     .trim()
     .split("\n");
   const shortened = [
-    [...subject].slice(0, 72).join(""),
+    /^Agent-Bootstrap-/i.test(subject)
+      ? defaultSubject
+      : [...subject].slice(0, 72).join(""),
     ...body.filter((line) => !/^Agent-Bootstrap-/i.test(line)),
   ].join("\n");
   const available = CANDIDATE_MESSAGE_BYTES - Buffer.byteLength(trailer);
@@ -104,7 +107,7 @@ function workerCommitMessage(run: string, proposal?: Uint8Array): string {
     end += character.length;
   }
   const message = shortened.slice(0, end).trimEnd();
-  return `${message || `Candidate from Worker run ${run}`}${trailer}`;
+  return `${message || defaultSubject}${trailer}`;
 }
 
 function copyTreePaths(
