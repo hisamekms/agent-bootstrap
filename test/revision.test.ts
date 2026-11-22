@@ -22,9 +22,10 @@ import {
   ReviewedIntegration,
   verificationResult,
 } from "../src/reviewed-integration.ts";
-import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
+import type { SandboxSpec } from "../src/sandbox-runtime.ts";
 import { ProfileCatalog, type ProfileName } from "../src/sandbox-profiles.ts";
-import { TrustedHost } from "../src/trusted-host.ts";
+import { TrustedHost, type BoundSandboxRuntime } from "../src/trusted-host.ts";
+import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
@@ -75,11 +76,18 @@ async function fixture(
   const workers: SandboxSpec[] = [];
   let round = 0;
   const specs = new Map<string, SandboxSpec>();
-  const runtime: SandboxRuntime = {
-    async create(spec) {
-      const id = randomUUID();
+  const runtime: BoundSandboxRuntime = {
+    netRuleDigest(spec) {
+      return sha256(JSON.stringify(spec.egressGateway ?? null));
+    },
+    async create() {
+      throw new Error("Required mode used an unbound create");
+    },
+    async createBound(spec, id) {
+      const netRuleDigest = this.netRuleDigest(spec);
+      assert.equal(spec.expectedNetRuleDigest, netRuleDigest);
       specs.set(id, spec);
-      return { id };
+      return { id, netRuleDigest };
     },
     async exec(handle, command) {
       const entry = command.argv[0];
@@ -113,7 +121,17 @@ async function fixture(
     async destroy() {},
   };
   const journal = new IntegrationJournal(journalDir, randomUUID());
-  const host = new TrustedHost(audit, runtime, profiles);
+  const host = new TrustedHost(audit, runtime, profiles, {
+    config: {
+      audit: { mode: "required" },
+      telemetry: {
+        enabled: false,
+        resourceSamplingIntervalMs: 1000,
+        traceSamplingRatio: 1,
+      },
+    },
+    gatewayFactory: (options) => fakeGateway([]).open(options),
+  });
   const flow = new ReviewedIntegration(git, host, journal, {
     path: "hello.txt",
     worker: { argv: ["worker"], timeoutMs: 123 },
@@ -313,6 +331,10 @@ test("provider egress reaches Worker and Reviewer VMs, never verification, and i
     created.map((spec) => spec.provider?.host ?? null),
     ["api.openai.com", "api.openai.com", null],
   );
+  assert.deepEqual(
+    created.map((spec) => Boolean(spec.egressGateway)),
+    [true, true, false],
+  );
   const runs = (await journal.read()).flatMap((event) =>
     "run" in event ? [event.run] : [],
   );
@@ -328,6 +350,12 @@ test("provider egress reaches Worker and Reviewer VMs, never verification, and i
       "operation.finished ok",
     ]);
   assert.deepEqual(egress(runs.at(-1)!), []);
+  for (const [sandboxId, spec] of specs) {
+    const [binding] = audit.readExecution(spec.invocationId!).sandboxBindings;
+    assert.equal(binding?.sandboxId, sandboxId);
+    assert.equal(binding?.netRuleDigest, spec.expectedNetRuleDigest);
+    assert.equal(binding?.egressMode, spec.provider ? "gateway" : "none");
+  }
 });
 
 const suite = [

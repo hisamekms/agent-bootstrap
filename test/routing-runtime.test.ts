@@ -79,3 +79,44 @@ test("sandboxes go to the runtime bound to their provider, and unknown providers
     /invalid-input/,
   );
 });
+
+test("bound creation routes by provider and retains ownership by handle", async () => {
+  const calls: string[] = [];
+  const digest = "a".repeat(64);
+  const audited = (name: string): SandboxRuntime => ({
+    ...fake(name, calls),
+    netRuleDigest: () => digest,
+    async createBound(spec, sandboxId) {
+      assert.equal(spec.expectedNetRuleDigest, digest);
+      calls.push(`${name}:createBound:${sandboxId}`);
+      return { id: sandboxId, netRuleDigest: digest };
+    },
+  });
+  const runtime = new RoutingSandboxRuntime([
+    { runtime: audited("plain") },
+    { provider: openai, runtime: audited("openai") },
+    { provider: anthropic, runtime: fake("anthropic", calls) },
+  ]);
+  const spec = { expectedNetRuleDigest: digest };
+  const plain = await runtime.createBound(spec, "bound-plain");
+  const credentialed = await runtime.createBound(
+    { ...spec, provider: openai },
+    "bound-openai",
+  );
+  assert.deepEqual(credentialed, { id: "bound-openai", netRuleDigest: digest });
+  await assert.rejects(runtime.destroy({ ...credentialed }), /unknown-handle/);
+  await assert.rejects(
+    runtime.createBound({ ...spec, provider: anthropic }, "bound-anthropic"),
+    /unsupported/,
+  );
+  await runtime.exec(credentialed, { argv: ["x"], timeoutMs: 10 });
+  await runtime.destroy(plain);
+  await runtime.destroy(credentialed);
+  assert.deepEqual(calls, [
+    "plain:createBound:bound-plain",
+    "openai:createBound:bound-openai",
+    "openai:exec",
+    "plain:destroy",
+    "openai:destroy",
+  ]);
+});

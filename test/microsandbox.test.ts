@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -85,6 +85,13 @@ if (args[0] === '--version') {
   else if (mode === 'inspect-array') console.log(JSON.stringify([{ digest }]));
   else if (mode === 'inspect-null') console.log('null');
   else console.log(JSON.stringify({ digest, architecture: 'arm64', layers: [] }));
+} else if (args[0] === 'list') {
+  log();
+  if (args[1] !== '--format' || args[2] !== 'json') fail();
+  if (mode === 'list-malformed') console.log('{"name":"unknown"}');
+  else console.log(JSON.stringify(readdirSync(guests, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(({ name }) => ({ name }))));
 } else if (args[0] === 'create') {
   const passwordIndex = args.indexOf('--socks5-password-env');
   if (passwordIndex !== -1) {
@@ -105,8 +112,12 @@ if (args[0] === '--version') {
   event.stagedBytes = files.reduce((n, f) => n + f.bytes, 0);
   event.copyFiles = args.flatMap((a, i) => args[i - 1] === '--copy-file' ? [a] : []);
   log();
+  if (mode === 'late-name-collision') mkdirSync(join(guests, name));
+  if (existsSync(join(guests, name))) fail();
   for (const c of event.copyFiles) if (c.endsWith(':/tmp/agent-bootstrap-tree.tar')) cpSync(c.split(':')[0], join(guests, name + '.tree'));
   cpSync(source, join(guests, name), { recursive: true });
+  const cleanupLabel = args.find((a, i) => args[i - 1] === '--label' && a.startsWith('agent-bootstrap-create='));
+  if (cleanupLabel) writeFileSync(join(guests, name, '.fixture-cleanup-label'), cleanupLabel);
   if (mode === 'gateway-create-failure') {
     process.stderr.write(process.env[args[passwordIndex + 1]] ?? '');
     process.exit(2);
@@ -152,8 +163,17 @@ if (args[0] === '--version') {
   else console.log(JSON.stringify({ vcpu_time_ns: 123, memory_bytes: 456, net_rx_bytes: null }));
 } else if (args[0] === 'rm') {
   log(); if (args[1] !== '--force' || mode === 'create-and-cleanup-failure') fail();
-  rmSync(join(guests, args[2]), { recursive: true, force: true });
-  rmSync(join(guests, args[2] + '.tree'), { force: true });
+  const names = args[2] === '--label'
+    ? readdirSync(guests, { withFileTypes: true }).filter(entry => {
+        if (!entry.isDirectory()) return false;
+        const marker = join(guests, entry.name, '.fixture-cleanup-label');
+        return existsSync(marker) && readFileSync(marker, 'utf8') === args[3];
+      }).map(entry => entry.name)
+    : [args[2]];
+  for (const name of names) {
+    rmSync(join(guests, name), { recursive: true, force: true });
+    rmSync(join(guests, name + '.tree'), { force: true });
+  }
 } else { log(); fail(); }
 `,
     { mode: 0o700 },
@@ -801,19 +821,24 @@ test("gateway mode binds exact argv and passes passwords only to create, with an
       .update(JSON.stringify(expectedNetworkArgs))
       .digest("hex");
     assert.equal(runtime.netRuleDigest(spec), expectedDigest);
-    const handle = await runtime.create({
-      ...spec,
-      expectedNetRuleDigest: expectedDigest,
-    });
-    assert.deepEqual(handle, { id: handle.id, netRuleDigest: expectedDigest });
+    const sandboxId = `bootstrap-${randomUUID()}`;
+    const handle = await runtime.createBound(
+      { ...spec, expectedNetRuleDigest: expectedDigest },
+      sandboxId,
+    );
+    assert.deepEqual(handle, { id: sandboxId, netRuleDigest: expectedDigest });
     const creates = (await f.events()).filter(
       ({ args }) => args[0] === "create",
     );
     const create = creates.at(-1)!;
+    const cleanupLabel = create.args[create.args.indexOf("--label") + 1]!;
+    assert.match(cleanupLabel, /^agent-bootstrap-create=[0-9a-f-]{36}$/);
     assert.deepEqual(create.args, [
       "create",
       "--name",
-      handle.id,
+      sandboxId,
+      "--label",
+      cleanupLabel,
       "--pull",
       "never",
       ...expectedNetworkArgs,
@@ -829,6 +854,12 @@ test("gateway mode binds exact argv and passes passwords only to create, with an
     const sample = { vcpuTimeNs: 123, memoryBytes: 456 };
     assert.deepEqual(await runtime.sampleResources(handle), sample);
     await runtime.destroy(handle);
+    assert.deepEqual((await f.events()).at(-1)?.args, [
+      "rm",
+      "--force",
+      "--label",
+      cleanupLabel,
+    ]);
     assert.deepEqual(runtime.finalResourceSample(handle), sample);
     assert.equal(runtime.finalResourceSample(handle), null);
   }
@@ -838,6 +869,90 @@ test("gateway mode binds exact argv and passes passwords only to create, with an
     assert.equal(envKeys.includes(provider.secretEnv), false);
   }
   assert.equal(JSON.stringify(events).includes(gatewayPassword), false);
+});
+
+test("bound create refuses invalid IDs and missing or mismatched digests before invoking the backend", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  for (const bad of ["", "--name", "../guest", randomUUID(), sandboxId + "\n"])
+    await assert.rejects(f.runtime.createBound(spec, bad), /invalid-input/);
+  await assert.rejects(f.runtime.createBound({}, sandboxId), /invalid-input/);
+  await assert.rejects(
+    f.runtime.createBound({ expectedNetRuleDigest: "0".repeat(64) }, sandboxId),
+    /invalid-input/,
+  );
+  assert.deepEqual(await f.events(), []);
+});
+
+test("bound create refuses concurrent and existing names without removing the owner", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const other = new MicrosandboxRuntime(f.config);
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  const results = await Promise.allSettled([
+    f.runtime.createBound(spec, sandboxId),
+    other.createBound(spec, sandboxId),
+  ]);
+  const [winner] = results.flatMap((result, index) =>
+    result.status === "fulfilled" ? [{ handle: result.value, index }] : [],
+  );
+  assert.ok(winner);
+  const loser = results[1 - winner.index];
+  assert.ok(loser?.status === "rejected");
+  assert.match(String(loser.reason), /name-collision/);
+  const [owner, contender] =
+    winner.index === 0 ? [f.runtime, other] : [other, f.runtime];
+  await assert.rejects(
+    contender.createBound(spec, sandboxId),
+    /name-collision/,
+  );
+  assert.deepEqual(await readdir(f.guests), [sandboxId]);
+  const ops = (await f.events()).map(({ args }) => args[0]);
+  assert.equal(ops.filter((op) => op === "create").length, 1);
+  assert.equal(ops.includes("rm"), false);
+  await owner.destroy(winner.handle);
+  await assertCleanup(f);
+  assert.deepEqual(await readdir(f.home), []);
+});
+
+test("failed bound create removes only its own partial sandbox", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  await f.setMode("partial-create-failure");
+  await assert.rejects(
+    f.runtime.createBound(spec, sandboxId),
+    /backend-failure/,
+  );
+  await assertCleanup(f);
+
+  await f.setMode("late-name-collision");
+  await assert.rejects(
+    f.runtime.createBound(spec, sandboxId),
+    /backend-failure/,
+  );
+  assert.deepEqual(await readdir(f.guests), [sandboxId]);
+  assert.deepEqual(await readdir(f.stagingRoot), []);
+  assert.deepEqual(await readdir(f.home), []);
+  const removals = (await f.events()).filter(({ args }) => args[0] === "rm");
+  for (const { args } of removals)
+    assert.deepEqual(args.slice(0, 3), ["rm", "--force", "--label"]);
+  assert.notEqual(removals[0]?.args[3], removals[1]?.args[3]);
+});
+
+test("bound create fails closed if the backend cannot list sandbox names", async (t) => {
+  const f = await fixture(t);
+  await f.setMode("list-malformed");
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  await assert.rejects(
+    f.runtime.createBound(spec, `bootstrap-${randomUUID()}`),
+    /backend-failure/,
+  );
+  assert.deepEqual(
+    (await f.events()).map(({ args }) => args[0]),
+    ["--version", "image", "list"],
+  );
 });
 
 test("unsafe gateway bindings are refused before the backend", async (t) => {

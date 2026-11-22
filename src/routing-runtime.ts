@@ -88,6 +88,18 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     return handle;
   }
 
+  async createBound(
+    spec: SandboxSpec,
+    sandboxId: string,
+  ): Promise<SandboxHandle> {
+    const runtime = this.#route(spec);
+    if (!runtime.createBound || !runtime.netRuleDigest)
+      throw new SandboxRuntimeError("unsupported");
+    const handle = await runtime.createBound(spec, sandboxId);
+    this.#owners.set(handle, runtime);
+    return handle;
+  }
+
   async exec(
     handle: SandboxHandle,
     command: SandboxCommand,

@@ -10,6 +10,7 @@ import {
   readdir,
   readFile,
   rm,
+  rmdir,
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -61,6 +62,8 @@ export const GATEWAY_NET_RULES =
   "allow@dns,deny@host,deny@0.0.0.0/0:tcp:53,deny@[::/0]:tcp:53,deny@0.0.0.0/0:tcp:853,deny@[::/0]:tcp:853,allow@0.0.0.0/0:tcp,allow@[::/0]:tcp";
 
 const METRICS_TIMEOUT_MS = 1000;
+const SANDBOX_NAME =
+  /^bootstrap-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 /** Conservative fixed bounds for this initial offline adapter. */
 export const MICROSANDBOX_LIMITS = {
@@ -134,6 +137,7 @@ type ProcessResult = {
 
 type State = {
   id: string;
+  cleanupLabel?: string;
   directory: string;
   deadline: number;
   busy: boolean;
@@ -525,6 +529,45 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   async create(
     spec: SandboxSpec,
   ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
+    return this.#create(spec, `bootstrap-${randomUUID()}`, false);
+  }
+
+  async createBound(
+    spec: SandboxSpec,
+    sandboxId: string,
+  ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
+    if (
+      typeof sandboxId !== "string" ||
+      sandboxId.length !== 46 ||
+      !SANDBOX_NAME.test(sandboxId)
+    )
+      invalid();
+    return this.#create(spec, sandboxId, true);
+  }
+
+  async #checkNameAvailable(sandboxId: string): Promise<void> {
+    const result = await this.#checked(["list", "--format", "json"]);
+    let sandboxes: unknown;
+    try {
+      sandboxes = JSON.parse(result.stdout.toString("utf8"));
+    } catch {
+      throw new SandboxRuntimeError("backend-failure");
+    }
+    if (!Array.isArray(sandboxes))
+      throw new SandboxRuntimeError("backend-failure");
+    for (const sandbox of sandboxes) {
+      if (!sandbox || typeof sandbox.name !== "string")
+        throw new SandboxRuntimeError("backend-failure");
+      if (sandbox.name === sandboxId)
+        throw new SandboxRuntimeError("name-collision");
+    }
+  }
+
+  async #create(
+    spec: SandboxSpec,
+    sandboxId: string,
+    bound: boolean,
+  ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
     const invocationId = spec.invocationId;
     if (
       invocationId !== undefined &&
@@ -555,7 +598,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const { args: networkArgs, gateway, provider } = this.#network(spec);
     const netRuleDigest = digestNetworkArgs(networkArgs);
     if (
-      spec.expectedNetRuleDigest !== undefined &&
+      (bound || spec.expectedNetRuleDigest !== undefined) &&
       spec.expectedNetRuleDigest !== netRuleDigest
     )
       invalid();
@@ -587,11 +630,28 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     });
     let state: State | undefined;
     let directory: string | undefined;
+    let reservation: string | undefined;
     try {
+      if (bound) {
+        // Reserve the name across adapters and processes sharing this home.
+        const path = join(
+          this.#config.home,
+          `.agent-bootstrap-create-${sandboxId}`,
+        );
+        try {
+          await mkdir(path, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST")
+            throw new SandboxRuntimeError("name-collision");
+          throw error;
+        }
+        reservation = path;
+      }
       const version = await this.#checked(["--version"]);
       if (version.stdout.toString("utf8").trim() !== "msb 0.7.16")
         throw new SandboxRuntimeError("unsupported-version");
       await this.#verifyImage(profile.image);
+      if (bound) await this.#checkNameAvailable(sandboxId);
       await mkdir(this.#config.stagingRoot, { recursive: true, mode: 0o700 });
       directory = await mkdtemp(join(this.#config.stagingRoot, "msb-"));
       // Copy each tool into private staging and verify the copy, so the
@@ -641,7 +701,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           invalid();
       }
       state = {
-        id: `bootstrap-${randomUUID()}`,
+        id: sandboxId,
+        ...(bound
+          ? { cleanupLabel: `agent-bootstrap-create=${randomUUID()}` }
+          : {}),
         directory,
         deadline: performance.now() + lifetime,
         busy: false,
@@ -655,6 +718,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(invocationId
           ? ["--label", `agent-bootstrap-invocation=${invocationId}`]
           : []),
+        ...(state.cleanupLabel ? ["--label", state.cleanupLabel] : []),
         "--pull",
         "never",
         ...networkArgs,
@@ -695,7 +759,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       this.#states.set(handle, state);
       return handle;
     } catch (error) {
-      if (state) return this.#withCleanup(state, error);
+      if (state) return await this.#withCleanup(state, error);
       let cleanupFailed = false;
       if (directory) {
         try {
@@ -708,6 +772,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         error instanceof SandboxRuntimeError ? error.code : "backend-failure",
         cleanupFailed,
       );
+    } finally {
+      // A stale reservation safely refuses reuse of this ID. Preserve the
+      // creation or cleanup outcome if the reservation cannot be removed.
+      if (reservation) await rmdir(reservation).catch(() => {});
     }
   }
 
@@ -1057,7 +1125,15 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         }
         const sample = await this.#sample(state.id);
         try {
-          await this.#checked(["rm", "--force", state.id]);
+          // A failed bound create may have collided after the list check.
+          // Remove only a sandbox carrying this create attempt's label.
+          await this.#checked([
+            "rm",
+            "--force",
+            ...(state.cleanupLabel
+              ? ["--label", state.cleanupLabel]
+              : [state.id]),
+          ]);
           state.removed = true;
           if (sample) state.finalSample = sample;
         } catch {

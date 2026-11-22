@@ -165,6 +165,8 @@ export interface SandboxRuntime {
   /** Computes the network argv digest before the host authorizes create. */
   netRuleDigest?(spec: SandboxSpec): string;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
+  /** Creates under the host's audited ID and enforces expectedNetRuleDigest. */
+  createBound?(spec: SandboxSpec, sandboxId: string): Promise<SandboxHandle>;
   exec(handle: SandboxHandle, command: SandboxCommand): Promise<ExecResult>;
   /** Optional: adapters without streaming do not support sessions. */
   openSession?(
