@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -13,14 +14,23 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   MICROSANDBOX_LIMITS,
+  type MicrosandboxConfig,
   MicrosandboxRuntime,
 } from "../src/microsandbox.ts";
+import { RoutingSandboxRuntime } from "../src/routing-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
 
 const image = `fixture.invalid/alpine@sha256:${"a".repeat(64)}`;
 const profiles = new ProfileCatalog({ base: { image } });
 const diagnostic = "synthetic-backend-diagnostic-do-not-propagate";
+const gatewayPassword = "synthetic-gateway-password";
+const gateway = {
+  socksPort: 18190,
+  dnsPort: 18153,
+  username: "fixture-sandbox",
+  passwordEnv: "GATEWAY_FIXTURE_SECRET",
+};
 
 type Event = {
   args: string[];
@@ -30,6 +40,7 @@ type Event = {
   stagedPaths?: string[];
   stagedBytes?: number;
   copyFiles?: string[];
+  gatewayPasswordMatches?: boolean;
 };
 
 // This executable simulates only CLI responses and copied fixture directories.
@@ -75,6 +86,11 @@ if (args[0] === '--version') {
   else if (mode === 'inspect-null') console.log('null');
   else console.log(JSON.stringify({ digest, architecture: 'arm64', layers: [] }));
 } else if (args[0] === 'create') {
+  const passwordIndex = args.indexOf('--socks5-password-env');
+  if (passwordIndex !== -1) {
+    const password = process.env[args[passwordIndex + 1]];
+    event.gatewayPasswordMatches = password === ${JSON.stringify(gatewayPassword)};
+  }
   const name = args[args.indexOf('--name') + 1];
   const copy = args[args.indexOf('--copy-dir') + 1];
   const [source, destination] = copy.split(':');
@@ -91,6 +107,10 @@ if (args[0] === '--version') {
   log();
   for (const c of event.copyFiles) if (c.endsWith(':/tmp/agent-bootstrap-tree.tar')) cpSync(c.split(':')[0], join(guests, name + '.tree'));
   cpSync(source, join(guests, name), { recursive: true });
+  if (mode === 'gateway-create-failure') {
+    process.stderr.write(process.env[args[passwordIndex + 1]] ?? '');
+    process.exit(2);
+  }
   if (mode === 'partial-create-failure' || mode === 'create-and-cleanup-failure') fail();
 } else if (args[0] === 'exec') {
   log();
@@ -124,6 +144,12 @@ if (args[0] === '--version') {
   else writeFileSync(args[2], 'TREE-BYTES');
 } else if (args[0] === 'stop') {
   log(); if (mode === 'create-and-cleanup-failure') fail();
+} else if (args[0] === 'metrics') {
+  log();
+  if (!existsSync(join(guests, args[1])) || mode === 'metrics-failure') fail();
+  if (mode === 'metrics-malformed') console.log('{bad json');
+  else if (mode === 'metrics-oversized') process.stdout.write(' '.repeat(20 * 1024));
+  else console.log(JSON.stringify({ vcpu_time_ns: 123, memory_bytes: 456, net_rx_bytes: null }));
 } else if (args[0] === 'rm') {
   log(); if (args[1] !== '--force' || mode === 'create-and-cleanup-failure') fail();
   rmSync(join(guests, args[2]), { recursive: true, force: true });
@@ -132,20 +158,23 @@ if (args[0] === '--version') {
 `,
     { mode: 0o700 },
   );
-  const runtime = new MicrosandboxRuntime({
+  const config = {
     binary,
     home,
     stagingRoot,
     profiles,
-  });
+  };
+  const runtime = new MicrosandboxRuntime(config);
   return {
+    config,
     runtime,
-    withCredentials: (token: string) =>
+    withCredentials: (
+      token: string,
+      resolvePassword?: MicrosandboxConfig["gatewayPassword"],
+    ) =>
       new MicrosandboxRuntime({
-        binary,
-        home,
-        stagingRoot,
-        profiles,
+        ...config,
+        ...(resolvePassword ? { gatewayPassword: resolvePassword } : {}),
         providers: [
           { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
         ],
@@ -715,6 +744,203 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
       }),
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
+});
+
+test("gateway mode binds exact argv and passes passwords only to create, with and without a provider", async (t) => {
+  const f = await fixture(t);
+  const provider = {
+    host: "api.openai.com",
+    secretEnv: "AGENT_BOOTSTRAP_TOKEN",
+  };
+  const resolvePassword: NonNullable<MicrosandboxConfig["gatewayPassword"]> = (
+    binding,
+  ) => {
+    assert.deepEqual(binding, gateway);
+    return gatewayPassword;
+  };
+  const runtime = new RoutingSandboxRuntime([
+    {
+      runtime: new MicrosandboxRuntime({
+        ...f.config,
+        gatewayPassword: resolvePassword,
+      }),
+    },
+    {
+      provider,
+      runtime: f.withCredentials("fixture-token", resolvePassword),
+    },
+  ]);
+  for (const binding of [undefined, provider]) {
+    const spec = {
+      egressGateway: gateway,
+      ...(binding ? { provider: binding } : {}),
+    };
+    const expectedNetworkArgs = [
+      "--no-net",
+      "--net-rule",
+      "allow@dns,deny@host,deny@0.0.0.0/0:tcp:53,deny@[::/0]:tcp:53,deny@0.0.0.0/0:tcp:853,deny@[::/0]:tcp:853,allow@0.0.0.0/0:tcp,allow@[::/0]:tcp",
+      "--dns-nameserver",
+      "127.0.0.1:18153",
+      "--proxy",
+      "socks5://127.0.0.1:18190",
+      "--socks5-username",
+      "fixture-sandbox",
+      "--socks5-password-env",
+      "GATEWAY_FIXTURE_SECRET",
+      ...(binding
+        ? [
+            "--tls-intercept",
+            "--secret",
+            "AGENT_BOOTSTRAP_TOKEN:headers=authorization@api.openai.com",
+            "--secret-violation-action",
+            "block",
+          ]
+        : []),
+    ];
+    const expectedDigest = createHash("sha256")
+      .update(JSON.stringify(expectedNetworkArgs))
+      .digest("hex");
+    assert.equal(runtime.netRuleDigest(spec), expectedDigest);
+    const handle = await runtime.create({
+      ...spec,
+      expectedNetRuleDigest: expectedDigest,
+    });
+    assert.deepEqual(handle, { id: handle.id, netRuleDigest: expectedDigest });
+    const creates = (await f.events()).filter(
+      ({ args }) => args[0] === "create",
+    );
+    const create = creates.at(-1)!;
+    assert.deepEqual(create.args, [
+      "create",
+      "--name",
+      handle.id,
+      "--pull",
+      "never",
+      ...expectedNetworkArgs,
+      "--max-duration",
+      "120s",
+      "--copy-dir",
+      `${create.workspace}:/workspace`,
+      image,
+    ]);
+    assert.equal(create.gatewayPasswordMatches, true);
+    assert.equal(create.envKeys.includes(provider.secretEnv), !!binding);
+    assert.equal(create.envKeys.includes(gateway.passwordEnv), true);
+    const sample = { vcpuTimeNs: 123, memoryBytes: 456 };
+    assert.deepEqual(await runtime.sampleResources(handle), sample);
+    await runtime.destroy(handle);
+    assert.deepEqual(runtime.finalResourceSample(handle), sample);
+    assert.equal(runtime.finalResourceSample(handle), null);
+  }
+  const events = await f.events();
+  for (const { envKeys } of events.filter(({ args }) => args[0] !== "create")) {
+    assert.equal(envKeys.includes(gateway.passwordEnv), false);
+    assert.equal(envKeys.includes(provider.secretEnv), false);
+  }
+  assert.equal(JSON.stringify(events).includes(gatewayPassword), false);
+});
+
+test("unsafe gateway bindings are refused before the backend", async (t) => {
+  const f = await fixture(t);
+  const provider = {
+    host: "api.openai.com",
+    secretEnv: "AGENT_BOOTSTRAP_TOKEN",
+  };
+  const runtime = f.withCredentials("fixture-token", () => gatewayPassword);
+  for (const spec of [
+    { egressGateway: gateway, hostTcpPort: 8080 },
+    {
+      egressGateway: { ...gateway, passwordEnv: provider.secretEnv },
+      provider,
+    },
+    { egressGateway: { ...gateway, passwordEnv: "MSB_CONFIG_SECRET" } },
+    { egressGateway: { ...gateway, passwordEnv: "PATH" } },
+    { egressGateway: { ...gateway, socksPort: 0 } },
+    { egressGateway: { ...gateway, dnsPort: 65536 } },
+    { egressGateway: { ...gateway, dnsPort: gateway.socksPort } },
+    { egressGateway: { ...gateway, username: "--no-net" } },
+  ]) {
+    assert.throws(() => runtime.netRuleDigest(spec), /invalid-input/);
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  }
+  await assert.rejects(
+    f.runtime.create({ egressGateway: gateway }),
+    /invalid-input/,
+  );
+  await assert.rejects(
+    runtime.create({
+      egressGateway: { ...gateway, dnsPort: gateway.dnsPort + 1 },
+      expectedNetRuleDigest: runtime.netRuleDigest({ egressGateway: gateway }),
+    }),
+    /invalid-input/,
+  );
+  assert.deepEqual(await f.events(), []);
+});
+
+test("gateway password and backend diagnostics stay out of errors", async (t) => {
+  const f = await fixture(t);
+  const spec = { egressGateway: gateway };
+  const failure = (error: unknown) => {
+    assert.ok(error instanceof SandboxRuntimeError);
+    assert.equal(error.code, "backend-failure");
+    assert.equal(error.stack?.includes(gatewayPassword), false);
+    assert.equal(JSON.stringify(error).includes(gatewayPassword), false);
+    return true;
+  };
+  const unavailable = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword() {
+      throw new SandboxRuntimeError(gatewayPassword);
+    },
+  });
+  await assert.rejects(unavailable.create(spec), failure);
+  const invalidPassword = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword: () => "",
+  });
+  await assert.rejects(invalidPassword.create(spec), /invalid-input/);
+  assert.equal(
+    (await f.events()).some(({ args }) => args[0] === "create"),
+    false,
+  );
+
+  const runtime = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword: () => gatewayPassword,
+  });
+  await f.setMode("gateway-create-failure");
+  await assert.rejects(runtime.create(spec), failure);
+  await assertCleanup(f);
+});
+
+test("destroy samples before removal and continues after CLI or parser failure", async (t) => {
+  const f = await fixture(t);
+  for (const mode of [
+    "normal",
+    "metrics-failure",
+    "metrics-malformed",
+    "metrics-oversized",
+  ]) {
+    const handle = await f.runtime.create({});
+    await f.setMode(mode);
+    assert.equal(f.runtime.finalResourceSample(handle), null);
+    await Promise.all([f.runtime.destroy(handle), f.runtime.destroy(handle)]);
+    assert.deepEqual(
+      (await f.events()).slice(-2).map(({ args }) => args),
+      [
+        ["metrics", handle.id, "--format", "json"],
+        ["rm", "--force", handle.id],
+      ],
+    );
+    assert.deepEqual(
+      f.runtime.finalResourceSample(handle),
+      mode === "normal" ? { vcpuTimeNs: 123, memoryBytes: 456 } : null,
+    );
+    assert.equal(f.runtime.finalResourceSample(handle), null);
+    assert.equal(await f.runtime.sampleResources(handle), null);
+    await f.setMode("normal");
+  }
+  await assertCleanup(f, 4);
 });
 
 test("one runtime binds its single credential to at most one provider", () => {
