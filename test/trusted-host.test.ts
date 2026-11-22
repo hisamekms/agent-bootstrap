@@ -515,7 +515,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
   assert.deepEqual(calls, ["create"]);
 });
 
-test("a new audit database uses schema 4 and records provider egress", async (t) => {
+test("a new audit database uses schema 5 and records provider egress", async (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   const id = randomUUID();
@@ -541,7 +541,7 @@ test("a new audit database uses schema 4 and records provider egress", async (t)
       encoding: "utf8",
     },
   );
-  if (version.status === 0) assert.equal(version.stdout.trim(), "4");
+  if (version.status === 0) assert.equal(version.stdout.trim(), "5");
 });
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
