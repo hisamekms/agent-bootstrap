@@ -4,11 +4,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isAbsolute, join } from "node:path";
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { SqliteAudit } from "../../src/audit.ts";
 import {
+  boundedLines,
   CodexAppServerCoordinator,
   type JsonlChannel,
 } from "../../src/codex-app-server.ts";
@@ -40,7 +40,14 @@ const msbPath = await new Promise<string>((resolve, reject) =>
   ),
 );
 
-const provider = { requests: 0, followUps: 0, calls: [] as string[] };
+const provider = {
+  requests: 0,
+  followUps: 0,
+  calls: [] as string[],
+  tools: [] as string[],
+  /** "native" makes the model call Codex's own clock.sleep tool. */
+  mode: "router" as "router" | "native",
+};
 const server = createServer(async (request, response) => {
   if (request.method !== "POST" || request.url !== "/v1/responses") {
     response.writeHead(404).end();
@@ -50,14 +57,46 @@ const server = createServer(async (request, response) => {
   for await (const chunk of request) chunks.push(chunk);
   const body = Buffer.concat(chunks).toString();
   provider.requests++;
+  try {
+    type Offered = {
+      type?: string;
+      name?: string;
+      description?: string;
+      tools?: Offered[];
+    };
+    const parsed = JSON.parse(body) as {
+      tools?: Offered[];
+      input?: { type?: string; tools?: Offered[] }[];
+    };
+    const visit = (items: Offered[] | undefined, prefix: string) => {
+      for (const item of items ?? []) {
+        const label = `${prefix}${item.name ?? `<${item.type}>`}`;
+        if (item.tools) visit(item.tools, `${label}.`);
+        else if (!provider.tools.includes(label)) provider.tools.push(label);
+        // Code mode lists its nested tools in the description.
+        for (const [, nested] of (item.description ?? "").matchAll(
+          /^### `([^`]+)`/gm,
+        ))
+          if (!provider.tools.includes(`${label}>${nested}`))
+            provider.tools.push(`${label}>${nested}`);
+      }
+    };
+    visit(parsed.tools, "");
+    for (const entry of parsed.input ?? [])
+      if (entry.type === "additional_tools") visit(entry.tools, "");
+  } catch {
+    provider.tools.push("<unparsed>");
+  }
   const id = `mock-${provider.requests}`;
   const followUp = body.includes("function_call_output");
   // Decide like a model would: from the host-provided state in the prompt.
   const call = followUp
     ? undefined
-    : /\\"role\\": \\"Worker\\",\\n\s*\\"id\\"/.test(body)
-      ? { name: "requestIntegration", arguments: { key: "ship" } }
-      : { name: "delegate", arguments: { key: "change", role: "Worker" } };
+    : provider.mode === "native"
+      ? { name: "sleep", arguments: { duration_ms: 10 } }
+      : /\\"role\\": \\"Worker\\",\\n\s*\\"id\\"/.test(body)
+        ? { name: "requestIntegration", arguments: { key: "ship" } }
+        : { name: "delegate", arguments: { key: "change", role: "Worker" } };
   if (followUp) provider.followUps++;
   if (call) provider.calls.push(call.name);
   const events = [
@@ -69,6 +108,7 @@ const server = createServer(async (request, response) => {
             type: "function_call",
             call_id: `call-${provider.requests}`,
             name: call.name,
+            ...(call.name === "sleep" ? { namespace: "clock" } : {}),
             arguments: JSON.stringify(call.arguments),
           }
         : {
@@ -111,8 +151,24 @@ const cleanups: Promise<unknown>[] = [];
 
 /** Spike-only streamed transport. The product port has no streaming exec yet,
  * so these Coordinator VMs are not in the SQLite sandbox audit. */
+const remove = (name: string) =>
+  msb(msbPath, ["rm", "--force", name], {
+    env,
+    timeout: 15_000,
+    killSignal: "SIGKILL",
+  }).catch(() => {});
+
 async function connect(id: string): Promise<JsonlChannel> {
   const name = `coord-${id.slice(0, 8)}`;
+  try {
+    return await open(name);
+  } catch (error) {
+    cleanups.push(remove(name));
+    throw error;
+  }
+}
+
+async function open(name: string): Promise<JsonlChannel> {
   await msb(
     msbPath,
     [
@@ -164,23 +220,19 @@ async function connect(id: string): Promise<JsonlChannel> {
   child.stdin.on("error", () => {});
   child.stderr.resume();
   let closed = false;
+  // A spawn failure ends stdout, so the adapter sees a closed channel.
+  child.on("error", () => child.stdout.destroy());
   return {
     send(line) {
       if (!closed) child.stdin.write(`${line}\n`);
     },
-    lines: createInterface({ input: child.stdout, crlfDelay: Infinity }),
+    lines: boundedLines(child.stdout),
     close() {
       if (closed) return;
       closed = true;
       child.stdin.end();
       child.kill("SIGKILL");
-      cleanups.push(
-        msb(msbPath, ["rm", "--force", name], {
-          env,
-          timeout: 15_000,
-          killSignal: "SIGKILL",
-        }).catch(() => {}),
-      );
+      cleanups.push(remove(name));
     },
   };
 }
@@ -200,40 +252,42 @@ try {
     }),
   );
   const delegated: string[] = [];
-  const task = new CoordinatorTask(join(root, "tasks"), randomUUID(), {
-    step: modelStep(
-      new CodexAppServerCoordinator({ connect, timeoutMs: 90_000 }),
-    ),
-    async delegate(role, _control, id) {
-      assert.equal(role, "Worker");
-      const run = await host.runWorker(
-        {
-          sandbox: {
-            files: [{ path: "hello.txt", bytes: Buffer.from("hello\n") }],
-            maxLifetimeMs: 30_000,
+  const coordinator = () =>
+    new CoordinatorTask(join(root, "tasks"), randomUUID(), {
+      step: modelStep(
+        new CodexAppServerCoordinator({ connect, timeoutMs: 90_000 }),
+      ),
+      async delegate(role, _control, id) {
+        assert.equal(role, "Worker");
+        const run = await host.runWorker(
+          {
+            sandbox: {
+              files: [{ path: "hello.txt", bytes: Buffer.from("hello\n") }],
+              maxLifetimeMs: 30_000,
+            },
+            command: {
+              argv: [
+                "/bin/sh",
+                "-ec",
+                `printf 'hello from Worker\\n' > /workspace/hello.txt; printf '{"tool":"collect"}'`,
+              ],
+              timeoutMs: 8000,
+            },
+            collectPaths: ["hello.txt"],
           },
-          command: {
-            argv: [
-              "/bin/sh",
-              "-ec",
-              `printf 'hello from Worker\\n' > /workspace/hello.txt; printf '{"tool":"collect"}'`,
-            ],
-            timeoutMs: 8000,
-          },
-          collectPaths: ["hello.txt"],
-        },
-        id,
-      );
-      delegated.push(run.id);
-      return { id: run.id, outcome: run.outcome === "ok" ? "ok" : "failed" };
-    },
-    async reviewedCandidate() {
-      return null;
-    },
-    async decide() {
-      return "denied";
-    },
-  });
+          id,
+        );
+        delegated.push(run.id);
+        return { id: run.id, outcome: run.outcome === "ok" ? "ok" : "failed" };
+      },
+      async reviewedCandidate() {
+        return null;
+      },
+      async decide() {
+        return "denied";
+      },
+    });
+  const task = coordinator();
   await task.submit("Change the greeting in hello.txt.");
   const outcome = await task.run();
   const kinds = (await task.trace()).map((event) => event.kind);
@@ -263,6 +317,26 @@ try {
   ]);
   assert.deepEqual(provider.calls, ["delegate", "requestIntegration"]);
   assert.equal(worker.at(-1)?.outcome, "ok");
+  // Native tools that remain visible are recorded. Shell access must not be.
+  const shell = /(^|[.>])(exec_command|write_stdin|shell|unified_exec)$/;
+  assert.deepEqual(
+    provider.tools.filter((name) => shell.test(name)),
+    [],
+  );
+  // A native tool item voids the turn even though no approval is requested.
+  provider.mode = "native";
+  const native = coordinator();
+  await native.submit("Change the greeting in hello.txt.");
+  assert.equal(await native.run(), "denied");
+  assert.deepEqual(
+    (await native.trace()).map((event) => event.kind),
+    ["submitted", "turn.started", "turn.denied"],
+  );
+  assert.deepEqual(provider.calls, ["delegate", "requestIntegration", "sleep"]);
+  assert.equal(delegated.length, 1);
+  console.log(
+    "A native clock.sleep call voided its turn, and the router recorded turn.denied.",
+  );
   console.log(
     "Real app-server turns proposed one authorized delegation and one out-of-policy integration request; the router denied the second.",
   );

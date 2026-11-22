@@ -6,6 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { type AuditInput, SqliteAudit } from "../src/audit.ts";
 import {
+  boundedLines,
+  CODEX_COORDINATOR_CONFIG,
   CodexAppServerCoordinator,
   type JsonlChannel,
 } from "../src/codex-app-server.ts";
@@ -23,6 +25,9 @@ type Emission =
   | { call: string; arguments: unknown }
   | { request: string }
   | { message: string }
+  | { item: string }
+  | { raw: string }
+  | { close: true }
   | { hang: true };
 
 type Observed = {
@@ -46,10 +51,17 @@ function fakeAppServer(turns: Emission[][], observed: Observed) {
     let turnId = "";
     let pending = 0;
     let finished = false;
-    const emit = (message: object) => {
-      queue.push(JSON.stringify(message));
+    const emit = (message: object | string) => {
+      queue.push(
+        typeof message === "string" ? message : JSON.stringify(message),
+      );
       wake?.();
     };
+    const started = (type: string) =>
+      emit({
+        method: "item/started",
+        params: { threadId, turnId, item: { type, id: `item-${next++}` } },
+      });
     const complete = (status: string) => {
       if (finished) return;
       finished = true;
@@ -61,7 +73,25 @@ function fakeAppServer(turns: Emission[][], observed: Observed) {
     const play = () => {
       for (const step of script) {
         if ("hang" in step) return;
-        if ("message" in step) continue;
+        if ("close" in step) {
+          closed = true;
+          wake?.();
+          return;
+        }
+        if ("raw" in step) {
+          emit(step.raw);
+          continue;
+        }
+        if ("message" in step) {
+          started("agentMessage");
+          continue;
+        }
+        // A native item that Codex runs without any approval request.
+        if ("item" in step) {
+          started(step.item);
+          continue;
+        }
+        if ("call" in step) started("dynamicToolCall");
         pending++;
         if ("request" in step)
           emit({
@@ -96,6 +126,7 @@ function fakeAppServer(turns: Emission[][], observed: Observed) {
           );
           assert.equal(message.params.sandbox, "read-only");
           assert.equal(message.params.approvalPolicy, "never");
+          assert.deepEqual(message.params.config, CODEX_COORDINATOR_CONFIG);
           threadId = randomUUID();
           emit({ id: message.id, result: { thread: { id: threadId } } });
         } else if (message.method === "turn/start") {
@@ -338,4 +369,88 @@ test("encoding keeps the router as the only authority", () => {
     arguments: [1],
     tool: "push",
   });
+});
+
+test("a native tool item voids the turn even without an approval request", async (t) => {
+  for (const item of [
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "collabAgentToolCall",
+    "webSearch",
+    "imageView",
+    "sleep",
+  ]) {
+    const { task, delegated } = await fixture(t, [
+      [
+        { item },
+        { call: "delegate", arguments: { key: "change", role: "Worker" } },
+      ],
+    ]);
+    assert.equal(await task.run(), "denied", item);
+    assert.equal((await kinds(task)).at(-1), "turn.denied");
+    assert.equal(delegated.length, 0);
+  }
+});
+
+test("malformed, oversized or truncated app-server output stops the turn", async (t) => {
+  for (const [turn, code] of [
+    [[{ raw: "not json" }], /protocol/],
+    [[{ raw: "[1]" }], /protocol/],
+    [[{ raw: '{"id":2,"result":{"turn":{"id":"again"}}}' }], /protocol/],
+    [[{ close: true }], /closed/],
+  ] satisfies [Emission[], RegExp][]) {
+    const { task, reopen, delegated } = await fixture(t, [turn]);
+    await assert.rejects(task.run(), code);
+    assert.equal(await reopen().run(), "uncertain");
+    assert.equal(delegated.length, 0);
+  }
+  const lines = async (chunks: string[], max: number) => {
+    const out: string[] = [];
+    for await (const line of boundedLines(
+      (async function* () {
+        yield* chunks;
+      })(),
+      max,
+    ))
+      out.push(line);
+    return out;
+  };
+  assert.deepEqual(await lines(["ab\r\nc", "d\n", "e"], 4), ["ab", "cd", "e"]);
+  await assert.rejects(lines(["abc", "de"], 4), /limit/);
+  await assert.rejects(lines(["abcde\n"], 4), /limit/);
+});
+
+test("a failed or slow connection reports a fixed error and closes late channels", async () => {
+  const input = { prompt: "fixture", tools: COORDINATOR_TOOLS };
+  await assert.rejects(
+    new CodexAppServerCoordinator({
+      async connect() {
+        throw new Error("fixture-private-detail");
+      },
+      timeoutMs: 1000,
+    }).turn(input, randomUUID()),
+    (error: Error) =>
+      /Codex app-server: connect/.test(error.message) &&
+      !error.message.includes("fixture-private-detail"),
+  );
+  let closedLate = false;
+  await assert.rejects(
+    new CodexAppServerCoordinator({
+      async connect() {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return {
+          send() {},
+          lines: (async function* () {})(),
+          close() {
+            closedLate = true;
+          },
+        };
+      },
+      timeoutMs: 20,
+    }).turn(input, randomUUID()),
+    /timed-out/,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.ok(closedLate);
 });
