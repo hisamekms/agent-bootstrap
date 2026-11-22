@@ -17,6 +17,26 @@ export const DEBIAN_TRIXIE = {
   reference:
     "docker.io/library/debian@sha256:24a01011d10eba3a023bc8585b9650b8b29021240d4217c05b905e09ef4a5232",
   snapshot: "20261120T000000Z",
+  inRelease: [
+    {
+      archive: "debian",
+      suite: "trixie",
+      sha256:
+        "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+    },
+    {
+      archive: "debian",
+      suite: "trixie-updates",
+      sha256:
+        "6f57bff7c8bf51425b0d654b57a93a8cf83f07a6a5d6116ee766f4612336c642",
+    },
+    {
+      archive: "debian-security",
+      suite: "trixie-security",
+      sha256:
+        "d0b3748b4eb57be9fe9c58b867fe6f1634863313af007d47767658a0fd7abd90",
+    },
+  ],
   egress: "snapshot.debian.org:80",
 } as const;
 
@@ -372,6 +392,7 @@ export function recipeDigest(name: string): string {
           kind: recipe.base.kind,
           base: recipe.base.reference,
           snapshot: recipe.base.snapshot,
+          inRelease: recipe.base.inRelease,
           egress: recipe.base.egress,
           apt: aptPackages(name),
           setup: setupsOf(recipe),
@@ -409,7 +430,12 @@ const TOP_LEVEL_LOOP = [
 ];
 
 function debianBuildScript(recipe: DebianRecipe, name: string): string {
-  const { snapshot } = recipe.base;
+  const { snapshot, inRelease } = recipe.base;
+  const lists = "/var/lib/apt/lists";
+  const releases = inRelease.map(({ archive, suite, sha256 }) => ({
+    path: `${lists}/snapshot.debian.org_archive_${archive}_${snapshot}_dists_${suite}_InRelease`,
+    sha256,
+  }));
   const keyring = "/usr/share/keyrings/debian-archive-keyring.gpg";
   const sources = [
     "Types: deb",
@@ -433,6 +459,17 @@ function debianBuildScript(recipe: DebianRecipe, name: string): string {
     // Snapshot Release files are old by design; their signatures still apply.
     `printf 'Acquire::Check-Valid-Until "false";\\n' > /etc/apt/apt.conf.d/99snapshot`,
     "apt-get update >/dev/null",
+    // Signatures alone would still allow replay of older snapshot metadata.
+    "printf '%s  %s\\n' \\",
+    ...releases.map(({ path, sha256 }) => `  '${sha256}' '${path}' \\`),
+    "  | sha256sum -c -",
+    `for release in ${lists}/*Release ${lists}/.*Release; do`,
+    '  [ -e "$release" ] || [ -L "$release" ] || continue',
+    '  case "$release" in',
+    `    ${releases.map(({ path }) => `'${path}'`).join("|")}) ;;`,
+    '    *) printf "Unexpected apt release file: %s\\n" "$release" >&2; exit 1 ;;',
+    "  esac",
+    "done",
     `DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates ${aptPackages(name).join(" ")} >/dev/null`,
     ...setupsOf(recipe),
     // Cleanup for determinism. The snapshot sources stay: they record where
@@ -484,6 +521,7 @@ export function buildNetRules(name: string): string[] {
   const { base } = recipeFor(name);
   if (base.kind === "alpine") return [];
   const [host, port] = base.egress.split(":");
+  // The allow@dns rule is unscoped and permits queries for any name.
   return ["allow@dns", `allow@${host}:tcp:${port}`];
 }
 

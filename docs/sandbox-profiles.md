@@ -205,11 +205,13 @@ A recipe has a base kind. `alpine` is the flow above. `debian-snapshot`
 installs with apt from a fixed `snapshot.debian.org` timestamp
 (`20261120T000000Z`) instead of host-pinned files. Features list apt package
 names only. The recipe digest covers the base reference, the timestamp, the
-sorted apt names, the setup scripts and the limits.
+three `InRelease` SHA-256 pins, the sorted apt names, the setup scripts and the
+limits.
 
 1. **Build VM.** Started from the pinned
    `debian@sha256:24a01011…` with `--no-net`, `allow@dns`,
-   `allow@snapshot.debian.org:tcp:80`, 2048 MiB and 2 CPUs. No other egress.
+   `allow@snapshot.debian.org:tcp:80`, 2048 MiB and 2 CPUs. DNS queries are
+   unscoped. TCP egress is limited to the snapshot host on port 80.
 2. **Sources.** The script removes the stock `debian.sources`, writes a
    deb822 `snapshot.sources` (`debian` suites `trixie trixie-updates` and
    `debian-security` suite `trixie-security`, both at the timestamp) with
@@ -217,9 +219,13 @@ sorted apt names, the setup scripts and the limits.
    `Acquire::Check-Valid-Until "false"`, since snapshot Release files have
    expired. Signatures are still checked: never `[trusted=yes]` or
    `--allow-unauthenticated`.
-3. **Install.** `apt-get install --no-install-recommends` of the feature
-   packages plus `ca-certificates`. Then the setup scripts: the Debian
-   `agent-bootstrap-postgres` (binaries in `/usr/lib/postgresql/17/bin`; the
+3. **Install.** After `apt-get update`, `sha256sum -c` verifies the three pinned
+   `InRelease` files to prevent replay of older signed snapshots. A missing
+   file, a hash mismatch, or extra release metadata in the apt lists directory
+   stops the build. The script then runs `apt-get install` with
+   `--no-install-recommends` for the feature packages plus `ca-certificates`.
+   The setup scripts add the Debian `agent-bootstrap-postgres` helper
+   (binaries in `/usr/lib/postgresql/17/bin`; the
    random cluster the package creates is dropped), and
    `agent-bootstrap-chromium` (`chromium --headless --no-sandbox
 --disable-gpu`) with `/etc/profile.d/agent-bootstrap-browser.sh` setting

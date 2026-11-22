@@ -249,6 +249,35 @@ describe("browser recipe (Debian snapshot)", () => {
     assert.ok(!script.includes("apk "));
   });
 
+  test("build script verifies exactly the pinned InRelease files before installing", () => {
+    const lines = BUILD_SCRIPT("browser").split("\n");
+    const update = lines.findIndex((line) => line.startsWith("apt-get update"));
+    const check = lines.indexOf("  | sha256sum -c -");
+    const install = lines.findIndex((line) => line.includes("apt-get install"));
+    const lists = "/var/lib/apt/lists/snapshot.debian.org_archive";
+    const ts = DEBIAN_TRIXIE.snapshot;
+    assert.ok(update >= 0 && update < check && check < install);
+    assert.deepEqual(lines.slice(update + 1, check), [
+      "printf '%s  %s\\n' \\",
+      `  '0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675' '${lists}_debian_${ts}_dists_trixie_InRelease' \\`,
+      `  '6f57bff7c8bf51425b0d654b57a93a8cf83f07a6a5d6116ee766f4612336c642' '${lists}_debian_${ts}_dists_trixie-updates_InRelease' \\`,
+      `  'd0b3748b4eb57be9fe9c58b867fe6f1634863313af007d47767658a0fd7abd90' '${lists}_debian-security_${ts}_dists_trixie-security_InRelease' \\`,
+    ]);
+  });
+
+  test("the browser recipe digest changes when an InRelease pin changes", () => {
+    const first = recipeDigest("browser");
+    const release = DEBIAN_TRIXIE.inRelease[0] as { sha256: string };
+    const saved = release.sha256;
+    release.sha256 = "0".repeat(64);
+    try {
+      assert.notEqual(recipeDigest("browser"), first);
+    } finally {
+      release.sha256 = saved;
+    }
+    assert.equal(recipeDigest("browser"), first);
+  });
+
   test("egress is limited to DNS and the snapshot host", () => {
     assert.deepEqual(buildNetRules("browser"), [
       "allow@dns",
