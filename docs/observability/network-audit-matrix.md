@@ -26,7 +26,8 @@ decision recording. SOCKS and DNS TCP accept refusals at capacity or during
 quarantine, disconnects before a decision is recorded, DNS queries over the
 in-flight cap, malformed DNS queries or qnames that fail letter/digit/hyphen
 hostname validation, and DNS TCP framing errors may leave no per-attempt
-record. A parallel task adds aggregate counts for these gateway cases.
+record. The gateway sends aggregate refusal counts to runtime observers,
+including telemetry. The counts describe volume and are absent from the audit.
 Upstream TCP connects and DNS policy replies still require a durable decision.
 
 Status legend:

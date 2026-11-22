@@ -266,8 +266,9 @@ The guarantees are:
   or during quarantine, client disconnects before a decision is recorded,
   DNS queries over the in-flight cap, malformed queries or qnames that
   fail letter/digit/hyphen hostname validation, and DNS-over-TCP framing
-  errors. A parallel task adds aggregate counts for these gateway cases.
-  Those counts provide visibility into volume only.
+  errors. The gateway sends aggregate refusal counts to runtime observers,
+  including telemetry. Those counts describe volume and are absent from
+  the audit.
 - There is no visibility inside allowed connections: TLS bodies, HTTP
   methods and paths, headers, or DoH inside an allowed host. Exfiltration to
   an allowlisted destination is possible.

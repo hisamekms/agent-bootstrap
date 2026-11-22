@@ -1,6 +1,6 @@
 # Microsandbox runtime
 
-## Implementation plan
+## M1 implementation plan
 
 The bootstrap currently has provider-neutral agent contracts, credential-free
 unit tests, and local Microsandbox and Codex spikes. Bun 1.4.4 is the package
@@ -35,11 +35,11 @@ instance that issued them. Guest commands and artifact bytes are untrusted.
 CLI path, a dedicated `MSB_HOME`, a private staging root, and a cached
 digest-pinned image. It verifies the CLI version and launches a local
 Microsandbox with `--pull never --no-net`. It supplies a minimal subprocess
-environment and stages a per-VM guest-local copy at `/workspace`. There are
-no host directory mounts, devices, credential sources, published ports, or
-network exceptions. Host Git state and integration remain host-owned. The
-host-created staging directory and MSB_HOME are trusted inputs and must
-remain inaccessible to guests and unauthorized local processes.
+environment and stages a per-VM guest-local copy at `/workspace`. The offline
+M1 path uses no host directory mounts, devices, credential sources,
+published ports or network exceptions. The host owns Git state and
+integration. The staging directory and `MSB_HOME` are trusted inputs and
+must remain inaccessible to guests and unauthorized local processes.
 
 Import and collection are limited to 64 files, 256 KiB per file, and 1 MiB
 total each. Exec accepts an argument vector and a bounded timeout. A
@@ -59,6 +59,26 @@ path checks or fabricate output. Treat returned bytes as guest-controlled
 evidence. CLI stdout and stderr can contain guest data or runtime
 diagnostics. The adapter returns them to the trusted caller, and errors
 contain fixed outcome codes. Keep raw streams out of audit logs.
+
+## Audit-required networking
+
+`createObservedHost` composes the runtime with writable SQLite v5 in
+required mode. It opens a per-sandbox host gateway for invocations with a
+provider binding or mapped host service. Microsandbox 0.7.16 applies the
+pinned rule set for that gateway.
+Policy-admitted non-DNS TCP reaches the gateway through authenticated SOCKS5.
+The guest's configured DNS resolver reaches the gateway's UDP and TCP DNS
+listeners. The gateway commits its decisions before upstream connects or
+DNS policy replies. A host fixture service uses a gateway mapping in required
+mode. Direct `hostTcpPort` requires disabled mode and per-run opt-in.
+
+The Microsandbox netstack and `--proxy` are trusted for enforcement. The
+host group, foreign resolvers, DoT, UDP outside gateway DNS, ICMP and raw IP
+are blocked before the gateway and have no individual audit record. The
+host samples resources with `msb metrics`, including an attempt at a final
+sample before removal. Missing samples mean unavailable. See the
+[v0.1 guarantees](observability/guarantees.md) and
+[OBS-10 evidence](observability/phase1-evidence.md).
 
 ## Smoke test
 
