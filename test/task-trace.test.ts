@@ -47,6 +47,26 @@ function readTrace(...args: string[]) {
   return JSON.parse(result.stdout);
 }
 
+/** Equality of audit files, with a precise diagnostic on mismatch. */
+function assertSameAudit(
+  actual: (Buffer | null)[],
+  expected: (Buffer | null)[],
+): void {
+  const describe = (files: (Buffer | null)[]) =>
+    files.map((file, i) => `${["db", "wal"][i]}=${file?.length ?? "absent"}`);
+  const firstDiff = actual.map((file, i) => {
+    const other = expected[i];
+    if (!file || !other) return file === other ? -1 : 0;
+    const n = Math.min(file.length, other.length);
+    for (let k = 0; k < n; k++) if (file[k] !== other[k]) return k;
+    return file.length === other.length ? -1 : n;
+  });
+  assert.ok(
+    firstDiff.every((offset) => offset === -1),
+    `audit files changed: before ${describe(expected)} after ${describe(actual)} first differing offsets ${firstDiff}`,
+  );
+}
+
 function auditBytes(filename: string) {
   return ["", "-wal"].map((suffix) => {
     const path = filename + suffix;
@@ -221,7 +241,7 @@ test("invocation and task views show the same v5 evidence and keep connection ou
     readTrace(filename, delegation.invocation).executionContexts[0].executionId,
     delegation.invocation,
   );
-  assert.deepEqual(auditBytes(filename), before);
+  assertSameAudit(auditBytes(filename), before);
 });
 
 test("the trace reads v4 without upgrading it and reports missing invocations", (t) => {
@@ -256,7 +276,7 @@ test("the trace reads v4 without upgrading it and reports missing invocations", 
   const missing = runTrace(filename, randomUUID());
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /Invocation was not found/);
-  assert.deepEqual(auditBytes(filename), before);
+  assertSameAudit(auditBytes(filename), before);
   const audit = new SqliteAudit(filename, { readonly: true });
   try {
     assert.equal(audit.schemaVersion, 4);
