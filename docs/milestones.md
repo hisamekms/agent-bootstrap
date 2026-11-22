@@ -587,6 +587,288 @@ Known gaps:
   them.
 - **Note files are kept forever.** There is no retention rule yet.
 
+## M5 dogfood
+
+### Preparation
+
+[`spike/m5/dogfood.ts`](../spike/m5/dogfood.ts) runs one small local change
+with model-driven roles, all using one model (see the model selection
+notes below):
+
+- **Coordinator** runs on the Codex app-server.
+- **Planner, Worker and Reviewer** run `codex exec` in their own VMs.
+- **Verification** is a fixed shell check.
+
+The task works on a disposable repository. It asks for the greeting in
+`hello.txt` to become a polite, formal English greeting on one line. The
+pieces are wired as follows:
+
+- **Worker.** It may run shell commands inside its VM
+  (`--dangerously-bypass-approvals-and-sandbox`, because the VM is the
+  sandbox), and must only edit `/workspace/hello.txt`.
+- **Reviewer.** It runs read-only with an output schema that requires
+  `review` and `notes`. Blank notes mean none.
+- **Human input.** Questions and approval go through `/dev/tty`. Approval
+  shows the pinned diff and requires typing the full candidate ID.
+- **Report.** At the end the run writes `report.json` with:
+  - elapsed time and Coordinator turns;
+  - delegations per role;
+  - replayed requests, failed turns and voided turns;
+  - reviews and revisions;
+  - human answers and decisions;
+  - Coordinator token usage from `thread/tokenUsage/updated`;
+  - the integration journal, per-invocation durations, the result and
+    known audit gaps.
+
+The run uses `gpt-5.5` because it is the only model in the Codex 0.170.0
+catalog without `tool_mode: code_mode_only`. Code mode needs a
+`codex-code-mode-host` that the guest does not have, so it fails closed. A
+code-mode Worker therefore could not edit files. With `gpt-5.5` and
+`CODEX_COORDINATOR_CONFIG`, the mock provider recorded these tools:
+
+- **Coordinator** saw only `request_user_input`, `apply_patch` and
+  `view_image` besides its own tools, with no code mode, collaboration or
+  shell tools.
+- **Worker** saw `exec_command`, `write_stdin`, `request_user_input`,
+  `apply_patch`, `view_image`, the goal tools and `tool_search`.
+
+A live provider may serve a different catalog, so the live run records
+what it actually saw.
+
+The product gains these pieces for it:
+
+- **Provider egress.** `SandboxSpec.provider` sets the host and the guest
+  placeholder variable. The Microsandbox adapter applies:
+  - `allow@dns` and `allow@<host>:tcp:443`;
+  - `--tls-intercept`;
+  - `--secret <ENV>:headers=authorization@<host>`;
+  - `--secret-violation-action block`.
+
+  The adapter's `CredentialProvider` passes the token only in the
+  environment of the `msb create` process and the VM supervisor that it
+  starts. It is never in argv, in other backend commands or in the guest. A canary run on 2026-11-22 showed where
+  it lives on the host. The long-lived `msb machine` supervisor of that VM
+  inherits it in its environment for the VM's lifetime, and it disappears
+  after destroy. No file under `MSB_HOME` contained the canary, and the
+  guest variable held only the placeholder.
+
+- **Allowed hosts and variable names.** The adapter accepts only hosts in
+  its configured `providerHosts` allowlist. The guest variable name must
+  match `AGENT_BOOTSTRAP_*`.
+- **Audit of the grant.** Before creating any sandbox that receives
+  provider egress, the trusted host records `provider.egress` as requested
+  and allowed. It closes the grant as `ok` exactly when no sandbox holds it
+  any more, meaning none was created or the sandbox was destroyed. This uses
+  audit schema version 3. Version 1 and 2 databases still open, but they
+  refuse this event, so the grant fails closed.
+- **Failure handling in the runner.** Only an ineligible Worker change
+  counts as a failed delegation; audit, journal and unexpected errors stop
+  the run. The runner exits non-zero unless the task finishes `done`.
+- **Per-role sandbox options.** `ReviewedIntegration` passes tools and
+  egress to Worker and Reviewer VMs, but not to verification. Model-driven
+  roles get a 300-second VM lifetime and a 240-second command limit.
+- **Adapter options.** The Codex adapter accepts a model and reports token
+  usage.
+- **Replay limit.** The router now allows one replay per request key and
+  denies a repeat. A fixture run showed why: a model that kept resending
+  the same delegation key had used about 40 turns before the event limit
+  stopped it.
+
+On 2026-11-22, `--fixture` mode ran the whole flow with a loopback mock
+provider, real Codex and real VMs in about 18 seconds:
+
+- **Coordinator:** three turns: delegate Worker, delegate Reviewer, then
+  request integration.
+- **Worker:** `codex exec` changed the file through `exec_command`.
+- **Reviewer:** `codex exec` returned `pass` through the output schema.
+- **Approval:** one automatic approval in fixture mode.
+- **Integration:** verification passed and integration completed. The
+  repository head contains the changed file.
+
+All six VM invocations finished `ok` in the audit. In the report,
+verification appears with the Reviewer role because it uses the same host
+entry point.
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  bun spike/m5/dogfood.ts --fixture /absolute/path/to/msb /absolute/path/to/codex
+```
+
+The live run needs explicit operator opt-in and the browser consent flow.
+Run it from a terminal; the launcher passes the single-run token on stdin:
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 \
+  /absolute/path/to/msb /absolute/path/to/codex
+```
+
+### Model selection after the first live attempts
+
+On 2026-11-22, the first live attempt stopped after one Coordinator turn of
+about 5 seconds, with no usage. The adapter then recorded only `no-call`
+because it did not look at the turn status. It now records a failed turn
+as `turn-failed/<category>`, using fixed Codex error names and HTTP
+statuses only. The runner also exits after writing its report; before
+this fix an open `/dev/tty` read kept it alive.
+
+The second attempt recorded `turn-failed/modelNotFound`: the ChatGPT plan
+route does not serve `gpt-5.5`. The run therefore uses `gpt-6.2-sol`,
+which completed the M1 subscription turn. Its catalog entry is
+`code_mode_only`, so the runner works around code mode as follows:
+
+1. It extracts the catalog embedded in the pinned Codex binary.
+2. It sets `tool_mode` to `null` for that one model.
+3. It passes the result as a digest-checked tool, `/tmp/models.json`, with
+   `model_catalog_json`.
+
+With this override, the mock provider recorded the following:
+
+- **Coordinator** saw its own tools directly, plus `request_user_input`,
+  `apply_patch`, `view_image`, the `clock` tools and the `collaboration`
+  tools.
+- **Worker** saw `exec_command`, `write_stdin` and `apply_patch`, among
+  others.
+
+The fixture run completed `done`. Whether the provider accepts this tool
+layout for `gpt-6.2-sol` is what the next live run shows.
+
+The third attempt failed after 40 seconds with an unclassified error. The
+adapter now records every `CodexErrorInfo` name from the 0.170.0 schema, as
+well as `none` and `unknown`.
+
+The fourth attempt, on 2026-11-22, was the first in which real models did
+the work. It took 58 seconds.
+
+1. **Worker.** The Coordinator delegated to Worker, which changed the line
+   to `Good day, and welcome.` (13 seconds).
+2. **Reviewer.** It answered `revise` (10 seconds). Its notes said that
+   Codex's own sandbox could not start because bubblewrap is unavailable,
+   so it could not read the files.
+3. **Coordinator.** It then called `getInvocation`, replayed it once, and
+   was denied by the replay limit. Its prompt had not explained that a
+   failed Reviewer means a revision is needed, nor that queries return
+   nothing new.
+4. **Usage.** Only one of five Coordinator turns reported usage before its
+   interrupt: 8,979 input and 52 output tokens.
+
+The fixes are as follows:
+
+- **Planner and Reviewer prompts.** The guest shell inlines bounded file
+  contents into these prompts, between data markers.
+- **No Codex sandbox (later reverted).** In the live run below, Planner and
+  Reviewer ran without Codex's own sandbox, as Worker does. The later
+  review changes put them back in Codex's read-only sandbox (see below).
+- **Coordinator instructions.** They now explain invocation outcomes, the
+  revision step and that queries add nothing.
+
+Known risks and gaps before the live run:
+
+- **The token is a bearer credential that the guest can use.** Every
+  model-driven VM can reach `api.openai.com:443`, and the backend
+  substitutes the token into any request to that host. A Worker shell
+  command or a prompt-injected model could therefore make other API
+  requests with the run's credential. Method, path and request count are
+  not enforced, and provider requests are not audited one by one.
+- **The token is not refreshed.** It must stay valid for at least 20
+  minutes when the run starts. After the run, the launcher revokes the
+  refresh token, but the access token stays valid until it expires.
+- **Same-user processes can read the token.** While a credentialed VM is
+  alive, its `msb machine` process holds the token in its environment, so
+  a process running as the same user can read it with `ps eww`.
+- **Guest egress has further side channels.** `allow@dns` lets the guest
+  send whatever data it can see out through DNS queries. Within the
+  account, the guest can also create lasting objects, such as files or
+  stored responses, and use up plan quota, with no request cap. An allowed
+  upstream could also reflect the substituted header back to the guest.
+- **Some usage is not collected.** Planner, Worker and Reviewer token usage
+  are missing; only the Coordinator reports usage.
+- **Native tools are detected, not prevented.** Native tools in the
+  Coordinator are still only detected, and Worker tool calls inside its VM
+  are not audited individually.
+
+### Live run result
+
+On 2026-11-22, the sixth live attempt completed M5. It used task
+`245ae0b7-eb77-4965-9575-71b8186a67f8`, model `gpt-6.2-sol` with the
+derived catalog, and a ChatGPT plan OAuth token from the browser consent
+flow.
+
+| Measure             | Result                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| Outcome             | `done`. The disposable repository's `main` holds `Good day. It is a pleasure to meet you.`    |
+| Elapsed time        | 84.5 seconds, including about 40 seconds waiting for the operator's approval                  |
+| Coordinator turns   | 3: delegate Worker, delegate Reviewer, request integration                                    |
+| Delegations         | Planner 0, Worker 1, Reviewer 1                                                               |
+| Retries             | No replayed requests, failed turns or voided turns                                            |
+| Review iterations   | One review (`pass`, with notes) and no revisions                                              |
+| Human interventions | One approval; no questions                                                                    |
+| Coordinator usage   | Only one of three turns reported usage before its interrupt: 9,090 input and 71 output tokens |
+| Invocation times    | Coordinator 6.5–7.2 s per turn, Worker 15.9 s, Reviewer 6.2 s, verification 0.5 s             |
+
+The task trace links all six invocations:
+
+- **Model-driven roles.** Each Coordinator, Worker and Reviewer invocation
+  shows `sandbox.create`, `sandbox.exec` and `sandbox.destroy` finished
+  `ok`, plus a `provider.egress` grant closed `ok`. The Worker also shows
+  `sandbox.collect`.
+- **Verification.** It received no grant.
+- **Proposals.** The three stored proposals are the encoded `delegate`,
+  `delegate` and `requestIntegration` actions.
+
+The earlier attempts and their fixes are described above. The fifth
+attempt reached approval, but the operator's input did not match exactly
+and was recorded as a rejection. The approval prompt now trims input,
+rejects only on an explicit `reject`, and asks again up to three times. The
+launcher can now open the consent URL with Enter.
+
+Audit gaps and open points from this run:
+
+- **Most usage is missing.** Planner, Worker and Reviewer usage was not
+  collected, and Coordinator usage covers only one turn.
+- **Account usage was not checked.** ChatGPT's App limits view was not
+  confirmed for this run.
+- **Some activity is not audited in detail.** Provider requests are not
+  audited one by one, and native tool calls inside the Worker VM are not
+  audited individually.
+- **Native tools were visible.** The Coordinator could see the
+  `collaboration` and `clock` tools, which the catalog override had
+  enabled; none were used.
+- **The revision path is untested live.** It has not yet run in a live
+  attempt.
+
+### Changes after the live run review
+
+A security review of the changes made during the live attempts led to
+these follow-up changes. They were checked in fixture mode but have not
+run live.
+
+- **Codex sandbox restored.** Planner and Reviewer are back in Codex's
+  read-only sandbox. Their full inputs are inlined, so they need no shell.
+  Because that sandbox cannot start in the guest, any shell command the
+  model tries fails closed. This was observed with the pinned image and
+  Codex 0.170.0, where Codex's bundled bubblewrap cannot start. The guest
+  script checks that no `bwrap` is on the image's `PATH`, so a different
+  image or Codex version needs this claim checked again.
+  - Only Worker can still run shell commands in a VM that has credentialed
+    egress.
+  - Reviewer still reads untrusted candidate text, so its verdict can be
+    steered by prompt injection. The operator's own review of the full
+    diff remains the independent check.
+- **Narrower catalog override.**
+  - The derived catalog entry now also clears
+    `experimental_supported_tools` and `multi_agent_version`.
+  - In fixture mode the Coordinator then sees only its own tools plus
+    `request_user_input`, `apply_patch` and `view_image`. This is the same
+    as the `gpt-5.5` layout, with no `collaboration` or `clock` tools.
+  - The derived catalog is pinned to SHA-256
+    `9a6ef910866167ed194b1374ff346256fa813fb46d768b9683d1ce61d60419b9`.
+- **Bounded, marked inputs.**
+  - Reviewer inputs over the inline limits, 6,000 bytes of diff or 2,000
+    bytes of source, are not reviewed partially; they become a concern.
+  - Data blocks are delimited with a random marker for each invocation.
+    The script stops if the marker is not 24 hexadecimal characters.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |

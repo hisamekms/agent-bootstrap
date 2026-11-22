@@ -10,6 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
 import {
   SandboxRuntimeError,
@@ -29,6 +30,11 @@ export interface MicrosandboxConfig {
   readonly home: string;
   readonly stagingRoot: string;
   readonly image: string;
+  /** Required only for specs with `provider`. Used on the host to pass the
+   * credential to the backend's TLS substitution at create time. */
+  readonly credentials?: CredentialProvider;
+  /** Exact provider hosts that specs may name. Default: none. */
+  readonly providerHosts?: readonly string[];
 }
 
 /** Conservative fixed bounds for this initial offline adapter. */
@@ -37,7 +43,7 @@ export const MICROSANDBOX_LIMITS = {
   fileBytes: 256 * 1024,
   workspaceBytes: 1024 * 1024,
   outputBytes: 1024 * 1024,
-  commandTimeoutMs: 60_000,
+  commandTimeoutMs: 240_000,
   defaultLifetimeMs: 120_000,
   maxLifetimeMs: 300_000,
   backendTimeoutMs: 15_000,
@@ -134,11 +140,17 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       !/^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:[a-f0-9]{64}$/.test(config.image)
     )
       invalid();
-    this.#config = { ...config };
+    this.#config = {
+      ...config,
+      ...(config.providerHosts
+        ? { providerHosts: Object.freeze([...config.providerHosts]) }
+        : {}),
+    };
   }
 
-  #env() {
+  #env(extra: Record<string, string> = {}) {
     return {
+      ...extra,
       PATH: "/usr/bin:/bin",
       MSB_HOME: this.#config.home,
       MSB_BACKEND: "local",
@@ -149,6 +161,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     args: readonly string[],
     timeoutMs: number,
     signal?: AbortSignal,
+    extraEnv?: Record<string, string>,
   ): Promise<ProcessResult> {
     if (signal?.aborted)
       return Promise.resolve({
@@ -172,7 +185,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         this.#config.binary,
         [...args],
         {
-          env: this.#env(),
+          env: this.#env(extraEnv),
           cwd: this.#config.home,
           encoding: "buffer",
           killSignal: "SIGKILL",
@@ -198,8 +211,16 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     });
   }
 
-  async #checked(args: readonly string[]): Promise<ProcessResult> {
-    const result = await this.#run(args, MICROSANDBOX_LIMITS.backendTimeoutMs);
+  async #checked(
+    args: readonly string[],
+    extraEnv?: Record<string, string>,
+  ): Promise<ProcessResult> {
+    const result = await this.#run(
+      args,
+      MICROSANDBOX_LIMITS.backendTimeoutMs,
+      undefined,
+      extraEnv,
+    );
     if (result.failure || result.code !== 0)
       throw new SandboxRuntimeError(result.failure ?? "backend-failure");
     return result;
@@ -242,6 +263,20 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const tools = checkTools(spec.tools ?? []);
     const port = spec.hostTcpPort;
     if (port !== undefined) boundedInteger(port, 65_535);
+    const provider = spec.provider ? { ...spec.provider } : undefined;
+    if (
+      provider &&
+      (port !== undefined ||
+        !this.#config.credentials ||
+        typeof provider.host !== "string" ||
+        !this.#config.providerHosts?.includes(provider.host) ||
+        !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+          provider.host,
+        ) ||
+        typeof provider.secretEnv !== "string" ||
+        !/^AGENT_BOOTSTRAP_[A-Z0-9_]{1,48}$/.test(provider.secretEnv))
+    )
+      invalid();
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
     if (fileGroups.flat().length > MICROSANDBOX_LIMITS.files) invalid();
     let total = 0;
@@ -307,7 +342,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         closed: false,
         removed: false,
       };
-      await this.#checked([
+      const createArgs = [
         "create",
         "--name",
         state.id,
@@ -318,6 +353,19 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         "never",
         "--no-net",
         ...(port !== undefined ? ["--net-rule", `allow@host:tcp:${port}`] : []),
+        ...(provider
+          ? [
+              "--net-rule",
+              "allow@dns",
+              "--net-rule",
+              `allow@${provider.host}:tcp:443`,
+              "--tls-intercept",
+              "--secret",
+              `${provider.secretEnv}:headers=authorization@${provider.host}`,
+              "--secret-violation-action",
+              "block",
+            ]
+          : []),
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
         "--copy-dir",
@@ -328,7 +376,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           `${staged[index]}:${tool.guestPath}`,
         ]),
         this.#config.image,
-      ]);
+      ];
+      // The credential reaches only the backend process environment.
+      const credentials = this.#config.credentials;
+      if (provider && credentials)
+        await credentials.withAccessToken((token) =>
+          this.#checked(createArgs, { [provider.secretEnv]: token }),
+        );
+      else await this.#checked(createArgs);
       const handle = Object.freeze({ id: state.id });
       this.#states.set(handle, state);
       return handle;

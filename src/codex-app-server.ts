@@ -23,6 +23,39 @@ export interface CodexCoordinatorOptions {
   open<T>(id: string, use: (channel: JsonlChannel) => Promise<T>): Promise<T>;
   /** Covers opening and the whole turn. */
   readonly timeoutMs: number;
+  /** Model slug for the thread. Default: the app-server's configured model. */
+  readonly model?: string;
+  /** Called with the thread's cumulative token totals, as validated integers. Each turn uses a fresh thread, so the last call per turn is that turn's usage. */
+  onUsage?(usage: TokenUsage): void;
+}
+
+export interface TokenUsage {
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+  readonly totalTokens: number;
+}
+
+function tokenUsage(params: unknown): TokenUsage | null {
+  const keys = [
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+  ] as const;
+  const values = keys.map((key) => field(params, "tokenUsage", "total", key));
+  if (
+    values.some(
+      (value) =>
+        typeof value !== "number" || !Number.isSafeInteger(value) || value < 0,
+    )
+  )
+    return null;
+  return Object.fromEntries(
+    keys.map((key, index) => [key, values[index]]),
+  ) as unknown as TokenUsage;
 }
 
 export const CODEX_LIMITS = {
@@ -149,6 +182,52 @@ function label(value: unknown, known: ReadonlySet<string>): string {
   return typeof value === "string" && known.has(value) ? value : "other";
 }
 
+/** A fixed label for a failed turn's Codex error category, with the HTTP
+ * status when Codex reports one. Never includes provider message text. */
+function turnFailure(info: unknown): string {
+  // CodexErrorInfo string variants in the Codex 0.170.0 schema.
+  const simple = [
+    "contextWindowExceeded",
+    "sessionBudgetExceeded",
+    "usageLimitExceeded",
+    "rateLimitExceeded",
+    "flexUnavailable",
+    "serverOverloaded",
+    "modelNotFound",
+    "policyCapacityUnavailable",
+    "cyberPolicy",
+    "misalignmentPolicyViolation",
+    "tooManyDenials",
+    "internalServerError",
+    "unauthorized",
+    "badRequest",
+    "threadRollbackFailed",
+    "sandboxError",
+    "inferenceHookDenied",
+    "other",
+  ];
+  if (info === null || info === undefined) return "none";
+  if (typeof info === "string") return simple.includes(info) ? info : "unknown";
+  for (const key of [
+    "httpConnectionFailed",
+    "responseStreamConnectionFailed",
+    "responseStreamDisconnected",
+    "responseTooManyFailedAttempts",
+    "activeTurnNotSteerable",
+  ]) {
+    const entry = field(info, key);
+    if (entry === undefined) continue;
+    const code = field(entry, "httpStatusCode");
+    return typeof code === "number" &&
+      Number.isInteger(code) &&
+      code >= 400 &&
+      code <= 599
+      ? `${key}/${code}`
+      : key;
+  }
+  return "unknown";
+}
+
 /** Keep host and adapter errors, which carry fixed diagnostics; replace
  * anything else with a fixed code. */
 function transportError(error: unknown, fallback: "closed" | "connect"): Error {
@@ -179,6 +258,11 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
   constructor(options: CodexCoordinatorOptions) {
     if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)
       throw new Error("Invalid Codex app-server timeout");
+    if (
+      options.model !== undefined &&
+      !/^[a-z0-9][a-z0-9._-]{0,80}$/.test(options.model)
+    )
+      throw new Error("Invalid Codex model");
     this.#options = options;
   }
 
@@ -304,6 +388,7 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
             id: 1,
             method: "thread/start",
             params: {
+              ...(this.#options.model ? { model: this.#options.model } : {}),
               cwd: "/tmp",
               ephemeral: true,
               sandbox: "read-only",
@@ -381,6 +466,14 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
         }
         continue;
       }
+      if (
+        method === "thread/tokenUsage/updated" &&
+        field(params, "threadId") === threadId
+      ) {
+        const usage = tokenUsage(params);
+        if (usage) this.#options.onUsage?.(usage);
+        continue;
+      }
       if (method === "item/started" || method === "item/completed") {
         const type = field(params, "item", "type");
         if (typeof type !== "string" || !allowedItems.has(type))
@@ -396,7 +489,13 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
           ? { call: null, reason: voided }
           : call
             ? { call }
-            : { call: null, reason: "no-call" };
+            : {
+                call: null,
+                reason:
+                  field(params, "turn", "status") === "failed"
+                    ? `turn-failed/${turnFailure(field(params, "turn", "error", "codexErrorInfo"))}`
+                    : "no-call",
+              };
     }
     throw new CodexAppServerError("closed");
   }

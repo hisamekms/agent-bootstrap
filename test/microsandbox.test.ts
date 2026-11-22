@@ -104,6 +104,21 @@ if (args[0] === '--version') {
   const runtime = new MicrosandboxRuntime({ binary, home, stagingRoot, image });
   return {
     runtime,
+    withCredentials: (token: string) =>
+      new MicrosandboxRuntime({
+        binary,
+        home,
+        stagingRoot,
+        image,
+        providerHosts: ["api.openai.com"],
+        credentials: {
+          async withAccessToken(consume) {
+            if (token === "throw")
+              throw new Error("fixture-credential-failure");
+            return consume(token);
+          },
+        },
+      }),
     home,
     stagingRoot,
     guests,
@@ -532,4 +547,58 @@ test("a session streams bounded lines, holds the handle busy and stops on close"
   flood.close();
   await flood.finished;
   await f.runtime.destroy(long);
+});
+
+test("provider egress passes the credential only to the create process", async (t) => {
+  const f = await fixture(t);
+  const token = "fixture-provider-token-value";
+  const runtime = f.withCredentials(token);
+  const env = "AGENT_BOOTSTRAP_TOKEN";
+  const provider = { host: "api.openai.com", secretEnv: env };
+  const handle = await runtime.create({ provider });
+  await runtime
+    .exec(handle, { argv: ["fixture-cat", "missing"], timeoutMs: 1000 })
+    .catch(() => {});
+  const events = await f.events();
+  const create = events.find(({ args }) => args[0] === "create");
+  assert.ok(create);
+  assert.match(
+    create.args.join(" "),
+    /--no-net --net-rule allow@dns --net-rule allow@api\.openai\.com:tcp:443 --tls-intercept --secret AGENT_BOOTSTRAP_TOKEN:headers=authorization@api\.openai\.com --secret-violation-action block /,
+  );
+  assert.ok(create.envKeys.includes(env));
+  for (const event of events.filter(({ args }) => args[0] !== "create"))
+    assert.ok(!event.envKeys.includes(env));
+  assert.doesNotMatch(JSON.stringify(events), /fixture-provider-token-value/);
+  await runtime.destroy(handle).catch(() => {});
+  // Without credentials and a host allowlist, provider egress is refused.
+  await assert.rejects(
+    f.runtime.create({ provider }),
+    (error: SandboxRuntimeError) => error.code === "invalid-input",
+  );
+  // A failing credential provider stops create with a fixed diagnostic.
+  await assert.rejects(
+    f.withCredentials("throw").create({ provider }),
+    (error: Error) =>
+      error instanceof SandboxRuntimeError &&
+      !error.message.includes("fixture-credential-failure"),
+  );
+  for (const bad of [
+    { host: "api.openai.com:443", secretEnv: env },
+    { host: "localhost", secretEnv: env },
+    { host: "metadata.internal", secretEnv: env },
+    { host: "chatgpt.com", secretEnv: env },
+    { host: "api.openai.com", secretEnv: "PATH" },
+    { host: "api.openai.com", secretEnv: "HTTPS_PROXY" },
+    { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_" },
+    { host: "api.openai.com", secretEnv: "agent_bootstrap_token" },
+  ])
+    await assert.rejects(
+      runtime.create({ provider: bad }),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
+  await assert.rejects(
+    runtime.create({ provider, hostTcpPort: 4242 }),
+    (error: SandboxRuntimeError) => error.code === "invalid-input",
+  );
 });

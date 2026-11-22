@@ -612,3 +612,85 @@ test("stored proposals escape bidirectional controls in the trace", async (t) =>
   assert.ok(joined.proposals[0]?.text?.includes("\\u202eWorker"));
   assert.ok(!joined.proposals[0]?.text?.includes("\u202e"));
 });
+
+test("a failed provider turn is voided with a fixed error category", async () => {
+  const lines = (turnStatus: object) => {
+    const queue: string[] = [];
+    let wake: (() => void) | undefined;
+    let closed = false;
+    const emit = (message: object) => {
+      queue.push(JSON.stringify(message));
+      wake?.();
+    };
+    return {
+      send(line: string) {
+        const message = JSON.parse(line);
+        if (message.method === "initialize") emit({ id: 0, result: {} });
+        if (message.method === "thread/start")
+          emit({ id: 1, result: { thread: { id: "thread" } } });
+        if (message.method === "turn/start") {
+          emit({ id: 2, result: { turn: { id: "turn" } } });
+          emit({
+            method: "turn/completed",
+            params: { threadId: "thread", turn: { id: "turn", ...turnStatus } },
+          });
+        }
+      },
+      lines: {
+        async *[Symbol.asyncIterator]() {
+          while (!closed) {
+            const line = queue.shift();
+            if (line !== undefined) yield line;
+            else await new Promise<void>((resolve) => (wake = resolve));
+          }
+        },
+      },
+      close() {
+        closed = true;
+        wake?.();
+      },
+    };
+  };
+  const reason = async (turn: object) => {
+    const result = await new CodexAppServerCoordinator({
+      ...direct(async () => lines(turn)),
+      timeoutMs: 1000,
+    }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID());
+    return result.call === null ? result.reason : "call";
+  };
+  assert.equal(
+    await reason({
+      status: "failed",
+      error: { codexErrorInfo: "unauthorized", message: "fixture-secret" },
+    }),
+    "turn-failed/unauthorized",
+  );
+  assert.equal(
+    await reason({
+      status: "failed",
+      error: {
+        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 403 } },
+      },
+    }),
+    "turn-failed/httpConnectionFailed/403",
+  );
+  assert.equal(
+    await reason({
+      status: "failed",
+      error: { codexErrorInfo: "fixture-guest-text" },
+    }),
+    "turn-failed/unknown",
+  );
+  assert.equal(
+    await reason({
+      status: "failed",
+      error: { codexErrorInfo: "serverOverloaded" },
+    }),
+    "turn-failed/serverOverloaded",
+  );
+  assert.equal(
+    await reason({ status: "failed", error: { codexErrorInfo: null } }),
+    "turn-failed/none",
+  );
+  assert.equal(await reason({ status: "completed" }), "no-call");
+});

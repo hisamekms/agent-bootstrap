@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { SqliteAudit } from "./audit.ts";
 import { CoordinatorTask, type CoordinatorDriver } from "./coordinator.ts";
 import { taskTrace } from "./task-trace.ts";
@@ -68,10 +69,11 @@ async function task(filename: string, root: string, taskId: string) {
 if (import.meta.main) {
   const args = process.argv.slice(2);
   try {
+    // Paths may be relative to the current directory.
     if (args[0] === "task" && args.length === 4)
-      await task(args[1]!, args[2]!, args[3]!);
+      await task(resolve(args[1]!), resolve(args[2]!), args[3]!);
     else if (args.length === 2 && args[0] !== "task")
-      await invocation(args[0]!, args[1]!);
+      await invocation(resolve(args[0]!), args[1]!);
     else {
       console.error(usage);
       process.exitCode = 2;

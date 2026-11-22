@@ -25,7 +25,10 @@ export interface WorkerRun {
 }
 
 export interface ReviewerPlan {
-  readonly sandbox: Pick<SandboxSpec, "readOnlyFiles" | "maxLifetimeMs">;
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "readOnlyFiles" | "maxLifetimeMs" | "tools" | "provider" | "hostTcpPort"
+  >;
   readonly command: SandboxCommand;
 }
 
@@ -38,7 +41,7 @@ export interface ReviewerRun {
 export interface CoordinatorSessionPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "tools" | "hostTcpPort" | "maxLifetimeMs"
+    "tools" | "hostTcpPort" | "provider" | "maxLifetimeMs"
   >;
   readonly command: SandboxCommand;
 }
@@ -106,7 +109,10 @@ export class TrustedHost {
       !open ||
       Object.keys(plan.sandbox).some(
         (key) =>
-          key !== "tools" && key !== "hostTcpPort" && key !== "maxLifetimeMs",
+          key !== "tools" &&
+          key !== "hostTcpPort" &&
+          key !== "provider" &&
+          key !== "maxLifetimeMs",
       )
     )
       throw new Error("Coordinator session requires a streaming sandbox");
@@ -116,6 +122,9 @@ export class TrustedHost {
         : {}),
       ...(plan.sandbox.hostTcpPort !== undefined
         ? { hostTcpPort: plan.sandbox.hostTcpPort }
+        : {}),
+      ...(plan.sandbox.provider
+        ? { provider: { ...plan.sandbox.provider } }
         : {}),
       ...(plan.sandbox.maxLifetimeMs !== undefined
         ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
@@ -142,7 +151,10 @@ export class TrustedHost {
     let handle: SandboxHandle | undefined;
     let failure: { error: unknown } | undefined;
     let value: T | undefined;
+    const egress = sandbox.provider !== undefined;
+    let destroyedOk = false;
     try {
+      if (egress) await allow("provider.egress");
       await allow("sandbox.create");
       try {
         handle = await this.#sandbox.create({ ...sandbox, invocationId: id });
@@ -190,10 +202,12 @@ export class TrustedHost {
       const current = handle;
       await allow("sandbox.destroy");
       let destroyed: Outcome = "ok";
+      destroyedOk = true;
       try {
         await this.#sandbox.destroy(current);
       } catch {
         destroyed = "failed";
+        destroyedOk = false;
         if (outcome === "ok") outcome = "failed";
       }
       await append({
@@ -202,6 +216,14 @@ export class TrustedHost {
         outcome: destroyed,
       });
     }
+    // The grant is closed `ok` exactly when no sandbox holds it any more:
+    // none was created, or it was destroyed. The turn result is in exec.
+    if (egress)
+      await append({
+        kind: "operation.finished",
+        operation: "provider.egress",
+        outcome: !handle || destroyedOk ? "ok" : "failed",
+      });
     await append({ kind: "invocation.finished", outcome });
     if (failure) throw failure.error;
     return outcome === "ok"
@@ -227,6 +249,15 @@ export class TrustedHost {
         : {}),
       ...(plan.sandbox.maxLifetimeMs !== undefined
         ? { maxLifetimeMs: plan.sandbox.maxLifetimeMs }
+        : {}),
+      ...(plan.sandbox.tools
+        ? { tools: plan.sandbox.tools.map((tool) => ({ ...tool })) }
+        : {}),
+      ...(plan.sandbox.provider
+        ? { provider: { ...plan.sandbox.provider } }
+        : {}),
+      ...(plan.sandbox.hostTcpPort !== undefined
+        ? { hostTcpPort: plan.sandbox.hostTcpPort }
         : {}),
     };
     return this.#run(
@@ -297,6 +328,10 @@ export class TrustedHost {
     let outcome: Outcome = "failed";
     let artifacts: CollectedArtifacts | undefined;
     let response: Uint8Array | undefined;
+    // Credentialed provider egress is its own audited grant, recorded before
+    // the sandbox that receives it exists and closed after teardown.
+    const egress = plan.sandbox.provider !== undefined;
+    if (egress) await authorize("provider.egress", true);
     try {
       const created = await execute("sandbox.create", () =>
         this.#sandbox.create({ ...plan.sandbox, invocationId: id }),
@@ -352,7 +387,19 @@ export class TrustedHost {
         this.#sandbox.destroy(current),
       );
       if (!destroyed) outcome = "failed";
-    }
+      if (egress)
+        await append({
+          kind: "operation.finished",
+          operation: "provider.egress",
+          outcome: destroyed ? "ok" : "failed",
+        });
+    } else if (egress)
+      // No sandbox was created, so the grant ended unused.
+      await append({
+        kind: "operation.finished",
+        operation: "provider.egress",
+        outcome: "ok",
+      });
     await append({ kind: "invocation.finished", outcome });
     return {
       id,

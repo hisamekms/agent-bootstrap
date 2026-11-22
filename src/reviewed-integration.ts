@@ -6,7 +6,11 @@ import {
   NOTE_LIMIT_BYTES,
   type IntegrationEvent,
 } from "./integration-journal.ts";
-import type { SandboxCommand, SandboxFile } from "./sandbox-runtime.ts";
+import type {
+  SandboxCommand,
+  SandboxFile,
+  SandboxSpec,
+} from "./sandbox-runtime.ts";
 import type { ReviewerRun, TrustedHost } from "./trusted-host.ts";
 
 type Review = "pass" | "revise" | "concern";
@@ -17,12 +21,25 @@ type IntegrationGit = Pick<
   "head" | "snapshot" | "createCandidate" | "diff" | "advance" | "targetId"
 >;
 
+/** Extra sandbox inputs for model-driven roles. Verification gets none. */
+type RoleSandbox = Pick<SandboxSpec, "tools" | "provider" | "hostTcpPort">;
+
 type Plan = {
   readonly path: string;
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
   readonly verification: SandboxCommand;
+  readonly workerSandbox?: RoleSandbox;
+  readonly reviewerSandbox?: RoleSandbox;
 };
+
+const roleSandbox = (extra?: RoleSandbox): RoleSandbox => ({
+  ...(extra?.tools ? { tools: extra.tools.map((tool) => ({ ...tool })) } : {}),
+  ...(extra?.provider ? { provider: { ...extra.provider } } : {}),
+  ...(extra?.hostTcpPort !== undefined
+    ? { hostTcpPort: extra.hostTcpPort }
+    : {}),
+});
 
 export type PinnedCandidate = {
   readonly base: string;
@@ -54,7 +71,8 @@ function verificationResult(run: ReviewerRun): Review {
 }
 
 /** `{"review": "pass" | "revise"}`, optionally with bounded `notes` text for
- * the next Worker. Anything else is a concern without notes. */
+ * the next Worker; blank notes mean none. Anything else is a concern without
+ * notes. */
 function reviewResult(run: ReviewerRun): { review: Review; notes?: string } {
   const bytes = run.response;
   if (run.outcome !== "ok" || !bytes || bytes.length > 4096)
@@ -70,6 +88,9 @@ function reviewResult(run: ReviewerRun): { review: Review; notes?: string } {
     if (review !== "pass" && review !== "revise") return { review: "concern" };
     if (keys.length === 1) return { review };
     const notes = result.notes;
+    // A structured-output schema may require `notes`; blank means none.
+    if (keys.length === 2 && typeof notes === "string" && !notes.trim())
+      return { review };
     if (
       keys.length === 2 &&
       typeof notes === "string" &&
@@ -158,6 +179,8 @@ export class ReviewedIntegration {
       worker: copy(plan.worker),
       reviewer: copy(plan.reviewer),
       verification: copy(plan.verification),
+      workerSandbox: roleSandbox(plan.workerSandbox),
+      reviewerSandbox: roleSandbox(plan.reviewerSandbox),
     };
   }
 
@@ -185,12 +208,14 @@ export class ReviewedIntegration {
     diff: Uint8Array,
     command: SandboxCommand,
     id?: string,
+    extra: RoleSandbox = {},
   ) {
     const bytes = await this.#git.snapshot(pin.candidate, this.#plan.path);
     return this.#host.runReviewer(
       {
         sandbox: {
-          maxLifetimeMs: 30_000,
+          ...extra,
+          maxLifetimeMs: 300_000,
           readOnlyFiles: [
             { path: "candidate.diff", bytes: diff },
             { path: "candidate.source", bytes },
@@ -231,7 +256,8 @@ export class ReviewedIntegration {
     const worker = await this.#host.runWorker(
       {
         sandbox: {
-          maxLifetimeMs: 30_000,
+          ...this.#plan.workerSandbox,
+          maxLifetimeMs: 300_000,
           files: [{ path, bytes: source }],
           ...(readOnlyFiles.length ? { readOnlyFiles } : {}),
         },
@@ -341,7 +367,13 @@ export class ReviewedIntegration {
     // This sequence CAS wins before snapshot import or Reviewer VM creation.
     // An authorized review without a result remains uncertain after a crash.
     await append({ kind: "review.authorized", ...pin });
-    const reviewer = await this.#review(pin, diff, this.#plan.reviewer, id);
+    const reviewer = await this.#review(
+      pin,
+      diff,
+      this.#plan.reviewer,
+      id,
+      this.#plan.reviewerSandbox,
+    );
     const { review, notes } = reviewResult(reviewer);
     if (notes !== undefined)
       await append({

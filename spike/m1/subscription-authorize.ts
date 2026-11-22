@@ -18,6 +18,7 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const issuer = "https://auth.openai.com";
@@ -27,9 +28,15 @@ const dynamicClient = "dynamic_agent_client";
 const statePath = fileURLToPath(
   new URL("../../.local/siwc-smoke/", import.meta.url),
 );
-const smoke = fileURLToPath(
-  new URL("./subscription-smoke.ts", import.meta.url),
-);
+// The operator chooses which live runner receives the single-run token.
+const runners: Record<string, string> = {
+  "--authorize-and-run": fileURLToPath(
+    new URL("./subscription-smoke.ts", import.meta.url),
+  ),
+  "--authorize-and-run-m5": fileURLToPath(
+    new URL("../m5/dogfood.ts", import.meta.url),
+  ),
+};
 const validId = (value: unknown) =>
   typeof value === "string" && /^[a-zA-Z0-9_-]{1,256}$/.test(value);
 const random = () => randomBytes(32).toString("base64url");
@@ -196,6 +203,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
   const cancel = () => fail(new Error("Authorization interrupted"));
   const deadline = setTimeout(cancel, 300_000);
   signal.addEventListener("abort", cancel, { once: true });
+  let prompt: Interface | undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -221,8 +229,28 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
     }).toString();
     console.log("Open this URL in your browser and approve Agent Bootstrap:");
     console.log(url.href);
+    // Enter opens the issuer URL in the default browser. The callback is
+    // accepted meanwhile, so opening it by hand still works.
+    if (process.platform === "darwin") {
+      prompt = createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      prompt.question("Press Enter to open it in your browser. ").then(
+        () => {
+          if (url.origin !== issuer) return;
+          spawn("/usr/bin/open", [url.href], { stdio: "ignore" }).on(
+            "error",
+            () =>
+              console.log("Could not open the browser; open the URL above."),
+          );
+        },
+        () => {},
+      );
+    }
     return { ...(await callback), nonce, verifier, redirectUri };
   } finally {
+    prompt?.close();
     clearTimeout(deadline);
     signal.removeEventListener("abort", cancel);
     server.closeAllConnections();
@@ -231,6 +259,7 @@ async function waitForConsent(registration: Registration, signal: AbortSignal) {
 }
 
 async function runSmoke(
+  smoke: string,
   msb: string,
   codex: string,
   home: string,
@@ -261,7 +290,8 @@ async function runSmoke(
 async function main() {
   const [optIn, msb, codex] = process.argv.slice(2);
   const home = process.env.MSB_HOME;
-  assert.equal(optIn, "--authorize-and-run");
+  assert.ok(optIn && Object.hasOwn(runners, optIn));
+  const runner = runners[optIn]!;
   assert.ok(process.stdin.isTTY && process.stdout.isTTY);
   assert.ok(msb && msb.startsWith("/") && !/[\0:\r\n]/.test(msb));
   assert.ok(codex && codex.startsWith("/"));
@@ -333,7 +363,14 @@ async function main() {
     );
     await saveRegistration(file, { ...registration, clientId, subjectHash });
     stage = "subscription smoke";
-    await runSmoke(msb, codex, home, tokens.access_token, controller.signal);
+    await runSmoke(
+      runner,
+      msb,
+      codex,
+      home,
+      tokens.access_token,
+      controller.signal,
+    );
   } finally {
     try {
       if (exchangeClientId) {
