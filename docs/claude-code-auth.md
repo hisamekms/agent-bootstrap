@@ -188,14 +188,33 @@ Do not put keys in repository files, CLI flags or shell history.
 values only. The untrusted prompt is a single argv entry (`$1`), passed after
 `--`. An agent's text cannot choose host commands or CLI flags.
 
-| Item                        | How it is set                                                                                                                                                                                                                                                           |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Flags (API key)             | `-p --bare --strict-mcp-config --setting-sources '' --disable-slash-commands --no-session-persistence --output-format json --model M --max-turns N --permission-mode ... --tools ... --allowedTools ...`                                                                |
-| Flags (operator credential) | The same flags without `--bare`.                                                                                                                                                                                                                                        |
-| Environment                 | Only `PATH`, a fresh `HOME` and `CLAUDE_CONFIG_DIR`, the one placeholder credential variable, the backend CA path (`NODE_EXTRA_CA_CERTS`), `ENABLE_TOOL_SEARCH=false`, and the variables that disable nonessential traffic, telemetry, error reporting and auto-update. |
-| Tools                       | `--tools` pins the exact set; Bash is never included. Planner and Reviewer get Read, Glob and Grep, and Worker also gets Edit and Write. In bare mode, CLI 2.1.330 still offers fewer: Read for Planner and Reviewer, Read and Edit for Worker.                         |
-| Output                      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                                                      |
-| Limits                      | The adapter bounds runtime, output size and turns. CPU and memory limits exist in Microsandbox (`--cpus`, `--memory`) but are not yet wired into the adapter.                                                                                                           |
+| Item                        | How it is set                                                                                                                                                                                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Flags (API key)             | `-p --bare --strict-mcp-config --setting-sources '' --disable-slash-commands --no-session-persistence --output-format json --model M --max-turns N --permission-mode ... --tools ... --allowedTools ...`                                                                       |
+| Flags (operator credential) | The same flags without `--bare`.                                                                                                                                                                                                                                               |
+| Environment                 | Only `PATH`, a fresh `HOME` and `CLAUDE_CONFIG_DIR`, the one placeholder credential variable, the backend CA path (`NODE_EXTRA_CA_CERTS`), `ENABLE_TOOL_SEARCH=false`, and the variables that disable nonessential traffic, telemetry, error reporting and auto-update.        |
+| Tools                       | `--tools` pins the exact set; Bash is included only for a Worker with `shell: true`. Planner and Reviewer get Read, Glob and Grep, and Worker also gets Edit and Write. In bare mode, CLI 2.1.330 still offers fewer: Read for Planner and Reviewer, Read and Edit for Worker. |
+| Output                      | Worker prints only the bounded collect request, and the host collects the files. Planner and Reviewer print the CLI's JSON result, at most 64 KiB.                                                                                                                             |
+| Limits                      | The adapter bounds runtime, output size and turns. CPU and memory come from the sandbox profile (`--cpus`, `--memory`; see `docs/sandbox-profiles.md`).                                                                                                                        |
+
+### Worker shell
+
+`claudeCodeCommand` takes an optional `shell: true`, and `claudeRoleHarness`
+takes the same option. It is opt-in and allowed only for the Worker role;
+any other role throws, and the harness never passes it to Planner or
+Reviewer commands. With it, the Worker's pinned set adds `Bash` to both
+`--tools` and `--allowedTools`. The permission mode stays `acceptEdits`: in
+print mode a tool that is not pre-approved is denied, so `--allowedTools`
+alone approves Bash. Without the option, the flags are unchanged.
+
+Bare mode (API-key auth) already offers fewer tools than `--tools` lists,
+so a Worker in that mode may not get Bash. A VM run has not verified this yet.
+
+A shell in the VM can send arbitrary requests to the bound provider host,
+and the backend substitutes the credential at egress. The value never
+enters the guest. The Codex Worker has the same property today. So a
+compromised Worker can do more with the provider account, but the
+credential's exposure does not change.
 
 ## Trust boundaries and risks
 

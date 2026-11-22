@@ -135,7 +135,8 @@ export function claudeCodeTools(install: ClaudeCodeInstall): SandboxTool[] {
 }
 
 /** The exact tool set each role sees (`--tools`), all pre-approved. Bash is
- * never offered: the VM has credentialed egress, and file tools are enough.
+ * offered only to a Worker task that opts in with `shell: true`: the VM has
+ * credentialed egress, and file tools are enough by default.
  * Pinning the set matters outside bare mode, where the CLI would otherwise
  * offer agents, workflows, scheduling and deferred tools. */
 const roleTools = {
@@ -159,6 +160,8 @@ export interface ClaudeCodeTask {
   readonly timeoutMs: number;
   /** Override for local fixtures, e.g. `https://host.microsandbox.internal:8443`. */
   readonly baseUrl?: string;
+  /** Opt-in Bash for the Worker only. Pre-approved through `--allowedTools`. */
+  readonly shell?: boolean;
 }
 
 /**
@@ -195,10 +198,17 @@ export function claudeCodeCommand(
     task.prompt.includes("\0")
   )
     throw new Error("Invalid prompt");
+  if (task.shell !== undefined && typeof task.shell !== "boolean")
+    throw new Error("Invalid shell option");
+  if (task.shell === true && task.role !== "Worker")
+    throw new Error("Shell is allowed only for the Worker");
   const tools = roleTools[task.role];
+  const toolList: readonly string[] = task.shell
+    ? [...tools.tools, "Bash"]
+    : tools.tools;
   const cwd = task.role === "Worker" ? "/workspace" : "/review";
-  const toolFlags = tools.tools.length
-    ? `--tools '${tools.tools.join(",")}' --allowedTools '${tools.tools.join(",")}'`
+  const toolFlags = toolList.length
+    ? `--tools '${toolList.join(",")}' --allowedTools '${toolList.join(",")}'`
     : `--tools ''`;
   // The Coordinator's prompt is the host-prepared control.json, read as
   // bounded data; other roles take the caller's prompt as $1.
