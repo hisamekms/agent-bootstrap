@@ -335,6 +335,59 @@ verification passed and the journal recorded `integration.completed` and
 `approval.finished`. A Git read confirmed that the disposable
 repository's `refs/heads/main` points to the approved candidate.
 
+### Model-driven Coordinator turn with a mock provider
+
+[`src/model-coordinator.ts`](../src/model-coordinator.ts) defines a
+provider-neutral `CoordinatorModel` port and `modelStep`, which plugs into
+`CoordinatorDriver.step`. Each turn registers the five Coordinator host
+tools plus `finish`, then takes the model's first proposed call. That call
+is encoded unchanged as the router's action bytes. The adapter makes no
+authorization decision, so unknown tools, extra fields, forged roles and
+non-object arguments stay malformed and the existing router denies them.
+[`src/codex-app-server.ts`](../src/codex-app-server.ts) is the first adapter.
+It registers the tools as app-server dynamic tools on a read-only,
+`approvalPolicy: "never"`, ephemeral thread, and captures the first
+`item/tool/call`. It answers that call with a fixed "submitted" result and
+interrupts the turn. Further calls in the same turn are refused. Any other
+server request, such as a native command approval, is declined and voids
+the turn. Diagnostics are fixed codes, and a timeout closes the channel.
+
+The credential-free tests in `test/model-coordinator.test.ts` use an
+in-memory app-server with a scripted mock provider. They send the router's
+decisions through `TrustedHost` and SQLite audit. The tests cover:
+
+- an authorized Worker delegation with a complete Worker audit trace;
+- an out-of-policy `requestIntegration` with no host audit event;
+- forged and injected calls, and only the first of two calls being used;
+- a declined native approval request and a turn with no tool call;
+- a timeout that reopens as uncertain and is not retried.
+
+The smoke runs the verified Codex 0.170.0 app-server in a disposable VM per
+turn. It uses a loopback mock Responses provider and no credential:
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- \
+  bun spike/m4/model-coordinator-smoke.ts /absolute/path/to/codex
+```
+
+On 2026-11-22, the smoke finished in about 7 seconds. The provider made a
+`delegate` call in the first turn. The router authorized it, and the Worker
+VM's SQLite trace ended with `invocation.finished ok`. In the second turn,
+the provider saw the Worker outcome in the prompt and made a
+`requestIntegration` call without a review. The router recorded
+`tool.denied`. The interrupts reached Codex before it returned either tool
+output to the provider, so the provider received no follow-up requests. No
+sandbox remained after the run.
+
+Known gaps: the Codex VM in this smoke uses a spike-only streamed `msb exec`
+transport. The product `SandboxRuntime` port has no streaming exec, so these
+Coordinator VMs are absent from the SQLite sandbox audit. The router journal
+still records `turn.started` before each model call. A provider or transport
+failure leaves `turn.started` as the last event, so the task reopens as
+uncertain without retrying, although no host effect occurred. Usage
+notifications are not yet collected.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |
