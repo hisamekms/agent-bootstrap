@@ -185,23 +185,35 @@ function label(value: unknown, known: ReadonlySet<string>): string {
 /** A fixed label for a failed turn's Codex error category, with the HTTP
  * status when Codex reports one. Never includes provider message text. */
 function turnFailure(info: unknown): string {
+  // CodexErrorInfo string variants in the Codex 0.170.0 schema.
   const simple = [
-    "unauthorized",
-    "modelNotFound",
-    "badRequest",
-    "rateLimitExceeded",
+    "contextWindowExceeded",
+    "sessionBudgetExceeded",
     "usageLimitExceeded",
+    "rateLimitExceeded",
+    "flexUnavailable",
+    "serverOverloaded",
+    "modelNotFound",
+    "policyCapacityUnavailable",
+    "cyberPolicy",
+    "misalignmentPolicyViolation",
+    "tooManyDenials",
+    "internalServerError",
+    "unauthorized",
+    "badRequest",
+    "threadRollbackFailed",
     "sandboxError",
     "inferenceHookDenied",
-    "contextWindowExceeded",
-    "internalServerError",
+    "other",
   ];
-  if (typeof info === "string") return simple.includes(info) ? info : "other";
+  if (info === null || info === undefined) return "none";
+  if (typeof info === "string") return simple.includes(info) ? info : "unknown";
   for (const key of [
     "httpConnectionFailed",
     "responseStreamConnectionFailed",
     "responseStreamDisconnected",
     "responseTooManyFailedAttempts",
+    "activeTurnNotSteerable",
   ]) {
     const entry = field(info, key);
     if (entry === undefined) continue;
@@ -213,7 +225,7 @@ function turnFailure(info: unknown): string {
       ? `${key}/${code}`
       : key;
   }
-  return "other";
+  return "unknown";
 }
 
 /** Keep host and adapter errors, which carry fixed diagnostics; replace

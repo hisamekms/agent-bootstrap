@@ -679,7 +679,18 @@ test("a failed provider turn is voided with a fixed error category", async () =>
       status: "failed",
       error: { codexErrorInfo: "fixture-guest-text" },
     }),
-    "turn-failed/other",
+    "turn-failed/unknown",
+  );
+  assert.equal(
+    await reason({
+      status: "failed",
+      error: { codexErrorInfo: "serverOverloaded" },
+    }),
+    "turn-failed/serverOverloaded",
+  );
+  assert.equal(
+    await reason({ status: "failed", error: { codexErrorInfo: null } }),
+    "turn-failed/none",
   );
   assert.equal(await reason({ status: "completed" }), "no-call");
 });
