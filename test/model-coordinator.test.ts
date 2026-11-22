@@ -454,3 +454,57 @@ test("a failed or slow connection reports a fixed error and closes late channels
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.ok(closedLate);
 });
+
+test("violations after a captured call still void the turn, and request floods stop it", async (t) => {
+  const delegate = {
+    call: "delegate",
+    arguments: { key: "change", role: "Worker" },
+  };
+  for (const after of [
+    { item: "commandExecution" },
+    // A call that does not belong to this thread and turn.
+    {
+      raw: JSON.stringify({
+        id: 999,
+        method: "item/tool/call",
+        params: {
+          threadId: "other",
+          turnId: "other",
+          callId: "stray",
+          tool: "delegate",
+          arguments: { key: "change", role: "Worker" },
+        },
+      }),
+    },
+  ] satisfies Emission[]) {
+    const { task, delegated } = await fixture(t, [[delegate, after]]);
+    assert.equal(await task.run(), "denied");
+    assert.equal((await kinds(task)).at(-1), "turn.denied");
+    assert.equal(delegated.length, 0);
+  }
+  const flood = Array.from({ length: 65 }, () => ({
+    request: "item/tool/requestUserInput",
+  }));
+  const { task, reopen } = await fixture(t, [flood]);
+  await assert.rejects(task.run(), /Codex app-server: limit/);
+  assert.equal(await reopen().run(), "uncertain");
+});
+
+test("a transport error is reported with a fixed code", async () => {
+  await assert.rejects(
+    new CodexAppServerCoordinator({
+      async connect() {
+        return {
+          send() {},
+          lines: (async function* () {
+            yield* [];
+            throw new Error("fixture-premature-close");
+          })(),
+          close() {},
+        };
+      },
+      timeoutMs: 1000,
+    }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID()),
+    (error: Error) => error.message === "Codex app-server: closed",
+  );
+});

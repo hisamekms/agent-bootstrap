@@ -173,7 +173,13 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
         opened.close();
         throw new CodexAppServerError("timed-out");
       }
-      return this.#converse(opened, input);
+      try {
+        return await this.#converse(opened, input);
+      } catch (error) {
+        // Transport errors carry no adapter meaning; report a fixed code.
+        if (error instanceof CodexAppServerError) throw error;
+        throw new CodexAppServerError("closed");
+      }
     })();
     run.catch(() => {});
     try {
