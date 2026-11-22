@@ -447,6 +447,7 @@ test("a native tool item voids the turn even without an approval request", async
     "webSearch",
     "imageView",
     "sleep",
+    "futureToolFromGuest",
   ]) {
     const { task, delegated } = await fixture(t, [
       [
@@ -458,7 +459,7 @@ test("a native tool item voids the turn even without an approval request", async
     const tail = (await task.trace()).at(-1);
     assert.equal(
       tail?.kind === "turn.voided" && tail.reason,
-      `native-item/${item}`,
+      `native-item/${item === "futureToolFromGuest" ? "other" : item}`,
     );
     assert.equal(delegated.length, 0);
   }
@@ -577,4 +578,29 @@ test("a transport error is reported with a fixed code", async () => {
     }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID()),
     (error: Error) => error.message === "Codex app-server: closed",
   );
+});
+
+test("a host audit failure outranks the adapter timeout", async () => {
+  const { HostAuditError } = await import("../src/trusted-host.ts");
+  await assert.rejects(
+    new CodexAppServerCoordinator({
+      async open() {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        throw new HostAuditError(randomUUID());
+      },
+      timeoutMs: 10,
+    }).turn({ prompt: "fixture", tools: COORDINATOR_TOOLS }, randomUUID()),
+    HostAuditError,
+  );
+});
+
+test("stored proposals escape bidirectional controls in the trace", async (t) => {
+  const { task, audit } = await fixture(t, [
+    [{ call: "delegate", arguments: { key: "x", role: "\u202eWorker" } }],
+  ]);
+  assert.equal(await task.run(), "denied");
+  const joined = await taskTrace(task, audit);
+  assert.equal(joined.proposals.length, 1);
+  assert.ok(joined.proposals[0]?.text?.includes("\\u202eWorker"));
+  assert.ok(!joined.proposals[0]?.text?.includes("\u202e"));
 });

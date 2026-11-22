@@ -443,7 +443,10 @@ test("tools and the host port reach the backend only after a host digest check",
   assert.ok(create);
   const args = create.args.join(" ");
   assert.match(args, /--no-net --net-rule allow@host:tcp:4242 /);
-  assert.ok(create.args.includes(`${tool}:/tmp/tool`));
+  // The backend copies the verified staging copy, not the caller's path.
+  const copy = create.args[create.args.indexOf("--copy-file") + 1] ?? "";
+  assert.ok(copy.startsWith(f.stagingRoot) && copy.endsWith(":/tmp/tool"));
+  assert.ok(!create.args.includes(`${tool}:/tmp/tool`));
   await f.runtime.destroy(handle);
   const before = (await f.events()).length;
   await assert.rejects(
@@ -451,6 +454,15 @@ test("tools and the host port reach the backend only after a host digest check",
       tools: [
         { hostPath: tool, guestPath: "/tmp/tool", sha256: "0".repeat(64) },
       ],
+    }),
+    (error: SandboxRuntimeError) => error.code === "tool-digest",
+  );
+  const { symlink } = await import("node:fs/promises");
+  const link = join(f.home, "..", "tool.link");
+  await symlink(tool, link);
+  await assert.rejects(
+    f.runtime.create({
+      tools: [{ hostPath: link, guestPath: "/tmp/tool", sha256 }],
     }),
     (error: SandboxRuntimeError) => error.code === "tool-digest",
   );

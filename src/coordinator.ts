@@ -290,7 +290,7 @@ export class CoordinatorTask {
     if (!digestPattern.test(hash)) throw new Error("Invalid proposal hash");
     try {
       const data = await readFile(join(this.#root, `proposal-${hash}`));
-      if (digest(data) !== hash)
+      if (data.length > proposalBytes || digest(data) !== hash)
         throw new Error("Proposal integrity check failed");
       return data;
     } catch (error) {
@@ -306,7 +306,10 @@ export class CoordinatorTask {
       try {
         await publishPrivateFile(this.#root, `proposal-${hash}`, data);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST")
+        if (
+          (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          !(await this.proposal(hash).catch(() => null))
+        )
           throw new Error("Proposal could not be stored");
       }
     }

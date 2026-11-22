@@ -93,7 +93,9 @@ export class TrustedHost {
 
   /** A streamed Coordinator turn. The sandbox receives no files; the host
    * passes the prompt over the session and treats all output as data. The
-   * create, exec and destroy operations are audited like any invocation. */
+   * create, exec and destroy operations are audited like any invocation.
+   * If a mandatory audit write fails after create, the host stops without
+   * further effects, including destroy; the backend lifetime then applies. */
   async runCoordinatorSession<T>(
     plan: CoordinatorSessionPlan,
     id: string,
@@ -170,7 +172,9 @@ export class TrustedHost {
         session?.close();
       }
       const stopped = session ? await session.finished : undefined;
-      if (status !== "ok" && stopped === "timed-out") status = "timed-out";
+      const code = (failure?.error as { code?: unknown } | undefined)?.code;
+      if (status !== "ok" && (stopped === "timed-out" || code === "timed-out"))
+        status = "timed-out";
       await append({
         kind: "operation.finished",
         operation: "sandbox.exec",

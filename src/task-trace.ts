@@ -3,7 +3,9 @@ import type { CoordinatorTask } from "./coordinator.ts";
 
 export interface TaskTrace {
   readonly coordinator: Awaited<ReturnType<CoordinatorTask["trace"]>>;
-  /** Raw model proposals, decoded as text. Untrusted data. */
+  /** The router's encoded action for each proposal, decoded as text, with
+   * C1 and bidirectional control characters escaped. Untrusted data. `text`
+   * is null when the proposal was too large to keep or is unreadable. */
   readonly proposals: readonly {
     readonly run: string;
     readonly hash: string;
@@ -14,6 +16,13 @@ export interface TaskTrace {
     readonly id: string;
     readonly events: readonly AuditEvent[];
   }[];
+}
+
+function escapeControls(text: string): string {
+  return text.replace(
+    /[\u0080-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
 /** One task's Coordinator journal joined with the host audit. Turn run IDs
@@ -31,11 +40,14 @@ export async function taskTrace(
       if (key in event)
         ids.add((event as unknown as Record<typeof key, string>)[key]);
     if (event.kind === "turn.proposed") {
-      const bytes = await task.proposal(event.hash);
+      // An unreadable proposal must not hide the rest of the trace.
+      const bytes = await task.proposal(event.hash).catch(() => null);
       proposals.push({
         run: event.run,
         hash: event.hash,
-        text: bytes ? Buffer.from(bytes).toString("utf8") : null,
+        text: bytes
+          ? escapeControls(Buffer.from(bytes).toString("utf8"))
+          : null,
       });
     }
   }

@@ -1,7 +1,14 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { boundedLines } from "./lines.ts";
 import {
@@ -38,6 +45,7 @@ export const MICROSANDBOX_LIMITS = {
   toolBytes: 512 * 1024 * 1024,
   sessionLineBytes: 1024 * 1024,
   sessionBytes: 16 * 1024 * 1024,
+  sessionStopMs: 5000,
 } as const;
 
 type ProcessResult = {
@@ -260,11 +268,21 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       const version = await this.#checked(["--version"]);
       if (version.stdout.toString("utf8").trim() !== "msb 0.7.16")
         throw new SandboxRuntimeError("unsupported-version");
-      for (const tool of tools)
-        if ((await sha256File(tool.hostPath)) !== tool.sha256)
-          throw new SandboxRuntimeError("tool-digest");
       await mkdir(this.#config.stagingRoot, { recursive: true, mode: 0o700 });
       directory = await mkdtemp(join(this.#config.stagingRoot, "msb-"));
+      // Copy each tool into private staging and verify the copy, so the
+      // bytes handed to the backend are the bytes that were checked.
+      const staged: string[] = [];
+      if (tools.length) await mkdir(join(directory, "tools"), { mode: 0o700 });
+      for (const [index, tool] of tools.entries()) {
+        const info = await lstat(tool.hostPath).catch(() => null);
+        if (!info?.isFile()) throw new SandboxRuntimeError("tool-digest");
+        const copy = join(directory, "tools", String(index));
+        await copyFile(tool.hostPath, copy);
+        if ((await sha256File(copy)) !== tool.sha256)
+          throw new SandboxRuntimeError("tool-digest");
+        staged.push(copy);
+      }
       const workspace = join(directory, "workspace");
       const review = join(directory, "review");
       const [writable = [], readOnly = []] = snapshots;
@@ -304,9 +322,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         "--copy-dir",
         `${workspace}:/workspace`,
         ...(readOnly.length ? ["--mount-dir", `${review}:/review:ro`] : []),
-        ...tools.flatMap((tool) => [
+        ...tools.flatMap((tool, index) => [
           "--copy-file",
-          `${tool.hostPath}:${tool.guestPath}`,
+          `${staged[index]}:${tool.guestPath}`,
         ]),
         this.#config.image,
       ]);
@@ -423,54 +441,72 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const remaining = state.deadline - performance.now();
     if (remaining <= 0) throw new SandboxRuntimeError("lifetime-expired");
     const duration = Math.min(command.timeoutMs, remaining);
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        this.#config.binary,
+        [
+          "exec",
+          "--stream",
+          "--timeout",
+          `${Math.ceil(duration / 1000) + 2}s`,
+          state.id,
+          "--",
+          ...command.argv,
+        ],
+        {
+          env: this.#env(),
+          cwd: this.#config.home,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+    } catch {
+      throw new SandboxRuntimeError("backend-failure");
+    }
+    const stdin = child.stdin!;
+    const stdout = child.stdout!;
     state.busy = true;
-    const child = spawn(
-      this.#config.binary,
-      [
-        "exec",
-        "--stream",
-        "--timeout",
-        `${Math.ceil(duration / 1000) + 2}s`,
-        state.id,
-        "--",
-        ...command.argv,
-      ],
-      {
-        env: this.#env(),
-        cwd: this.#config.home,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
     let stop: ExecResult["status"] | undefined;
     const kill = (reason: ExecResult["status"]) => {
       stop ??= reason;
-      child.stdin.end();
+      stdin.end();
       if (child.exitCode === null && child.signalCode === null)
         child.kill("SIGKILL");
+      // A descendant holding stdout can delay "close" indefinitely.
+      forced ??= setTimeout(() => {
+        stdout.destroy();
+        settle();
+      }, MICROSANDBOX_LIMITS.sessionStopMs);
     };
+    let forced: ReturnType<typeof setTimeout> | undefined;
+    let settle: () => void = () => {};
     const cancel = () => kill("cancelled");
     const timer = setTimeout(() => kill("timed-out"), duration);
     command.signal?.addEventListener("abort", cancel, { once: true });
-    child.stdin.on("error", () => {});
-    child.stderr.resume();
+    stdin.on("error", () => {});
+    child.stderr?.resume();
     const finished = new Promise<ExecResult["status"]>((resolve) => {
-      const done = () => {
+      let settled = false;
+      settle = () => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        clearTimeout(forced);
         command.signal?.removeEventListener("abort", cancel);
         state.busy = false;
         resolve(stop ?? "exited");
       };
-      child.once("close", done);
+      child.once("close", settle);
       child.once("error", () => {
         stop ??= "cancelled";
-        child.stdout.destroy();
-        done();
+        stdout.destroy();
+        settle();
       });
     });
     async function* capped(): AsyncGenerator<Buffer> {
       let total = 0;
       try {
-        for await (const chunk of child.stdout) {
+        for await (const chunk of stdout) {
           total += (chunk as Buffer).length;
           if (total > MICROSANDBOX_LIMITS.sessionBytes) {
             kill("cancelled");
@@ -485,8 +521,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     }
     return {
       send(line) {
-        if (stop === undefined && child.stdin.writable)
-          child.stdin.write(`${line}\n`);
+        if (stop === undefined && stdin.writable) stdin.write(`${line}\n`);
       },
       lines: boundedLines(capped(), MICROSANDBOX_LIMITS.sessionLineBytes),
       close: () => kill("cancelled"),

@@ -29,6 +29,8 @@ export const CODEX_LIMITS = {
   lineBytes: 1024 * 1024,
   turnBytes: 16 * 1024 * 1024,
   serverRequests: 64,
+  /** How long a timed-out turn waits for the host to tear down and audit. */
+  teardownMs: 30_000,
 } as const;
 
 /** Fixed diagnostics only: no app-server output, model text or arguments. */
@@ -105,11 +107,46 @@ const allowedItems = new Set([
   "contextCompaction",
 ]);
 
-/** A fixed-shape label for an untrusted protocol name. */
-function label(value: unknown): string {
-  return typeof value === "string" && /^[a-zA-Z0-9/]{1,48}$/.test(value)
-    ? value
-    : "unknown";
+/** Known app-server names for the trace. Codex 0.170.0 schema. */
+const knownRequests = new Set([
+  "item/commandExecution/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/tool/requestUserInput",
+  "mcpServer/elicitation/request",
+  "item/permissions/requestApproval",
+  "item/tool/call",
+  "account/chatgptAuthTokens/refresh",
+  "attestation/generate",
+  "currentTime/read",
+  "applyPatchApproval",
+  "execCommandApproval",
+]);
+const knownItems = new Set([
+  "userMessage",
+  "hookPrompt",
+  "agentMessage",
+  "functionCallOutput",
+  "plan",
+  "reasoning",
+  "commandExecution",
+  "fileChange",
+  "mcpToolCall",
+  "dynamicToolCall",
+  "collabAgentToolCall",
+  "subAgentActivity",
+  "webSearch",
+  "imageView",
+  "sleep",
+  "imageGeneration",
+  "enteredReviewMode",
+  "exitedReviewMode",
+  "contextCompaction",
+]);
+
+/** A fixed label: a known protocol name, or `other`. Guest-chosen text never
+ * reaches the journal. */
+function label(value: unknown, known: ReadonlySet<string>): string {
+  return typeof value === "string" && known.has(value) ? value : "other";
 }
 
 /** Keep host and adapter errors, which carry fixed diagnostics; replace
@@ -179,8 +216,20 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
       if (first === "expired") {
         expired = true;
         channel?.close();
-        // Let the host finish teardown and audit before reporting.
-        await run.catch(() => {});
+        // Let the host finish teardown and audit, within a bound, before
+        // reporting. A host audit failure takes precedence over the timeout.
+        let wait: ReturnType<typeof setTimeout> | undefined;
+        const settled = await Promise.race([
+          run.then(
+            () => null,
+            (error: unknown) => error,
+          ),
+          new Promise<null>((resolve) => {
+            wait = setTimeout(() => resolve(null), CODEX_LIMITS.teardownMs);
+          }),
+        ]);
+        clearTimeout(wait);
+        if (settled instanceof HostAuditError) throw settled;
         throw new CodexAppServerError("timed-out");
       }
       if ("error" in first)
@@ -325,14 +374,14 @@ export class CodexAppServerCoordinator implements CoordinatorModel {
           else interrupt();
         } else {
           send({ id, error: { code: -32601, message: "Declined by host" } });
-          voidTurn(`server-request/${label(method)}`);
+          voidTurn(`server-request/${label(method, knownRequests)}`);
         }
         continue;
       }
       if (method === "item/started" || method === "item/completed") {
         const type = field(params, "item", "type");
         if (typeof type !== "string" || !allowedItems.has(type))
-          voidTurn(`native-item/${label(type)}`);
+          voidTurn(`native-item/${label(type, knownItems)}`);
         continue;
       }
       if (
