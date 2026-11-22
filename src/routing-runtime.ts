@@ -41,7 +41,17 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
         )
       )
         throw new SandboxRuntimeError("invalid-input");
-    this.#routes = routes.map((route) => ({ ...route }));
+    // Copy and freeze each binding so later host changes cannot alter routing.
+    this.#routes = Object.freeze(
+      routes.map((route) =>
+        Object.freeze({
+          runtime: route.runtime,
+          ...(route.provider
+            ? { provider: Object.freeze({ ...route.provider }) }
+            : {}),
+        }),
+      ),
+    );
   }
 
   #owner(handle: SandboxHandle): SandboxRuntime {

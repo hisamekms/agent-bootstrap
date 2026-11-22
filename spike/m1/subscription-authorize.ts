@@ -93,7 +93,11 @@ export function verifyIdentity(
   clientId: string,
   nonce: string,
 ): string {
-  assert.match(idToken, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  // assert.ok, not assert.match: a failed match would quote the token.
+  assert.ok(
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(idToken),
+    "token shape",
+  );
   const [header, payload, signature] = idToken.split(".");
   assert.ok(header && payload && signature);
   const protectedHeader = JSON.parse(

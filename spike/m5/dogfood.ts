@@ -92,7 +92,11 @@ let fixtureSeen: unknown;
 
 function checkCodexToken(token: string) {
   // Preflight only: OpenAI validates the bearer. Never print the token.
-  assert.match(token, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  // assert.ok, not assert.match: a failed match would quote the token.
+  assert.ok(
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token),
+    "token shape",
+  );
   const payload = JSON.parse(
     Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"),
   );
