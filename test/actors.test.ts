@@ -15,9 +15,11 @@ import { CLAUDE_CODE_BUILDS } from "../src/claude-code.ts";
 import { ClaudeCodeCoordinator } from "../src/claude-coordinator.ts";
 import {
   codexCoordinatorCommand,
+  codexHostService,
   codexRoleCommand,
   deriveCodexCatalog,
 } from "../src/codex-exec.ts";
+import { EgressPolicy, HOST_SERVICE_NAME } from "../src/egress-policy.ts";
 import {
   COORDINATOR_TOOLS,
   coordinatorPrompt,
@@ -68,6 +70,7 @@ test("Codex role commands take the prompt as one argv entry and follow the role 
   assert.equal(worker.argv[4], prompt);
   assert.ok(!worker.argv[2]!.includes("Change it"));
   assert.match(worker.argv[2]!, /printf '%s' '\{"tool":"collect"\}'/);
+  assert.match(worker.argv[2]!, /\/tmp\/agent-bootstrap\/commit-message/);
   assert.match(worker.argv[2]!, /model_catalog_json/);
   assert.match(worker.argv[2]!, /\$gateway:8080/);
   const reviewer = codexRoleCommand(
@@ -105,7 +108,42 @@ test("Codex role commands take the prompt as one argv entry and follow the role 
   assert.equal(codexRoleHarness(fixture, [], 8080).sandbox.hostTcpPort, 8080);
 });
 
-test("the Codex Reviewer inlines the diff with or without candidate source", () => {
+test("Codex uses the audited host service for HTTP fixtures", () => {
+  const options = {
+    endpoint: { kind: "host-service" as const, port: 18080 },
+    model: "gpt-6.2-sol",
+  };
+  const harness = codexRoleHarness(options, []);
+  assert.deepEqual(harness.sandbox, { tools: [] });
+  const service = codexHostService(options.endpoint);
+  assert.ok(service);
+  assert.equal(service.hostname, `codex.${HOST_SERVICE_NAME}`);
+  for (const command of [
+    harness.command({ role: "Worker", prompt: "fixture", timeoutMs: 1000 }),
+    codexCoordinatorCommand(options, 1000),
+  ]) {
+    assert.ok(command.argv[2]?.includes(`http://${service.hostname}:18080/v1`));
+    assert.doesNotMatch(command.argv[2]!, /\$gateway|env_key/);
+  }
+  const policy = new EgressPolicy({ allow: [], hostServices: [service] });
+  assert.equal(
+    policy.decideConnect({ ...service, sandbox: "fixture" }).channel,
+    "host-service",
+  );
+  assert.throws(
+    () =>
+      codexCoordinatorCommand(
+        {
+          ...options,
+          endpoint: { ...options.endpoint, port: 65536 },
+        },
+        1000,
+      ),
+    /Invalid Codex endpoint/,
+  );
+});
+
+test("the Codex Reviewer inlines the diff and optional candidate files", () => {
   const reviewer = codexRoleCommand(
     { role: "Reviewer", prompt: "Review this.", timeoutMs: 1000 },
     { endpoint: { kind: "host-port", port: 8080 }, model: "m" },
@@ -140,6 +178,7 @@ test("the Codex Reviewer inlines the diff with or without candidate source", () 
   try {
     const diff = join(directory, "candidate.diff");
     const source = join(directory, "candidate.source");
+    const message = join(directory, "candidate.message");
     writeFileSync(diff, "+Good day.\n");
     const treePrompt = run();
     assert.match(
@@ -148,6 +187,12 @@ test("the Codex Reviewer inlines the diff with or without candidate source", () 
     );
     assert.doesNotMatch(treePrompt, /candidate\.source/);
 
+    writeFileSync(message, "Improve greeting\n");
+    assert.match(
+      run(),
+      /--- END candidate\.diff ([0-9a-f]{24}) ---\n--- BEGIN candidate\.message \1 ---\nImprove greeting\n--- END candidate\.message \1 ---$/,
+    );
+    rmSync(message);
     writeFileSync(source, "Good day.\n");
     assert.match(
       run(),

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -13,14 +14,23 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   MICROSANDBOX_LIMITS,
+  type MicrosandboxConfig,
   MicrosandboxRuntime,
 } from "../src/microsandbox.ts";
+import { RoutingSandboxRuntime } from "../src/routing-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
 
 const image = `fixture.invalid/alpine@sha256:${"a".repeat(64)}`;
 const profiles = new ProfileCatalog({ base: { image } });
 const diagnostic = "synthetic-backend-diagnostic-do-not-propagate";
+const gatewayPassword = "synthetic-gateway-password";
+const gateway = {
+  socksPort: 18190,
+  dnsPort: 18153,
+  username: "fixture-sandbox",
+  passwordEnv: "GATEWAY_FIXTURE_SECRET",
+};
 
 type Event = {
   args: string[];
@@ -30,6 +40,7 @@ type Event = {
   stagedPaths?: string[];
   stagedBytes?: number;
   copyFiles?: string[];
+  gatewayPasswordMatches?: boolean;
 };
 
 // This executable simulates only CLI responses and copied fixture directories.
@@ -74,7 +85,19 @@ if (args[0] === '--version') {
   else if (mode === 'inspect-array') console.log(JSON.stringify([{ digest }]));
   else if (mode === 'inspect-null') console.log('null');
   else console.log(JSON.stringify({ digest, architecture: 'arm64', layers: [] }));
+} else if (args[0] === 'list') {
+  log();
+  if (args[1] !== '--format' || args[2] !== 'json') fail();
+  if (mode === 'list-malformed') console.log('{"name":"unknown"}');
+  else console.log(JSON.stringify(readdirSync(guests, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(({ name }) => ({ name }))));
 } else if (args[0] === 'create') {
+  const passwordIndex = args.indexOf('--socks5-password-env');
+  if (passwordIndex !== -1) {
+    const password = process.env[args[passwordIndex + 1]];
+    event.gatewayPasswordMatches = password === ${JSON.stringify(gatewayPassword)};
+  }
   const name = args[args.indexOf('--name') + 1];
   const copy = args[args.indexOf('--copy-dir') + 1];
   const [source, destination] = copy.split(':');
@@ -89,8 +112,16 @@ if (args[0] === '--version') {
   event.stagedBytes = files.reduce((n, f) => n + f.bytes, 0);
   event.copyFiles = args.flatMap((a, i) => args[i - 1] === '--copy-file' ? [a] : []);
   log();
+  if (mode === 'late-name-collision') mkdirSync(join(guests, name));
+  if (existsSync(join(guests, name))) fail();
   for (const c of event.copyFiles) if (c.endsWith(':/tmp/agent-bootstrap-tree.tar')) cpSync(c.split(':')[0], join(guests, name + '.tree'));
   cpSync(source, join(guests, name), { recursive: true });
+  const cleanupLabel = args.find((a, i) => args[i - 1] === '--label' && a.startsWith('agent-bootstrap-create='));
+  if (cleanupLabel) writeFileSync(join(guests, name, '.fixture-cleanup-label'), cleanupLabel);
+  if (mode === 'gateway-create-failure') {
+    process.stderr.write(process.env[args[passwordIndex + 1]] ?? '');
+    process.exit(2);
+  }
   if (mode === 'partial-create-failure' || mode === 'create-and-cleanup-failure') fail();
 } else if (args[0] === 'exec') {
   log();
@@ -111,6 +142,19 @@ if (args[0] === '--version') {
     else cpSync(join(guests, name + '.tree'), join(workspace, 'extracted.tar'));
   }
   else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -cf')) { if (mode === 'pack-fail') process.exitCode = 1; }
+  else if (command[0] === '/bin/sh' && String(command[2]).includes('p=/tmp/agent-bootstrap/commit-message;')) {
+    const limit = Number(command[2].match(/head -c ([0-9]+)/)?.[1]);
+    if (!limit) fail();
+    // The swap yields zeros after the checks, like a link to a character device.
+    const contents = {
+      'message': Buffer.from('Improve greeting\\n'),
+      'max-message': Buffer.alloc(4096, 'a'),
+      'big-message': Buffer.alloc(4097, 'a'),
+      'message-swapped': Buffer.alloc(limit),
+    }[mode];
+    if (contents) console.log(contents.subarray(0, limit).toString('base64').match(/.{1,76}/g).join('\\n'));
+    else process.exitCode = 3; // Missing path, directory or symlink at check time.
+  }
   else if (command[0] === '/bin/sh' && command[3] === 'collect') {
     const bytes = readFileSync(join(workspace, command[4]));
     console.log(String(mode === 'oversized-collection' ? 999999999 : bytes.length));
@@ -119,33 +163,52 @@ if (args[0] === '--version') {
 } else if (args[0] === 'copy') {
   log();
   const [name, guestPath] = args[1].split(':');
-  if (!existsSync(join(guests, name)) || guestPath !== '/tmp/agent-bootstrap-collect.tar') fail();
-  if (mode === 'big-tree') { writeFileSync(args[2], ''); require_truncate(args[2]); }
+  if (!existsSync(join(guests, name))) fail();
+  if (guestPath !== '/tmp/agent-bootstrap-collect.tar') fail();
+  else if (mode === 'big-tree') { writeFileSync(args[2], ''); require_truncate(args[2]); }
   else writeFileSync(args[2], 'TREE-BYTES');
 } else if (args[0] === 'stop') {
   log(); if (mode === 'create-and-cleanup-failure') fail();
+} else if (args[0] === 'metrics') {
+  log();
+  if (!existsSync(join(guests, args[1])) || mode === 'metrics-failure') fail();
+  if (mode === 'metrics-malformed') console.log('{bad json');
+  else if (mode === 'metrics-oversized') process.stdout.write(' '.repeat(20 * 1024));
+  else console.log(JSON.stringify({ vcpu_time_ns: 123, memory_bytes: 456, net_rx_bytes: null }));
 } else if (args[0] === 'rm') {
   log(); if (args[1] !== '--force' || mode === 'create-and-cleanup-failure') fail();
-  rmSync(join(guests, args[2]), { recursive: true, force: true });
-  rmSync(join(guests, args[2] + '.tree'), { force: true });
+  const names = args[2] === '--label'
+    ? readdirSync(guests, { withFileTypes: true }).filter(entry => {
+        if (!entry.isDirectory()) return false;
+        const marker = join(guests, entry.name, '.fixture-cleanup-label');
+        return existsSync(marker) && readFileSync(marker, 'utf8') === args[3];
+      }).map(entry => entry.name)
+    : [args[2]];
+  for (const name of names) {
+    rmSync(join(guests, name), { recursive: true, force: true });
+    rmSync(join(guests, name + '.tree'), { force: true });
+  }
 } else { log(); fail(); }
 `,
     { mode: 0o700 },
   );
-  const runtime = new MicrosandboxRuntime({
+  const config = {
     binary,
     home,
     stagingRoot,
     profiles,
-  });
+  };
+  const runtime = new MicrosandboxRuntime(config);
   return {
+    config,
     runtime,
-    withCredentials: (token: string) =>
+    withCredentials: (
+      token: string,
+      resolvePassword?: MicrosandboxConfig["gatewayPassword"],
+    ) =>
       new MicrosandboxRuntime({
-        binary,
-        home,
-        stagingRoot,
-        profiles,
+        ...config,
+        ...(resolvePassword ? { gatewayPassword: resolvePassword } : {}),
         providers: [
           { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },
         ],
@@ -717,6 +780,298 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
     );
 });
 
+test("gateway mode binds exact argv and passes passwords only to create, with and without a provider", async (t) => {
+  const f = await fixture(t);
+  const provider = {
+    host: "api.openai.com",
+    secretEnv: "AGENT_BOOTSTRAP_TOKEN",
+  };
+  const resolvePassword: NonNullable<MicrosandboxConfig["gatewayPassword"]> = (
+    binding,
+  ) => {
+    assert.deepEqual(binding, gateway);
+    return gatewayPassword;
+  };
+  const runtime = new RoutingSandboxRuntime([
+    {
+      runtime: new MicrosandboxRuntime({
+        ...f.config,
+        gatewayPassword: resolvePassword,
+      }),
+    },
+    {
+      provider,
+      runtime: f.withCredentials("fixture-token", resolvePassword),
+    },
+  ]);
+  for (const binding of [undefined, provider]) {
+    const spec = {
+      egressGateway: gateway,
+      ...(binding ? { provider: binding } : {}),
+    };
+    const expectedNetworkArgs = [
+      "--no-net",
+      "--net-rule",
+      "allow@dns,deny@host,deny@0.0.0.0/0:tcp:53,deny@[::/0]:tcp:53,deny@0.0.0.0/0:tcp:853,deny@[::/0]:tcp:853,allow@0.0.0.0/0:tcp,allow@[::/0]:tcp",
+      "--dns-nameserver",
+      "127.0.0.1:18153",
+      "--proxy",
+      "socks5://127.0.0.1:18190",
+      "--socks5-username",
+      "fixture-sandbox",
+      "--socks5-password-env",
+      "GATEWAY_FIXTURE_SECRET",
+      ...(binding
+        ? [
+            "--tls-intercept",
+            "--secret",
+            "AGENT_BOOTSTRAP_TOKEN:headers=authorization@api.openai.com",
+            "--secret-violation-action",
+            "block",
+          ]
+        : []),
+    ];
+    const expectedDigest = createHash("sha256")
+      .update(JSON.stringify(expectedNetworkArgs))
+      .digest("hex");
+    assert.equal(runtime.netRuleDigest(spec), expectedDigest);
+    const sandboxId = `bootstrap-${randomUUID()}`;
+    const handle = await runtime.createBound(
+      { ...spec, expectedNetRuleDigest: expectedDigest },
+      sandboxId,
+    );
+    assert.deepEqual(handle, { id: sandboxId, netRuleDigest: expectedDigest });
+    const creates = (await f.events()).filter(
+      ({ args }) => args[0] === "create",
+    );
+    const create = creates.at(-1)!;
+    const cleanupLabel = create.args[create.args.indexOf("--label") + 1]!;
+    assert.match(cleanupLabel, /^agent-bootstrap-create=[0-9a-f-]{36}$/);
+    assert.deepEqual(create.args, [
+      "create",
+      "--name",
+      sandboxId,
+      "--label",
+      cleanupLabel,
+      "--pull",
+      "never",
+      ...expectedNetworkArgs,
+      "--max-duration",
+      "120s",
+      "--copy-dir",
+      `${create.workspace}:/workspace`,
+      image,
+    ]);
+    assert.equal(create.gatewayPasswordMatches, true);
+    assert.equal(create.envKeys.includes(provider.secretEnv), !!binding);
+    assert.equal(create.envKeys.includes(gateway.passwordEnv), true);
+    const sample = { vcpuTimeNs: 123, memoryBytes: 456 };
+    assert.deepEqual(await runtime.sampleResources(handle), sample);
+    await runtime.destroy(handle);
+    assert.deepEqual((await f.events()).at(-1)?.args, [
+      "rm",
+      "--force",
+      "--label",
+      cleanupLabel,
+    ]);
+    assert.deepEqual(runtime.finalResourceSample(handle), sample);
+    assert.equal(runtime.finalResourceSample(handle), null);
+  }
+  const events = await f.events();
+  for (const { envKeys } of events.filter(({ args }) => args[0] !== "create")) {
+    assert.equal(envKeys.includes(gateway.passwordEnv), false);
+    assert.equal(envKeys.includes(provider.secretEnv), false);
+  }
+  assert.equal(JSON.stringify(events).includes(gatewayPassword), false);
+});
+
+test("bound create refuses invalid IDs and missing or mismatched digests before invoking the backend", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  for (const bad of ["", "--name", "../guest", randomUUID(), sandboxId + "\n"])
+    await assert.rejects(f.runtime.createBound(spec, bad), /invalid-input/);
+  await assert.rejects(f.runtime.createBound({}, sandboxId), /invalid-input/);
+  await assert.rejects(
+    f.runtime.createBound({ expectedNetRuleDigest: "0".repeat(64) }, sandboxId),
+    /invalid-input/,
+  );
+  assert.deepEqual(await f.events(), []);
+});
+
+test("bound create refuses concurrent and existing names without removing the owner", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const other = new MicrosandboxRuntime(f.config);
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  const results = await Promise.allSettled([
+    f.runtime.createBound(spec, sandboxId),
+    other.createBound(spec, sandboxId),
+  ]);
+  const [winner] = results.flatMap((result, index) =>
+    result.status === "fulfilled" ? [{ handle: result.value, index }] : [],
+  );
+  assert.ok(winner);
+  const loser = results[1 - winner.index];
+  assert.ok(loser?.status === "rejected");
+  assert.match(String(loser.reason), /name-collision/);
+  const [owner, contender] =
+    winner.index === 0 ? [f.runtime, other] : [other, f.runtime];
+  await assert.rejects(
+    contender.createBound(spec, sandboxId),
+    /name-collision/,
+  );
+  assert.deepEqual(await readdir(f.guests), [sandboxId]);
+  const ops = (await f.events()).map(({ args }) => args[0]);
+  assert.equal(ops.filter((op) => op === "create").length, 1);
+  assert.equal(ops.includes("rm"), false);
+  await owner.destroy(winner.handle);
+  await assertCleanup(f);
+  assert.deepEqual(await readdir(f.home), []);
+});
+
+test("failed bound create removes only its own partial sandbox", async (t) => {
+  const f = await fixture(t);
+  const sandboxId = `bootstrap-${randomUUID()}`;
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  await f.setMode("partial-create-failure");
+  await assert.rejects(
+    f.runtime.createBound(spec, sandboxId),
+    /backend-failure/,
+  );
+  await assertCleanup(f);
+
+  await f.setMode("late-name-collision");
+  await assert.rejects(
+    f.runtime.createBound(spec, sandboxId),
+    /backend-failure/,
+  );
+  assert.deepEqual(await readdir(f.guests), [sandboxId]);
+  assert.deepEqual(await readdir(f.stagingRoot), []);
+  assert.deepEqual(await readdir(f.home), []);
+  const removals = (await f.events()).filter(({ args }) => args[0] === "rm");
+  for (const { args } of removals)
+    assert.deepEqual(args.slice(0, 3), ["rm", "--force", "--label"]);
+  assert.notEqual(removals[0]?.args[3], removals[1]?.args[3]);
+});
+
+test("bound create fails closed if the backend cannot list sandbox names", async (t) => {
+  const f = await fixture(t);
+  await f.setMode("list-malformed");
+  const spec = { expectedNetRuleDigest: f.runtime.netRuleDigest({}) };
+  await assert.rejects(
+    f.runtime.createBound(spec, `bootstrap-${randomUUID()}`),
+    /backend-failure/,
+  );
+  assert.deepEqual(
+    (await f.events()).map(({ args }) => args[0]),
+    ["--version", "image", "list"],
+  );
+});
+
+test("unsafe gateway bindings are refused before the backend", async (t) => {
+  const f = await fixture(t);
+  const provider = {
+    host: "api.openai.com",
+    secretEnv: "AGENT_BOOTSTRAP_TOKEN",
+  };
+  const runtime = f.withCredentials("fixture-token", () => gatewayPassword);
+  for (const spec of [
+    { egressGateway: gateway, hostTcpPort: 8080 },
+    {
+      egressGateway: { ...gateway, passwordEnv: provider.secretEnv },
+      provider,
+    },
+    { egressGateway: { ...gateway, passwordEnv: "MSB_CONFIG_SECRET" } },
+    { egressGateway: { ...gateway, passwordEnv: "PATH" } },
+    { egressGateway: { ...gateway, socksPort: 0 } },
+    { egressGateway: { ...gateway, dnsPort: 65536 } },
+    { egressGateway: { ...gateway, dnsPort: gateway.socksPort } },
+    { egressGateway: { ...gateway, username: "--no-net" } },
+  ]) {
+    assert.throws(() => runtime.netRuleDigest(spec), /invalid-input/);
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  }
+  await assert.rejects(
+    f.runtime.create({ egressGateway: gateway }),
+    /invalid-input/,
+  );
+  await assert.rejects(
+    runtime.create({
+      egressGateway: { ...gateway, dnsPort: gateway.dnsPort + 1 },
+      expectedNetRuleDigest: runtime.netRuleDigest({ egressGateway: gateway }),
+    }),
+    /invalid-input/,
+  );
+  assert.deepEqual(await f.events(), []);
+});
+
+test("gateway password and backend diagnostics stay out of errors", async (t) => {
+  const f = await fixture(t);
+  const spec = { egressGateway: gateway };
+  const failure = (error: unknown) => {
+    assert.ok(error instanceof SandboxRuntimeError);
+    assert.equal(error.code, "backend-failure");
+    assert.equal(error.stack?.includes(gatewayPassword), false);
+    assert.equal(JSON.stringify(error).includes(gatewayPassword), false);
+    return true;
+  };
+  const unavailable = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword() {
+      throw new SandboxRuntimeError(gatewayPassword);
+    },
+  });
+  await assert.rejects(unavailable.create(spec), failure);
+  const invalidPassword = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword: () => "",
+  });
+  await assert.rejects(invalidPassword.create(spec), /invalid-input/);
+  assert.equal(
+    (await f.events()).some(({ args }) => args[0] === "create"),
+    false,
+  );
+
+  const runtime = new MicrosandboxRuntime({
+    ...f.config,
+    gatewayPassword: () => gatewayPassword,
+  });
+  await f.setMode("gateway-create-failure");
+  await assert.rejects(runtime.create(spec), failure);
+  await assertCleanup(f);
+});
+
+test("destroy samples before removal and continues after CLI or parser failure", async (t) => {
+  const f = await fixture(t);
+  for (const mode of [
+    "normal",
+    "metrics-failure",
+    "metrics-malformed",
+    "metrics-oversized",
+  ]) {
+    const handle = await f.runtime.create({});
+    await f.setMode(mode);
+    assert.equal(f.runtime.finalResourceSample(handle), null);
+    await Promise.all([f.runtime.destroy(handle), f.runtime.destroy(handle)]);
+    assert.deepEqual(
+      (await f.events()).slice(-2).map(({ args }) => args),
+      [
+        ["metrics", handle.id, "--format", "json"],
+        ["rm", "--force", handle.id],
+      ],
+    );
+    assert.deepEqual(
+      f.runtime.finalResourceSample(handle),
+      mode === "normal" ? { vcpuTimeNs: 123, memoryBytes: 456 } : null,
+    );
+    assert.equal(f.runtime.finalResourceSample(handle), null);
+    assert.equal(await f.runtime.sampleResources(handle), null);
+    await f.setMode("normal");
+  }
+  await assertCleanup(f, 4);
+});
+
 test("one runtime binds its single credential to at most one provider", () => {
   const provider = {
     host: "api.anthropic.com",
@@ -918,12 +1273,13 @@ test("tree collection tars in the guest, copies the tar out and returns its byte
   const result = await f.runtime.collect(handle, { tree: true });
   assert.deepEqual(result.files, []);
   assert.equal(text(result.tree!), "TREE-BYTES");
+  assert.equal(result.message, undefined);
   const events = await f.events();
-  const exec = events.filter(({ args }) => args[0] === "exec").at(-1)!;
+  const exec = events.find(({ args }) => args.at(-1)?.includes("tar -cf"))!;
   const script = exec.args.at(-1)!;
   assert.ok(script.includes("tar -cf /tmp/agent-bootstrap-collect.tar"));
   assert.ok(script.includes("--exclude ./.git"));
-  const copy = events.at(-1)!;
+  const copy = events.find(({ args }) => args[0] === "copy")!;
   assert.equal(copy.args[0], "copy");
   assert.match(
     copy.args[1]!,
@@ -931,6 +1287,35 @@ test("tree collection tars in the guest, copies the tar out and returns its byte
   );
   await f.runtime.destroy(handle);
   await assertCleanup(f);
+});
+
+test("tree collection bounds message reads and ignores oversized, swapped and non-regular messages", async (t) => {
+  for (const [mode, expected] of [
+    ["message", "Improve greeting\n"],
+    ["max-message", "a".repeat(4096)],
+    ["big-message", undefined],
+    ["message-swapped", undefined],
+    ["message-directory", undefined],
+    ["message-symlink", undefined],
+  ] as const) {
+    const f = await fixture(t);
+    const handle = await f.runtime.create({});
+    await f.setMode(mode);
+    const result = await f.runtime.collect(handle, { tree: true });
+    assert.equal(result.message && text(result.message), expected);
+    assert.equal(text(result.tree!), "TREE-BYTES");
+    const events = await f.events();
+    const reads = events.filter(({ args }) =>
+      args.some((arg) => arg.includes("/tmp/agent-bootstrap/commit-message")),
+    );
+    assert.equal(reads.length, 1, mode);
+    assert.equal(reads[0]?.args[0], "exec", mode);
+    const script = reads[0]?.args.at(-1) ?? "";
+    assert.match(script, /\[ ! -L "\$p" \] && \[ -f "\$p" \] \|\| exit 3/);
+    assert.match(script, /head -c 4097 -- "\$p" \| base64/);
+    await f.runtime.destroy(handle);
+    await assertCleanup(f);
+  }
 });
 
 test("tree collection failures and oversized tars clean up", async (t) => {

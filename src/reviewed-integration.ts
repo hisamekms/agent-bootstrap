@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { HostService } from "./egress-policy.ts";
 import type {
   LocalGitIntegration,
   PreparedWorkspace,
@@ -25,6 +26,7 @@ import {
 
 type Review = "pass" | "revise" | "concern";
 type Decision = "approve" | "reject";
+export type DecisionOptions = { acknowledgeProtected?: readonly string[] };
 type Event = Parameters<IntegrationJournal["append"]>[1];
 type IntegrationGit = Pick<
   LocalGitIntegration,
@@ -37,6 +39,7 @@ type IntegrationGit = Pick<
   | "prepareWorkspace"
   | "cleanupWorkspace"
   | "createCandidateTree"
+  | "candidateMessage"
   | "listTree"
   | "protectedPaths"
 >;
@@ -72,6 +75,45 @@ export type TreePlan = {
 const SCOPE_LIMIT = 256;
 const PROTECTED_LIMIT = 100;
 const TREE_PATH_BYTES = 4096;
+const CANDIDATE_MESSAGE_BYTES = 2048;
+
+/** Exported for unit tests; candidates call it with the collected proposal. */
+export function workerCommitMessage(
+  run: string,
+  proposal?: Uint8Array,
+): string {
+  const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+  const defaultSubject = `Candidate from Worker run ${run}`;
+  let text = "";
+  if (proposal) {
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(proposal);
+    } catch {
+      // An invalid UTF-8 proposal is treated as absent.
+    }
+  }
+  const [subject = "", ...body] = text
+    .replace(/[^\P{Cc}\n\t]/gu, "")
+    .replace(/[\p{Cf}\p{Zl}\p{Zp}]/gu, "")
+    .trim()
+    .split("\n");
+  const shortened = [
+    /^Agent-Bootstrap-/i.test(subject)
+      ? defaultSubject
+      : [...subject].slice(0, 72).join(""),
+    ...body.filter((line) => !/^Agent-Bootstrap-/i.test(line)),
+  ].join("\n");
+  const available = CANDIDATE_MESSAGE_BYTES - Buffer.byteLength(trailer);
+  let end = 0;
+  let size = 0;
+  for (const character of shortened) {
+    size += Buffer.byteLength(character);
+    if (size > available) break;
+    end += character.length;
+  }
+  const message = shortened.slice(0, end).trimEnd();
+  return `${message || defaultSubject}${trailer}`;
+}
 
 function copyTreePaths(
   value: readonly string[] | undefined,
@@ -119,6 +161,8 @@ type Plan = {
   readonly verification: Verification;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
+  readonly workerHostServices?: readonly HostService[];
+  readonly reviewerHostServices?: readonly HostService[];
   /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
    * wrap their answer (for example a CLI result object). Verification output
    * is never transformed. */
@@ -354,6 +398,20 @@ export class ReviewedIntegration {
       verification,
       workerSandbox: roleSandbox(plan.workerSandbox),
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
+      ...(plan.workerHostServices
+        ? {
+            workerHostServices: plan.workerHostServices.map((service) => ({
+              ...service,
+            })),
+          }
+        : {}),
+      ...(plan.reviewerHostServices
+        ? {
+            reviewerHostServices: plan.reviewerHostServices.map((service) => ({
+              ...service,
+            })),
+          }
+        : {}),
       ...(plan.reviewerOutput ? { reviewerOutput: plan.reviewerOutput } : {}),
     };
   }
@@ -387,20 +445,27 @@ export class ReviewedIntegration {
     };
   }
 
-  async #review(
-    pin: PinnedCandidate,
-    diff: Uint8Array,
-    command: SandboxCommand,
-    id?: string,
-    extra: RoleSandbox = {},
-  ) {
+  async #review(pin: PinnedCandidate, diff: Uint8Array, id?: string) {
     const files = await this.#candidateFiles(pin, diff);
+    if (this.#plan.tree)
+      files.push({
+        path: "candidate.message",
+        bytes: await this.candidateMessage(pin),
+      });
     return this.#host.runReviewer(
       {
-        sandbox: { ...extra, maxLifetimeMs: 300_000, readOnlyFiles: files },
-        command,
+        sandbox: {
+          ...this.#plan.reviewerSandbox,
+          maxLifetimeMs: 300_000,
+          readOnlyFiles: files,
+        },
+        command: this.#plan.reviewer,
       },
       id,
+      undefined,
+      this.#plan.reviewerHostServices
+        ? { hostServices: this.#plan.reviewerHostServices }
+        : undefined,
     );
   }
 
@@ -468,6 +533,10 @@ export class ReviewedIntegration {
         collectPaths: [path],
       },
       id,
+      undefined,
+      this.#plan.workerHostServices
+        ? { hostServices: this.#plan.workerHostServices }
+        : undefined,
     );
     const changed = worker.artifacts?.files[0];
     if (
@@ -537,6 +606,10 @@ export class ReviewedIntegration {
           collectTree: true,
         },
         id,
+        undefined,
+        this.#plan.workerHostServices
+          ? { hostServices: this.#plan.workerHostServices }
+          : undefined,
       );
       let changes: TreeChange[] = [];
       let flagged = 0;
@@ -579,12 +652,9 @@ export class ReviewedIntegration {
       });
       let candidate: string;
       let diff: Uint8Array;
+      const message = workerCommitMessage(worker.id, worker.artifacts?.message);
       try {
-        candidate = await this.#git.createCandidateTree(
-          base,
-          changes,
-          `Candidate from Worker run ${worker.id}`,
-        );
+        candidate = await this.#git.createCandidateTree(base, changes, message);
         diff = await this.#git.diff(base, candidate);
       } catch (error) {
         const cleanup = (error as { cleanupFailed?: boolean } | null)
@@ -600,6 +670,7 @@ export class ReviewedIntegration {
         candidate,
         digest: pin.digest,
         protectedCount: flagged,
+        messageDigest: sha256(message),
       });
       return pin;
     } finally {
@@ -689,13 +760,7 @@ export class ReviewedIntegration {
     // This sequence CAS wins before snapshot import or Reviewer VM creation.
     // An authorized review without a result remains uncertain after a crash.
     await append({ kind: "review.authorized", ...pin });
-    const reviewer = await this.#review(
-      pin,
-      diff,
-      this.#plan.reviewer,
-      id,
-      this.#plan.reviewerSandbox,
-    );
+    const reviewer = await this.#review(pin, diff, id);
     const transformed = this.#plan.reviewerOutput
       ? this.#plan.reviewerOutput(reviewer.response)
       : reviewer.response;
@@ -739,10 +804,28 @@ export class ReviewedIntegration {
     return this.#protectedPaths(expected);
   }
 
+  /** Read the final message of the current pinned tree candidate. */
+  async candidateMessage(pin: PinnedCandidate): Promise<Uint8Array> {
+    const events = await this.#journal.read();
+    const expected = candidatePin(events, await this.#target());
+    if (!this.#plan.tree || !samePin(pin, expected))
+      throw new Error("Candidate evidence does not match its durable pin");
+    const message = await this.#git.candidateMessage(expected.candidate);
+    const created = events.findLast(
+      (event) => event.kind === "candidate.created",
+    );
+    if (
+      created?.messageDigest !== undefined &&
+      sha256(message) !== created.messageDigest
+    )
+      throw new Error("Candidate evidence does not match its durable pin");
+    return message;
+  }
+
   async decide(
     pin: PinnedCandidate,
     decision: Decision,
-    options?: { acknowledgeProtected?: readonly string[] },
+    options?: DecisionOptions,
   ): Promise<void> {
     const events = await this.#journal.read();
     const expected = latestPin(events, await this.#target());

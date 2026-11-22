@@ -66,13 +66,25 @@ async function fixture(
 }
 
 test("an answered question resumes the same request after reopening and can reach pinned approval", async (t) => {
-  const { task, reopen, roles, inputs } = await fixture(t, [
-    { tool: "delegate", key: "plan", role: "Planner" },
-    ask,
-    worker,
-    review,
-    integration,
-  ]);
+  const options = { acknowledgeProtected: ["hello.txt"] };
+  const { task, reopen, roles, inputs } = await fixture(
+    t,
+    [
+      { tool: "delegate", key: "plan", role: "Planner" },
+      ask,
+      worker,
+      review,
+      integration,
+    ],
+    {
+      async decide(pinToIntegrate, decision, _attempt, received) {
+        assert.deepEqual(pinToIntegrate, pin);
+        assert.equal(decision, "approve");
+        assert.deepEqual(received, options);
+        return "completed";
+      },
+    },
+  );
   assert.equal(await task.run(), "paused");
   const { question } = await task.status();
   assert.ok(question);
@@ -92,12 +104,15 @@ test("an answered question resumes the same request after reopening and can reac
   await assert.rejects(
     fresh.decide(approval.id, { ...pin, base: "d".repeat(40) }, "approve"),
   );
-  assert.equal(await fresh.decide(approval.id, pin, "approve"), "completed");
+  assert.equal(
+    await fresh.decide(approval.id, pin, "approve", options),
+    "completed",
+  );
   assert.equal(await reopen().run(), "done");
   assert.equal((await fresh.status()).approval?.status, "completed");
   assert.doesNotMatch(
     JSON.stringify(await fresh.trace()),
-    /Which greeting|Change the greeting|formal/,
+    /Which greeting|Change the greeting|formal|hello\.txt/,
   );
 });
 

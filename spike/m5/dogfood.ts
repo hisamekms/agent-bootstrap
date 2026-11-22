@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
+import { connect } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -21,9 +22,10 @@ import {
   codexRoleHarness,
   guestOf,
   parseActorHarnesses,
+  type Harness,
   type RoleHarness,
 } from "../../src/actors.ts";
-import { SqliteAudit } from "../../src/audit.ts";
+import { exportAudit } from "../../src/audit-export.ts";
 import {
   claudeCodeProvider,
   claudeCodeTools,
@@ -35,6 +37,7 @@ import {
   CODEX,
   CODEX_REVIEW_SCHEMA,
   codexCoordinatorCommand,
+  codexHostService,
   codexProvider,
   codexTools,
   deriveCodexCatalog,
@@ -46,13 +49,19 @@ import {
   type CoordinatorDriver,
 } from "../../src/coordinator.ts";
 import type { CredentialProvider } from "../../src/credentials.ts";
+import { EgressGateway } from "../../src/egress-gateway.ts";
+import type { ExecutionContext } from "../../src/execution-context.ts";
 import { LocalGitIntegration } from "../../src/git-integration.ts";
 import { IntegrationJournal } from "../../src/integration-journal.ts";
-import { MicrosandboxRuntime } from "../../src/microsandbox.ts";
 import {
   modelStep,
   type CoordinatorModel,
 } from "../../src/model-coordinator.ts";
+import { parseObservabilityConfig } from "../../src/observability-config.ts";
+import {
+  createObservedHost,
+  type ObservedHostOptions,
+} from "../../src/observed-host.ts";
 import {
   parseProfileLock,
   profileCatalog,
@@ -60,13 +69,12 @@ import {
 } from "../../src/profile-lock.ts";
 import { ReviewedIntegration } from "../../src/reviewed-integration.ts";
 import {
-  RoutingSandboxRuntime,
-  type RuntimeRoute,
-} from "../../src/routing-runtime.ts";
-import type { SandboxProvider } from "../../src/sandbox-runtime.ts";
+  WORKER_MESSAGE_PATH,
+  type SandboxProvider,
+} from "../../src/sandbox-runtime.ts";
 import type { ProfileName } from "../../src/sandbox-profiles.ts";
 import { taskTrace } from "../../src/task-trace.ts";
-import { TrustedHost } from "../../src/trusted-host.ts";
+import { createTelemetry } from "../../src/telemetry.ts";
 
 // M5 dogfood: one small local change, with a harness chosen per actor.
 //   --fixture  loopback mock OpenAI and Anthropic APIs, synthetic credentials,
@@ -92,10 +100,12 @@ const codexModel = "gpt-6.2-sol";
 const codexCatalogDigest =
   "9a6ef910866167ed194b1374ff346256fa813fb46d768b9683d1ce61d60419b9";
 const codexSecretEnv = "AGENT_BOOTSTRAP_SUBSCRIPTION_TOKEN";
-const fixtureHost = "host.microsandbox.internal";
+const claudeFixtureHost = "m5-anthropic.agent-bootstrap.internal";
+const claudeFixtureIp = "192.0.2.11";
 const path = "hello.txt";
 const task =
   "Change the greeting in hello.txt to a polite, formal English greeting. Keep the file to exactly one line.";
+const fixtureMessage = "Use a formal greeting";
 const run = promisify(execFile);
 const gitBinary = "/usr/bin/git";
 const gitEnv = {
@@ -214,6 +224,17 @@ async function operatorTerminal() {
   };
 }
 
+function quoteForTerminal(text: string, asciiOnly = false): string {
+  const escaped = JSON.stringify(text);
+  const unsafe = asciiOnly ? /[^\x20-\x7e]/g : /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+  return escaped.replace(unsafe, (character) =>
+    character
+      .split("")
+      .map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`)
+      .join(""),
+  );
+}
+
 /** The fixture Coordinator's choice, from the host state in its prompt. */
 function fixtureDecision(prompt: string): Record<string, string> {
   const start = prompt.indexOf("\n{");
@@ -235,7 +256,7 @@ function fixtureDecision(prompt: string): Record<string, string> {
 const roleOf = (text: string) => /M5 ROLE: (\w+)/.exec(text)?.[1] ?? "unknown";
 
 /** Loopback mock OpenAI Responses API (plain HTTP) for Codex actors. */
-async function codexFixture(seen: Record<string, number>) {
+async function codexFixture(seen: Record<string, number>, tree: boolean) {
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -274,7 +295,11 @@ async function codexFixture(seen: Record<string, number>) {
       }
     } else if (role === "Worker" && !followUp)
       item = call("exec_command", {
-        cmd: "printf '%s\\n' 'Good day from Codex.' > hello.txt",
+        cmd:
+          "printf '%s\\n' 'Good day from Codex.' > hello.txt" +
+          (tree
+            ? ` && mkdir -p /tmp/agent-bootstrap && printf '%s\\n' '${fixtureMessage}' > ${WORKER_MESSAGE_PATH}`
+            : ""),
         workdir: "/workspace",
       });
     else if (role === "Reviewer")
@@ -330,11 +355,11 @@ async function claudeFixture(
   );
   await writeFile(
     join(directory, "server.conf"),
-    `[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=${fixtureHost}\n`,
+    `[req]\nprompt=no\ndistinguished_name=dn\n[dn]\nCN=${claudeFixtureHost}\n`,
   );
   await writeFile(
     join(directory, "server.ext"),
-    `subjectAltName=DNS:${fixtureHost}\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n`,
+    `subjectAltName=DNS:${claudeFixtureHost}\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n`,
   );
   await ssl(
     "req -new -x509 -newkey rsa:2048 -nodes -days 1 -config ca.conf -keyout ca.key -out ca.pem".split(
@@ -492,10 +517,21 @@ async function claudeFixture(
   };
 }
 
+function traceContext(executionId: string): ExecutionContext {
+  return {
+    executionId,
+    traceContext: {
+      traceparent: `00-${randomBytes(16).toString("hex")}-${randomBytes(8).toString("hex")}-01`,
+    },
+  };
+}
+
 async function main() {
   const [mode, msb, codexBinary] = process.argv.slice(2);
   const live = mode === "--live";
   assert.ok(live || mode === "--fixture");
+  if (live)
+    assert.ok(process.stdout.isTTY, "Live M5 requires an operator terminal");
   const home = process.env.MSB_HOME;
   assert.ok(home && isAbsolute(home) && msb && isAbsolute(msb));
   assert.ok(codexBinary && isAbsolute(codexBinary));
@@ -561,7 +597,7 @@ async function main() {
   seed(repository);
   if (tree) addTreeFiles(repository);
   const codexMock =
-    !live && uses("codex") ? await codexFixture(seen) : undefined;
+    !live && uses("codex") ? await codexFixture(seen, tree) : undefined;
   const claudeMock =
     !live && uses("claude")
       ? await claudeFixture(seen, claudeToken, tls)
@@ -588,7 +624,7 @@ async function main() {
     await writeFile(schemaPath, CODEX_REVIEW_SCHEMA, { mode: 0o600 });
     codexOptions = {
       endpoint: codexMock
-        ? { kind: "host-port", port: codexMock.port }
+        ? { kind: "host-service", port: codexMock.port }
         : {
             kind: "provider",
             host: "api.openai.com",
@@ -605,14 +641,9 @@ async function main() {
       catalog: { path: catalogPath, sha256: sha(catalogText) },
       reviewSchema: { path: schemaPath, sha256: sha(CODEX_REVIEW_SCHEMA) },
     });
-    codexHarness = codexRoleHarness(codexOptions, tools, codexMock?.port);
+    codexHarness = codexRoleHarness(codexOptions, tools);
     if (actors.Worker === "codex")
-      workerHarness = codexRoleHarness(
-        codexOptions,
-        tools,
-        codexMock?.port,
-        profile,
-      );
+      workerHarness = codexRoleHarness(codexOptions, tools, undefined, profile);
   }
 
   // Claude: provider binding, tools and role harness.
@@ -620,7 +651,7 @@ async function main() {
   let claudeProvider: SandboxProvider | undefined;
   const claudeBinding = claudeMock
     ? {
-        host: fixtureHost,
+        host: claudeFixtureHost,
         port: claudeMock.port,
         upstreamCaCertPath: claudeMock.caPath,
       }
@@ -653,35 +684,25 @@ async function main() {
 
   const worker = workerHarness;
   assert.ok(worker);
-  // One runtime adapter per credential. Each VM still lives for one run.
-  const adapter = (
-    name: string,
-    provider?: SandboxProvider,
-    value?: () => string,
-  ) =>
-    new MicrosandboxRuntime({
-      binary: msb,
-      home,
-      profiles,
-      stagingRoot: join(root, `sandboxes-${name}`),
-      ...(provider && value
-        ? { providers: [provider], credentials: credential(value) }
-        : {}),
-    });
-  const routes: RuntimeRoute[] = [{ runtime: adapter("plain") }];
+  const providerBindings: NonNullable<
+    ObservedHostOptions["providerBindings"]
+  >[number][] = [];
   const codexEgress = codexOptions
     ? codexProvider(codexOptions.endpoint)
     : undefined;
   if (codexEgress)
-    routes.push({
+    providerBindings.push({
       provider: codexEgress,
-      runtime: adapter("codex", codexEgress, () => codexToken),
+      credentials: credential(() => codexToken),
     });
   if (claudeProvider)
-    routes.push({
+    providerBindings.push({
       provider: claudeProvider,
-      runtime: adapter("claude", claudeProvider, () => claudeToken),
+      credentials: credential(() => claudeToken),
     });
+  const codexService = codexOptions && codexHostService(codexOptions.endpoint);
+  const hostServicesFor = (harness: Harness) =>
+    harness === "codex" && codexService ? [codexService] : undefined;
 
   const git = new LocalGitIntegration({
     binary: gitBinary,
@@ -689,9 +710,9 @@ async function main() {
     branch: "main",
     stagingRoot: join(root, "worktrees"),
   });
-  const audit = new SqliteAudit(join(root, "audit.sqlite"));
   const usage: { turn: number; input: number; output: number }[] = [];
   const humans = { answers: 0, decisions: 0 };
+  let protectedAcknowledged: readonly string[] = [];
   const started = Date.now();
   // The fixture mocks answer by role marker; live prompts carry none.
   const marker = (role: string, text: string) =>
@@ -699,24 +720,113 @@ async function main() {
   const harnessFor = (actor: "Planner" | "Reviewer") =>
     (actors[actor] === "codex" ? codexHarness : claudeHarness)!;
   const workerTask = tree
-    ? `${task}\nEdit /workspace/hello.txt in place. Do not edit any other files.${
+    ? `${task}\nEdit /workspace/hello.txt in place. Leave other project files alone.${
         profile === "browser" ? " Git is available in /workspace." : ""
-      }`
+      }\nYou may create /tmp/agent-bootstrap and write a short commit message (subject at most 72 characters, optional body) to ${WORKER_MESSAGE_PATH}. The host treats it as untrusted data.`
     : task;
   const reviewInput = tree
-    ? "/review/candidate.diff"
+    ? "/review/candidate.diff and its commit message in /review/candidate.message"
     : "/review/candidate.diff (the new file is /review/candidate.source)";
+  const auditPath = join(root, "audit.sqlite");
+  const obsDir = join(root, "observability");
+  console.error(`M5 observability artifacts: ${quoteForTerminal(obsDir)}`);
+  let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
+  let telemetry: ReturnType<typeof createTelemetry> | undefined;
+  let auditExported: boolean | undefined;
+  function exportRunAudit() {
+    try {
+      exportAudit(auditPath, obsDir);
+      auditExported = true;
+    } catch {
+      auditExported = false;
+      console.error("M5 audit JSONL export failed.");
+    }
+  }
   try {
-    const host = new TrustedHost(
-      audit,
-      new RoutingSandboxRuntime(routes),
-      profiles,
+    stage = "observability setup";
+    const msbConfig = {
+      binary: msb,
+      home,
+      stagingRoot: join(root, "sandboxes"),
+    };
+    const config = parseObservabilityConfig(
+      {
+        directory: obsDir,
+        audit: { mode: "required" },
+        telemetry: { enabled: true, resourceSamplingIntervalMs: 1000 },
+      },
+      { msbHome: home, stagingRoot: msbConfig.stagingRoot },
     );
+    const telemetryObserver = createTelemetry(
+      config.telemetry,
+      config.directory,
+    );
+    telemetry = telemetryObserver;
+    observed = await createObservedHost({
+      config,
+      auditPath,
+      msb: msbConfig,
+      profiles,
+      providerBindings,
+      observers: [
+        {
+          ...telemetryObserver,
+          observe(event) {
+            if (
+              event.eventType !== "execution.started" ||
+              event.payload.role === "Verification"
+            ) {
+              telemetryObserver.observe(event);
+              return;
+            }
+            telemetryObserver.observe({
+              ...event,
+              payload: {
+                ...event.payload,
+                agentKind: actors[event.payload.role],
+              },
+            });
+          },
+        },
+      ],
+      ...(live
+        ? {}
+        : {
+            openGateway: (options) =>
+              EgressGateway.open({
+                ...options,
+                // The TLS fixture goes through provider policy and TLS substitution.
+                // Resolve its synthetic name locally and connect only to mock listeners.
+                async resolver(hostname, qtype) {
+                  return claudeBinding &&
+                    hostname === claudeBinding.host &&
+                    qtype === 1
+                    ? [{ address: claudeFixtureIp, ttl: 60 }]
+                    : [];
+                },
+                connect({ ip, port }) {
+                  if (
+                    (ip !== claudeFixtureIp || port !== claudeBinding?.port) &&
+                    (ip !== "127.0.0.1" || port !== codexService?.loopbackPort)
+                  )
+                    throw new Error("Unexpected fixture gateway destination");
+                  return connect({
+                    host: "127.0.0.1",
+                    port,
+                    allowHalfOpen: true,
+                  });
+                },
+              }),
+          }),
+    });
+    const { host, audit } = observed;
     const journal = new IntegrationJournal(reviewDir, randomUUID());
     const flow = (control?: CoordinatorControl) => {
       const reviewer = harnessFor("Reviewer");
+      const workerHostServices = hostServicesFor(worker.harness);
+      const reviewerHostServices = hostServicesFor(reviewer.harness);
       return new ReviewedIntegration(git, host, journal, {
-        ...(tree ? { tree: {} } : { path }),
+        ...(tree ? { tree: live ? {} : { protectedPaths: [path] } } : { path }),
         worker: worker.command({
           role: "Worker",
           prompt: marker(
@@ -753,6 +863,8 @@ async function main() {
         },
         workerSandbox: worker.sandbox,
         reviewerSandbox: reviewer.sandbox,
+        ...(workerHostServices ? { workerHostServices } : {}),
+        ...(reviewerHostServices ? { reviewerHostServices } : {}),
         ...(reviewer.reviewerOutput
           ? { reviewerOutput: reviewer.reviewerOutput }
           : {}),
@@ -782,13 +894,15 @@ async function main() {
             },
             id,
             use,
+            traceContext(id),
+            codexService ? { hostServices: [codexService] } : undefined,
           );
           return result.value as never;
         },
       });
     } else
       coordinator = new ClaudeCodeCoordinator({
-        run: (plan, id) => host.runCoordinator(plan, id),
+        run: (plan, id) => host.runCoordinator(plan, id, traceContext(id)),
         sandbox: claudeHarness!.sandbox,
         auth,
         model: claudeModel,
@@ -811,6 +925,7 @@ async function main() {
         stage = `${role} delegation`;
         if (role === "Planner") {
           const harness = harnessFor("Planner");
+          const hostServices = hostServicesFor(harness.harness);
           const bytes = await git.snapshot(await git.head(), path);
           const planned = await host.runPlanner(
             {
@@ -829,6 +944,8 @@ async function main() {
               }),
             },
             id,
+            traceContext(id),
+            hostServices ? { hostServices } : undefined,
           );
           return {
             id: planned.id,
@@ -866,10 +983,10 @@ async function main() {
       async reviewedCandidate() {
         return flow().reviewedPin();
       },
-      async decide(pin, decision, attempt) {
+      async decide(pin, decision, attempt, options) {
         stage = "integration";
         const integration = flow();
-        await integration.decide(pin, decision);
+        await integration.decide(pin, decision, options);
         return integration.integrate(attempt);
       },
     };
@@ -897,29 +1014,56 @@ async function main() {
           createHash("sha256").update(diff).digest("hex"),
           approval.digest,
         );
+        const integration = flow();
+        const paths = tree ? await integration.protectedPaths(approval) : [];
+        const message = tree
+          ? new TextDecoder().decode(
+              await integration.candidateMessage(approval),
+            )
+          : undefined;
+        if (!live && tree && actors.Worker === "codex")
+          assert.ok(
+            message?.startsWith(
+              `${fixtureMessage}\n\nAgent-Bootstrap-Worker-Run: `,
+            ),
+          );
+        const approvalText = `approve ${approval.candidate}${paths.length ? " protected" : ""}`;
         let decision: "approve" | "reject" = "approve";
         if (operator) {
           operator.say(
             new TextDecoder().decode(diff).replace(/[^\x20-\x7e\n]/gu, "?"),
           );
+          if (message !== undefined) {
+            operator.say("Commit message");
+            for (const line of message.replace(/\n$/, "").split("\n"))
+              operator.say(`  ${quoteForTerminal(line)}`);
+            if (paths.length) {
+              operator.say("Protected paths");
+              for (const path of paths)
+                operator.say(`  ${quoteForTerminal(path, true)}`);
+            }
+          }
           // Approval needs the exact candidate ID. Rejection must be explicit;
           // anything else asks again, and three unclear answers reject.
           decision = "reject";
           for (let attempt = 0; attempt < 3; attempt++) {
-            const typed = (
-              await operator.ask(
-                `Type "approve ${approval.candidate}" to integrate, or "reject": `,
-              )
-            ).trim();
-            if (typed === `approve ${approval.candidate}`) {
+            const typed = await operator.ask(
+              `Type "${approvalText}" to integrate, or "reject": `,
+            );
+            if ((paths.length ? typed : typed.trim()) === approvalText) {
               decision = "approve";
               break;
             }
-            if (typed === "reject") break;
+            if (typed.trim() === "reject") break;
             operator.say("That did not match. Nothing was decided yet.");
           }
         }
-        await coordinatorTask.decide(approval.id, approval, decision);
+        const options =
+          tree && decision === "approve"
+            ? { acknowledgeProtected: paths }
+            : undefined;
+        await coordinatorTask.decide(approval.id, approval, decision, options);
+        protectedAcknowledged = options?.acknowledgeProtected ?? [];
       }
       outcome = await coordinatorTask.run();
     }
@@ -939,6 +1083,7 @@ async function main() {
       const first = events[0];
       const last = events.at(-1);
       return {
+        executionId: id,
         role: first?.role,
         outcome:
           last?.kind === "invocation.finished" ? last.outcome : "incomplete",
@@ -950,6 +1095,35 @@ async function main() {
             : null,
       };
     });
+    const networkCounts = { allowed: 0, denied: 0, finished: 0 };
+    const networkEventsByRole = {
+      Coordinator: { ...networkCounts },
+      Planner: { ...networkCounts },
+      Worker: { ...networkCounts },
+      Reviewer: { ...networkCounts },
+      Verification: { ...networkCounts },
+    };
+    const invocationRoles = new Map<string, keyof typeof networkEventsByRole>();
+    const auditRows = audit.readSince({});
+    for (const row of auditRows) {
+      if (
+        row.table === "audit_events" &&
+        row.kind === "invocation.started" &&
+        row.role
+      )
+        invocationRoles.set(row.invocationId, row.role);
+    }
+    for (const row of auditRows) {
+      if (row.table !== "network_events") continue;
+      const role = invocationRoles.get(row.invocationId);
+      if (!role) continue;
+      const counts = networkEventsByRole[role];
+      if (row.phase === "finished") counts.finished++;
+      if (row.phase === "decided" || row.phase === "dns") {
+        if (row.decision === "allow") counts.allowed++;
+        else counts.denied++;
+      }
+    }
     const kinds = trace.coordinator.map((event) => event.kind);
     const count = (kind: string) =>
       kinds.filter((value) => value === kind).length;
@@ -975,6 +1149,8 @@ async function main() {
           .split("\0")
           .slice(0, -1)
       : [];
+    exportRunAudit();
+    await telemetry.shutdown();
     const report = {
       mode: live ? "live" : "fixture",
       tree,
@@ -1015,10 +1191,18 @@ async function main() {
       coordinatorUsage: usage.filter(Boolean),
       integration: integration.map((event) => event.kind),
       invocations,
+      observability: {
+        directory: obsDir,
+        auditSqlite: auditPath,
+        auditJsonlDirectory: join(obsDir, "audit"),
+        auditExported,
+        telemetryDirectory: join(obsDir, "telemetry"),
+        networkEventsByRole,
+      },
       result: Buffer.from(await git.snapshot(await git.head(), path))
         .toString("utf8")
         .replace(/[^\x20-\x7e\n]/gu, "?"),
-      ...(live ? {} : { fixture: seen }),
+      ...(live ? {} : { fixture: seen, protectedAcknowledged }),
     };
     await writeFile(
       join(root, "report.json"),
@@ -1033,10 +1217,18 @@ async function main() {
   } finally {
     codexToken = "";
     claudeToken = "";
-    audit.close();
     operator?.close();
     codexMock?.close();
     claudeMock?.close();
+    try {
+      await observed?.close();
+    } finally {
+      try {
+        if (observed && auditExported === undefined) exportRunAudit();
+      } finally {
+        await telemetry?.shutdown();
+      }
+    }
   }
 }
 

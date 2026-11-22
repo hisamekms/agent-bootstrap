@@ -1,5 +1,35 @@
-import type { AuditEvent } from "./audit.ts";
+import type {
+  AuditEvent,
+  ExecutionAudit,
+  NetworkEvent,
+  SqliteAudit,
+} from "./audit.ts";
 import type { CoordinatorTask } from "./coordinator.ts";
+
+type AuditReader = Pick<SqliteAudit, "read"> &
+  Partial<Pick<SqliteAudit, "readExecution">>;
+type DnsQuery = Extract<NetworkEvent, { phase: "dns" }>;
+type ConnectionPhase = Exclude<NetworkEvent, DnsQuery>;
+type ConnectionResult = Extract<
+  ConnectionPhase,
+  { phase: "finished" }
+>["result"];
+
+interface InvocationTrace {
+  readonly id: string;
+  readonly events: readonly AuditEvent[];
+  readonly executionContexts: Readonly<ExecutionAudit["executionContexts"]>;
+  readonly sandboxBindings: Readonly<ExecutionAudit["sandboxBindings"]>;
+  readonly processResults: Readonly<ExecutionAudit["processResults"]>;
+  readonly networkConnections: readonly {
+    readonly connectionId: string;
+    readonly sandboxId: string;
+    readonly phases: readonly ConnectionPhase[];
+    readonly outcome?: ConnectionResult | "unknown";
+  }[];
+  readonly dnsQueries: readonly DnsQuery[];
+  readonly resourceEvents: Readonly<ExecutionAudit["resourceEvents"]>;
+}
 
 export interface TaskTrace {
   readonly coordinator: Awaited<ReturnType<CoordinatorTask["trace"]>>;
@@ -12,17 +42,61 @@ export interface TaskTrace {
     readonly text: string | null;
   }[];
   /** Host audit for every run, attempt and invocation the journal names. */
-  readonly invocations: readonly {
-    readonly id: string;
-    readonly events: readonly AuditEvent[];
-  }[];
+  readonly invocations: readonly InvocationTrace[];
 }
 
-function escapeControls(text: string): string {
+export function escapeControls(text: string): string {
   return text.replace(
-    /[\u0080-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
+    /[\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
     (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
+}
+
+export function readInvocationTrace(
+  audit: AuditReader,
+  id: string,
+): InvocationTrace | undefined {
+  const execution = audit.readExecution?.(id);
+  const events = execution?.auditEvents ?? audit.read(id);
+  const groups = new Map<string, ConnectionPhase[]>();
+  const dnsQueries: DnsQuery[] = [];
+  for (const event of execution?.networkEvents ?? []) {
+    if (event.phase === "dns") {
+      dnsQueries.push(event);
+    } else {
+      // The audit identifies a connection within an invocation and sandbox.
+      const key = `${event.sandboxId}/${event.connectionId}`;
+      const phases = groups.get(key);
+      if (phases) phases.push(event);
+      else groups.set(key, [event]);
+    }
+  }
+  const networkConnections = Array.from(groups.values(), (phases) => {
+    const { sandboxId, connectionId } = phases[0]!;
+    const finished = phases.find((event) => event.phase === "finished");
+    const allowed = phases.some(
+      (event) => event.phase === "decided" && event.decision === "allow",
+    );
+    const outcome =
+      finished?.result ?? (allowed ? ("unknown" as const) : undefined);
+    return {
+      connectionId,
+      sandboxId,
+      phases,
+      ...(outcome === undefined ? {} : { outcome }),
+    };
+  });
+  const rows = {
+    events,
+    executionContexts: execution?.executionContexts ?? [],
+    sandboxBindings: execution?.sandboxBindings ?? [],
+    processResults: execution?.processResults ?? [],
+    networkConnections,
+    dnsQueries,
+    resourceEvents: execution?.resourceEvents ?? [],
+  };
+  if (Object.values(rows).some((entries) => entries.length > 0))
+    return { id, ...rows };
 }
 
 /** One task's Coordinator journal joined with the host audit. Turn run IDs
@@ -30,7 +104,7 @@ function escapeControls(text: string): string {
  * the delegated role invocation IDs. */
 export async function taskTrace(
   task: CoordinatorTask,
-  audit: { read(id: string): AuditEvent[] },
+  audit: AuditReader,
 ): Promise<TaskTrace> {
   const coordinator = await task.trace();
   const ids = new Set<string>();
@@ -51,8 +125,10 @@ export async function taskTrace(
       });
     }
   }
-  const invocations = [...ids]
-    .map((id) => ({ id, events: audit.read(id) }))
-    .filter((entry) => entry.events.length > 0);
+  const invocations = [];
+  for (const id of ids) {
+    const invocation = readInvocationTrace(audit, id);
+    if (invocation) invocations.push(invocation);
+  }
   return { coordinator, proposals, invocations };
 }

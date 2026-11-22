@@ -32,6 +32,16 @@
   `src/sandbox-profiles.ts` owns sandbox profiles (digest-pinned images,
   resources, and the profiles each role may use); see
   `docs/sandbox-profiles.md`.
+  Under `src/`, `execution-context.ts` and `runtime-events.ts` define execution
+  metadata and observer events. `egress-policy.ts` and `egress-gateway.ts` own
+  egress decisions and relays. `socks5.ts` and `dns-wire.ts` own wire formats.
+  `observability-config.ts` validates settings and `observed-host.ts` composes
+  the host. `jsonl-files.ts` owns file writing, `audit-export.ts` projects SQLite,
+  and `otlp-file-exporters.ts` writes telemetry. `telemetry.ts` instruments runtime
+  events, `resource-sampler.ts` samples resources, and `microsandbox-metrics.ts`
+  parses backend metrics. `workspace-tree.ts` owns workspace diffs. `oci-image.ts`,
+  `image-recipes.ts`, and `profile-lock.ts` own OCI image assembly, recipes, and
+  profile locks.
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and
   milestone evidence. `.codex/` configures development roles and models.

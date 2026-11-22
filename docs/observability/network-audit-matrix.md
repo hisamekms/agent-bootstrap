@@ -21,6 +21,15 @@ Column meanings:
 the gateway. It is enforced, but there is no per-attempt record (gap G1 in
 the ADR).
 
+For gateway rows, a per-attempt record describes traffic that reaches
+decision recording. SOCKS and DNS TCP accept refusals at capacity or during
+quarantine, disconnects before a decision is recorded, DNS queries over the
+in-flight cap, malformed DNS queries or qnames that fail letter/digit/hyphen
+hostname validation, and DNS TCP framing errors may leave no per-attempt
+record. The gateway sends aggregate refusal counts to runtime observers,
+including telemetry. The counts describe volume and are absent from the audit.
+Upstream TCP connects and DNS policy replies still require a durable decision.
+
 Status legend:
 
 - **verified**: observed in this Phase 0 with the real backend;
@@ -81,6 +90,7 @@ It still depends on these conditions:
    requirement is **not met** in v0.1 and is listed as a non-guarantee.
    Closing it needs a Microsandbox change: a structured, synchronous
    deny-event stream (for example, a JSON Lines socket or a callback per
-   denied flow).
+   denied flow). The gateway cases listed above also lack guaranteed
+   per-attempt coverage. Aggregate counts will describe refusal volume.
 4. The Phase 1 gate is not passed until N-22, N-25, N-26 and the gateway
    records in N-01 to N-09 and N-24 pass with the real backend.

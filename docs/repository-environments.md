@@ -52,8 +52,20 @@ The result path and git in the VM are implemented. The pieces are
 `prepareWorkspace`, `createCandidateTree` and the multi-file `diff` and
 `advance` in `src/git-integration.ts`, the `repository` and `{ tree: true }`
 collection in the adapter, `src/workspace-tree.ts`, and the `tree` plan in
-`src/reviewed-integration.ts`. The Worker's proposed commit message is not
-implemented yet; the host writes a fixed message.
+`src/reviewed-integration.ts`.
+
+In tree mode the Worker may propose a commit message in
+`/tmp/agent-bootstrap/commit-message`. The adapter skips missing files and
+files larger than 4096 bytes. The host requires valid UTF-8, removes control
+characters other than newline and tab, trims whitespace, and truncates the
+subject to 72 Unicode code points. It limits the final message, including
+the host's `Agent-Bootstrap-Worker-Run` trailer, to 2048 bytes. An absent
+or unusable proposal gets the subject `Candidate from Worker run <id>`.
+The Reviewer receives the final message at `/review/candidate.message`.
+The integration journal stores its SHA-256 digest.
+The adapter checks size before and after copying. Microsandbox's copy
+operation can stage a file that grows between the two checks before the
+adapter discards it.
 
 Before approval, the operator interface must show the exact paths returned
 by `ReviewedIntegration.protectedPaths(pin)` alongside the pinned review
@@ -68,6 +80,12 @@ whole list. The interface passes those paths through
 `decide(pin, "approve", { acknowledgeProtected: paths })`. The host requires
 an exact match as a set and records a digest of the acknowledged paths.
 Rejection needs no acknowledgement.
+
+The M5 runner displays the message and protected paths alongside the diff.
+When protected paths are present, the operator must type
+`approve <candidate id> protected`. The tree fixture marks its changed file
+as protected, acknowledges it automatically, and reports the paths in
+`protectedAcknowledged`.
 
 On 2026-11-23, `spike/workspace/tree-smoke.ts` ran in real VMs with the
 `browser` profile for Worker and verification:

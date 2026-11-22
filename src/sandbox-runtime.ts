@@ -62,6 +62,14 @@ export function sameProvider(
   return key(a) === key(b);
 }
 
+/** Host-owned binding to per-sandbox loopback listeners. */
+export interface SandboxEgressGateway {
+  readonly socksPort: number;
+  readonly dnsPort: number;
+  readonly username: string;
+  readonly passwordEnv: string;
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -79,8 +87,11 @@ export interface SandboxSpec {
     readonly tree: string;
   };
   readonly tools?: readonly SandboxTool[];
-  /** The only network egress: TCP to this port on the host. Default: none. */
+  /** Direct TCP to this host port. Mutually exclusive with the gateway. */
   readonly hostTcpPort?: number;
+  readonly egressGateway?: SandboxEgressGateway;
+  /** Network argv digest already recorded by the host before create. */
+  readonly expectedNetRuleDigest?: string;
   /** HTTPS egress to one model provider host, with the trusted host's
    * credential substituted for a guest placeholder in the Authorization
    * header. The guest sees only `$<secretEnv>`, set to a placeholder. */
@@ -94,6 +105,26 @@ export interface SandboxSpec {
 
 export interface SandboxHandle {
   readonly id: string;
+  readonly netRuleDigest?: string;
+}
+
+/** VM-wide point sample. Missing counters are unavailable. */
+export interface ResourceSample {
+  readonly cpuPercent?: number;
+  readonly cpus?: number;
+  readonly vcpuTimeNs?: number;
+  readonly memoryBytes?: number;
+  readonly memoryAvailableBytes?: number;
+  readonly memoryLimitBytes?: number;
+  readonly memoryHostResidentBytes?: number;
+  readonly diskReadBytes?: number;
+  readonly diskWriteBytes?: number;
+  readonly netRxBytes?: number;
+  readonly netTxBytes?: number;
+  readonly upperUsedBytes?: number;
+  readonly upperFreeBytes?: number;
+  readonly upperHostAllocatedBytes?: number;
+  readonly uptimeSecs?: number;
 }
 
 export interface SandboxCommand {
@@ -113,10 +144,15 @@ export interface ExecResult {
 export type CollectSpec =
   { readonly paths: readonly string[] } | { readonly tree: true };
 
+export const WORKER_MESSAGE_PATH = "/tmp/agent-bootstrap/commit-message";
+export const WORKER_MESSAGE_LIMIT = 4096;
+
 export interface CollectedArtifacts {
   readonly files: readonly SandboxFile[];
   /** Tar of the workspace without `.git`, for `{ tree: true }`. */
   readonly tree?: Uint8Array;
+  /** Untrusted Worker commit message proposal, for `{ tree: true }` only. */
+  readonly message?: Uint8Array;
 }
 
 /** A long-running guest command with line-delimited stdin and stdout. */
@@ -131,7 +167,11 @@ export interface SandboxSession {
 }
 
 export interface SandboxRuntime {
+  /** Computes the network argv digest before the host authorizes create. */
+  netRuleDigest?(spec: SandboxSpec): string;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
+  /** Creates under the host's audited ID and enforces expectedNetRuleDigest. */
+  createBound?(spec: SandboxSpec, sandboxId: string): Promise<SandboxHandle>;
   exec(handle: SandboxHandle, command: SandboxCommand): Promise<ExecResult>;
   /** Optional: adapters without streaming do not support sessions. */
   openSession?(
@@ -142,6 +182,9 @@ export interface SandboxRuntime {
     handle: SandboxHandle,
     spec: CollectSpec,
   ): Promise<CollectedArtifacts>;
+  sampleResources?(handle: SandboxHandle): Promise<ResourceSample | null>;
+  /** Consumes the sample captured before successful backend removal. */
+  finalResourceSample?(handle: SandboxHandle): ResourceSample | null;
   destroy(handle: SandboxHandle): Promise<void>;
 }
 

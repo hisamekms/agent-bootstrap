@@ -938,6 +938,41 @@ MSB_HOME="$MSB_HOME" M5_TREE=0 M5_PROFILE=db M5_ACTORS=all=codex \
   bun spike/m5/dogfood.ts --fixture "$MSB" "$CODEX_BINARY"
 ```
 
+### OBS-11b gateway migration
+
+The M4 Coordinator model smoke now maps its HTTP fixture through an audited
+host service. The M6 Claude Code smoke uses a DNS-pinned TEST-NET provider
+binding and relays TLS to its loopback fixture. Both enable telemetry at
+1,000 ms and export audit JSONL under the run's `observability/` directory.
+VM verification is pending, including end-to-end secret substitution.
+
+M5 still needs a composition root that routes multiple provider bindings to
+their credential-specific runtimes under one trusted host and audit writer.
+Its HTTP Codex fixture needs a Codex endpoint that targets the gateway's
+host-service name and `ReviewedIntegration` support for passing
+`hostServices` to Worker and Reviewer runs. The M5 report and export are
+pending with that migration.
+
+## Runtime Observability v0.1
+
+SQLite v5 records execution context, sandbox bindings, process results,
+gateway decisions and resource events. Audit JSONL and OTLP telemetry files
+support offline analysis. The [v0.1 guarantees](observability/guarantees.md)
+record the trust boundary, compatibility and the changes pending coordinator
+verification.
+
+- **OBS-10.** Real VMs exercised gateway attribution, synthetic credential
+  substitution, audit failure, host crash and forced removal. Forced removal
+  can end the relay as `client-closed` or `sandbox-destroyed`. The packet
+  coverage gaps remain N-10, N-11, N-15, N-16 and N-18. Across 100 connects
+  per mode, direct p50/p95 were 2.7/3.6 ms and gateway p50/p95 were 6.7/8.0
+  ms, about 4 ms added at p50. See [Phase 1 evidence](observability/phase1-evidence.md).
+- **OBS-16.** The recorded run passed 16 socket-free fixture executions.
+  The DuckDB joins link audit and spans by execution ID. CPU and memory
+  values are scripted. Real-VM evidence comes from OBS-10 and the M5, M4
+  and M6 fixture runs. Live Codex and Claude Code observability dogfooding
+  awaits operator opt-in. See [OBS-16 dogfooding](observability/dogfooding.md).
+
 ## Planned: credential fallback per actor
 
 Status: planned, not implemented (recorded on 2026-11-22).

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   lstat,
@@ -18,12 +18,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { SqliteAudit } from "../src/audit.ts";
+import type { EgressPolicy } from "../src/egress-policy.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
-import { ReviewedIntegration } from "../src/reviewed-integration.ts";
+import {
+  ReviewedIntegration,
+  workerCommitMessage,
+} from "../src/reviewed-integration.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
@@ -168,6 +173,12 @@ async function fixture(
   t: { after(fn: () => Promise<void>): void },
   tree: object,
   reviews: string[] = ['{"review":"pass"}'],
+  message?: Uint8Array,
+  workerHostServices?: readonly {
+    ip: string;
+    port: number;
+    loopbackPort: number;
+  }[],
 ) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "bootstrap-tree-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -189,21 +200,27 @@ async function fixture(
   const specs: SandboxSpec[] = [];
   const seen: Record<string, string[]>[] = [];
   const extracted = new Map<string, string>();
+  const policies: EgressPolicy[] = [];
   let workerOutcome = 0;
+  const digest = "a".repeat(64);
+  const create = async (spec: SandboxSpec, id: string = randomUUID()) => {
+    specs.push(spec);
+    if (spec.repository) {
+      const dir = join(root, `vm-${id}`);
+      await mkdir(dir);
+      await extract(spec.repository.tree, dir);
+      extracted.set(id, dir);
+      // The git directory is a host-prepared object store with a base ref.
+      assert.ok((await lstat(spec.repository.gitDir)).isDirectory());
+    }
+    return { id };
+  };
   const runtime: SandboxRuntime = {
-    async create(spec) {
-      const id = randomUUID();
-      specs.push(spec);
-      if (spec.repository) {
-        const dir = join(root, `vm-${id}`);
-        await mkdir(dir);
-        await extract(spec.repository.tree, dir);
-        extracted.set(id, dir);
-        // The git directory is a host-prepared object store with a base ref.
-        assert.ok((await lstat(spec.repository.gitDir)).isDirectory());
-      }
-      return { id };
+    create: (spec) => create(spec),
+    async createBound(spec, id) {
+      return { ...(await create(spec, id)), netRuleDigest: digest };
     },
+    netRuleDigest: () => digest,
     async exec(handle, command) {
       const entry = command.argv[0];
       const dir = extracted.get(handle.id);
@@ -232,19 +249,44 @@ async function fixture(
     async collect(handle) {
       const dir = extracted.get(handle.id);
       assert.ok(dir);
-      return { files: [], tree: await tarOf(dir) };
+      return {
+        files: [],
+        tree: await tarOf(dir),
+        ...(message ? { message } : {}),
+      };
     },
     async destroy() {},
   };
   const journal = new IntegrationJournal(journalDir, randomUUID());
   const flow = new ReviewedIntegration(
     integration,
-    new TrustedHost(audit, runtime, profiles),
+    new TrustedHost(
+      audit,
+      runtime,
+      profiles,
+      workerHostServices
+        ? {
+            config: {
+              audit: { mode: "required" },
+              telemetry: {
+                enabled: false,
+                resourceSamplingIntervalMs: 1000,
+                traceSamplingRatio: 1,
+              },
+            },
+            async gatewayFactory(options) {
+              policies.push(options.policy);
+              return fakeGateway([]).open(options);
+            },
+          }
+        : undefined,
+    ),
     journal,
     {
       tree,
       worker: { argv: ["worker"], timeoutMs: 123 },
       reviewer: { argv: ["reviewer"], timeoutMs: 123 },
+      ...(workerHostServices ? { workerHostServices } : {}),
       verification: {
         command: { argv: ["verify"], timeoutMs: 123 },
         suite: [{ path: "t.test.ts", bytes: Buffer.from("test") }],
@@ -261,6 +303,7 @@ async function fixture(
     journal,
     edits,
     specs,
+    policies,
     seen,
     leftovers,
     fail: () => (workerOutcome = 1),
@@ -290,7 +333,14 @@ const tree = (repository: string, rev: string) =>
   ]).split("\n");
 
 test("a multi-file candidate (add, modify, delete, mode change) is reviewed, verified and integrated", async (t) => {
-  const f = await fixture(t, { protectedPaths: ["run.sh", "docs/"] });
+  const service = { ip: "192.0.2.20", port: 8080, loopbackPort: 8081 };
+  const f = await fixture(
+    t,
+    { protectedPaths: ["run.sh", "docs/"] },
+    undefined,
+    undefined,
+    [service],
+  );
   f.edits.push(async (dir) => {
     await writeFile(join(dir, "README.md"), "readme 2\n");
     await mkdir(join(dir, "src/new/deep"), { recursive: true });
@@ -329,7 +379,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   );
   // run.sh is protected; docs/ is untouched.
   assert.equal(created?.protectedCount, 1);
-  // Worker got the repository and no loose files; Reviewer only the diff.
+  // Worker got the repository and no loose files; Reviewer got the diff and message.
   assert.ok(f.specs[0]?.repository);
   assert.equal(f.specs[0]?.files, undefined);
   assert.deepEqual(
@@ -338,7 +388,7 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   );
   assert.deepEqual(
     f.specs[1]?.readOnlyFiles?.map((file) => file.path),
-    ["candidate.diff"],
+    ["candidate.diff", "candidate.message"],
   );
   await f.flow.decide(pin, "approve", { acknowledgeProtected: ["run.sh"] });
   assert.equal(await f.flow.integrate(), "completed");
@@ -346,11 +396,111 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   // Verification got the whole candidate tree plus diff and suite.
   const verify = f.specs[2];
   assert.ok(verify?.repository);
+  assert.ok(f.specs[0]?.egressGateway);
+  assert.equal(f.specs[1]?.egressGateway, undefined);
+  assert.equal(verify.egressGateway, undefined);
+  assert.deepEqual(
+    f.policies.map((policy) => policy.hostServices),
+    [[service]],
+  );
   assert.deepEqual(
     verify.readOnlyFiles?.map((file) => file.path),
     ["candidate.diff", "suite/t.test.ts"],
   );
   assert.equal(await f.leftovers(), 0);
+});
+
+test("tree commits and reviews use the same bounded, sanitized Worker message", async (t) => {
+  const emoji = "😀";
+  const data = Buffer.from(
+    ` \n ` +
+      emoji.repeat(73) +
+      `\n\nAgent-Bootstrap-Worker-Run: forged\naGeNt-\u200bBoOtStRaP-Other: forged\n` +
+      `Bo\u202edy\ttext\0\r\u001b\u0085\u2066\u2067\u2068\u2069\u200d\u2028\u2029 ${"界".repeat(1000)}\n`,
+  );
+  const f = await fixture(t, {}, undefined, data);
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const run = randomUUID();
+  const pin = await f.flow.prepareCandidate(run);
+  const subjectAndBody = `${emoji.repeat(72)}\n\nBody\ttext `;
+  const trailer = `\n\nAgent-Bootstrap-Worker-Run: ${run}\n`;
+  const bodyLength = Math.floor(
+    (2048 - Buffer.byteLength(subjectAndBody + trailer)) / 3,
+  );
+  const expected = subjectAndBody + "界".repeat(bodyLength) + trailer;
+  const message = await f.flow.candidateMessage(pin);
+  assert.deepEqual(Buffer.from(message), Buffer.from(expected));
+  assert.equal(
+    git(f.repository, ["log", "-1", "--format=%B", pin.candidate]),
+    expected.trimEnd(),
+  );
+  await f.flow.reviewCandidate();
+  assert.equal(
+    f.specs[1]?.readOnlyFiles
+      ?.find((file) => file.path === "candidate.message")
+      ?.bytes.toString(),
+    expected,
+  );
+  const events = await f.journal.read();
+  const created = events.find((event) => event.kind === "candidate.created");
+  assert.equal(
+    created?.messageDigest,
+    createHash("sha256").update(expected).digest("hex"),
+  );
+  assert.doesNotMatch(
+    JSON.stringify(events),
+    /Body|Agent-Bootstrap-Worker-Run/,
+  );
+  await assert.rejects(
+    f.flow.candidateMessage({ ...pin, digest: "0".repeat(64) }),
+    /durable pin/,
+  );
+});
+
+test("missing, invalid UTF-8, empty and oversized Worker proposals get a host subject", async (t) => {
+  // Shapes are checked on the message builder directly; one end-to-end run
+  // below shows the collected proposal reaches the candidate commit.
+  for (const data of [
+    undefined,
+    Buffer.from([0xff]),
+    Buffer.from(" \t\n\0"),
+    Buffer.from("  aGeNt-\u200bBoOtStRaP-Worker-Run: forged"),
+  ]) {
+    const run = randomUUID();
+    assert.equal(
+      workerCommitMessage(run, data),
+      `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`,
+      String(data?.byteLength),
+    );
+  }
+  // An oversized proposal is dropped before the builder, by the collection
+  // size check, so this case goes through the whole flow.
+  const f = await fixture(t, {}, undefined, Buffer.alloc(4097, "a"));
+  f.edits.push((dir) => writeFile(join(dir, "README.md"), "changed\n"));
+  const run = randomUUID();
+  const pin = await f.flow.prepareCandidate(run);
+  assert.equal(
+    Buffer.from(await f.flow.candidateMessage(pin)).toString(),
+    `Candidate from Worker run ${run}\n\nAgent-Bootstrap-Worker-Run: ${run}\n`,
+  );
+});
+
+test("the journal accepts only a lowercase SHA-256 candidate message digest", async (t) => {
+  const { journal } = await fixture(t, {});
+  const event = {
+    kind: "candidate.created" as const,
+    candidate: "a".repeat(40),
+    digest: "b".repeat(64),
+    protectedCount: 1,
+  };
+  for (const messageDigest of ["d".repeat(63), "D".repeat(64), "message"]) {
+    await assert.rejects(
+      journal.append(0, { ...event, messageDigest }),
+      /Invalid integration event fields/,
+    );
+  }
+  await journal.append(0, { ...event, messageDigest: "d".repeat(64) });
+  assert.equal((await journal.read())[0]?.kind, "candidate.created");
 });
 
 test("a change outside the scope is denied, and nothing is left behind", async (t) => {

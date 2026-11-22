@@ -30,10 +30,29 @@ it rechecks the expected base, review evidence, and verification results.
 
 The audit design calls for append-only events and trace inspection. Events carry
 actor, correlation, task, run and invocation identifiers where applicable, and
-artifact references. Record provider usage or cost only when available. Persist
-large artifacts separately under controlled access and redact secrets before
-persistence. Process output by itself provides partial observation. Verify the
-actual SDK interception surface and document blind spots.
+artifact references. Persist large artifacts separately under controlled
+access and redact secrets before persistence. Process output by itself
+provides partial observation.
+
+## Runtime observability
+
+SQLite v5 is the authoritative audit store. In required mode the trusted
+host records the sandbox binding and rule-set digest before creation, and the
+host gateway records TCP and DNS decisions before the corresponding outbound
+connect or policy reply. Audit failure stops normal execution and triggers
+emergency teardown. JSONL and OTLP files are analysis copies with no tamper
+resistance against the host user or administrator. Treat the audit database
+and its export as sensitive because they hold raw guest-controlled DNS names.
+Telemetry is best effort and leaves the audit unchanged.
+
+The Microsandbox 0.7.16 netstack and `--proxy` are part of the trusted
+computing base. Blocks enforced before the gateway have no per-attempt audit
+record. Gateway records cover connections and DNS, with no inspection of
+requests inside permitted connections. An allowed destination can receive
+exfiltrated data. See the [v0.1 guarantees](observability/guarantees.md) for
+scope, evidence and operational limits.
+
+## Baseline evidence
 
 M0 exercises the TypeScript contracts using fake ports and fixtures. Actual
 isolation, authorization, audit durability, restart behavior, and approval

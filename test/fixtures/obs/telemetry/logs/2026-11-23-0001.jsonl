@@ -1,0 +1,1 @@
+{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"agent-bootstrap"}}],"droppedAttributesCount":0},"scopeLogs":[{"scope":{"name":"agent-bootstrap"},"logRecords":[{"timeUnixNano":"1795392000000000000","observedTimeUnixNano":"1795392000000000000","body":{"stringValue":"network.dns.query"},"attributes":[],"droppedAttributesCount":0}]}]}]}

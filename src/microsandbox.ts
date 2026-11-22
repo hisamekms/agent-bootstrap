@@ -10,20 +10,29 @@ import {
   readdir,
   readFile,
   rm,
+  rmdir,
   writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
+import {
+  METRICS_OUTPUT_BYTES,
+  parseMicrosandboxMetrics,
+} from "./microsandbox-metrics.ts";
 import { PROFILE_NAMES, ProfileCatalog } from "./sandbox-profiles.ts";
 import {
   isSafeCredentialVariable,
   sameProvider,
   SandboxRuntimeError,
+  WORKER_MESSAGE_LIMIT,
+  WORKER_MESSAGE_PATH,
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
+  type ResourceSample,
   type SandboxCommand,
+  type SandboxEgressGateway,
   type SandboxHandle,
   type SandboxProvider,
   type SandboxRuntime,
@@ -45,7 +54,18 @@ export interface MicrosandboxConfig {
    * equal it exactly. At most one entry, because `credentials` is a single
    * credential. Default: none. */
   readonly providers?: readonly SandboxProvider[];
+  /** Resolve the password for this binding on the host at create time. */
+  readonly gatewayPassword?: (
+    gateway: SandboxEgressGateway,
+  ) => string | Promise<string>;
 }
+
+export const GATEWAY_NET_RULES =
+  "allow@dns,deny@host,deny@0.0.0.0/0:tcp:53,deny@[::/0]:tcp:53,deny@0.0.0.0/0:tcp:853,deny@[::/0]:tcp:853,allow@0.0.0.0/0:tcp,allow@[::/0]:tcp";
+
+const METRICS_TIMEOUT_MS = 1000;
+const SANDBOX_NAME =
+  /^bootstrap-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 /** Conservative fixed bounds for this initial offline adapter. */
 export const MICROSANDBOX_LIMITS = {
@@ -119,12 +139,24 @@ type ProcessResult = {
 
 type State = {
   id: string;
+  cleanupLabel?: string;
   directory: string;
   deadline: number;
   busy: boolean;
   closed: boolean;
   removed: boolean;
   destruction?: Promise<void>;
+  sampling?: {
+    controller: AbortController;
+    result: Promise<ResourceSample | null>;
+  };
+  finalSample?: ResourceSample;
+};
+
+type NetworkConfig = {
+  args: string[];
+  gateway: SandboxEgressGateway | undefined;
+  provider: SandboxProvider | undefined;
 };
 
 function invalid(): never {
@@ -179,15 +211,22 @@ function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
 
 /** Backend arguments for credentialed provider egress. The host-gateway
  * name maps to the backend's `host` target; other names are domain rules. */
-function providerArgs(provider: SandboxProvider): string[] {
+function providerArgs(
+  provider: SandboxProvider,
+  throughGateway: boolean,
+): string[] {
   const port = provider.port ?? 443;
   const target =
     provider.host === "host.microsandbox.internal" ? "host" : provider.host;
   return [
-    "--net-rule",
-    "allow@dns",
-    "--net-rule",
-    `allow@${target}:tcp:${port}`,
+    ...(throughGateway
+      ? []
+      : [
+          "--net-rule",
+          "allow@dns",
+          "--net-rule",
+          `allow@${target}:tcp:${port}`,
+        ]),
     "--tls-intercept",
     ...(port !== 443 ? ["--tls-intercept-port", String(port)] : []),
     ...(provider.upstreamCaCertPath
@@ -201,6 +240,11 @@ function providerArgs(provider: SandboxProvider): string[] {
     "--secret-violation-action",
     "block",
   ];
+}
+
+function digestNetworkArgs(args: readonly string[]): string {
+  // JSON preserves the exact argument boundaries and order.
+  return createHash("sha256").update(JSON.stringify(args)).digest("hex");
 }
 
 /** Host-only adapter. Callers must supply dedicated trusted host directories and
@@ -248,6 +292,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     timeoutMs: number,
     signal?: AbortSignal,
     extraEnv?: Record<string, string>,
+    maxBuffer: number = MICROSANDBOX_LIMITS.outputBytes,
   ): Promise<ProcessResult> {
     if (signal?.aborted)
       return Promise.resolve({
@@ -275,7 +320,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           cwd: this.#config.home,
           encoding: "buffer",
           killSignal: "SIGKILL",
-          maxBuffer: MICROSANDBOX_LIMITS.outputBytes,
+          maxBuffer,
           signal: controller.signal,
         },
         (error, stdout, stderr) => {
@@ -360,7 +405,171 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     if (reported !== `sha256:${image.slice(-64)}`) invalid();
   }
 
-  async create(spec: SandboxSpec): Promise<SandboxHandle> {
+  #network(spec: SandboxSpec): NetworkConfig {
+    const port = spec.hostTcpPort;
+    if (port !== undefined) boundedInteger(port, 65_535);
+    const requestedProvider = spec.provider;
+    if (
+      requestedProvider !== undefined &&
+      (!requestedProvider || typeof requestedProvider !== "object")
+    )
+      invalid();
+    const provider = requestedProvider ? { ...requestedProvider } : undefined;
+    if (
+      provider &&
+      (port !== undefined ||
+        !this.#config.credentials ||
+        typeof provider.host !== "string" ||
+        !this.#config.providers?.some((allowed) =>
+          sameProvider(allowed, provider),
+        ) ||
+        !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+          provider.host,
+        ) ||
+        typeof provider.secretEnv !== "string" ||
+        !isSafeCredentialVariable(provider.secretEnv) ||
+        (provider.header !== undefined &&
+          provider.header !== "authorization" &&
+          provider.header !== "x-api-key") ||
+        (provider.port !== undefined &&
+          (!Number.isSafeInteger(provider.port) ||
+            provider.port < 1 ||
+            provider.port > 65_535)) ||
+        (provider.upstreamCaCertPath !== undefined &&
+          (typeof provider.upstreamCaCertPath !== "string" ||
+            !isAbsolute(provider.upstreamCaCertPath) ||
+            /[\0:=,\r\n]/.test(provider.upstreamCaCertPath))))
+    )
+      invalid();
+    const binding = spec.egressGateway;
+    let gateway: SandboxEgressGateway | undefined;
+    const args = ["--no-net"];
+    if (binding !== undefined) {
+      if (
+        port !== undefined ||
+        !this.#config.gatewayPassword ||
+        binding === null ||
+        typeof binding !== "object"
+      )
+        invalid();
+      const { socksPort, dnsPort, username, passwordEnv } = binding;
+      boundedInteger(socksPort, 65_535);
+      boundedInteger(dnsPort, 65_535);
+      if (
+        socksPort === dnsPort ||
+        typeof username !== "string" ||
+        username.length < 1 ||
+        username.length > 255 ||
+        /[^a-zA-Z0-9._-]/.test(username) ||
+        username.startsWith("-") ||
+        !isSafeCredentialVariable(passwordEnv) ||
+        this.#config.providers?.some(
+          (allowed) => allowed.secretEnv === passwordEnv,
+        )
+      )
+        invalid();
+      gateway = Object.freeze({ socksPort, dnsPort, username, passwordEnv });
+      args.push(
+        "--net-rule",
+        GATEWAY_NET_RULES,
+        "--dns-nameserver",
+        `127.0.0.1:${dnsPort}`,
+        "--proxy",
+        `socks5://127.0.0.1:${socksPort}`,
+        "--socks5-username",
+        username,
+        "--socks5-password-env",
+        passwordEnv,
+      );
+    } else if (port !== undefined) {
+      args.push("--net-rule", `allow@host:tcp:${port}`);
+    }
+    if (provider) args.push(...providerArgs(provider, gateway !== undefined));
+    return { args, gateway, provider };
+  }
+
+  netRuleDigest(spec: SandboxSpec): string {
+    return digestNetworkArgs(this.#network(spec).args);
+  }
+
+  async #createBackend(
+    state: State,
+    args: readonly string[],
+    gateway?: SandboxEgressGateway,
+    provider?: SandboxProvider,
+  ): Promise<void> {
+    const env: Record<string, string> = {};
+    if (gateway) {
+      let password: string | undefined;
+      try {
+        password = await this.#config.gatewayPassword?.(gateway);
+      } catch {
+        throw new SandboxRuntimeError("backend-failure");
+      }
+      if (
+        typeof password !== "string" ||
+        password.length < 1 ||
+        password.length > 255 ||
+        /[^\x21-\x7e]/.test(password)
+      )
+        invalid();
+      env[gateway.passwordEnv] = password;
+    }
+    const create = (extraEnv: Record<string, string>) => {
+      // A failed CLI create can leave a partially created sandbox.
+      state.removed = false;
+      return this.#checked(args, extraEnv);
+    };
+    const credentials = this.#config.credentials;
+    if (provider && credentials)
+      await credentials.withAccessToken((token) =>
+        create({ ...env, [provider.secretEnv]: token }),
+      );
+    else await create(env);
+  }
+
+  async create(
+    spec: SandboxSpec,
+  ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
+    return this.#create(spec, `bootstrap-${randomUUID()}`, false);
+  }
+
+  async createBound(
+    spec: SandboxSpec,
+    sandboxId: string,
+  ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
+    if (
+      typeof sandboxId !== "string" ||
+      sandboxId.length !== 46 ||
+      !SANDBOX_NAME.test(sandboxId)
+    )
+      invalid();
+    return this.#create(spec, sandboxId, true);
+  }
+
+  async #checkNameAvailable(sandboxId: string): Promise<void> {
+    const result = await this.#checked(["list", "--format", "json"]);
+    let sandboxes: unknown;
+    try {
+      sandboxes = JSON.parse(result.stdout.toString("utf8"));
+    } catch {
+      throw new SandboxRuntimeError("backend-failure");
+    }
+    if (!Array.isArray(sandboxes))
+      throw new SandboxRuntimeError("backend-failure");
+    for (const sandbox of sandboxes) {
+      if (!sandbox || typeof sandbox.name !== "string")
+        throw new SandboxRuntimeError("backend-failure");
+      if (sandbox.name === sandboxId)
+        throw new SandboxRuntimeError("name-collision");
+    }
+  }
+
+  async #create(
+    spec: SandboxSpec,
+    sandboxId: string,
+    bound: boolean,
+  ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
     const invocationId = spec.invocationId;
     if (
       invocationId !== undefined &&
@@ -388,33 +597,11 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     boundedInteger(lifetime, MICROSANDBOX_LIMITS.maxLifetimeMs);
     const tools = checkTools(spec.tools ?? []);
-    const port = spec.hostTcpPort;
-    if (port !== undefined) boundedInteger(port, 65_535);
-    const provider = spec.provider ? { ...spec.provider } : undefined;
+    const { args: networkArgs, gateway, provider } = this.#network(spec);
+    const netRuleDigest = digestNetworkArgs(networkArgs);
     if (
-      provider &&
-      (port !== undefined ||
-        !this.#config.credentials ||
-        typeof provider.host !== "string" ||
-        !this.#config.providers?.some((allowed) =>
-          sameProvider(allowed, provider),
-        ) ||
-        !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
-          provider.host,
-        ) ||
-        typeof provider.secretEnv !== "string" ||
-        !isSafeCredentialVariable(provider.secretEnv) ||
-        (provider.header !== undefined &&
-          provider.header !== "authorization" &&
-          provider.header !== "x-api-key") ||
-        (provider.port !== undefined &&
-          (!Number.isSafeInteger(provider.port) ||
-            provider.port < 1 ||
-            provider.port > 65_535)) ||
-        (provider.upstreamCaCertPath !== undefined &&
-          (typeof provider.upstreamCaCertPath !== "string" ||
-            !isAbsolute(provider.upstreamCaCertPath) ||
-            /[\0:=,\r\n]/.test(provider.upstreamCaCertPath))))
+      (bound || spec.expectedNetRuleDigest !== undefined) &&
+      spec.expectedNetRuleDigest !== netRuleDigest
     )
       invalid();
     const repository = spec.repository
@@ -445,11 +632,28 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     });
     let state: State | undefined;
     let directory: string | undefined;
+    let reservation: string | undefined;
     try {
+      if (bound) {
+        // Reserve the name across adapters and processes sharing this home.
+        const path = join(
+          this.#config.home,
+          `.agent-bootstrap-create-${sandboxId}`,
+        );
+        try {
+          await mkdir(path, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST")
+            throw new SandboxRuntimeError("name-collision");
+          throw error;
+        }
+        reservation = path;
+      }
       const version = await this.#checked(["--version"]);
       if (version.stdout.toString("utf8").trim() !== "msb 0.7.16")
         throw new SandboxRuntimeError("unsupported-version");
       await this.#verifyImage(profile.image);
+      if (bound) await this.#checkNameAvailable(sandboxId);
       await mkdir(this.#config.stagingRoot, { recursive: true, mode: 0o700 });
       directory = await mkdtemp(join(this.#config.stagingRoot, "msb-"));
       // Copy each tool into private staging and verify the copy, so the
@@ -499,12 +703,15 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           invalid();
       }
       state = {
-        id: `bootstrap-${randomUUID()}`,
+        id: sandboxId,
+        ...(bound
+          ? { cleanupLabel: `agent-bootstrap-create=${randomUUID()}` }
+          : {}),
         directory,
         deadline: performance.now() + lifetime,
         busy: false,
         closed: false,
-        removed: false,
+        removed: true,
       };
       const createArgs = [
         "create",
@@ -513,11 +720,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(invocationId
           ? ["--label", `agent-bootstrap-invocation=${invocationId}`]
           : []),
+        ...(state.cleanupLabel ? ["--label", state.cleanupLabel] : []),
         "--pull",
         "never",
-        "--no-net",
-        ...(port !== undefined ? ["--net-rule", `allow@host:tcp:${port}`] : []),
-        ...(provider ? providerArgs(provider) : []),
+        ...networkArgs,
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
         ...(profile.memoryMiB !== undefined
@@ -534,13 +740,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(stagedTree ? ["--copy-file", `${stagedTree}:${TREE_GUEST}`] : []),
         profile.image,
       ];
-      // The credential reaches only the backend process environment.
-      const credentials = this.#config.credentials;
-      if (provider && credentials)
-        await credentials.withAccessToken((token) =>
-          this.#checked(createArgs, { [provider.secretEnv]: token }),
-        );
-      else await this.#checked(createArgs);
+      await this.#createBackend(state, createArgs, gateway, provider);
       if (stagedTree) {
         const extracted = await this.#execute(
           state,
@@ -554,11 +754,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         if (extracted.status !== "exited" || extracted.exitCode !== 0)
           throw new SandboxRuntimeError("backend-failure");
       }
-      const handle = Object.freeze({ id: state.id });
+      const handle = Object.freeze({
+        id: state.id,
+        netRuleDigest,
+      });
       this.#states.set(handle, state);
       return handle;
     } catch (error) {
-      if (state) return this.#withCleanup(state, error);
+      if (state) return await this.#withCleanup(state, error);
       let cleanupFailed = false;
       if (directory) {
         try {
@@ -571,6 +774,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         error instanceof SandboxRuntimeError ? error.code : "backend-failure",
         cleanupFailed,
       );
+    } finally {
+      // A stale reservation safely refuses reuse of this ID. Preserve the
+      // creation or cleanup outcome if the reservation cannot be removed.
+      if (reservation) await rmdir(reservation).catch(() => {});
     }
   }
 
@@ -859,12 +1066,83 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         throw new SandboxRuntimeError("output-limit");
       const tree = new Uint8Array(await readFile(staging));
       await rm(staging, { force: true });
-      return { files: [], tree };
+      const message = await this.#collectMessage(state);
+      return { files: [], tree, ...(message ? { message } : {}) };
     } catch (error) {
       return this.#withCleanup(state, error);
     } finally {
       state.busy = false;
     }
+  }
+
+  async #sample(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<ResourceSample | null> {
+    try {
+      const result = await this.#run(
+        ["metrics", id, "--format", "json"],
+        METRICS_TIMEOUT_MS,
+        signal,
+        undefined,
+        METRICS_OUTPUT_BYTES,
+      );
+      if (result.failure || result.code !== 0) return null;
+      return parseMicrosandboxMetrics(result.stdout);
+    } catch {
+      return null;
+    }
+  }
+
+  async sampleResources(handle: SandboxHandle): Promise<ResourceSample | null> {
+    const state = this.#states.get(handle);
+    if (!state || state.closed) return null;
+    if (state.sampling) return state.sampling.result;
+    const controller = new AbortController();
+    const result = this.#sample(state.id, controller.signal);
+    state.sampling = { controller, result };
+    try {
+      return await result;
+    } finally {
+      delete state.sampling;
+    }
+  }
+
+  finalResourceSample(handle: SandboxHandle): ResourceSample | null {
+    const state = this.#states.get(handle);
+    const sample = state?.finalSample;
+    if (state) delete state.finalSample;
+    return sample ?? null;
+  }
+
+  async #collectMessage(state: State): Promise<Uint8Array | undefined> {
+    // Bound the read itself, even if the guest replaces the checked file.
+    const result = await this.#execute(
+      state,
+      [
+        "/bin/sh",
+        "-ec",
+        `p=${WORKER_MESSAGE_PATH};
+          [ ! -L "\${p%/*}" ] && [ ! -L "$p" ] && [ -f "$p" ] || exit 3;
+          head -c ${WORKER_MESSAGE_LIMIT + 1} -- "$p" | base64`,
+      ],
+      10_000,
+    );
+    if (result.status === "exited" && result.exitCode === 3) return;
+    if (result.status !== "exited" || result.exitCode !== 0)
+      throw new SandboxRuntimeError("collection-failed");
+    const encoded = Buffer.from(result.stdout)
+      .toString("latin1")
+      .replace(/[\r\n]/g, "");
+    if (
+      encoded.length > 4 * Math.ceil(WORKER_MESSAGE_LIMIT / 3) ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        encoded,
+      )
+    )
+      return;
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.byteLength <= WORKER_MESSAGE_LIMIT) return bytes;
   }
 
   #destroy(state: State): Promise<void> {
@@ -873,9 +1151,24 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     state.destruction = (async () => {
       let failed = false;
       if (!state.removed) {
+        const sampling = state.sampling;
+        if (sampling) {
+          sampling.controller.abort();
+          await sampling.result;
+        }
+        const sample = await this.#sample(state.id);
         try {
-          await this.#checked(["rm", "--force", state.id]);
+          // A failed bound create may have collided after the list check.
+          // Remove only a sandbox carrying this create attempt's label.
+          await this.#checked([
+            "rm",
+            "--force",
+            ...(state.cleanupLabel
+              ? ["--label", state.cleanupLabel]
+              : [state.id]),
+          ]);
           state.removed = true;
+          if (sample) state.finalSample = sample;
         } catch {
           failed = true;
         }

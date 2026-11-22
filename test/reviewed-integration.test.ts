@@ -6,18 +6,23 @@ import { join } from "node:path";
 import test from "node:test";
 import { seed } from "../spike/m3/integration-smoke.ts";
 import { SqliteAudit } from "../src/audit.ts";
+import type { EgressPolicy } from "../src/egress-policy.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
 import { ReviewedIntegration } from "../src/reviewed-integration.ts";
 import type { SandboxRuntime } from "../src/sandbox-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
 });
 
-async function fixture(t: { after(fn: () => Promise<void>): void }) {
+async function fixture(
+  t: { after(fn: () => Promise<void>): void },
+  audited = false,
+) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "bootstrap-integration-"),
   );
@@ -39,7 +44,9 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     audit.close();
   });
   const calls: string[] = [];
+  const policies: EgressPolicy[] = [];
   const changed = Buffer.from("hello from Worker\n");
+  const digest = "a".repeat(64);
   const runtime: SandboxRuntime = {
     async create(spec) {
       const id = randomUUID();
@@ -52,6 +59,11 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
       }
       return { id };
     },
+    async createBound(spec, id) {
+      await runtime.create(spec);
+      return { id, netRuleDigest: digest };
+    },
+    netRuleDigest: () => digest,
     async exec(_handle, command) {
       const entry = command.argv[0];
       assert.ok(entry);
@@ -81,10 +93,75 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     reviewer: { argv: ["reviewer"], timeoutMs: 123 },
     verification: { command: { argv: ["verify"], timeoutMs: 123 } },
   };
-  const host = new TrustedHost(audit, runtime, profiles);
+  const host = new TrustedHost(
+    audit,
+    runtime,
+    profiles,
+    audited
+      ? {
+          config: {
+            audit: { mode: "required" },
+            telemetry: {
+              enabled: false,
+              resourceSamplingIntervalMs: 1000,
+              traceSamplingRatio: 1,
+            },
+          },
+          async gatewayFactory(options) {
+            policies.push(options.policy);
+            return fakeGateway([]).open(options);
+          },
+        }
+      : undefined,
+  );
   const flow = new ReviewedIntegration(git, host, journal, plan);
-  return { flow, plan, git, config, journal, journalDir, host, audit, calls };
+  return {
+    flow,
+    plan,
+    git,
+    config,
+    journal,
+    journalDir,
+    host,
+    audit,
+    calls,
+    policies,
+  };
 }
+
+test("single-file integration scopes gateway services and provider to their roles", async (t) => {
+  const { git, host, journal, plan, policies, audit } = await fixture(t, true);
+  const workerService = { ip: "192.0.2.20", port: 8080, loopbackPort: 8081 };
+  const reviewerService = { ip: "192.0.2.21", port: 8080, loopbackPort: 8082 };
+  const flow = new ReviewedIntegration(git, host, journal, {
+    ...plan,
+    workerHostServices: [workerService],
+    reviewerHostServices: [reviewerService],
+    reviewerSandbox: {
+      provider: { host: "review.invalid", secretEnv: "REVIEW_KEY" },
+    },
+  });
+  const originalWorkerService = { ...workerService };
+  workerService.loopbackPort = 9999;
+  const pin = await flow.prepare();
+  await flow.decide(pin, "approve");
+  assert.equal(await flow.integrate(), "completed");
+  assert.deepEqual(
+    policies.map((policy) => policy.hostServices),
+    [[originalWorkerService], [reviewerService]],
+  );
+  assert.equal(policies[0]?.providerBinding, undefined);
+  assert.deepEqual(policies[1]?.providerBinding, {
+    hostname: "review.invalid",
+    port: 443,
+  });
+  const verification = (await journal.read()).find(
+    (event) => event.kind === "verification.finished",
+  );
+  assert.ok(verification);
+  const binding = audit.readExecution(verification.run).sandboxBindings[0];
+  assert.equal(binding?.egressMode, "none");
+});
 
 test("approval binds one candidate, the target and the verifier, and applies once", async (t) => {
   const { flow, plan, git, config, journal, host, calls, audit } =

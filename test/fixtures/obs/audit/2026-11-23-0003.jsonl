@@ -1,0 +1,2 @@
+{"auditId":"audit_events:13","schemaVersion":"agent-bootstrap.audit/v1","recordedAt":"2026-11-23T00:00:00.000Z","executionId":"6d0c4a77-b72d-4474-95a8-3ec70ab43268","sandboxId":null,"operationId":null,"actor":"host","action":"invocation","target":null,"phase":"intent","result":null,"policyId":null,"reasonCode":null,"traceId":null,"attributes":{}}
+{"auditId":"audit_events:14","schemaVersion":

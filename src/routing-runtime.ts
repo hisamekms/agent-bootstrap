@@ -4,6 +4,7 @@ import {
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
+  type ResourceSample,
   type SandboxCommand,
   type SandboxHandle,
   type SandboxProvider,
@@ -60,13 +61,42 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     return owner;
   }
 
-  async create(spec: SandboxSpec): Promise<SandboxHandle> {
+  #route(spec: SandboxSpec): SandboxRuntime {
     const route = this.#routes.find((candidate) =>
       sameProvider(candidate.provider, spec.provider),
     );
     if (!route) throw new SandboxRuntimeError("invalid-input");
-    const handle = await route.runtime.create(spec);
-    this.#owners.set(handle, route.runtime);
+    return route.runtime;
+  }
+
+  netRuleDigest(spec: SandboxSpec): string {
+    const runtime = this.#route(spec);
+    if (!runtime.netRuleDigest) throw new SandboxRuntimeError("unsupported");
+    return runtime.netRuleDigest(spec);
+  }
+
+  async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    const runtime = this.#route(spec);
+    if (
+      (spec.egressGateway !== undefined ||
+        spec.expectedNetRuleDigest !== undefined) &&
+      !runtime.netRuleDigest
+    )
+      throw new SandboxRuntimeError("unsupported");
+    const handle = await runtime.create(spec);
+    this.#owners.set(handle, runtime);
+    return handle;
+  }
+
+  async createBound(
+    spec: SandboxSpec,
+    sandboxId: string,
+  ): Promise<SandboxHandle> {
+    const runtime = this.#route(spec);
+    if (!runtime.createBound || !runtime.netRuleDigest)
+      throw new SandboxRuntimeError("unsupported");
+    const handle = await runtime.createBound(spec, sandboxId);
+    this.#owners.set(handle, runtime);
     return handle;
   }
 
@@ -91,6 +121,14 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     spec: CollectSpec,
   ): Promise<CollectedArtifacts> {
     return this.#owner(handle).collect(handle, spec);
+  }
+
+  async sampleResources(handle: SandboxHandle): Promise<ResourceSample | null> {
+    return (await this.#owner(handle).sampleResources?.(handle)) ?? null;
+  }
+
+  finalResourceSample(handle: SandboxHandle): ResourceSample | null {
+    return this.#owner(handle).finalResourceSample?.(handle) ?? null;
   }
 
   async destroy(handle: SandboxHandle): Promise<void> {
