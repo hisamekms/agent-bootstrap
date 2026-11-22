@@ -221,9 +221,16 @@ async function main(): Promise<void> {
     if (text !== undefined) {
       // The entry being rebuilt is expected to be stale. Every other entry is
       // still validated strictly.
-      const raw = JSON.parse(text) as {
-        profiles?: Record<string, unknown>;
-      };
+      const raw: unknown = JSON.parse(text);
+      const plain = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      // Refuse a malformed lock rather than rewrite it from a partial copy.
+      if (
+        !plain(raw) ||
+        Object.keys(raw).sort().join(",") !== "profiles,version" ||
+        !plain(raw.profiles)
+      )
+        throw new Error("Profile lock is malformed");
       const others = { ...raw, profiles: { ...raw.profiles } };
       delete others.profiles[profile];
       existing = parseProfileLock(JSON.stringify(others));
