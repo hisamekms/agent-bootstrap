@@ -18,12 +18,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { SqliteAudit } from "../src/audit.ts";
+import type { EgressPolicy } from "../src/egress-policy.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
 import { ReviewedIntegration } from "../src/reviewed-integration.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
+import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
@@ -169,6 +171,11 @@ async function fixture(
   tree: object,
   reviews: string[] = ['{"review":"pass"}'],
   message?: Uint8Array,
+  workerHostServices?: readonly {
+    ip: string;
+    port: number;
+    loopbackPort: number;
+  }[],
 ) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "bootstrap-tree-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -190,21 +197,27 @@ async function fixture(
   const specs: SandboxSpec[] = [];
   const seen: Record<string, string[]>[] = [];
   const extracted = new Map<string, string>();
+  const policies: EgressPolicy[] = [];
   let workerOutcome = 0;
+  const digest = "a".repeat(64);
+  const create = async (spec: SandboxSpec, id: string = randomUUID()) => {
+    specs.push(spec);
+    if (spec.repository) {
+      const dir = join(root, `vm-${id}`);
+      await mkdir(dir);
+      await extract(spec.repository.tree, dir);
+      extracted.set(id, dir);
+      // The git directory is a host-prepared object store with a base ref.
+      assert.ok((await lstat(spec.repository.gitDir)).isDirectory());
+    }
+    return { id };
+  };
   const runtime: SandboxRuntime = {
-    async create(spec) {
-      const id = randomUUID();
-      specs.push(spec);
-      if (spec.repository) {
-        const dir = join(root, `vm-${id}`);
-        await mkdir(dir);
-        await extract(spec.repository.tree, dir);
-        extracted.set(id, dir);
-        // The git directory is a host-prepared object store with a base ref.
-        assert.ok((await lstat(spec.repository.gitDir)).isDirectory());
-      }
-      return { id };
+    create: (spec) => create(spec),
+    async createBound(spec, id) {
+      return { ...(await create(spec, id)), netRuleDigest: digest };
     },
+    netRuleDigest: () => digest,
     async exec(handle, command) {
       const entry = command.argv[0];
       const dir = extracted.get(handle.id);
@@ -244,12 +257,33 @@ async function fixture(
   const journal = new IntegrationJournal(journalDir, randomUUID());
   const flow = new ReviewedIntegration(
     integration,
-    new TrustedHost(audit, runtime, profiles),
+    new TrustedHost(
+      audit,
+      runtime,
+      profiles,
+      workerHostServices
+        ? {
+            config: {
+              audit: { mode: "required" },
+              telemetry: {
+                enabled: false,
+                resourceSamplingIntervalMs: 1000,
+                traceSamplingRatio: 1,
+              },
+            },
+            async gatewayFactory(options) {
+              policies.push(options.policy);
+              return fakeGateway([]).open(options);
+            },
+          }
+        : undefined,
+    ),
     journal,
     {
       tree,
       worker: { argv: ["worker"], timeoutMs: 123 },
       reviewer: { argv: ["reviewer"], timeoutMs: 123 },
+      ...(workerHostServices ? { workerHostServices } : {}),
       verification: {
         command: { argv: ["verify"], timeoutMs: 123 },
         suite: [{ path: "t.test.ts", bytes: Buffer.from("test") }],
@@ -266,6 +300,7 @@ async function fixture(
     journal,
     edits,
     specs,
+    policies,
     seen,
     leftovers,
     fail: () => (workerOutcome = 1),
@@ -295,7 +330,14 @@ const tree = (repository: string, rev: string) =>
   ]).split("\n");
 
 test("a multi-file candidate (add, modify, delete, mode change) is reviewed, verified and integrated", async (t) => {
-  const f = await fixture(t, { protectedPaths: ["run.sh", "docs/"] });
+  const service = { ip: "192.0.2.20", port: 8080, loopbackPort: 8081 };
+  const f = await fixture(
+    t,
+    { protectedPaths: ["run.sh", "docs/"] },
+    undefined,
+    undefined,
+    [service],
+  );
   f.edits.push(async (dir) => {
     await writeFile(join(dir, "README.md"), "readme 2\n");
     await mkdir(join(dir, "src/new/deep"), { recursive: true });
@@ -351,6 +393,13 @@ test("a multi-file candidate (add, modify, delete, mode change) is reviewed, ver
   // Verification got the whole candidate tree plus diff and suite.
   const verify = f.specs[2];
   assert.ok(verify?.repository);
+  assert.ok(f.specs[0]?.egressGateway);
+  assert.equal(f.specs[1]?.egressGateway, undefined);
+  assert.equal(verify.egressGateway, undefined);
+  assert.deepEqual(
+    f.policies.map((policy) => policy.hostServices),
+    [[service]],
+  );
   assert.deepEqual(
     verify.readOnlyFiles?.map((file) => file.path),
     ["candidate.diff", "suite/t.test.ts"],

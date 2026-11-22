@@ -10,8 +10,10 @@ import {
   type MicrosandboxConfig,
 } from "./microsandbox.ts";
 import { parseObservabilityConfig } from "./observability-config.ts";
+import { RoutingSandboxRuntime } from "./routing-runtime.ts";
 import type {
   SandboxHandle,
+  SandboxProvider,
   SandboxRuntime,
   SandboxSpec,
 } from "./sandbox-runtime.ts";
@@ -36,6 +38,11 @@ export interface ObservedHostOptions {
   readonly profiles: MicrosandboxConfig["profiles"];
   readonly credentials?: MicrosandboxConfig["credentials"];
   readonly providers?: MicrosandboxConfig["providers"];
+  /** One credential per binding. Exclusive with credentials and providers. */
+  readonly providerBindings?: readonly {
+    readonly provider: SandboxProvider;
+    readonly credentials: NonNullable<MicrosandboxConfig["credentials"]>;
+  }[];
   readonly observers?: readonly ObservedHostObserver[];
   /** Host-side override for fixtures. The same factory serves startup and runs. */
   readonly openGateway?: (
@@ -109,6 +116,7 @@ export async function createObservedHost({
   profiles,
   credentials,
   providers,
+  providerBindings,
   observers = [],
   openGateway = EgressGateway.open,
 }: ObservedHostOptions): Promise<{
@@ -124,6 +132,11 @@ export async function createObservedHost({
     stagingRoot: msb.stagingRoot,
   });
   const required = config.audit.mode === "required";
+  if (
+    providerBindings !== undefined &&
+    (credentials !== undefined || providers !== undefined)
+  )
+    throw new Error("Conflicting observed host provider configuration");
   const audit = new SqliteAudit(auditPath);
   const gateways = new Set<Promise<HostGateway>>();
   let closing: Promise<void> | undefined;
@@ -214,33 +227,47 @@ export async function createObservedHost({
         },
       });
     }
-    const runtime = new ObservedRuntime(
-      {
-        binary: msb.binary,
-        home: msb.home,
-        stagingRoot: msb.stagingRoot,
-        profiles,
-        ...(credentials === undefined ? {} : { credentials }),
-        ...(providers === undefined ? {} : { providers }),
-        ...(required
-          ? {
-              gatewayPassword: (binding): string =>
-                host.gatewayPassword(binding),
-            }
-          : {}),
-      },
-      (spec, handle) => {
-        const id = spec.invocationId;
-        // The adapter keys its VM state by handle identity. The observer
-        // receives that handle after TrustedHost records the create outcome.
-        if (id !== undefined && pendingHandles.has(id))
-          pendingHandles.set(id, handle);
-      },
-      required,
-      () => {
-        if (closing) throw new Error("Observed host is closing");
-      },
-    );
+    const createRuntime = (
+      credentials?: MicrosandboxConfig["credentials"],
+      providers?: MicrosandboxConfig["providers"],
+    ) =>
+      new ObservedRuntime(
+        {
+          binary: msb.binary,
+          home: msb.home,
+          stagingRoot: msb.stagingRoot,
+          profiles,
+          ...(credentials === undefined ? {} : { credentials }),
+          ...(providers === undefined ? {} : { providers }),
+          ...(required
+            ? {
+                gatewayPassword: (binding): string =>
+                  host.gatewayPassword(binding),
+              }
+            : {}),
+        },
+        (spec, handle) => {
+          const id = spec.invocationId;
+          // The adapter keys its VM state by handle identity. The observer
+          // receives that handle after TrustedHost records the create outcome.
+          if (id !== undefined && pendingHandles.has(id))
+            pendingHandles.set(id, handle);
+        },
+        required,
+        () => {
+          if (closing) throw new Error("Observed host is closing");
+        },
+      );
+    const runtime =
+      providerBindings === undefined
+        ? createRuntime(credentials, providers)
+        : new RoutingSandboxRuntime([
+            { runtime: createRuntime() },
+            ...providerBindings.map(({ provider, credentials }) => ({
+              provider,
+              runtime: createRuntime(credentials, [provider]),
+            })),
+          ]);
     const samplingRuntime = Object.freeze({
       sampleResources: runtime.sampleResources.bind(runtime),
     });

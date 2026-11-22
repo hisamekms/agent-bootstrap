@@ -31,6 +31,7 @@ type BackendEvent = {
   args: string[];
   hasGatewayPassword?: boolean;
   durableBinding?: boolean;
+  credentialMatches?: boolean;
 };
 
 async function fixture(t: TestContext, version = "msb 0.7.16") {
@@ -56,6 +57,12 @@ if (args[0] === "create" && args.includes("--proxy")) {
   const audit = new Database(${JSON.stringify(auditPath)}, { readonly: true });
   event.durableBinding = !!audit.query("SELECT 1 FROM sandbox_bindings WHERE sandbox_id = ? AND egress_mode = 'gateway'").get(option("--name"));
   audit.close();
+  if (args.includes("--secret")) {
+    const variable = option("--secret").split(":")[0];
+    event.credentialMatches = process.env[variable] === variable + "-fixture" &&
+      ["FIXTURE_OPENAI_TOKEN", "FIXTURE_ANTHROPIC_KEY"].every((other) =>
+        other === variable || process.env[other] === undefined);
+  }
 }
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(event) + "\\n");
 switch (args[0]) {
@@ -225,6 +232,88 @@ test("required mode creates the durably bound sandbox and samples its original h
   ]);
   await observed.close();
   assert.equal(observed.audit.isV5Writable, false);
+});
+
+test("one required host routes provider bindings to isolated credentials", async (t) => {
+  const f = await fixture(t);
+  const providers = [
+    { host: "openai.invalid", secretEnv: "FIXTURE_OPENAI_TOKEN" },
+    {
+      host: "anthropic.invalid",
+      secretEnv: "FIXTURE_ANTHROPIC_KEY",
+      header: "x-api-key" as const,
+    },
+  ];
+  const opened: Parameters<
+    NonNullable<ObservedHostOptions["openGateway"]>
+  >[0][] = [];
+  const observed = await createObservedHost({
+    ...f.options,
+    providerBindings: providers.map((provider) => ({
+      provider,
+      credentials: {
+        async withAccessToken(use) {
+          return use(provider.secretEnv + "-fixture");
+        },
+      },
+    })),
+    async openGateway(options) {
+      opened.push(options);
+      return f.options.openGateway(options);
+    },
+  });
+  t.after(() => observed.close());
+
+  for (const provider of providers) {
+    const run = await observed.host.runWorker({
+      ...plan,
+      sandbox: { provider },
+    });
+    assert.equal(run.outcome, "ok");
+    const gateway = opened.at(-1)!;
+    assert.equal(gateway.executionId, run.id);
+    assert.deepEqual(gateway.policy.providerBinding, {
+      hostname: provider.host,
+      port: 443,
+    });
+    assert.equal(gateway.audit, observed.audit);
+    assert.equal(
+      observed.audit.readExecution(run.id).sandboxBindings[0]?.sandboxId,
+      gateway.sandboxLabel,
+    );
+  }
+  const offline = await observed.host.runVerification({
+    sandbox: {},
+    command: plan.command,
+  });
+  assert.equal(offline.outcome, "ok");
+  assert.equal(opened.length, 3); // Startup probe and one gateway per provider run.
+  assert.deepEqual(
+    f.calls,
+    Array.from({ length: 3 }, () => ["gateway.open", "gateway.close"]).flat(),
+  );
+  const events = await f.events();
+  const creates = events.filter(({ args }) => args[0] === "create");
+  assert.equal(creates.length, 3);
+  for (const [index, provider] of providers.entries()) {
+    const create = creates[index]!;
+    assert.ok(
+      create.hasGatewayPassword &&
+        create.durableBinding &&
+        create.credentialMatches,
+    );
+    assert.ok(
+      create.args.includes(
+        `${provider.secretEnv}:headers=${"header" in provider ? provider.header : "authorization"}@${provider.host}`,
+      ),
+    );
+    assert.ok(create.args.includes(GATEWAY_NET_RULES));
+    assert.ok(create.args.includes("--tls-intercept"));
+    assert.equal(create.args.filter((arg) => arg === "--net-rule").length, 1);
+  }
+  assert.ok(!creates[2]?.args.includes("--proxy"));
+  assert.equal(events.filter(({ args }) => args[0] === "metrics").length, 3);
+  assert.equal(events.filter(({ args }) => args[0] === "rm").length, 3);
 });
 
 test("close drains a pending gateway before closing the audit", async (t) => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { HOST_SERVICE_NAME, type HostService } from "./egress-policy.ts";
 import {
   isSafeCredentialVariable,
   WORKER_MESSAGE_PATH,
@@ -33,6 +34,7 @@ export const CODEX_REVIEW_SCHEMA = JSON.stringify({
  *   guest variable `secretEnv` holds only the backend placeholder.
  * - `host-port`: plain HTTP to a host port through the guest gateway, for
  *   local fixtures without credentials.
+ * - `host-service`: plain HTTP to a host service through the audit gateway.
  */
 export type CodexEndpoint =
   | {
@@ -41,7 +43,22 @@ export type CodexEndpoint =
       readonly secretEnv: string;
       readonly name: string;
     }
-  | { readonly kind: "host-port"; readonly port: number };
+  | { readonly kind: "host-port" | "host-service"; readonly port: number };
+
+const fixtureHostname = `codex.${HOST_SERVICE_NAME}`;
+
+/** Publish the Codex fixture only for invocations using its endpoint. */
+export function codexHostService(
+  endpoint: CodexEndpoint,
+): HostService | undefined {
+  if (endpoint.kind !== "host-service") return undefined;
+  return {
+    hostname: fixtureHostname,
+    ip: "192.0.2.10",
+    port: endpoint.port,
+    loopbackPort: endpoint.port,
+  };
+}
 
 export interface CodexOptions {
   readonly endpoint: CodexEndpoint;
@@ -88,7 +105,9 @@ export function codexConfigFlags(options: CodexOptions): string {
   const base =
     endpoint.kind === "provider"
       ? `https://${endpoint.host}/v1`
-      : `http://'"$gateway:${endpoint.port}"'/v1`;
+      : endpoint.kind === "host-service"
+        ? `http://${fixtureHostname}:${endpoint.port}/v1`
+        : `http://'"$gateway:${endpoint.port}"'/v1`;
   return [
     `-c 'model_provider="${name}"'`,
     `-c 'model_providers.${name}.name="${name}"'`,
@@ -122,8 +141,10 @@ export function codexPrelude(options: CodexOptions): string {
     ${
       endpoint.kind === "provider"
         ? `test "$${endpoint.secretEnv}" = '$MSB_${endpoint.secretEnv}'`
-        : `gateway=$(if command -v ip >/dev/null; then ip -4 route | awk '/^default/ { print $3; exit }'; else awk 'function h(s, i, v) { v = 0; for (i = 1; i <= 2; i++) v = v * 16 + index("0123456789ABCDEF", toupper(substr(s, i, 1))) - 1; return v } $2 == "00000000" { g = $3; printf "%d.%d.%d.%d", h(substr(g, 7, 2)), h(substr(g, 5, 2)), h(substr(g, 3, 2)), h(substr(g, 1, 2)); exit }' /proc/net/route; fi)
+        : endpoint.kind === "host-port"
+          ? `gateway=$(if command -v ip >/dev/null; then ip -4 route | awk '/^default/ { print $3; exit }'; else awk 'function h(s, i, v) { v = 0; for (i = 1; i <= 2; i++) v = v * 16 + index("0123456789ABCDEF", toupper(substr(s, i, 1))) - 1; return v } $2 == "00000000" { g = $3; printf "%d.%d.%d.%d", h(substr(g, 7, 2)), h(substr(g, 5, 2)), h(substr(g, 3, 2)), h(substr(g, 1, 2)); exit }' /proc/net/route; fi)
     test -n "$gateway"`
+          : ""
     }
   `;
 }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { HostService } from "./egress-policy.ts";
 import type {
   LocalGitIntegration,
   PreparedWorkspace,
@@ -156,6 +157,8 @@ type Plan = {
   readonly verification: Verification;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
+  readonly workerHostServices?: readonly HostService[];
+  readonly reviewerHostServices?: readonly HostService[];
   /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
    * wrap their answer (for example a CLI result object). Verification output
    * is never transformed. */
@@ -391,6 +394,20 @@ export class ReviewedIntegration {
       verification,
       workerSandbox: roleSandbox(plan.workerSandbox),
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
+      ...(plan.workerHostServices
+        ? {
+            workerHostServices: plan.workerHostServices.map((service) => ({
+              ...service,
+            })),
+          }
+        : {}),
+      ...(plan.reviewerHostServices
+        ? {
+            reviewerHostServices: plan.reviewerHostServices.map((service) => ({
+              ...service,
+            })),
+          }
+        : {}),
       ...(plan.reviewerOutput ? { reviewerOutput: plan.reviewerOutput } : {}),
     };
   }
@@ -424,13 +441,7 @@ export class ReviewedIntegration {
     };
   }
 
-  async #review(
-    pin: PinnedCandidate,
-    diff: Uint8Array,
-    command: SandboxCommand,
-    id?: string,
-    extra: RoleSandbox = {},
-  ) {
+  async #review(pin: PinnedCandidate, diff: Uint8Array, id?: string) {
     const files = await this.#candidateFiles(pin, diff);
     if (this.#plan.tree)
       files.push({
@@ -439,10 +450,18 @@ export class ReviewedIntegration {
       });
     return this.#host.runReviewer(
       {
-        sandbox: { ...extra, maxLifetimeMs: 300_000, readOnlyFiles: files },
-        command,
+        sandbox: {
+          ...this.#plan.reviewerSandbox,
+          maxLifetimeMs: 300_000,
+          readOnlyFiles: files,
+        },
+        command: this.#plan.reviewer,
       },
       id,
+      undefined,
+      this.#plan.reviewerHostServices
+        ? { hostServices: this.#plan.reviewerHostServices }
+        : undefined,
     );
   }
 
@@ -510,6 +529,10 @@ export class ReviewedIntegration {
         collectPaths: [path],
       },
       id,
+      undefined,
+      this.#plan.workerHostServices
+        ? { hostServices: this.#plan.workerHostServices }
+        : undefined,
     );
     const changed = worker.artifacts?.files[0];
     if (
@@ -579,6 +602,10 @@ export class ReviewedIntegration {
           collectTree: true,
         },
         id,
+        undefined,
+        this.#plan.workerHostServices
+          ? { hostServices: this.#plan.workerHostServices }
+          : undefined,
       );
       let changes: TreeChange[] = [];
       let flagged = 0;
@@ -729,13 +756,7 @@ export class ReviewedIntegration {
     // This sequence CAS wins before snapshot import or Reviewer VM creation.
     // An authorized review without a result remains uncertain after a crash.
     await append({ kind: "review.authorized", ...pin });
-    const reviewer = await this.#review(
-      pin,
-      diff,
-      this.#plan.reviewer,
-      id,
-      this.#plan.reviewerSandbox,
-    );
+    const reviewer = await this.#review(pin, diff, id);
     const transformed = this.#plan.reviewerOutput
       ? this.#plan.reviewerOutput(reviewer.response)
       : reviewer.response;
