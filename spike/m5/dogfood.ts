@@ -44,7 +44,11 @@ const codexDigest =
   "6a95492ca9d85ee76bd9fc5a4d8f72dd98a6130d1bb409bcfc50e61573106616";
 const providerHost = "api.openai.com";
 const secretEnv = "AGENT_BOOTSTRAP_SUBSCRIPTION_TOKEN";
-const model = "gpt-5.5";
+// gpt-5.5 is the only catalog model without code mode, but the ChatGPT plan
+// route answered modelNotFound for it. gpt-6.2-sol worked in M1. Its catalog
+// entry is code_mode_only, and code mode fails closed without a host binary,
+// so the run supplies a derived catalog with ordinary tools for that model.
+const model = "gpt-6.2-sol";
 const path = "hello.txt";
 const task =
   "Change the greeting in hello.txt to a polite, formal English greeting. Keep the file to exactly one line.";
@@ -75,6 +79,40 @@ function checkToken(token: string) {
   assert.ok(payload.exp > Date.now() / 1000 + 20 * 60);
 }
 
+/** Extract the catalog embedded in the pinned Codex binary and switch the
+ * run's model to ordinary tools. Returns the JSON text. */
+function derivedCatalog(binary: Buffer): string {
+  const marker = Buffer.from('{\n  "models": [');
+  const start = binary.indexOf(marker);
+  assert.ok(start >= 0 && binary.indexOf(marker, start + 1) < 0);
+  // Find the end of the JSON object, respecting strings and escapes.
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = -1;
+  for (let index = start; index < binary.length; index++) {
+    const byte = binary[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (byte === 0x5c) escaped = true;
+      else if (byte === 0x22) inString = false;
+    } else if (byte === 0x22) inString = true;
+    else if (byte === 0x7b) depth++;
+    else if (byte === 0x7d && --depth === 0) {
+      end = index + 1;
+      break;
+    }
+  }
+  assert.ok(end > start);
+  const catalog = JSON.parse(binary.subarray(start, end).toString("utf8")) as {
+    models: { slug: string; tool_mode: string | null }[];
+  };
+  const entry = catalog.models.find((item) => item.slug === model);
+  assert.ok(entry);
+  entry.tool_mode = null;
+  return JSON.stringify(catalog);
+}
+
 /** Codex config flags. Only constants and the fixture port are interpolated;
  * prompts reach the guest as separate argv entries. */
 function codexConfig(live: boolean): string {
@@ -98,6 +136,7 @@ function codexConfig(live: boolean): string {
     `-c 'model_providers.${name}.stream_max_retries=0'`,
     `-c 'web_search="disabled"'`,
     `-c 'model="${model}"'`,
+    `-c 'model_catalog_json="/tmp/models.json"'`,
   ].join(" ");
 }
 
@@ -139,14 +178,42 @@ async function fixtureProvider() {
     requests: 0,
     roles: {} as Record<string, number>,
     workerTools: [] as string[],
+    coordinatorTools: [] as string[],
   };
   const server: Server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
-    const parsed = JSON.parse(Buffer.concat(chunks).toString()) as {
-      tools?: { name?: string; type?: string }[];
-      input?: { type?: string; content?: { text?: string }[] }[];
+    type Offered = {
+      name?: string;
+      type?: string;
+      description?: string;
+      tools?: Offered[];
     };
+    const parsed = JSON.parse(Buffer.concat(chunks).toString()) as {
+      tools?: Offered[];
+      input?: {
+        type?: string;
+        content?: { text?: string }[];
+        tools?: Offered[];
+      }[];
+    };
+    // Tools may be top-level or in namespaced `additional_tools` input
+    // items; code mode lists its nested tools in the `exec` description.
+    const offered: string[] = [];
+    const visit = (items: Offered[] | undefined, prefix: string) => {
+      for (const item of items ?? []) {
+        const label = `${prefix}${item.name ?? `<${item.type}>`}`;
+        if (item.tools) visit(item.tools, `${label}.`);
+        else offered.push(label);
+        for (const [, nested] of (item.description ?? "").matchAll(
+          /^### `([^`]+)`/gm,
+        ))
+          offered.push(`${label}>${nested}`);
+      }
+    };
+    visit(parsed.tools, "");
+    for (const entry of parsed.input ?? [])
+      if (entry.type === "additional_tools") visit(entry.tools, "");
     seen.requests++;
     const texts = (parsed.input ?? []).flatMap((entry) =>
       (entry.content ?? []).map((part) => part.text ?? ""),
@@ -158,10 +225,10 @@ async function fixtureProvider() {
       (entry) => entry.type === "function_call_output",
     );
     let item: object;
+    if (role === "Coordinator" && !seen.coordinatorTools.length)
+      seen.coordinatorTools = offered;
     if (role === "Worker" && !followUp) {
-      seen.workerTools = (parsed.tools ?? []).map(
-        (tool) => tool.name ?? `<${tool.type}>`,
-      );
+      seen.workerTools = offered;
       item = {
         type: "function_call",
         call_id: `call-${seen.requests}`,
@@ -254,12 +321,9 @@ async function main() {
   const home = process.env.MSB_HOME;
   assert.ok(home && isAbsolute(home) && msb && isAbsolute(msb));
   assert.ok(codex && isAbsolute(codex));
-  assert.equal(
-    createHash("sha256")
-      .update(await readFile(codex))
-      .digest("hex"),
-    codexDigest,
-  );
+  const binary = await readFile(codex);
+  assert.equal(createHash("sha256").update(binary).digest("hex"), codexDigest);
+  const catalogText = derivedCatalog(binary);
 
   let token = "";
   if (live) {
@@ -294,8 +358,15 @@ async function main() {
   seed(repository);
   const schemaPath = join(root, "review-schema.json");
   await writeFile(schemaPath, reviewSchema, { mode: 0o600 });
+  const catalogPath = join(root, "models.json");
+  await writeFile(catalogPath, catalogText, { mode: 0o600 });
   const tools: SandboxTool[] = [
     { hostPath: codex, guestPath: "/tmp/codex", sha256: codexDigest },
+    {
+      hostPath: catalogPath,
+      guestPath: "/tmp/models.json",
+      sha256: createHash("sha256").update(catalogText).digest("hex"),
+    },
   ];
   const schemaTool: SandboxTool = {
     hostPath: schemaPath,

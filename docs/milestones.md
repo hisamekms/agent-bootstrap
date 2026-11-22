@@ -592,7 +592,8 @@ Known gaps:
 ### Preparation
 
 [`spike/m5/dogfood.ts`](../spike/m5/dogfood.ts) runs one small local change
-with model-driven roles, all using `gpt-5.5`:
+with model-driven roles, all using one model (see the model selection
+notes below):
 
 - **Coordinator** runs on the Codex app-server.
 - **Planner, Worker and Reviewer** run `codex exec` in their own VMs.
@@ -701,6 +702,36 @@ MSB_HOME=/absolute/short/msb-home \
   bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 \
   /absolute/path/to/msb /absolute/path/to/codex
 ```
+
+### Model selection after the first live attempts
+
+On 2026-11-22, the first live attempt stopped after one Coordinator turn of
+about 5 seconds, with no usage. The adapter then recorded only `no-call`
+because it did not look at the turn status. It now records a failed turn
+as `turn-failed/<category>`, using fixed Codex error names and HTTP
+statuses only. The runner also exits after writing its report; before
+this fix an open `/dev/tty` read kept it alive.
+
+The second attempt recorded `turn-failed/modelNotFound`: the ChatGPT plan
+route does not serve `gpt-5.5`. The run therefore uses `gpt-6.2-sol`,
+which completed the M1 subscription turn. Its catalog entry is
+`code_mode_only`, so the runner works around code mode as follows:
+
+1. It extracts the catalog embedded in the pinned Codex binary.
+2. It sets `tool_mode` to `null` for that one model.
+3. It passes the result as a digest-checked tool, `/tmp/models.json`, with
+   `model_catalog_json`.
+
+With this override, the mock provider recorded the following:
+
+- **Coordinator** saw its own tools directly, plus `request_user_input`,
+  `apply_patch`, `view_image`, the `clock` tools and the `collaboration`
+  tools.
+- **Worker** saw `exec_command`, `write_stdin` and `apply_patch`, among
+  others.
+
+The fixture run completed `done`. Whether the provider accepts this tool
+layout for `gpt-6.2-sol` is what the next live run shows.
 
 Known risks and gaps before the live run:
 
