@@ -35,7 +35,8 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
     /--tools 'Read,Glob,Grep,Edit,Write' --allowedTools 'Read,Glob,Grep,Edit,Write'/,
   );
   assert.doesNotMatch(script, /Bash'/);
-  assert.match(script, /-- "\$1" <\/dev\/null/);
+  assert.match(script, /prompt="\$1"/);
+  assert.match(script, /-- "\$prompt" <\/dev\/null/);
   assert.match(
     script,
     /test "\$ANTHROPIC_API_KEY" = '\$MSB_ANTHROPIC_API_KEY'/,
@@ -66,7 +67,7 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
 
 test("invalid roles, models, turn limits, base URLs and prompts are rejected", () => {
   for (const bad of [
-    { role: "Coordinator" as never },
+    { role: "Admin" as never },
     { model: "claude'; rm -rf /" },
     { maxTurns: 0 },
     { maxTurns: 51 },
@@ -231,4 +232,20 @@ test("credential variables must be credential-shaped and fit their fixed header"
   assert.doesNotMatch(script, /&& test|mktemp -d\) &&/);
   assert.match(script, /claude_config=\$\(mktemp -d\)/);
   assert.match(script, /ENABLE_TOOL_SEARCH=false/);
+});
+
+test("the Claude Coordinator gets no tools and reads its prompt from control.json", () => {
+  const script = claudeCodeCommand({
+    ...task,
+    role: "Coordinator",
+    prompt: "coordinator",
+  }).argv[2]!;
+  assert.match(script, /--tools ''/);
+  assert.doesNotMatch(script, /--allowedTools|Read|Edit|collect/);
+  assert.match(
+    script,
+    /test "\$\(wc -c < \/review\/control\.json\)" -le 65536/,
+  );
+  assert.match(script, /prompt=\$\(cat \/review\/control\.json\)/);
+  assert.match(script, /head -c 65536 \/tmp\/claude-out\.json/);
 });

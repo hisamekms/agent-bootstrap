@@ -83,7 +83,12 @@ export class TrustedHost {
   async runCoordinator(plan: ReviewerPlan, id?: string): Promise<ReviewerRun> {
     if (
       Object.keys(plan.sandbox).some(
-        (key) => key !== "readOnlyFiles" && key !== "maxLifetimeMs",
+        (key) =>
+          key !== "readOnlyFiles" &&
+          key !== "maxLifetimeMs" &&
+          key !== "tools" &&
+          key !== "provider" &&
+          key !== "hostTcpPort",
       ) ||
       plan.sandbox.readOnlyFiles?.length !== 1 ||
       plan.sandbox.readOnlyFiles[0]?.path !== "control.json"

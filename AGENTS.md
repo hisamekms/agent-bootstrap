@@ -25,6 +25,10 @@
   `src/task-trace.ts` joins one task's journal with the host audit.
   `src/claude-code.ts` owns the official Claude Code CLI adapter (API-key mode
   only; see `docs/claude-code-auth.md`).
+  `src/codex-exec.ts` owns Codex role commands, `src/claude-coordinator.ts`
+  the Claude Code Coordinator model, `src/actors.ts` the harness choice per
+  actor, and `src/routing-runtime.ts` routing to one runtime adapter per
+  credential.
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and
   milestone evidence. `.codex/` configures development roles and models.

@@ -43,6 +43,23 @@ export interface SandboxProvider {
   readonly upstreamCaCertPath?: string;
 }
 
+/** Whether two provider bindings are the same once defaults are filled in. */
+export function sameProvider(
+  a: SandboxProvider | undefined,
+  b: SandboxProvider | undefined,
+): boolean {
+  if (!a || !b) return a === b;
+  const key = (provider: SandboxProvider) =>
+    JSON.stringify([
+      provider.host,
+      provider.secretEnv,
+      provider.header ?? "authorization",
+      provider.port ?? 443,
+      provider.upstreamCaCertPath ?? null,
+    ]);
+  return key(a) === key(b);
+}
+
 export interface SandboxSpec {
   readonly files?: readonly SandboxFile[];
   readonly tools?: readonly SandboxTool[];

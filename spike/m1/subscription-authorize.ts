@@ -93,7 +93,11 @@ export function verifyIdentity(
   clientId: string,
   nonce: string,
 ): string {
-  assert.match(idToken, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  // assert.ok, not assert.match: a failed match would quote the token.
+  assert.ok(
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(idToken),
+    "token shape",
+  );
   const [header, payload, signature] = idToken.split(".");
   assert.ok(header && payload && signature);
   const protectedHeader = JSON.parse(
@@ -268,7 +272,20 @@ async function runSmoke(
 ) {
   signal.throwIfAborted();
   const child = spawn(process.execPath, [smoke, "--live", msb, codex], {
-    env: { PATH: "/usr/bin:/bin", MSB_HOME: home },
+    // Only the non-secret M5 actor settings (and USER, for the keychain
+    // lookup) pass through; the token goes on stdin.
+    env: {
+      PATH: "/usr/bin:/bin",
+      MSB_HOME: home,
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([name, value]) =>
+            value !== undefined &&
+            (name === "USER" ||
+              /^M5_(ACTORS|CLAUDE_(BINARY|MODEL|AUTH|KEYCHAIN))$/.test(name)),
+        ),
+      ),
+    },
     stdio: ["pipe", "inherit", "inherit"],
   });
   const cancel = () => child.kill("SIGTERM");

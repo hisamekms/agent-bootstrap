@@ -139,6 +139,9 @@ export function claudeCodeTools(install: ClaudeCodeInstall): SandboxTool[] {
  * Pinning the set matters outside bare mode, where the CLI would otherwise
  * offer agents, workflows, scheduling and deferred tools. */
 const roleTools = {
+  // The Coordinator gets no tools: it answers with one JSON action that the
+  // host router validates.
+  Coordinator: { tools: [], mode: "default" },
   Planner: { tools: ["Read", "Glob", "Grep"], mode: "default" },
   Reviewer: { tools: ["Read", "Glob", "Grep"], mode: "default" },
   Worker: {
@@ -194,6 +197,16 @@ export function claudeCodeCommand(
     throw new Error("Invalid prompt");
   const tools = roleTools[task.role];
   const cwd = task.role === "Worker" ? "/workspace" : "/review";
+  const toolFlags = tools.tools.length
+    ? `--tools '${tools.tools.join(",")}' --allowedTools '${tools.tools.join(",")}'`
+    : `--tools ''`;
+  // The Coordinator's prompt is the host-prepared control.json, read as
+  // bounded data; other roles take the caller's prompt as $1.
+  const promptSetup =
+    task.role === "Coordinator"
+      ? `test "$(wc -c < /review/control.json)" -le 65536
+    prompt=$(cat /review/control.json)`
+      : `prompt="$1"`;
   const packages = CLAUDE_CODE_GUEST_PACKAGES.map(
     (item, index) => `${item.sha256}  /tmp/apk-${index}.apk`,
   ).join("\\n");
@@ -219,6 +232,7 @@ export function claudeCodeCommand(
     test -z "$(ls -A "$claude_home")"
     test -z "$(ls -A "$claude_config")"
     cd ${cwd}
+    ${promptSetup}
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
       ${credential.variable}="$${credential.variable}" \\
@@ -230,8 +244,8 @@ export function claudeCodeCommand(
         --disable-slash-commands --no-session-persistence --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
         --permission-mode ${tools.mode} \\
-        --tools '${tools.tools.join(",")}' --allowedTools '${tools.tools.join(",")}' \\
-        -- "$1" </dev/null >/tmp/claude-out.json 2>/dev/null
+        ${toolFlags} \\
+        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/dev/null
     ${output}
   `;
   return {
