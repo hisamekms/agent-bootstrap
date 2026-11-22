@@ -121,7 +121,7 @@ export function codexPrelude(options: CodexOptions): string {
     ${
       endpoint.kind === "provider"
         ? `test "$${endpoint.secretEnv}" = '$MSB_${endpoint.secretEnv}'`
-        : `gateway=$(ip -4 route | awk '/^default/ { print $3; exit }')
+        : `gateway=$(if command -v ip >/dev/null; then ip -4 route | awk '/^default/ { print $3; exit }'; else awk 'function h(s, i, v) { v = 0; for (i = 1; i <= 2; i++) v = v * 16 + index("0123456789ABCDEF", toupper(substr(s, i, 1))) - 1; return v } $2 == "00000000" { g = $3; printf "%d.%d.%d.%d", h(substr(g, 7, 2)), h(substr(g, 5, 2)), h(substr(g, 3, 2)), h(substr(g, 1, 2)); exit }' /proc/net/route; fi)
     test -n "$gateway"`
     }
   `;

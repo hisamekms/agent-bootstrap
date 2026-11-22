@@ -14,8 +14,21 @@ export const CLAUDE_CODE = {
   guestPath: "/tmp/claude",
 } as const;
 
-/** Claude Code needs bash; the pinned Alpine 3.23 image has none. These are
- * Alpine's signed packages, verified by `apk` with the image's own keys. */
+/** The guest userland a sandbox image provides. Alpine (musl, busybox) is the
+ * base and db profiles; Debian (glibc, GNU coreutils, bash) is browser. */
+export type GuestKind = "alpine" | "debian";
+
+/** The pinned CLI build per guest kind (same version, per-libc binary). */
+export const CLAUDE_CODE_BUILDS = {
+  alpine: { platform: "linux-arm64-musl", sha256: CLAUDE_CODE.sha256 },
+  debian: {
+    platform: "linux-arm64",
+    sha256: "6016f90cac783e367fb1aa97c768a2efb94a0128a5b46b70fb3d8fcbbd9dd444",
+  },
+} as const;
+
+/** Claude Code needs bash. Debian images have it; the pinned Alpine 3.23
+ * image has none. These are Alpine's signed packages, verified by `apk` with the image's own keys. */
 export const CLAUDE_CODE_GUEST_PACKAGES = [
   {
     name: "bash-5.3.3-r1.apk",
@@ -119,13 +132,18 @@ export interface ClaudeCodeInstall {
   readonly packageDir: string;
 }
 
-export function claudeCodeTools(install: ClaudeCodeInstall): SandboxTool[] {
+export function claudeCodeTools(
+  install: ClaudeCodeInstall,
+  guest: GuestKind = "alpine",
+): SandboxTool[] {
+  const binary = {
+    hostPath: install.binary,
+    guestPath: CLAUDE_CODE.guestPath,
+    sha256: CLAUDE_CODE_BUILDS[guest].sha256,
+  };
+  if (guest === "debian") return [binary];
   return [
-    {
-      hostPath: install.binary,
-      guestPath: CLAUDE_CODE.guestPath,
-      sha256: CLAUDE_CODE.sha256,
-    },
+    binary,
     ...CLAUDE_CODE_GUEST_PACKAGES.map((item, index) => ({
       hostPath: `${install.packageDir}/${item.name}`,
       guestPath: `/tmp/apk-${index}.apk`,
@@ -176,7 +194,10 @@ export interface ClaudeCodeTask {
 export function claudeCodeCommand(
   task: ClaudeCodeTask,
   auth: ClaudeCodeAuth = { mode: "api-key", credential: "host-secret" },
+  guest: GuestKind = "alpine",
 ): SandboxCommand {
+  if (guest !== "alpine" && guest !== "debian")
+    throw new Error("Invalid guest kind");
   const credential = credentialOf(auth);
   if (!Object.hasOwn(roleTools, task.role)) throw new Error("Invalid role");
   if (!/^[a-z0-9][a-z0-9.-]{0,80}$/.test(task.model))
@@ -220,15 +241,19 @@ export function claudeCodeCommand(
   const packages = CLAUDE_CODE_GUEST_PACKAGES.map(
     (item, index) => `${item.sha256}  /tmp/apk-${index}.apk`,
   ).join("\\n");
+  const bashSetup =
+    guest === "alpine"
+      ? `    printf '${packages}\\n' | sha256sum -c - >/dev/null
+    apk add --no-network --no-cache /tmp/apk-*.apk >/dev/null 2>&1 </dev/null
+`
+      : "";
   const output =
     task.role === "Worker"
       ? `printf '%s' '{"tool":"collect"}'`
       : "head -c 65536 /tmp/claude-out.json";
   const script = `
-    printf '%s  ${CLAUDE_CODE.guestPath}\\n' '${CLAUDE_CODE.sha256}' | sha256sum -c - >/dev/null
-    printf '${packages}\\n' | sha256sum -c - >/dev/null
-    apk add --no-network --no-cache /tmp/apk-*.apk >/dev/null 2>&1 </dev/null
-    command -v bash >/dev/null
+    printf '%s  ${CLAUDE_CODE.guestPath}\\n' '${CLAUDE_CODE_BUILDS[guest].sha256}' | sha256sum -c - >/dev/null
+${bashSetup}    command -v bash >/dev/null
     chmod 700 ${CLAUDE_CODE.guestPath}
     # The guest holds only the backend placeholder, never the credential.
     test "$${credential.variable}" = '$MSB_${credential.variable}'

@@ -3,9 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import {
   claudeRoleHarness,
+  guestOf,
   codexRoleHarness,
   parseActorHarnesses,
 } from "../src/actors.ts";
+import { CLAUDE_CODE_BUILDS } from "../src/claude-code.ts";
 import { ClaudeCodeCoordinator } from "../src/claude-coordinator.ts";
 import {
   codexCoordinatorCommand,
@@ -228,5 +230,67 @@ test("the Claude harness passes shell to the Worker command only", () => {
   assert.doesNotMatch(
     make().command({ ...input, role: "Worker" }).argv[2]!,
     /Bash/,
+  );
+});
+
+test("harnesses set the profile and pick guest-specific tools and commands", () => {
+  assert.equal(guestOf("base"), "alpine");
+  assert.equal(guestOf("db"), "alpine");
+  assert.equal(guestOf("browser"), "debian");
+  const codex = codexRoleHarness(
+    { endpoint: { kind: "host-port", port: 8080 }, model: "gpt-6.2-sol" },
+    [],
+    8080,
+    "browser",
+  );
+  assert.equal(codex.sandbox.profile, "browser");
+  assert.equal(
+    codexRoleHarness(
+      { endpoint: { kind: "host-port", port: 1 }, model: "m" },
+      [],
+    ).sandbox.profile,
+    undefined,
+  );
+  const worker = codex.command({ role: "Worker", prompt: "x", timeoutMs: 1 });
+  const script = worker.argv[2]!;
+  assert.match(script, /\/proc\/net\/route/);
+  assert.match(script, /command -v ip/);
+  assert.doesNotMatch(script, /\$\{/);
+  assert.ok(!script.includes("\nx"));
+  const auth = { mode: "api-key" as const, credential: "host-secret" as const };
+  const tools = [
+    { hostPath: "/h/c", guestPath: "/tmp/claude", sha256: "0".repeat(64) },
+  ];
+  const debian = claudeRoleHarness({
+    auth,
+    model: "claude-opus-5-5",
+    tools,
+    profile: "browser",
+  });
+  assert.equal(debian.sandbox.profile, "browser");
+  const dScript = debian.command({ role: "Worker", prompt: "x", timeoutMs: 1 })
+    .argv[2]!;
+  assert.doesNotMatch(dScript, /apk/);
+  assert.ok(dScript.includes(CLAUDE_CODE_BUILDS.debian.sha256));
+  const base = claudeRoleHarness({
+    auth,
+    model: "claude-opus-5-5",
+    tools,
+    profile: "db",
+  });
+  assert.match(
+    base.command({ role: "Worker", prompt: "x", timeoutMs: 1 }).argv[2]!,
+    /apk add/,
+  );
+  const explicit = claudeRoleHarness({
+    auth,
+    model: "claude-opus-5-5",
+    tools,
+    guest: "debian",
+  });
+  assert.equal(explicit.sandbox.profile, undefined);
+  assert.doesNotMatch(
+    explicit.command({ role: "Reviewer", prompt: "x", timeoutMs: 1 }).argv[2]!,
+    /apk/,
   );
 });

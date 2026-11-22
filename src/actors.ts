@@ -3,12 +3,14 @@ import {
   claudeCodeProvider,
   parseClaudeCodeResult,
   type ClaudeCodeAuth,
+  type GuestKind,
 } from "./claude-code.ts";
 import {
   codexProvider,
   codexRoleCommand,
   type CodexOptions,
 } from "./codex-exec.ts";
+import type { ProfileName } from "./sandbox-profiles.ts";
 import type {
   SandboxCommand,
   SandboxSpec,
@@ -48,13 +50,22 @@ export function parseActorHarnesses(
   return Object.freeze(result);
 }
 
+/** The guest userland of a profile's image: base and db are Alpine, browser
+ * is Debian. */
+export function guestOf(profile: ProfileName): GuestKind {
+  return profile === "browser" ? "debian" : "alpine";
+}
+
 /** Sandbox inputs and the guest command for one Planner, Worker or Reviewer
  * invocation. Every harness follows the same output contract: Worker prints
  * the collect request, Reviewer yields `{"review", "notes"}` JSON (after
  * `reviewerOutput`), Planner prints its plan. */
 export interface RoleHarness {
   readonly harness: Harness;
-  readonly sandbox: Pick<SandboxSpec, "tools" | "provider" | "hostTcpPort">;
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "tools" | "provider" | "hostTcpPort" | "profile"
+  >;
   command(task: {
     readonly role: "Planner" | "Worker" | "Reviewer";
     readonly prompt: string;
@@ -69,6 +80,7 @@ export function codexRoleHarness(
   options: CodexOptions,
   tools: SandboxTool[],
   hostTcpPort?: number,
+  profile?: ProfileName,
 ): RoleHarness {
   const provider = codexProvider(options.endpoint);
   return {
@@ -77,6 +89,7 @@ export function codexRoleHarness(
       tools,
       ...(provider ? { provider } : {}),
       ...(hostTcpPort !== undefined ? { hostTcpPort } : {}),
+      ...(profile ? { profile } : {}),
     },
     command: (task) => codexRoleCommand(task, options),
   };
@@ -91,14 +104,24 @@ export function claudeRoleHarness(options: {
   readonly maxTurns?: number;
   /** Opt-in Bash for the Worker command only. */
   readonly shell?: boolean;
+  /** Guest userland the tools and command are built for. Default: from
+   * `profile`, else Alpine. */
+  readonly guest?: GuestKind;
+  readonly profile?: ProfileName;
 }): RoleHarness {
+  const guest =
+    options.guest ?? (options.profile ? guestOf(options.profile) : "alpine");
   const provider = claudeCodeProvider(options.auth, options.fixture);
   const baseUrl = options.fixture
     ? `https://${options.fixture.host}:${options.fixture.port}`
     : undefined;
   return {
     harness: "claude",
-    sandbox: { tools: options.tools, provider },
+    sandbox: {
+      tools: options.tools,
+      provider,
+      ...(options.profile ? { profile: options.profile } : {}),
+    },
     command: (task) =>
       claudeCodeCommand(
         {
@@ -111,6 +134,7 @@ export function claudeRoleHarness(options: {
           ...(options.shell && task.role === "Worker" ? { shell: true } : {}),
         },
         options.auth,
+        guest,
       ),
     // The CLI prints a result object; the review JSON is its text.
     reviewerOutput: (response) => {
