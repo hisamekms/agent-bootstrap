@@ -788,6 +788,55 @@ Known risks and gaps before the live run:
   Coordinator are still only detected, and Worker tool calls inside its VM
   are not audited individually.
 
+### Live run result
+
+On 2026-11-22, the sixth live attempt completed M5. It used task
+`245ae0b7-eb77-4965-9575-71b8186a67f8`, model `gpt-6.2-sol` with the
+derived catalog, and a ChatGPT plan OAuth token from the browser consent
+flow.
+
+| Measure             | Result                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| Outcome             | `done`. The disposable repository's `main` holds `Good day. It is a pleasure to meet you.`    |
+| Elapsed time        | 84.5 seconds, including about 40 seconds waiting for the operator's approval                  |
+| Coordinator turns   | 3: delegate Worker, delegate Reviewer, request integration                                    |
+| Delegations         | Planner 0, Worker 1, Reviewer 1                                                               |
+| Retries             | No replayed requests, failed turns or voided turns                                            |
+| Review iterations   | One review (`pass`, with notes) and no revisions                                              |
+| Human interventions | One approval; no questions                                                                    |
+| Coordinator usage   | Only one of three turns reported usage before its interrupt: 9,090 input and 71 output tokens |
+| Invocation times    | Coordinator 6.5–7.2 s per turn, Worker 15.9 s, Reviewer 6.2 s, verification 0.5 s             |
+
+The task trace links all six invocations:
+
+- **Model-driven roles.** Each Coordinator, Worker and Reviewer invocation
+  shows `sandbox.create`, `sandbox.exec` and `sandbox.destroy` finished
+  `ok`, plus a `provider.egress` grant closed `ok`. The Worker also shows
+  `sandbox.collect`.
+- **Verification.** It received no grant.
+- **Proposals.** The three stored proposals are the encoded `delegate`,
+  `delegate` and `requestIntegration` actions.
+
+The earlier attempts and their fixes are described above. The fifth
+attempt reached approval, but the operator's input did not match exactly
+and was recorded as a rejection. The approval prompt now trims input,
+rejects only on an explicit `reject`, and asks again up to three times. The
+launcher can now open the consent URL with Enter.
+
+Audit gaps and open points from this run:
+
+- **Most usage is missing.** Planner, Worker and Reviewer usage was not
+  collected, and Coordinator usage covers only one turn.
+- **Account usage was not checked.** ChatGPT's App limits view was not
+  confirmed for this run.
+- **Some activity is not audited in detail.** Provider requests are not
+  audited one by one, and native tool calls inside the Worker VM are not
+  audited individually.
+- **Native tools stay visible.** The Coordinator could still see the
+  `collaboration` and `clock` tools; none were used.
+- **The revision path is untested live.** It has not yet run in a live
+  attempt.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |
