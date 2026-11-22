@@ -641,14 +641,16 @@ async function main() {
           timeoutMs: 240_000,
         }),
         verification: {
-          argv: [
-            "/bin/sh",
-            "-ec",
-            `test "$(wc -l < /review/candidate.source)" = 1
+          command: {
+            argv: [
+              "/bin/sh",
+              "-ec",
+              `test "$(wc -l < /review/candidate.source)" = 1
           grep -q '[A-Za-z]' /review/candidate.source
           printf '%s' '{"review":"pass"}'`,
-          ],
-          timeoutMs: 10_000,
+            ],
+            timeoutMs: 10_000,
+          },
         },
         workerSandbox: worker.sandbox,
         reviewerSandbox: reviewer.sandbox,

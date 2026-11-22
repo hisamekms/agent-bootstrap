@@ -118,10 +118,12 @@ async function main() {
         test "$(cat /review/candidate.source)" = "hello from Worker"
         printf '%s' '{"review":"pass"}'
       `),
-        verification: command(`
+        verification: {
+          command: command(`
         test "$(cat /review/candidate.source)" = "hello from Worker"
         printf '%s' '{"review":"pass"}'
       `),
+        },
       },
     );
     if (mode === "prepare") {

@@ -18,13 +18,17 @@ import {
   IntegrationJournal,
   MAX_REVISIONS,
 } from "../src/integration-journal.ts";
-import { ReviewedIntegration } from "../src/reviewed-integration.ts";
+import {
+  ReviewedIntegration,
+  verificationResult,
+} from "../src/reviewed-integration.ts";
 import type { SandboxRuntime, SandboxSpec } from "../src/sandbox-runtime.ts";
-import { ProfileCatalog } from "../src/sandbox-profiles.ts";
+import { ProfileCatalog, type ProfileName } from "../src/sandbox-profiles.ts";
 import { TrustedHost } from "../src/trusted-host.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+  db: { image: `fixture.invalid/db@sha256:${"b".repeat(64)}` },
 });
 
 const notes = "Use a formal greeting. fixture-private-note";
@@ -38,8 +42,17 @@ async function fixture(
   reviews: string[],
   verification = '{"review":"pass"}',
   extras: {
-    workerSandbox?: { provider: { host: string; secretEnv: string } };
-    reviewerSandbox?: { provider: { host: string; secretEnv: string } };
+    workerSandbox?: {
+      provider?: { host: string; secretEnv: string };
+      profile?: ProfileName;
+    };
+    reviewerSandbox?: {
+      provider?: { host: string; secretEnv: string };
+      profile?: ProfileName;
+    };
+    verification?: ConstructorParameters<
+      typeof ReviewedIntegration
+    >[3]["verification"];
   } = {},
 ) {
   const root = await mkdtemp(
@@ -100,19 +113,15 @@ async function fixture(
     async destroy() {},
   };
   const journal = new IntegrationJournal(journalDir, randomUUID());
-  const flow = new ReviewedIntegration(
-    git,
-    new TrustedHost(audit, runtime, profiles),
-    journal,
-    {
-      path: "hello.txt",
-      worker: { argv: ["worker"], timeoutMs: 123 },
-      reviewer: { argv: ["reviewer"], timeoutMs: 123 },
-      verification: { argv: ["verify"], timeoutMs: 123 },
-      ...extras,
-    },
-  );
-  return { flow, git, journal, journalDir, workers, specs, audit };
+  const host = new TrustedHost(audit, runtime, profiles);
+  const flow = new ReviewedIntegration(git, host, journal, {
+    path: "hello.txt",
+    worker: { argv: ["worker"], timeoutMs: 123 },
+    reviewer: { argv: ["reviewer"], timeoutMs: 123 },
+    verification: { command: { argv: ["verify"], timeoutMs: 123 } },
+    ...extras,
+  });
+  return { flow, git, host, journal, journalDir, workers, specs, audit };
 }
 
 test("a revision is a new candidate that needs its own review and approval", async (t) => {
@@ -319,4 +328,226 @@ test("provider egress reaches Worker and Reviewer VMs, never verification, and i
       "operation.finished ok",
     ]);
   assert.deepEqual(egress(runs.at(-1)!), []);
+});
+
+const suite = [
+  { path: "suite/test.sh", bytes: Buffer.from("echo one\n") },
+  { path: "data.txt", bytes: Buffer.from("fixture") },
+];
+const verifier = { argv: ["verify"], timeoutMs: 123 };
+const paths = (spec?: SandboxSpec) =>
+  spec?.readOnlyFiles?.map((file) => file.path);
+
+test("suite and profile reach Worker (both rounds) and verification, never the Reviewer", async (t) => {
+  const { flow, specs, git } = await fixture(
+    t,
+    [JSON.stringify({ review: "revise", notes }), '{"review":"pass"}'],
+    '{"review":"pass"}',
+    { verification: { command: verifier, profile: "db", suite } },
+  );
+  await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  const second = await flow.revise();
+  await flow.reviewCandidate();
+  await flow.decide(second, "approve");
+  assert.equal(await flow.integrate(), "completed");
+  assert.equal(await git.head(), second.candidate);
+  // Worker, Reviewer, Worker, Reviewer, verification.
+  const all = [...specs.values()];
+  assert.equal(all.length, 5);
+  const [w1, r1, w2, r2, v] = all;
+  assert.deepEqual(paths(w1), ["suite/suite/test.sh", "suite/data.txt"]);
+  assert.deepEqual(paths(w2), [
+    "review-notes.txt",
+    "suite/suite/test.sh",
+    "suite/data.txt",
+  ]);
+  assert.deepEqual(paths(v), [
+    "candidate.diff",
+    "candidate.source",
+    "suite/suite/test.sh",
+    "suite/data.txt",
+  ]);
+  assert.equal(
+    Buffer.from(v!.readOnlyFiles![2]!.bytes).toString(),
+    "echo one\n",
+  );
+  assert.equal(w1?.profile, "db");
+  assert.equal(w2?.profile, "db");
+  assert.equal(v?.profile, "db");
+  for (const r of [r1, r2]) {
+    assert.deepEqual(paths(r), ["candidate.diff", "candidate.source"]);
+    assert.ok(r?.profile === undefined || r.profile === "base");
+  }
+});
+
+test("workerSandbox.profile overrides the verification profile for the Worker", async (t) => {
+  const { flow, specs } = await fixture(t, [], '{"review":"pass"}', {
+    workerSandbox: { profile: "base" },
+    verification: { command: verifier, profile: "db" },
+  });
+  await flow.prepareCandidate();
+  assert.equal([...specs.values()][0]?.profile, "base");
+});
+
+test("no suite and no profile send no extras", async (t) => {
+  const { flow, specs } = await fixture(t, []);
+  const pin = await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  await flow.decide(pin, "approve");
+  await flow.integrate();
+  const [w, , v] = [...specs.values()];
+  assert.equal(w?.readOnlyFiles, undefined);
+  // The host resolves an omitted profile to "base".
+  assert.equal(w?.profile ?? "base", "base");
+  assert.equal(v?.profile ?? "base", "base");
+  assert.deepEqual(paths(v), ["candidate.diff", "candidate.source"]);
+});
+
+test("an invalid suite is rejected by the constructor", async (t) => {
+  const bytes = new Uint8Array(1);
+  const bad = [
+    [{ path: "../x", bytes }],
+    [{ path: "/x", bytes }],
+    [{ path: "a//b", bytes }],
+    [
+      { path: "a", bytes },
+      { path: "a", bytes },
+    ],
+    Array.from({ length: 33 }, (_, i) => ({ path: `f${i}`, bytes })),
+  ];
+  for (const files of bad)
+    await assert.rejects(
+      fixture(t, [], "", { verification: { command: verifier, suite: files } }),
+      /Invalid verification suite/,
+    );
+});
+
+test("changing the suite or profile invalidates earlier approvals", async (t) => {
+  const first = await fixture(t, [], '{"review":"pass"}', {
+    verification: { command: verifier, suite },
+  });
+  const pin = await first.flow.prepare();
+  const make = (
+    verification: (typeof suite)[number][] | undefined,
+    profile?: ProfileName,
+  ) =>
+    new ReviewedIntegration(first.git, first.host, first.journal, {
+      path: "hello.txt",
+      worker: { argv: ["worker"], timeoutMs: 123 },
+      reviewer: { argv: ["reviewer"], timeoutMs: 123 },
+      verification: {
+        command: verifier,
+        ...(profile ? { profile } : {}),
+        ...(verification ? { suite: verification } : {}),
+      },
+    });
+  const edited = [
+    { ...suite[0]!, bytes: Buffer.from("echo two\n") },
+    suite[1]!,
+  ];
+  for (const other of [make(edited), make(suite, "db"), make(undefined)]) {
+    await assert.rejects(other.decide(pin, "approve"), /incomplete/);
+    assert.equal(await other.reviewedPin(), null);
+  }
+  // An unchanged verifier, and an explicit "base", still match.
+  assert.equal((await make(suite).reviewedPin())?.digest, pin.digest);
+  await make(suite).decide(pin, "approve");
+});
+
+async function verificationOutcome(
+  t: Parameters<typeof fixture>[0],
+  output: string,
+) {
+  const { flow, journal } = await fixture(t, [], output);
+  const pin = await flow.prepareCandidate();
+  await flow.reviewCandidate();
+  await flow.decide(pin, "approve");
+  const result = await flow.integrate();
+  const finished = (await journal.read()).findLast(
+    (event) => event.kind === "verification.finished",
+  );
+  assert.equal(finished?.kind, "verification.finished");
+  return { result, finished: finished as Record<string, unknown> };
+}
+
+test("verification test counts reach the journal, never failure names", async (t) => {
+  // One end-to-end run; output shapes are covered by the unit test below.
+  const revise = await verificationOutcome(
+    t,
+    JSON.stringify({
+      review: "revise",
+      tests: { passed: 1, failed: 2, failures: ["a b", "c"] },
+    }),
+  );
+  assert.equal(revise.result, "denied");
+  assert.equal(revise.finished.review, "revise");
+  assert.deepEqual(revise.finished.tests, { passed: 1, failed: 2 });
+  assert.ok(!JSON.stringify(revise.finished).includes("a b"));
+});
+
+test("verification output shapes are strict", () => {
+  const judge = (text: string) =>
+    verificationResult({
+      id: randomUUID(),
+      outcome: "ok",
+      response: Buffer.from(text),
+    });
+  assert.deepEqual(judge('{"review":"pass"}'), { review: "pass" });
+  assert.deepEqual(
+    judge(
+      JSON.stringify({
+        review: "pass",
+        tests: { passed: 12, failed: 0, failures: [] },
+      }),
+    ),
+    { review: "pass", tests: { passed: 12, failed: 0 } },
+  );
+  const t0 = { passed: 1, failed: 0, failures: [] as unknown[] };
+  for (const value of [
+    { review: "pass", tests: { ...t0, failed: 1 } }, // contradiction
+    { review: "pass", tests: { ...t0, extra: 1 } },
+    { review: "pass", tests: { passed: 1, failed: 0 } },
+    { review: "pass", tests: { ...t0, passed: 1.5 } },
+    { review: "pass", tests: { ...t0, passed: -1 } },
+    { review: "pass", tests: { ...t0, passed: 100_001 } },
+    { review: "pass", tests: { ...t0, failures: ["\u00e9"] } },
+    { review: "pass", tests: { ...t0, failures: ["line\nbreak"] } },
+    { review: "pass", tests: { ...t0, failures: ["x".repeat(201)] } },
+    { review: "pass", tests: { ...t0, failures: Array(21).fill("x") } },
+    { review: "pass", tests: { ...t0, failures: [1] } },
+    { review: "pass", tests: [] },
+    { review: "pass", tests: t0, other: 1 },
+    { review: "pass", notes: "x" },
+    { review: "ok" },
+  ])
+    assert.deepEqual(
+      judge(JSON.stringify(value)),
+      { review: "concern" },
+      JSON.stringify(value),
+    );
+  const big = JSON.stringify({
+    review: "pass",
+    tests: { ...t0, failures: Array(20).fill("x".repeat(200)) },
+  });
+  assert.ok(big.length > 4096);
+  assert.deepEqual(judge(big), { review: "concern" });
+  const bounded = JSON.stringify({
+    review: "revise",
+    tests: { ...t0, failed: 20, failures: Array(20).fill("x".repeat(150)) },
+  });
+  assert.ok(bounded.length < 4096);
+  assert.equal(judge(bounded).review, "revise");
+  // The bare form keeps its 128-byte bound.
+  assert.deepEqual(judge(`{"review":"pass"${" ".repeat(120)}}`), {
+    review: "concern",
+  });
+  assert.deepEqual(
+    verificationResult({
+      id: randomUUID(),
+      outcome: "failed",
+      response: Buffer.from('{"review":"pass"}'),
+    }),
+    { review: "concern" },
+  );
 });

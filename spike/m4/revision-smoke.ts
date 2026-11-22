@@ -82,7 +82,7 @@ try {
         printf '%s' '{"review":"pass"}'
       fi
     `),
-    verification: command(`printf '%s' '{"review":"pass"}'`),
+    verification: { command: command(`printf '%s' '{"review":"pass"}'`) },
   });
   const started = performance.now();
   const first = await flow.prepareCandidate();

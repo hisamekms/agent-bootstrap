@@ -6,6 +6,7 @@ import {
   NOTE_LIMIT_BYTES,
   type IntegrationEvent,
 } from "./integration-journal.ts";
+import type { ProfileName } from "./sandbox-profiles.ts";
 import type {
   SandboxCommand,
   SandboxFile,
@@ -22,13 +23,26 @@ type IntegrationGit = Pick<
 >;
 
 /** Extra sandbox inputs for model-driven roles. Verification gets none. */
-type RoleSandbox = Pick<SandboxSpec, "tools" | "provider" | "hostTcpPort">;
+type RoleSandbox = Pick<
+  SandboxSpec,
+  "tools" | "provider" | "hostTcpPort" | "profile"
+>;
+
+type Verification = {
+  readonly command: SandboxCommand;
+  readonly profile?: ProfileName;
+  /** Host-pinned test files, delivered read-only under `suite/`. */
+  readonly suite?: readonly SandboxFile[];
+};
+
+const SUITE_PREFIX = "suite/";
+const SUITE_LIMIT = 32;
 
 type Plan = {
   readonly path: string;
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
-  readonly verification: SandboxCommand;
+  readonly verification: Verification;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
   /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
@@ -45,7 +59,36 @@ const roleSandbox = (extra?: RoleSandbox): RoleSandbox => ({
   ...(extra?.hostTcpPort !== undefined
     ? { hostTcpPort: extra.hostTcpPort }
     : {}),
+  ...(extra?.profile !== undefined ? { profile: extra.profile } : {}),
 });
+
+function copyVerification(input: Verification): Verification {
+  if (!input || typeof input !== "object" || !input.command)
+    throw new Error("Invalid verification plan");
+  const suite = input.suite ?? [];
+  if (!Array.isArray(suite) || suite.length > SUITE_LIMIT)
+    throw new Error("Invalid verification suite");
+  const seen = new Set<string>();
+  const files = suite.map((file) => {
+    const path = file?.path;
+    if (
+      typeof path !== "string" ||
+      !path ||
+      path.startsWith("/") ||
+      path.split("/").some((part) => !part || part === "." || part === "..") ||
+      seen.has(path) ||
+      !(file.bytes instanceof Uint8Array)
+    )
+      throw new Error("Invalid verification suite");
+    seen.add(path);
+    return { path, bytes: new Uint8Array(file.bytes) };
+  });
+  return {
+    command: { ...input.command, argv: [...input.command.argv] },
+    ...(input.profile !== undefined ? { profile: input.profile } : {}),
+    ...(files.length ? { suite: files } : {}),
+  };
+}
 
 export type PinnedCandidate = {
   readonly base: string;
@@ -58,22 +101,57 @@ const sha256 = (data: Uint8Array | string) =>
 
 const NO_NOTES = sha256("");
 
+type Tests = { passed: number; failed: number };
+
 /** Verification accepts exactly `{"review": "pass" | "revise"}` in at most
- * 128 bytes; anything else is a concern. */
-function verificationResult(run: ReviewerRun): Review {
+ * 128 bytes, or that plus a bounded `tests` summary in at most 4096 bytes.
+ * Anything else, or a pass with failing tests, is a concern. */
+export function verificationResult(run: ReviewerRun): {
+  review: Review;
+  tests?: Tests;
+} {
+  const concern = { review: "concern" as Review };
   const bytes = run.response;
-  if (run.outcome !== "ok" || !bytes || bytes.length > 128) return "concern";
+  if (run.outcome !== "ok" || !bytes || bytes.length > 4096) return concern;
   try {
     const result = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(bytes),
     );
-    if (result && !Array.isArray(result) && Object.keys(result).length === 1)
-      if (result.review === "pass" || result.review === "revise")
-        return result.review;
+    if (!result || Array.isArray(result) || typeof result !== "object")
+      return concern;
+    const keys = Object.keys(result);
+    const review = result.review;
+    if (review !== "pass" && review !== "revise") return concern;
+    if (keys.length === 1) return bytes.length <= 128 ? { review } : concern;
+    if (keys.length !== 2 || !Object.hasOwn(result, "tests")) return concern;
+    const tests = result.tests;
+    if (!tests || Array.isArray(tests) || typeof tests !== "object")
+      return concern;
+    const keyList = Object.keys(tests).sort().join(",");
+    const { passed, failed, failures } = tests;
+    const count = (value: unknown): value is number =>
+      Number.isSafeInteger(value) &&
+      (value as number) >= 0 &&
+      (value as number) <= 100_000;
+    if (
+      keyList !== "failed,failures,passed" ||
+      !count(passed) ||
+      !count(failed) ||
+      !Array.isArray(failures) ||
+      failures.length > 20 ||
+      failures.some(
+        (failure) =>
+          typeof failure !== "string" ||
+          failure.length > 200 ||
+          !/^[\x20-\x7e]*$/.test(failure),
+      ) ||
+      (review === "pass" && failed > 0)
+    )
+      return concern;
+    return { review, tests: { passed, failed } };
   } catch {
-    return "concern";
+    return concern;
   }
-  return "concern";
 }
 
 /** `{"review": "pass" | "revise"}`, optionally with bounded `notes` text for
@@ -180,11 +258,12 @@ export class ReviewedIntegration {
       ...command,
       argv: [...command.argv],
     });
+    const verification = copyVerification(plan.verification);
     this.#plan = {
       path: plan.path,
       worker: copy(plan.worker),
       reviewer: copy(plan.reviewer),
-      verification: copy(plan.verification),
+      verification,
       workerSandbox: roleSandbox(plan.workerSandbox),
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
       ...(plan.reviewerOutput ? { reviewerOutput: plan.reviewerOutput } : {}),
@@ -197,8 +276,13 @@ export class ReviewedIntegration {
       JSON.stringify([
         await this.#git.targetId(),
         path,
-        verification.argv,
-        verification.timeoutMs,
+        verification.command.argv,
+        verification.command.timeoutMs,
+        verification.profile ?? "base",
+        (verification.suite ?? []).map((file) => [
+          file.path,
+          sha256(file.bytes),
+        ]),
       ]),
     );
   }
@@ -217,21 +301,29 @@ export class ReviewedIntegration {
     id?: string,
     extra: RoleSandbox = {},
   ) {
-    const bytes = await this.#git.snapshot(pin.candidate, this.#plan.path);
+    const files = await this.#candidateFiles(pin, diff);
     return this.#host.runReviewer(
       {
-        sandbox: {
-          ...extra,
-          maxLifetimeMs: 300_000,
-          readOnlyFiles: [
-            { path: "candidate.diff", bytes: diff },
-            { path: "candidate.source", bytes },
-          ],
-        },
+        sandbox: { ...extra, maxLifetimeMs: 300_000, readOnlyFiles: files },
         command,
       },
       id,
     );
+  }
+
+  async #candidateFiles(pin: PinnedCandidate, diff: Uint8Array) {
+    const bytes = await this.#git.snapshot(pin.candidate, this.#plan.path);
+    return [
+      { path: "candidate.diff", bytes: diff },
+      { path: "candidate.source", bytes },
+    ];
+  }
+
+  #suiteFiles(): SandboxFile[] {
+    return (this.#plan.verification.suite ?? []).map((file) => ({
+      path: SUITE_PREFIX + file.path,
+      bytes: new Uint8Array(file.bytes),
+    }));
   }
 
   async prepare(): Promise<PinnedCandidate & { review: Review }> {
@@ -260,13 +352,17 @@ export class ReviewedIntegration {
     id?: string,
   ): Promise<PinnedCandidate> {
     const { path } = this.#plan;
+    const profile =
+      this.#plan.workerSandbox?.profile ?? this.#plan.verification.profile;
+    const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
     const worker = await this.#host.runWorker(
       {
         sandbox: {
           ...this.#plan.workerSandbox,
+          ...(profile !== undefined ? { profile } : {}),
           maxLifetimeMs: 300_000,
           files: [{ path, bytes: source }],
-          ...(readOnlyFiles.length ? { readOnlyFiles } : {}),
+          ...(allReadOnly.length ? { readOnlyFiles: allReadOnly } : {}),
         },
         command: this.#plan.worker,
         collectPaths: [path],
@@ -447,18 +543,28 @@ export class ReviewedIntegration {
       return "denied";
     }
     await append({ kind: "verification.authorized", ...pin });
-    const verification = await this.#review(
-      pin,
-      diff,
-      this.#plan.verification,
+    const { profile } = this.#plan.verification;
+    const verification = await this.#host.runVerification(
+      {
+        sandbox: {
+          maxLifetimeMs: 300_000,
+          readOnlyFiles: [
+            ...(await this.#candidateFiles(pin, diff)),
+            ...this.#suiteFiles(),
+          ],
+          ...(profile !== undefined ? { profile } : {}),
+        },
+        command: this.#plan.verification.command,
+      },
       id,
     );
-    const verified = verificationResult(verification);
+    const { review: verified, tests } = verificationResult(verification);
     await append({
       kind: "verification.finished",
       run: verification.id,
       digest: pin.digest,
       review: verified,
+      ...(tests ? { tests } : {}),
     });
     if (verified !== "pass") {
       await append({ kind: "denied", reason: "verification" });

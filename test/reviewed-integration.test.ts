@@ -79,7 +79,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
     path: "hello.txt",
     worker: { argv: ["worker"], timeoutMs: 123 },
     reviewer: { argv: ["reviewer"], timeoutMs: 123 },
-    verification: { argv: ["verify"], timeoutMs: 123 },
+    verification: { command: { argv: ["verify"], timeoutMs: 123 } },
   };
   const host = new TrustedHost(audit, runtime, profiles);
   const flow = new ReviewedIntegration(git, host, journal, plan);
@@ -103,7 +103,7 @@ test("approval binds one candidate, the target and the verifier, and applies onc
   );
   await assert.rejects(wrongTarget.decide(pin, "approve"), /incomplete/);
   await flow.decide(pin, "approve");
-  plan.verification.argv[0] = "changed-verifier";
+  plan.verification.command.argv[0] = "changed-verifier";
   const results = await Promise.allSettled([
     flow.integrate(),
     flow.integrate(),
@@ -157,7 +157,9 @@ test("failed verification records its result without advancing the branch", asyn
   const { plan, git, host, journal } = await fixture(t);
   const flow = new ReviewedIntegration(git, host, journal, {
     ...plan,
-    verification: { ...plan.verification, argv: ["revise"] },
+    verification: {
+      command: { ...plan.verification.command, argv: ["revise"] },
+    },
   });
   const pin = await flow.prepare();
   await flow.decide(pin, "approve");

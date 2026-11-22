@@ -139,7 +139,7 @@ async function main() {
         grep -Exq '(hello|good day) from Worker' /review/candidate.source
         printf '%s' '{"review":"pass"}'
       `),
-        verification: verifier,
+        verification: { command: verifier },
       });
     const driver: CoordinatorDriver = {
       step(control, id) {
