@@ -303,6 +303,11 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     )
       invalid();
     const profile = this.#config.profiles.get(profileName);
+    if (
+      spec.imageDigest !== undefined &&
+      spec.imageDigest !== this.#config.profiles.imageDigest(profileName)
+    )
+      invalid();
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     boundedInteger(lifetime, MICROSANDBOX_LIMITS.maxLifetimeMs);

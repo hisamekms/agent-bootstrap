@@ -37,6 +37,10 @@ type Verification = {
 
 const SUITE_PREFIX = "suite/";
 const SUITE_LIMIT = 32;
+// Kept within the sandbox file limits, with room for the candidate files and
+// review notes that share the same read-only mount.
+const SUITE_FILE_BYTES = 256 * 1024;
+const SUITE_TOTAL_BYTES = 512 * 1024;
 
 type Plan = {
   readonly path: string;
@@ -81,8 +85,15 @@ function copyVerification(input: Verification): Verification {
     )
       throw new Error("Invalid verification suite");
     seen.add(path);
+    if (file.bytes.byteLength > SUITE_FILE_BYTES)
+      throw new Error("Invalid verification suite");
     return { path, bytes: new Uint8Array(file.bytes) };
   });
+  if (
+    files.reduce((total, file) => total + file.bytes.byteLength, 0) >
+    SUITE_TOTAL_BYTES
+  )
+    throw new Error("Invalid verification suite");
   return {
     command: { ...input.command, argv: [...input.command.argv] },
     ...(input.profile !== undefined ? { profile: input.profile } : {}),
@@ -103,7 +114,11 @@ const NO_NOTES = sha256("");
 
 type Tests = { passed: number; failed: number };
 
-/** Verification accepts exactly `{"review": "pass" | "revise"}` in at most
+/** The verdict and `tests` are self-reported by a VM that also runs the
+ * candidate code, which can print a forged pass. Verification catches honest
+ * failures; Reviewer and human approval remain the integration gate.
+ *
+ * Verification accepts exactly `{"review": "pass" | "revise"}` in at most
  * 128 bytes, or that plus a bounded `tests` summary in at most 4096 bytes.
  * Anything else, or a pass with failing tests, is a concern. */
 export function verificationResult(run: ReviewerRun): {

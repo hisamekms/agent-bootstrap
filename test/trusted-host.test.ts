@@ -608,6 +608,8 @@ test("sandbox.create records the default base profile and its digest", async (t)
   assert.equal(event?.profile, "base");
   assert.equal(event?.image, "a".repeat(64));
   assert.equal(specs[0]?.profile, "base");
+  // The adapter receives the audited digest to check against its own catalog.
+  assert.equal(specs[0]?.imageDigest, event?.image);
   assert.equal(
     audit.read(run.id).filter((e) => e.profile !== undefined).length,
     1,
@@ -685,6 +687,8 @@ test("the session path records profile and image on sandbox.create", async (t) =
   assert.equal(event?.profile, "base");
   assert.equal(event?.image, "a".repeat(64));
   assert.equal(specs[0]?.profile, "base");
+  // The adapter receives the audited digest to check against its own catalog.
+  assert.equal(specs[0]?.imageDigest, event?.image);
   assert.equal(event?.role, "Coordinator");
 });
 

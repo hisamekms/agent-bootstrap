@@ -224,6 +224,7 @@ export class TrustedHost {
         handle = await this.#sandbox.create({
           ...sandbox,
           profile,
+          imageDigest: image,
           invocationId: id,
         });
       } catch (error) {
@@ -411,7 +412,12 @@ export class TrustedHost {
     if (egress) await authorize("provider.egress", true);
     try {
       const created = await execute("sandbox.create", () =>
-        this.#sandbox.create({ ...plan.sandbox, profile, invocationId: id }),
+        this.#sandbox.create({
+          ...plan.sandbox,
+          profile,
+          imageDigest: image,
+          invocationId: id,
+        }),
       );
       if (created) {
         handle = created.value;

@@ -1,6 +1,7 @@
 # Sandbox profiles
 
-Status: in progress on `feat/sandbox-profiles` (design from 2026-11-22).
+Status: the mechanism is implemented with only `base` configured
+(2026-11-22). The `db` and `browser` images are not built yet.
 
 Some tasks need a database or a browser in the VM, and most do not. A
 **sandbox profile** names one VM environment: a digest-pinned image plus
@@ -63,7 +64,10 @@ unchanged.
 `MicrosandboxConfig` replaces `image` with `profiles: ProfileCatalog`.
 `create` resolves `spec.profile ?? "base"`, refuses an unconfigured profile
 with `invalid-input` before any backend call, and passes the profile's image,
-plus `--memory <n>M` and `--cpus <n>` when they are set.
+plus `--memory <n>M` and `--cpus <n>` when they are set. The host passes
+the image digest it recorded in the audit as `SandboxSpec.imageDigest`. The
+adapter refuses the spec if its own catalog resolves a different image, so
+the audit cannot name one image while another boots.
 
 ### Trusted host
 
@@ -91,15 +95,19 @@ plus `--memory <n>M` and `--cpus <n>` when they are set.
   `Verification` to them fails closed with `invalid-event` or
   `append-failed`. This is the same pattern v3 used for `provider.egress`.
   An old trace therefore never silently loses profile evidence. Events
-  without these fields still append to old databases.
+  without these fields still append to old databases. But the trusted host
+  records `profile` and `image` on every `sandbox.create`, so a v1–v3
+  database can no longer run any invocation: it stops before a VM is created.
+  Use a new audit database for new runs. Old ones remain readable.
 - Reads return `profile` and `image` when they are present.
 
 ### Reviewed integration
 
 - `Plan.verification` becomes
   `{ command: SandboxCommand; profile?: ProfileName; suite?: readonly SandboxFile[] }`.
-  - The suite holds host-pinned test files (bounded by the adapter's file
-    limits).
+  - The suite holds host-pinned test files: at most 32 files, 256 KiB each and
+    512 KiB in total. These limits are checked when the integration flow is
+    built.
   - Verification runs through `host.runVerification` with
     `readOnlyFiles` = `candidate.diff`, `candidate.source` and the suite under
     `suite/<path>`.
@@ -120,8 +128,17 @@ plus `--memory <n>M` and `--cpus <n>` when they are set.
   - there are at most 20 failures;
   - each failure is at most 200 bytes, printable ASCII only.
 
-  Any other shape is a concern. The journal's `verification.finished` event
-  records the counts when they are present.
+  Any other shape is a concern, as is `pass` with failing tests. The
+  journal's `verification.finished` event records the counts when they are
+  present.
+
+- **The verdict is self-reported.** The verification VM also runs the
+  candidate code, as the same user, so a hostile candidate can print a forged
+  `pass` and invented counts. Verification catches honest failures. Reviewer
+  and human approval remain the integration gate, and the counts are evidence
+  of what the VM reported, not proof. Planned hardening: run the candidate as
+  a separate unprivileged user, and have a host-pinned runner report through
+  a channel the candidate cannot write.
 
 ### Claude Code Worker shell
 
@@ -131,6 +148,15 @@ set is unchanged. Consequence: a shell in the VM can make arbitrary requests
 to the bound provider host with the substituted credential. The Codex Worker
 has the same property today. The value itself never enters the guest. This
 needs a security review.
+
+## Evidence
+
+On 2026-11-22, `bun verify` passed 114 tests. Two M5 fixture runs in real
+VMs completed with outcome `done`: `all=codex` and
+`Coordinator=claude,Worker=claude,Reviewer=codex`. The audit database was
+v4, and every `sandbox.create` request recorded profile `base` with the
+pinned Alpine image digest. Verification was recorded under its own role,
+`Verification`, with no `provider.egress` grant.
 
 ## Not in this step
 

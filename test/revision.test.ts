@@ -415,6 +415,11 @@ test("an invalid suite is rejected by the constructor", async (t) => {
       { path: "a", bytes },
     ],
     Array.from({ length: 33 }, (_, i) => ({ path: `f${i}`, bytes })),
+    [{ path: "big", bytes: new Uint8Array(256 * 1024 + 1) }],
+    Array.from({ length: 3 }, (_, i) => ({
+      path: `part${i}`,
+      bytes: new Uint8Array(200 * 1024),
+    })),
   ];
   for (const files of bad)
     await assert.rejects(
@@ -549,5 +554,37 @@ test("verification output shapes are strict", () => {
       response: Buffer.from('{"review":"pass"}'),
     }),
     { review: "concern" },
+  );
+});
+
+test("the journal refuses a pass that reports failing tests", async (t) => {
+  const directory = await realpath(
+    await mkdtemp(join(tmpdir(), "bootstrap-journal-")),
+  );
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const journal = new IntegrationJournal(directory, randomUUID());
+  const event = {
+    kind: "verification.finished" as const,
+    run: randomUUID(),
+    digest: "0".repeat(64),
+  };
+  await assert.rejects(
+    journal.append(0, {
+      ...event,
+      review: "pass",
+      tests: { passed: 1, failed: 1 },
+    }),
+  );
+  await journal.append(0, {
+    ...event,
+    review: "revise",
+    tests: { passed: 1, failed: 1 },
+  });
+  const [stored] = await journal.read();
+  assert.deepEqual(
+    stored?.kind === "verification.finished" && "tests" in stored
+      ? stored.tests
+      : null,
+    { passed: 1, failed: 1 },
   );
 });

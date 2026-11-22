@@ -741,5 +741,16 @@ test("profiles select the image and resources; unconfigured or malformed profile
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
   }
+  // The digest the host audited must be the image this adapter boots.
+  for (const imageDigest of ["c".repeat(64), "a".repeat(64), 1])
+    await assert.rejects(
+      runtime.create({ profile: "db", imageDigest } as never),
+      (error: SandboxRuntimeError) => error.code === "invalid-input",
+    );
   assert.equal((await f.events()).length, before);
+  const matched = await runtime.create({
+    profile: "db",
+    imageDigest: "b".repeat(64),
+  });
+  await runtime.destroy(matched);
 });

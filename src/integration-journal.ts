@@ -88,7 +88,11 @@ function decode(value: unknown): IntegrationEvent {
   // Only verification.finished may carry the optional `tests` counts.
   const optional =
     kind === "verification.finished" && Object.hasOwn(data, "tests") ? 1 : 0;
-  if (optional && !validTests(data.tests))
+  if (
+    optional &&
+    (!validTests(data.tests) ||
+      (data.review === "pass" && (data.tests as { failed: number }).failed > 0))
+  )
     throw new Error("Invalid integration event fields");
   if (
     Object.keys(data).length !== expected.length + 2 + optional ||
