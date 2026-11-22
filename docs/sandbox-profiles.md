@@ -136,7 +136,10 @@ the audit cannot name one image while another boots.
   candidate code, as the same user, so a hostile candidate can print a forged
   `pass` and invented counts. Verification catches honest failures. Reviewer
   and human approval remain the integration gate, and the counts are evidence
-  of what the VM reported, not proof. Planned hardening: run the candidate as
+  of what the VM reported, not proof. A Worker with the opt-in shell can
+  rehearse against the same suite, which makes a forged pass easier to
+  build. The adapter also still accepts a spec without `imageDigest`; the
+  trusted host always sets it. Planned hardening: run the candidate as
   a separate unprivileged user, and have a host-pinned runner report through
   a channel the candidate cannot write.
 
