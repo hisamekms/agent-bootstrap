@@ -335,6 +335,103 @@ verification passed and the journal recorded `integration.completed` and
 `approval.finished`. A Git read confirmed that the disposable
 repository's `refs/heads/main` points to the approved candidate.
 
+### Model-driven Coordinator turn with a mock provider
+
+[`src/model-coordinator.ts`](../src/model-coordinator.ts) defines a
+provider-neutral `CoordinatorModel` port and `modelStep`, which plugs into
+`CoordinatorDriver.step`. Each turn registers the five Coordinator host
+tools plus `finish`, then takes the model's first proposed call. That call
+is encoded unchanged as the router's action bytes. The adapter makes no
+authorization decision, so unknown tools, extra fields, forged roles and
+non-object arguments stay malformed and the existing router denies them.
+
+[`src/codex-app-server.ts`](../src/codex-app-server.ts) is the first adapter.
+It registers the tools as app-server dynamic tools on a read-only,
+`approvalPolicy: "never"`, ephemeral thread. It captures the first
+`item/tool/call`, answers it with a fixed "submitted" result, and interrupts
+the turn. It voids the turn when any of the following happens:
+
+- the model makes another dynamic call;
+- the app-server sends any other server request;
+- a thread item other than a user or agent message, reasoning, a dynamic
+  tool call or a context compaction starts.
+
+Line size, total bytes and server requests are bounded. A timeout covers
+connecting and the whole turn. Diagnostics are fixed codes.
+
+Native tools are the main residual risk. Under `approvalPolicy: "never"`,
+Codex runs its own tools without any approval request, so the adapter
+cannot decline them in advance. On 2026-11-22, the mock provider recorded
+the tools that Codex 0.170.0 offered upstream with the default model:
+
+- Without hardening, the model saw 29 tools, including `exec_command`,
+  `write_stdin`, `apply_patch`, MCP resources and `spawn_agent`.
+- `CODEX_COORDINATOR_CONFIG` removed the shell, stdin and goal tools.
+- Code mode `exec` with nested `apply_patch`, MCP resource and `view_image`
+  tools remained, along with `request_user_input`, `clock.sleep` and the
+  `collaboration` tools. The model catalog enables these, and config keys
+  do not remove them. An uncataloged model name left only
+  `request_user_input` and `view_image`.
+- The guest has no code-mode host, and Codex reported that code mode fails
+  closed.
+
+The adapter therefore treats starting a native item as a policy violation,
+but this is detection, not prevention: the item may already be running.
+Before real-provider use, the Coordinator needs a model configuration
+that offers no native tools, and this needs to be verified upstream.
+
+The credential-free tests in `test/model-coordinator.test.ts` use an
+in-memory app-server with a scripted mock provider. They send the router's
+decisions through `TrustedHost` and SQLite audit. The tests cover:
+
+- an authorized Worker delegation with a complete Worker audit trace;
+- an out-of-policy `requestIntegration` with no host audit event;
+- forged and injected calls, and only the first of two calls being used;
+- a declined native approval request and a turn with no tool call;
+- native command, file, MCP, collaboration, web, image and sleep items
+  that start without an approval request;
+- malformed, non-object, duplicate and truncated output;
+- bounded line reading;
+- connection failure and a connection that outlives the deadline;
+- a timeout that reopens as uncertain and is not retried.
+
+The smoke runs the verified Codex 0.170.0 app-server in a disposable VM per
+turn. It uses a loopback mock Responses provider and no credential:
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- \
+  bun spike/m4/model-coordinator-smoke.ts /absolute/path/to/codex
+```
+
+On 2026-11-22, the smoke ran two tasks in about 9 seconds.
+
+- **First task.** The provider made a `delegate` call. The router
+  authorized it, and the Worker VM's SQLite trace ended with
+  `invocation.finished ok`. In the second turn, the provider saw the Worker
+  outcome in the prompt and made a `requestIntegration` call without a
+  review. The router recorded `tool.denied`.
+- **Second task.** The provider called the native `clock.sleep` tool. The
+  adapter voided the turn when the `sleep` item started, and the router
+  recorded `turn.denied`.
+
+The interrupts reached Codex before it returned any tool output to the
+provider. The smoke asserts that no shell tool is offered. No sandbox
+remained after the run.
+
+Known gaps:
+
+- **Coordinator VMs are not in the SQLite sandbox audit.** They use a
+  spike-only streamed `msb exec` transport because the product
+  `SandboxRuntime` port has no streaming exec. The router journal still
+  records `turn.started` before each model call.
+- **Failed turns become uncertain.** A provider or transport failure leaves
+  `turn.started` as the last event. The task then reopens as uncertain and
+  is not retried, although no host effect occurred.
+- **Denials record no proposal digest.** Denial events do not record a
+  digest of the model's proposed action.
+- **Usage is not collected.** Usage notifications are ignored.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |
