@@ -495,6 +495,98 @@ Known gaps:
 - **Reviewed-integration records are not joined.** The task trace does not
   join the reviewed-integration journal used by the M4 smoke.
 
+### Revision candidates
+
+On 2026-11-22, the reviewed integration gained revisions within one task.
+A Reviewer may answer `{"review":"revise","notes":"..."}`. The notes are
+untrusted text of up to 2 KiB. They are stored as a private,
+content-addressed file, and the journal records only their SHA-256 in
+`review.noted`. Malformed or oversized notes make the review a `concern`
+without notes.
+
+`ReviewedIntegration.revise` is allowed only when the latest event is the
+current candidate's review, and that review is `revise` or `concern`. It
+works like this:
+
+1. It records `revision.requested` with the round, the current diff digest
+   and the notes digest. This write is the sequence CAS that comes before
+   any Worker VM.
+2. A new Worker VM receives the current candidate's file and the notes as
+   read-only `/review/review-notes.txt`.
+3. The new candidate is a single-parent commit on the original base. It has
+   its own commit, diff and digest, and needs its own review.
+
+One integration journal, which the M4 smoke keeps per task, allows at most
+`MAX_REVISIONS` (3) revisions. Verification keeps its strict format:
+exactly `{"review": ...}` in at most 128 bytes, and notes are not accepted.
+
+Review, decision and integration always use the most recent candidate, and
+a review counts only if it comes after that candidate. A decision about an
+earlier candidate therefore never qualifies, and no approval is reused for a
+revision. `reviewedPin()` returns the current candidate only when its latest
+review passed. The integration journal limit is now 31 events.
+
+The Coordinator router follows the same order:
+
+- **Worker** can run again only after the latest Reviewer invocation failed
+  (`revise` or `concern`). The task allows up to 1 + `MAX_REVISIONS` Worker
+  runs, and failed runs count toward that limit.
+- **Reviewer** runs only when a Worker candidate is newer than the last
+  review.
+- **`requestIntegration`** needs a passing review that is newer than the
+  latest Worker.
+
+By the `CoordinatorDriver` contract, a Reviewer outcome of `ok` means the
+review passed, and `failed` means it asked for changes, raised a concern or
+did not finish.
+
+The credential-free tests in `test/revision.test.ts` use a real disposable
+Git repository. They cover these cases:
+
+- the revised candidate with read-only notes;
+- rejection of every decision about the earlier candidate;
+- integration of the revised candidate after its own approval;
+- a concern revised without notes;
+- the revision cap;
+- malformed notes.
+
+`test/coordinator.test.ts` covers the router order and its denials.
+
+The offline revision smoke runs Worker, Reviewer, a revising Worker and a
+second Reviewer in separate VMs, and stops before the human decision:
+
+```sh
+MSB_HOME=/absolute/short/msb-home \
+  mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- \
+  bun spike/m4/revision-smoke.ts
+```
+
+On 2026-11-22, the smoke finished in about 4 seconds.
+
+- **First review.** The first candidate was reviewed as `revise` with notes.
+- **Revising Worker.** It saw the previous candidate and the notes, and its
+  write to the notes was refused.
+- **Second candidate.** It had the same base and a new commit and digest,
+  and it passed review.
+- **Approval.** An approval of the first candidate was rejected.
+
+All four invocations finished `ok` in the SQLite audit, and no sandbox
+remained. The M4 Coordinator smoke driver now calls `revise()` for a later
+Worker delegation and `reviewedPin()` for integration.
+
+Known gaps:
+
+- **Human rejection does not lead to a revision.** A human rejection still
+  ends the task.
+- **The task trace does not include the integration journal.** The
+  candidate, review and revision events have to be read separately.
+- **Revision rounds have only fixture evidence.** A real model has not yet
+  run a review and revision round.
+- **Notes are not sanitized for display.** They may contain terminal escape
+  or bidirectional characters, so they must be escaped before a human sees
+  them.
+- **Note files are kept forever.** There is no retention rule yet.
+
 ## Later acceptance checks
 
 | Milestone                            | Executable acceptance scenario                                                                                                                                                        |

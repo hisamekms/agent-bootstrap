@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import type { LocalGitIntegration } from "./git-integration.ts";
 import {
   IntegrationJournal,
+  MAX_REVISIONS,
+  NOTE_LIMIT_BYTES,
   type IntegrationEvent,
 } from "./integration-journal.ts";
-import type { SandboxCommand } from "./sandbox-runtime.ts";
+import type { SandboxCommand, SandboxFile } from "./sandbox-runtime.ts";
 import type { ReviewerRun, TrustedHost } from "./trusted-host.ts";
 
 type Review = "pass" | "revise" | "concern";
@@ -31,21 +33,55 @@ export type PinnedCandidate = {
 const sha256 = (data: Uint8Array | string) =>
   createHash("sha256").update(data).digest("hex");
 
-function reviewResult(run: ReviewerRun): Review {
+const NO_NOTES = sha256("");
+
+/** Verification accepts exactly `{"review": "pass" | "revise"}` in at most
+ * 128 bytes; anything else is a concern. */
+function verificationResult(run: ReviewerRun): Review {
   const bytes = run.response;
   if (run.outcome !== "ok" || !bytes || bytes.length > 128) return "concern";
   try {
     const result = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(bytes),
     );
-    if (result && !Array.isArray(result) && Object.keys(result).length === 1) {
+    if (result && !Array.isArray(result) && Object.keys(result).length === 1)
       if (result.review === "pass" || result.review === "revise")
         return result.review;
-    }
   } catch {
     return "concern";
   }
   return "concern";
+}
+
+/** `{"review": "pass" | "revise"}`, optionally with bounded `notes` text for
+ * the next Worker. Anything else is a concern without notes. */
+function reviewResult(run: ReviewerRun): { review: Review; notes?: string } {
+  const bytes = run.response;
+  if (run.outcome !== "ok" || !bytes || bytes.length > 4096)
+    return { review: "concern" };
+  try {
+    const result = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    );
+    if (!result || Array.isArray(result) || typeof result !== "object")
+      return { review: "concern" };
+    const keys = Object.keys(result);
+    const review = result.review;
+    if (review !== "pass" && review !== "revise") return { review: "concern" };
+    if (keys.length === 1) return { review };
+    const notes = result.notes;
+    if (
+      keys.length === 2 &&
+      typeof notes === "string" &&
+      notes.trim().length > 0 &&
+      Buffer.byteLength(notes) <= NOTE_LIMIT_BYTES &&
+      !notes.includes("\0")
+    )
+      return { review, notes };
+  } catch {
+    return { review: "concern" };
+  }
+  return { review: "concern" };
 }
 
 function samePin(a: PinnedCandidate, b: PinnedCandidate): boolean {
@@ -54,12 +90,16 @@ function samePin(a: PinnedCandidate, b: PinnedCandidate): boolean {
   );
 }
 
+/** The current candidate is the most recent one. Earlier candidates and any
+ * decisions about them never qualify for review, approval or integration. */
 function candidatePin(
   events: IntegrationEvent[],
   target: string,
 ): PinnedCandidate {
   const requested = events[0];
-  const candidate = events.find((event) => event.kind === "candidate.created");
+  const candidate = events.findLast(
+    (event) => event.kind === "candidate.created",
+  );
   if (
     !requested ||
     requested.kind !== "requested" ||
@@ -76,10 +116,20 @@ function candidatePin(
 
 function latestPin(events: IntegrationEvent[], target: string) {
   const pin = candidatePin(events, target);
-  const review = events.find((event) => event.kind === "review.submitted");
-  if (!review || review.digest !== pin.digest)
+  const created = events.findLastIndex(
+    (event) => event.kind === "candidate.created",
+  );
+  const index = events.findLastIndex(
+    (event) => event.kind === "review.submitted",
+  );
+  const review = events[index];
+  if (
+    index < created ||
+    review?.kind !== "review.submitted" ||
+    review.digest !== pin.digest
+  )
     throw new Error("Integration evidence is incomplete");
-  return { pin, review: review.review };
+  return { pin, review: review.review, run: review.run };
 }
 
 /** Host-only authority. Worker, Reviewer and verification get separate VMs.
@@ -165,9 +215,26 @@ export class ReviewedIntegration {
     const base = await this.#git.head();
     await append({ kind: "requested", target: await this.#target(), base });
     const source = await this.#git.snapshot(base, path);
+    return this.#produce(append, base, source, [], id);
+  }
+
+  /** Run Worker on `source`, then create and pin a single-parent candidate on
+   * `base`. Each candidate has its own commit and diff digest. */
+  async #produce(
+    append: (event: Event) => Promise<void>,
+    base: string,
+    source: Uint8Array,
+    readOnlyFiles: SandboxFile[],
+    id?: string,
+  ): Promise<PinnedCandidate> {
+    const { path } = this.#plan;
     const worker = await this.#host.runWorker(
       {
-        sandbox: { maxLifetimeMs: 30_000, files: [{ path, bytes: source }] },
+        sandbox: {
+          maxLifetimeMs: 30_000,
+          files: [{ path, bytes: source }],
+          ...(readOnlyFiles.length ? { readOnlyFiles } : {}),
+        },
         command: this.#plan.worker,
         collectPaths: [path],
       },
@@ -206,6 +273,60 @@ export class ReviewedIntegration {
     return pin;
   }
 
+  /** Start a revised candidate after the current one was reviewed as
+   * `revise` or `concern`. Worker gets the current candidate's file and the
+   * review notes, read-only, in a new VM. The new candidate starts from the
+   * original base, so it gets a new commit, diff and digest, and needs its own
+   * review and human decision. */
+  async revise(id?: string): Promise<PinnedCandidate> {
+    const events = await this.#journal.read();
+    const { pin, review, run } = latestPin(events, await this.#target());
+    const rounds = events.filter(
+      (event) => event.kind === "revision.requested",
+    ).length;
+    if (events.at(-1)?.kind !== "review.submitted" || review === "pass")
+      throw new Error(
+        "Only a candidate reviewed as needing changes can be revised",
+      );
+    if (rounds >= MAX_REVISIONS) throw new Error("Revision limit reached");
+    // Notes count only when recorded immediately before this review.
+    const noted = events.at(-2);
+    const notes =
+      noted?.kind === "review.noted" && noted.run === run
+        ? noted.notes
+        : NO_NOTES;
+    const append = this.#writer(events.length);
+    // This sequence CAS wins before any snapshot or Worker VM.
+    await append({
+      kind: "revision.requested",
+      round: String(rounds + 1),
+      from: pin.digest,
+      notes,
+    });
+    const source = await this.#git.snapshot(pin.candidate, this.#plan.path);
+    const readOnly =
+      notes === NO_NOTES
+        ? []
+        : [
+            {
+              path: "review-notes.txt",
+              bytes: await this.#journal.readNote(notes),
+            },
+          ];
+    return this.#produce(append, pin.base, source, readOnly, id);
+  }
+
+  /** The current candidate when its latest review passed, else null. */
+  async reviewedPin(): Promise<PinnedCandidate | null> {
+    const events = await this.#journal.read();
+    try {
+      const { pin, review } = latestPin(events, await this.#target());
+      return review === "pass" ? pin : null;
+    } catch {
+      return null;
+    }
+  }
+
   async reviewCandidate(
     id?: string,
   ): Promise<PinnedCandidate & { review: Review }> {
@@ -221,7 +342,13 @@ export class ReviewedIntegration {
     // An authorized review without a result remains uncertain after a crash.
     await append({ kind: "review.authorized", ...pin });
     const reviewer = await this.#review(pin, diff, this.#plan.reviewer, id);
-    const review = reviewResult(reviewer);
+    const { review, notes } = reviewResult(reviewer);
+    if (notes !== undefined)
+      await append({
+        kind: "review.noted",
+        run: reviewer.id,
+        notes: await this.#journal.saveNote(notes),
+      });
     await append({
       kind: "review.submitted",
       run: reviewer.id,
@@ -280,7 +407,7 @@ export class ReviewedIntegration {
       this.#plan.verification,
       id,
     );
-    const verified = reviewResult(verification);
+    const verified = verificationResult(verification);
     await append({
       kind: "verification.finished",
       run: verification.id,

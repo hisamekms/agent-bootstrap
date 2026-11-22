@@ -189,3 +189,101 @@ test("the task stops at its event limit before starting another sandbox", async 
   assert.equal(calls, 31);
   assert.equal((await task.trace()).at(-1)?.kind, "query.finished");
 });
+
+test("a Worker can revise only after a failed review, and integration needs a passing review of the latest candidate", async (t) => {
+  const reviews = ["failed", "ok"] as const;
+  const revise = { tool: "delegate", key: "revise-1", role: "Worker" };
+  const reviewAgain = { tool: "delegate", key: "review-2", role: "Reviewer" };
+  const { task, roles } = await fixture(
+    t,
+    [worker, review, revise, reviewAgain, integration],
+    {
+      async delegate(role, _control, id) {
+        roles.push(role);
+        return {
+          id,
+          outcome:
+            role === "Reviewer"
+              ? (reviews[roles.filter((r) => r === "Reviewer").length - 1] ??
+                "ok")
+              : "ok",
+        };
+      },
+    },
+  );
+  assert.equal(await task.run(), "paused");
+  assert.deepEqual(roles, ["Worker", "Reviewer", "Worker", "Reviewer"]);
+  assert.ok((await task.status()).approval);
+});
+
+test("revision rules deny out-of-order delegations", async (t) => {
+  const failing = {
+    async delegate(role: string, _control: unknown, id: string) {
+      return {
+        id,
+        outcome: role === "Reviewer" ? ("failed" as const) : ("ok" as const),
+      };
+    },
+  };
+  for (const [actions, overrides, ran] of [
+    // A second Worker after a passing review.
+    [[worker, review, { ...worker, key: "again" }], {}, 2],
+    // A second review of the same candidate.
+    [[worker, review, { ...review, key: "again" }], {}, 2],
+    // Integration after a failed review.
+    [[worker, review, integration], failing, 2],
+    // Integration when the latest candidate has not been reviewed.
+    [[worker, review, { ...worker, key: "revise" }, integration], failing, 3],
+  ] as const) {
+    let count = 0;
+    const { task } = await fixture(t, [...actions], {
+      ...overrides,
+      async delegate(role, control, id) {
+        count++;
+        return "delegate" in overrides
+          ? (overrides as typeof failing).delegate(role, control, id)
+          : { id, outcome: "ok" };
+      },
+    });
+    assert.equal(await task.run(), "denied");
+    assert.equal((await task.trace()).at(-1)?.kind, "tool.denied");
+    assert.equal(count, ran);
+  }
+  // Revisions stop at the cap: 1 + MAX_REVISIONS Worker candidates.
+  const { MAX_REVISIONS } = await import("../src/integration-journal.ts");
+  const loop = [worker, review];
+  for (let round = 1; round <= MAX_REVISIONS + 1; round++)
+    loop.push(
+      { tool: "delegate", key: `revise-${round}`, role: "Worker" },
+      { tool: "delegate", key: `review-${round}`, role: "Reviewer" },
+    );
+  let workers = 0;
+  const { task } = await fixture(t, loop, {
+    async delegate(role, _control, id) {
+      if (role === "Worker") workers++;
+      return { id, outcome: role === "Reviewer" ? "failed" : "ok" };
+    },
+  });
+  let outcome = await task.run();
+  while (outcome === "limit") outcome = await task.run();
+  assert.equal(outcome, "denied");
+  assert.equal(workers, 1 + MAX_REVISIONS);
+});
+
+test("failed Worker runs also count toward the revision cap", async (t) => {
+  const { MAX_REVISIONS } = await import("../src/integration-journal.ts");
+  const attempts = Array.from({ length: MAX_REVISIONS + 3 }, (_, index) => ({
+    tool: "delegate",
+    key: `worker-${index}`,
+    role: "Worker",
+  }));
+  let started = 0;
+  const { task } = await fixture(t, attempts, {
+    async delegate(_role, _control, id) {
+      started++;
+      return { id, outcome: "failed" };
+    },
+  });
+  assert.equal(await task.run(), "denied");
+  assert.equal(started, 1 + MAX_REVISIONS);
+});
