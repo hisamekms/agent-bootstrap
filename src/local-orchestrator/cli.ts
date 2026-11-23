@@ -1,4 +1,10 @@
-import { join, resolve } from "node:path";
+import {
+  configuredCredentialScanner,
+  recordedCredentialScanner,
+  type CredentialScanner,
+} from "./credential-scan.ts";
+import { ClaudeRunError } from "./credentials-volume.ts";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { GitIntegrationError } from "../git-integration.ts";
 import {
@@ -334,10 +340,15 @@ async function execute(
   command: Exclude<Command, AnalysisCommand>,
   directory: string | undefined,
   repoRoot: string,
+  scan?: CredentialScanner,
 ): Promise<0 | 1> {
+  const writeCheckedJson = async (value: unknown) => {
+    await scan?.(JSON.stringify(value));
+    writeJson(io, value);
+  };
   switch (command.kind) {
     case "verification-show":
-      writeJson(io, readVerificationConfig(directory!));
+      await writeCheckedJson(readVerificationConfig(directory!));
       return 0;
     case "verification-clear":
     case "verification-set": {
@@ -345,7 +356,7 @@ async function execute(
         command.kind === "verification-set" ? command.config : null;
       const digest = config === null ? null : contentDigest(config);
       const previous = readVerificationConfig(directory!);
-      writeJson(io, {
+      await writeCheckedJson({
         target: repoRoot,
         current: previous,
         verification: config,
@@ -384,12 +395,12 @@ async function execute(
         directory,
         command.id,
       );
-      writeJson(io, { goalId: command.id, from, to });
+      await writeCheckedJson({ goalId: command.id, from, to });
       const phrase = `update-goal-base ${command.id} ${to.slice(0, 12)}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await apply();
-      writeJson(io, store.getGoal(command.id));
+      await writeCheckedJson(store.getGoal(command.id));
       return 0;
     }
     case "export-goal-branch": {
@@ -399,8 +410,15 @@ async function execute(
         checkout,
         directory!,
         command.id,
+        scan,
       );
-      writeJson(io, { goalId: command.id, checkout, branch, from, to });
+      await writeCheckedJson({
+        goalId: command.id,
+        checkout,
+        branch,
+        from,
+        to,
+      });
       const phrase = `export-goal-branch ${command.id} ${to.slice(0, 12)}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
@@ -420,13 +438,13 @@ async function execute(
       const phrase = `retry-task ${task.id}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
-      writeJson(io, store.retryTask(task.id, task.retries));
+      await writeCheckedJson(store.retryTask(task.id, task.retries));
       return 0;
     }
     case "show-execution": {
       const execution = store.getExecution(command.id);
       if (!execution) return refuse(io, "Execution was not found.");
-      writeJson(io, execution);
+      await writeCheckedJson(execution);
       return 0;
     }
     case "reconcile": {
@@ -434,7 +452,7 @@ async function execute(
       const count =
         rows.sessions.length + rows.executions.length + rows.tasks.length;
       if (count > 0) {
-        writeJson(io, { pending: rows });
+        await writeCheckedJson({ pending: rows });
         const phrase = `reconcile ${count}`;
         if (
           (await io.prompt(
@@ -454,7 +472,7 @@ async function execute(
                 rows.tasks,
               ),
             );
-      writeJson(io, { reconciled });
+      await writeCheckedJson({ reconciled });
       return 0;
     }
     case "status": {
@@ -474,7 +492,7 @@ async function execute(
           ...proposalPolicy(requireProposalDetails(store, proposal.id)),
         }));
       const { recentExecutions, recentTasks } = store.getHostApiStatus();
-      writeJson(io, {
+      await writeCheckedJson({
         counts: {
           goals: goals.length,
           tasks: goals.reduce(
@@ -494,8 +512,7 @@ async function execute(
       const proposals = store.listProposals(
         command.status === undefined ? {} : { status: command.status },
       );
-      writeJson(
-        io,
+      await writeCheckedJson(
         proposals.map(({ id }) =>
           displayProposal(requireProposalDetails(store, id)),
         ),
@@ -508,13 +525,13 @@ async function execute(
       if (command.kind === "show") {
         const goal = store.getGoal(command.id);
         if (goal) {
-          writeJson(io, goal);
+          await writeCheckedJson(goal);
           return 0;
         }
         const task = store.getTask(command.id);
         if (task) {
           const usage = store.taskUsage(task.id);
-          writeJson(io, {
+          await writeCheckedJson({
             ...task,
             ...usage,
             budgetTokens: usage.tokens,
@@ -534,10 +551,17 @@ async function execute(
             io,
             "Integration proposals with --db also require --target <path>.",
           );
-        diffStat = await candidateDiffStat(directory, proposal.content);
+        if (command.kind !== "reject" || !scan)
+          diffStat = await candidateDiffStat(directory, proposal.content, scan);
       }
-      writeJson(io, {
-        ...displayProposal(proposal),
+      await writeCheckedJson({
+        ...(command.kind === "reject" && scan
+          ? {
+              id: proposal.id,
+              digest: proposal.digest,
+              status: proposal.status,
+            }
+          : displayProposal(proposal)),
         ...(command.kind === "show" &&
         proposal.kind === "goal" &&
         proposal.status === "approved"
@@ -554,6 +578,7 @@ async function execute(
       if (command.kind === "show") return 0;
       if (proposal.status !== "pending")
         return refuse(io, "Proposal is no longer pending.");
+      await scan?.(JSON.stringify(command));
       const { digest } = proposal;
       if (!/^[a-f0-9]{64}$/.test(digest))
         return refuse(io, "Proposal digest is invalid.");
@@ -561,8 +586,7 @@ async function execute(
       const phrase = `${command.kind} ${digest.slice(0, 12)}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
-      writeJson(
-        io,
+      await writeCheckedJson(
         store.decide(proposal.id, {
           digest,
           decision: command.kind,
@@ -576,7 +600,7 @@ async function execute(
       return 0;
     }
     case "policy-show":
-      writeJson(io, projectDefaults(store));
+      await writeCheckedJson(projectDefaults(store));
       return 0;
     case "policy-set":
       store.setProjectDefaults(
@@ -587,7 +611,7 @@ async function execute(
       return 0;
     case "events": {
       const { kind: _kind, ...options } = command;
-      writeJson(io, store.listEvents(options));
+      await writeCheckedJson(store.listEvents(options));
       return 0;
     }
   }
@@ -686,17 +710,32 @@ export async function runCli(
       await prepareTargetDirectory(target.bootstrapRoot, directory);
     const store = OrchestratorStore.open(db ?? join(directory, "state.db"));
     try {
+      const note = (message: string) => io.stderr.write(message + "\n");
+      const targetScan = configuredCredentialScanner(directory, note);
+      const dbScan =
+        db && dirname(resolve(db)) !== directory
+          ? recordedCredentialScanner(dirname(resolve(db)), note)
+          : undefined;
+      const scan: CredentialScanner | undefined =
+        targetScan && dbScan
+          ? async (...text) => {
+              await targetScan(...text);
+              await dbScan(...text);
+            }
+          : (targetScan ?? dbScan);
       return await execute(
         io,
         store,
         command,
         db !== undefined && targetPath === undefined ? undefined : directory,
         repoRoot,
+        scan,
       );
     } finally {
       store.close();
     }
   } catch (error) {
+    if (error instanceof ClaudeRunError) return refuse(io, error.code);
     if (error instanceof TargetError) return refuse(io, error.message);
     if (command.kind === "analyze" || command.kind === "denials")
       return refuse(io, "Local orchestrator analysis export failed.");

@@ -44,11 +44,10 @@ export function parseVerificationConfig(value: unknown): VerificationConfig {
 }
 
 function readTargetConfig(directory: string) {
-  return fields(readPrivateConfig(join(directory, "config.json"), 256 * 1024), [
-    "profile",
-    "argv",
-    "claude",
-  ]);
+  return fields(
+    readPrivateConfig(join(directory, "config.json"), 256 * 1024, true),
+    ["profile", "argv", "claude"],
+  );
 }
 
 export function readVerificationConfig(

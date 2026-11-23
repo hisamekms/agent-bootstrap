@@ -1,9 +1,10 @@
+import { configuredCredentialScanner } from "../../src/local-orchestrator/credential-scan.ts";
 import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { exportAudit } from "../../src/audit-export.ts";
+import { exportAudit, exportAuditChecked } from "../../src/audit-export.ts";
 import {
   CLAUDE_CODE,
   claudeCodeProvider,
@@ -210,6 +211,15 @@ async function main(args: readonly string[]) {
     userStateDirectory(process.env),
     (note) => console.error(note),
   );
+  const scan = login
+    ? claude.configDir?.scan
+    : (claude.configDir?.scan ??
+      configuredCredentialScanner(
+        directory,
+        (note) => console.error(note),
+        process.env,
+        flags.claudeAuth,
+      ));
   const telemetry = createTelemetry(config.telemetry, config.directory);
   let store: OrchestratorStore | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
@@ -231,6 +241,9 @@ async function main(args: readonly string[]) {
       msb,
       profiles,
       claude,
+      ...(effective.gatewayHosts
+        ? { gatewayHosts: effective.gatewayHosts }
+        : {}),
       ...(provider
         ? {
             providers: [provider],
@@ -263,6 +276,7 @@ async function main(args: readonly string[]) {
         host: observed.host,
         store,
         snapshot: snapshotConciergeRepo,
+        ...(scan ? { scan } : {}),
         install,
         auth,
         ...(verificationConfig
@@ -300,7 +314,8 @@ async function main(args: readonly string[]) {
       if (sessionId && observed && store) {
         let exported = false;
         try {
-          exportAudit(auditPath, config.directory);
+          if (scan) await exportAuditChecked(auditPath, config.directory, scan);
+          else exportAudit(auditPath, config.directory);
           exported = true;
         } catch {
           console.error("concierge-audit-export-failed");

@@ -1345,6 +1345,32 @@ export class OrchestratorStore {
     });
   }
 
+  failIntegrationApprovalForCredentialLeak(id: string) {
+    this.#write((at) => {
+      const row = this.#proposal(identifier(id));
+      if (!row || row.kind !== "integration" || row.status !== "pending")
+        return;
+      const proposal = proposalRecord(row);
+      if (proposal.kind !== "integration") return;
+      const task = required(this.#task(proposal.content.taskId));
+      if (
+        task.status === "awaiting-integration" &&
+        this.#latestIntegrationProposalId(task.id) === id
+      ) {
+        this.#run(
+          "UPDATE proposals SET status = 'rejected', decided_at = ? WHERE id = ?",
+          at,
+          id,
+        );
+        this.#event(at, "proposal.blocked", "proposal", id, {
+          code: "credential-leak",
+          taskId: task.id,
+        });
+        this.#setTaskStatus(task.id, "failed", "credential-leak", at);
+      }
+    });
+  }
+
   rejectApprovedIntegration(id: string, code: string) {
     this.#write((at) => {
       const proposal = proposalRecord(required(this.#proposal(id)));

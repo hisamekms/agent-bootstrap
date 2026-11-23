@@ -195,7 +195,7 @@ export const helpTopics = {
       "A private config.json with the volume path, Keychain service name and actor groups. API-key mode remains the default.",
     commands: [],
     output:
-      "Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. Detach clears a stale attachment when no run still holds it.",
+      "Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. After doctor reports a stale lease, confirm no VM is running and use detach --force.",
     next: "If integrity fails, inspect the evidence path and use credentials verify --accept from an operator terminal. Use the same target and authentication options as the failing run.",
     human:
       "The operator inspects and accepts any intended changes to the group's configuration.",
@@ -315,7 +315,7 @@ export const onboardingOutputs = {
   },
   credentials: {
     usage:
-      "credentials <status|init|attach|detach|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]",
+      "credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]",
     json: "{ mounted, active, stale } for status or { status } after a completed action.",
   },
   login: {

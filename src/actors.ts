@@ -102,6 +102,7 @@ export function claudeRoleHarness(options: {
   /** Local stand-in for the provider host, for fixtures. */
   readonly fixture?: { host: string; port: number; upstreamCaCertPath: string };
   readonly maxTurns?: number;
+  readonly gatewayHosts?: readonly string[];
   /** Opt-in Bash for the Worker command only. */
   readonly shell?: boolean;
   readonly reportWorkerUsage?: boolean;
@@ -115,7 +116,7 @@ export function claudeRoleHarness(options: {
   const provider =
     options.auth.mode === "config-dir"
       ? undefined
-      : claudeCodeProvider(options.auth, options.fixture);
+      : claudeCodeProvider(options.auth, options.fixture, options.gatewayHosts);
   const baseUrl = options.fixture
     ? `https://${options.fixture.host}:${options.fixture.port}`
     : undefined;

@@ -38,6 +38,7 @@ export interface ObservedHostOptions {
   readonly msb: Pick<MicrosandboxConfig, "binary" | "home" | "stagingRoot">;
   readonly profiles: MicrosandboxConfig["profiles"];
   readonly credentials?: MicrosandboxConfig["credentials"];
+  readonly gatewayHosts?: readonly string[];
   readonly providers?: MicrosandboxConfig["providers"];
   /** One credential per binding. Exclusive with credentials and providers. */
   readonly providerBindings?: readonly {
@@ -119,6 +120,7 @@ export async function createObservedHost({
   claude,
   credentials,
   providers,
+  gatewayHosts = [],
   providerBindings,
   observers = [],
   openGateway = EgressGateway.open,
@@ -246,6 +248,7 @@ export async function createObservedHost({
           home: msb.home,
           stagingRoot: msb.stagingRoot,
           profiles,
+          gatewayHosts,
           ...(credentials === undefined ? {} : { credentials }),
           ...(providers === undefined ? {} : { providers }),
           ...(required
@@ -282,6 +285,7 @@ export async function createObservedHost({
     });
     const host = new TrustedHost(audit, runtime, profiles, {
       config,
+      gatewayHosts,
       observers: [...activeObservers, ...samplingObservers],
       ...(required ? { gatewayFactory } : {}),
       ...(claude ? { claude } : {}),

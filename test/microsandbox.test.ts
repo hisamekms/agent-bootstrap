@@ -227,6 +227,7 @@ if (args[0] === '--version') {
     ) =>
       new MicrosandboxRuntime({
         ...config,
+        gatewayHosts: ["api.openai.com"],
         ...(resolvePassword ? { gatewayPassword: resolvePassword } : {}),
         providers: [
           { host: "api.openai.com", secretEnv: "AGENT_BOOTSTRAP_TOKEN" },

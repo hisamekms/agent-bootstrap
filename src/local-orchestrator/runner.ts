@@ -1,3 +1,5 @@
+import type { CredentialScanner } from "./credential-scan.ts";
+import { ClaudeRunError } from "./credentials-volume.ts";
 import { randomUUID } from "node:crypto";
 import type { RoleHarness } from "../actors.ts";
 import {
@@ -33,6 +35,7 @@ type PlannerCall = (
 
 export interface RunnerDeps {
   readonly store: OrchestratorStore;
+  readonly scan?: CredentialScanner;
   readonly tasks?: TaskExecutor;
   readonly canScheduleTasks?: () => boolean;
   /** Forward retry context to TrustedHost so its audit can link the attempts. */
@@ -352,6 +355,7 @@ export class ActorRunner {
                 this.#deps.tasks!,
                 job.id,
                 this.#deps.canScheduleTasks,
+                this.#deps.scan,
               );
           } else if (job.kind === "integration") {
             if (this.#deps.canScheduleTasks?.() === false) continue;
@@ -497,13 +501,20 @@ export class ActorRunner {
           : await this.#runApproval(job, recordResult);
     } catch (error) {
       const code =
-        error instanceof RunnerError || error instanceof OrchestratorStoreError
+        error instanceof ClaudeRunError ||
+        error instanceof RunnerError ||
+        error instanceof OrchestratorStoreError
           ? error.code
           : "host-error";
       completion = { status: "failed", result: { code } };
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {
+        if (
+          job.kind === "approval" &&
+          completion.result.code === "credential-leak"
+        )
+          store.failIntegrationApprovalForCredentialLeak(job.proposalId);
         const reported = results
           .map(reportedUsage)
           .filter((run) => run !== undefined);
@@ -596,6 +607,11 @@ export class ActorRunner {
             });
       if (run.id !== invocationId)
         return { status: "failed", result: { code: "host-error" } };
+      if (run.response)
+        await this.#deps.scan?.(
+          run.response,
+          parseClaudeCodeResult(run.response)?.text ?? "",
+        );
       recordResult(
         harness.harness === "claude"
           ? parseClaudeCodeResult(run.response)
@@ -629,6 +645,7 @@ export class ActorRunner {
           commit,
           base == null ? "planning" : "base",
         );
+      await this.#deps.scan?.(JSON.stringify(drafts));
       const proposals = this.#submit(id, input.sessionId, drafts);
       return { status: "succeeded", result: { proposals } };
     }
@@ -724,6 +741,7 @@ export class ActorRunner {
       if (this.#deps.canScheduleTasks?.() === false)
         return { status: "failed", result: { code: "session-ended" } };
     }
+    await this.#deps.scan?.(...files.map(({ bytes }) => bytes));
     const run = await this.#deps.runReviewer(
       this.#plan(
         "Reviewer",
@@ -736,6 +754,7 @@ export class ActorRunner {
       return { status: "failed", result: { code: "host-error" } };
     const result =
       harness.harness === "claude" ? parseClaudeCodeResult(run.response) : null;
+    if (run.response) await this.#deps.scan?.(run.response, result?.text ?? "");
     recordResult(result);
     const timedOut = run.outcome === "timed-out";
     if (run.outcome !== "ok" || result?.isError)

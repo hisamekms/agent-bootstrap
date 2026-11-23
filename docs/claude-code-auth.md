@@ -21,15 +21,16 @@ agent-bootstrap doctor
 
 Edit an existing file in place and preserve its permissions. An optional
 `claude` section in the target state directory's `config.json` overrides
-user settings per key. It can coexist with the target's verification
+user settings per key. Target files must be user-owned with no group or
+other permission bits. The target file can coexist with the target's verification
 settings. The invocation's `--claude-auth` flag takes precedence over
 both files. Doctor reports the mode and its source. The legacy
 `LO_CLAUDE_AUTH` and `LO_CLAUDE_KEYCHAIN` environment variables are a
 deprecated fallback for API-key mode.
 
 API-key mode uses the `ANTHROPIC_API_KEY` variable. Authorization-header
-substitution is available only for an operator-configured gateway outside
-Anthropic domains. The API endpoint uses `x-api-key`.
+substitution requires an exact host in the operator file’s `claude.gateway`
+list (`hostname:443`). IP literals and Anthropic domains are excluded. The API endpoint uses `x-api-key`.
 
 ## Configuration directory fields
 
@@ -52,13 +53,26 @@ Anthropic domains. The API endpoint uses `x-api-key`.
   `auth-required`, `rate-limited`, or `config-invalid`. Patterns are
   bounded and time-limited. Keep provider-specific text in your own
   configuration.
+- `claude.configDir.leakPatterns` adds case-insensitive host-side patterns
+  to the built-in credential shape checks. Each file accepts up to 16
+  expressions of at most 160 characters. A scan exceeding its time or
+  size budget blocks the output. A rejection records a private evidence
+  path and the fixed code `credential-leak` without copying the match.
+  A target that has used configuration-directory mode continues to screen
+  later operator output and exports when the launch mode changes.
 
 `credentials init` creates a small AES-256 encrypted APFS image and saves
 a randomly generated passphrase in Keychain. The launcher attaches it
 before granting a group mount and detaches it after the last lease ends.
+The SQLite lease serializes runs in the same group across launchers. A
+second run waits up to 30 seconds for its group. Use a dedicated Concierge
+group when Planner, Executor, or Reviewer must run during its session.
+The default Keychain ACL allows processes running as the same user to
+read the volume passphrase. This is an accepted risk of this setup.
 `credentials attach` prepares an attachment for the next run.
 `credentials status` reports active leases and stale state. For a stale
-attachment, use `credentials detach` after the remaining runs exit. Use
+lease, run `agent-bootstrap doctor`, confirm that no VM is still using
+the volume, and run `agent-bootstrap credentials detach --force`. Use
 the same target and mode options as the affected run.
 
 `login` opens the Concierge image with the selected group, an audited
@@ -68,10 +82,12 @@ Concierge volume also holds its guest home.
 
 ## Integrity and managed settings
 
-The host hashes `settings.json`, `settings.local.json`, `CLAUDE.md`, and the
-`hooks`, `plugins`, `commands`, and `agents` trees before and after a run.
-Other files are listed by name only during traversal. The host never parses
-or copies CLI state or sign-in files. A change in the checked paths fails
+The host hashes the group directory before and after each run. It skips
+the contents of `.credentials.json`, `.claude.json`, `.claude.json.*`,
+`*.lock` and `*.lock.owner` files and the `backups/`, `projects/`,
+`sessions/`, `todos/`, `statsig/` and `shell-snapshots/` directories
+at the group root. Links and special files fail the integrity check
+throughout the tree, including the state directories. A change in the checked paths fails
 the run with `config-tampered`. Inspect the evidence path and use
 `credentials verify --accept` from an operator terminal to accept intended
 changes. Use `--group` to accept one group. Stop active Claude runs before
@@ -88,3 +104,11 @@ matches the fixed orchestrator relay command and arguments. Other actors
 and login have an empty MCP allowlist. Headless roles use fixed tool lists,
 managed permission rules, strict MCP, empty setting sources, and no
 session persistence.
+
+Managed file permissions limit Planner and Reviewer to `/review` and
+Executor to `/workspace`. The rules deny access to `/claude-config` and
+`/etc/claude-code`. Claude permission rules use `//` for guest-absolute
+paths. Directory-mode Workers can return an optional commit message in
+the final answer. Worker shell is available only in API-key mode. The host audits
+the managed-settings digest, guest mount paths, mode and group for each
+run. The volume database records integrity holds and accepted baselines.

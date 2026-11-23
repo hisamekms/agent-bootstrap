@@ -327,6 +327,7 @@ async function runFixture(
       profiles: new ProfileCatalog({
         base: { image: `fixture.invalid/base@sha256:${"a".repeat(64)}` },
       }),
+      gatewayHosts: [provider.host],
       providerBindings: [
         {
           provider,

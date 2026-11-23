@@ -1,9 +1,12 @@
+import { permitsProviderHeader } from "../src/sandbox-runtime.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
   CLAUDE_CODE_GUEST_PACKAGES,
+  CLAUDE_WORKER_USAGE_MARKER,
+  claudeWorkerMessage,
   ClaudeCodeUnsupportedError,
   claudeCodeCommand,
   claudeCodeProvider,
@@ -185,11 +188,15 @@ test("an operator-chosen credential variable runs without bare mode and keeps is
   };
   assert.throws(() => claudeCodeProvider(auth), /operator gateway host/);
   assert.deepEqual(
-    claudeCodeProvider(auth, {
-      host: "gateway.example.test",
-      port: 443,
-      upstreamCaCertPath: "/fixture/ca",
-    }),
+    claudeCodeProvider(
+      auth,
+      {
+        host: "gateway.example.test",
+        port: 443,
+        upstreamCaCertPath: "/fixture/ca",
+      },
+      ["gateway.example.test"],
+    ),
     {
       host: "gateway.example.test",
       port: 443,
@@ -351,4 +358,50 @@ test("claudeCodeTools ships the apks on Alpine and only the binary on Debian", (
   assert.equal(debian.length, 1);
   assert.equal(debian[0]!.sha256, CLAUDE_CODE_BUILDS.debian.sha256);
   assert.equal(CLAUDE_CODE_BUILDS.alpine.sha256, CLAUDE_CODE.sha256);
+});
+
+test("authorization substitution requires an exact operator gateway host", () => {
+  const provider = { host: "gateway.example.test", secretEnv: "FIXTURE_KEY" };
+  assert.equal(permitsProviderHeader(provider), false);
+  assert.equal(permitsProviderHeader(provider, ["example.test"]), false);
+  assert.equal(permitsProviderHeader(provider, [provider.host]), true);
+  for (const host of [
+    "127.0.0.1",
+    "::1",
+    "api.anthropic.com",
+    "sub.claude.ai",
+    "sub.claude.com",
+  ]) {
+    assert.equal(permitsProviderHeader({ ...provider, host }, [host]), false);
+  }
+  assert.equal(
+    permitsProviderHeader({
+      ...provider,
+      host: "api.anthropic.com",
+      header: "x-api-key",
+    }),
+    true,
+  );
+});
+
+test("directory Workers return optional commit messages in their result envelope", () => {
+  const script = claudeCodeCommand(task, { mode: "config-dir" }).argv[2]!;
+  assert.match(script, /cat \/review\/review-notes\.txt/);
+  assert.doesNotMatch(script, /--allowedTools/);
+  const encode = (value: object) =>
+    Buffer.from(
+      "\n" +
+        CLAUDE_WORKER_USAGE_MARKER +
+        JSON.stringify({ result: JSON.stringify(value) }),
+    );
+  assert.equal(
+    Buffer.from(
+      claudeWorkerMessage(encode({ commitMessage: "Fix file" }))!,
+    ).toString(),
+    "Fix file",
+  );
+  assert.equal(
+    claudeWorkerMessage(encode({ commitMessage: "Fix file", unrelated: true })),
+    undefined,
+  );
 });

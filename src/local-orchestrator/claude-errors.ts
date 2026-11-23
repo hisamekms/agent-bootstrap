@@ -59,6 +59,10 @@ export function claudeNext(code: ClaudeFailureCode, group?: string): string {
       return "Review the Claude configuration and run agent-bootstrap doctor.";
     case "credentials-detached":
       return "agent-bootstrap credentials attach";
+    case "shell-disabled":
+      return "Disable Worker shell and run tests through host verification, or select api-key mode.";
+    case "credential-leak":
+      return "Inspect the host evidence before retrying.";
     case "config-tampered":
       return "Inspect the evidence, then run agent-bootstrap credentials verify --accept.";
   }

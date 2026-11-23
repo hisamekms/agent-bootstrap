@@ -279,6 +279,24 @@ function saveState(directory: string, state: ExportState): void {
 /** Publish changed stream snapshots together from one read-only transaction.
  * DuckDB reads only the generations selected by the committed checkpoint. */
 export function exportOrchestrator(stateDb: string, obsDir: string): void {
+  for (const _ of exportRecords(stateDb, obsDir)) {
+    // The synchronous exporter consumes the same projected records.
+  }
+}
+
+export async function exportOrchestratorChecked(
+  stateDb: string,
+  obsDir: string,
+  scan: (text: string) => Promise<void>,
+): Promise<void> {
+  for (const batch of exportRecords(stateDb, obsDir))
+    await scan(batch.map((row) => JSON.stringify(row)).join("\n"));
+}
+
+function* exportRecords(
+  stateDb: string,
+  obsDir: string,
+): Generator<Row[], void> {
   const filename = resolve(stateDb);
   const stat = fs.lstatSync(filename, { bigint: true });
   if (!stat.isFile()) throw new Error("Invalid orchestrator database");
@@ -299,36 +317,46 @@ export function exportOrchestrator(stateDb: string, obsDir: string): void {
           ?.application_id !== 0x4c4f5231
       )
         throw new Error("Invalid orchestrator database");
-      db.transaction(() => {
-        let changed = false;
-        const generation = randomUUID();
-        for (const stream of Object.keys(queries) as Stream[]) {
-          const spec: { sql: string; project?: (row: Row) => Row } =
-            queries[stream];
-          const query = db.query<Row>(spec.sql);
-          const records = function* () {
-            for (const row of query.iterate())
-              yield project(spec.project?.(row) ?? row);
-          };
-          const hash = createHash("sha256");
-          for (const record of records())
-            hash.update(JSON.stringify(record)).update("\n");
-          const digest = hash.digest("hex");
-          if (state.streams[stream]?.digest === digest) continue;
-          const streamDirectory = join(directory, stream);
-          const writer = new JsonlWriter(streamDirectory);
-          try {
-            for (const record of records())
-              writer.write({ ...record, generation });
-          } finally {
-            writer.close();
+      db.exec("BEGIN");
+      let changed = false;
+      const generation = randomUUID();
+      for (const stream of Object.keys(queries) as Stream[]) {
+        const spec: { sql: string; project?: (row: Row) => Row } =
+          queries[stream];
+        const query = db.query<Row>(spec.sql);
+        const records = function* () {
+          for (const row of query.iterate())
+            yield project(spec.project?.(row) ?? row);
+        };
+        const hash = createHash("sha256");
+        for (const record of records())
+          hash.update(JSON.stringify(record)).update("\n");
+        const digest = hash.digest("hex");
+        if (state.streams[stream]?.digest === digest) continue;
+        const streamDirectory = join(directory, stream);
+        const writer = new JsonlWriter(streamDirectory);
+        try {
+          const pending: Row[] = [];
+          function* publish() {
+            if (!pending.length) return;
+            yield pending;
+            for (const record of pending) writer.write(record);
+            pending.length = 0;
           }
-          syncDirectory(streamDirectory);
-          state.streams[stream] = { generation, digest };
-          changed = true;
+          for (const record of records()) {
+            pending.push({ ...record, generation });
+            if (pending.length >= 256) yield* publish();
+          }
+          yield* publish();
+        } finally {
+          writer.close();
         }
-        if (changed) saveState(directory, state);
-      })();
+        syncDirectory(streamDirectory);
+        state.streams[stream] = { generation, digest };
+        changed = true;
+      }
+      db.exec("COMMIT");
+      if (changed) saveState(directory, state);
     } finally {
       db.close();
     }

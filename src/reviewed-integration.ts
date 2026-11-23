@@ -172,6 +172,9 @@ type Plan = {
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
   readonly workerHostServices?: readonly HostService[];
+  readonly scanCandidate?: (
+    ...text: readonly (string | Uint8Array)[]
+  ) => Promise<void>;
   readonly onWorkerStderr?: TrustedHostRunOptions["onWorkerStderr"];
   readonly reviewerHostServices?: readonly HostService[];
   /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
@@ -435,6 +438,7 @@ export class ReviewedIntegration {
       ...(plan.allowUnverified ? { allowUnverified: true } : {}),
       workerSandbox: roleSandbox(plan.workerSandbox),
       onWorkerStderr: plan.onWorkerStderr,
+      ...(plan.scanCandidate ? { scanCandidate: plan.scanCandidate } : {}),
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
       ...(plan.workerHostServices
         ? {
@@ -636,6 +640,35 @@ export class ReviewedIntegration {
       ...(previous !== undefined ? { previous } : {}),
       ...(scope ? { sparsePaths: scope.map((p) => p.replace(/\/$/, "")) } : {}),
     });
+    const readChanges = async (tree: Uint8Array) => {
+      const result = diffWorkspace({
+        base: parseLsTree(await this.#git.listTree(base)),
+        workspace: workspaceFiles(tree),
+        ...(scope ? { scope } : {}),
+        ...(protectedPaths ? { protectedPaths } : {}),
+      });
+      const changes: TreeChange[] = [
+        ...result.changes,
+        ...result.deletions.map((path) => ({ path, deleted: true as const })),
+      ];
+      return { changes, flagged: result.protected.length };
+    };
+    const changeSources = (changes: TreeChange[]) =>
+      changes.flatMap((change) =>
+        "deleted" in change ? [change.path] : [change.path, change.bytes],
+      );
+    let inspected: Awaited<ReturnType<typeof readChanges>> | undefined;
+    const scan = this.#plan.scanCandidate;
+    const options = scan
+      ? {
+          ...this.#workerOptions(),
+          async inspectWorkerTree(tree: Uint8Array) {
+            const result = await readChanges(tree);
+            await scan(...changeSources(result.changes));
+            inspected = result;
+          },
+        }
+      : this.#workerOptions();
     try {
       const worker = await this.#host.runWorker(
         {
@@ -652,26 +685,14 @@ export class ReviewedIntegration {
         },
         id,
         undefined,
-        this.#workerOptions(),
+        options,
       );
       let changes: TreeChange[] = [];
       let flagged = 0;
       if (worker.outcome === "ok" && worker.artifacts?.tree) {
         try {
-          const result = diffWorkspace({
-            base: parseLsTree(await this.#git.listTree(base)),
-            workspace: workspaceFiles(worker.artifacts.tree),
-            ...(scope ? { scope } : {}),
-            ...(protectedPaths ? { protectedPaths } : {}),
-          });
-          changes = [
-            ...result.changes,
-            ...result.deletions.map((path) => ({
-              path,
-              deleted: true as const,
-            })),
-          ];
-          flagged = result.protected.length;
+          ({ changes, flagged } =
+            inspected ?? (await readChanges(worker.artifacts.tree)));
         } catch {
           changes = [];
         }
@@ -680,6 +701,12 @@ export class ReviewedIntegration {
         await append({ kind: "denied", reason: "worker" });
         throw new Error("Worker did not produce an eligible change");
       }
+      const message = workerCommitMessage(worker.id, worker.artifacts?.message);
+      await this.#plan.scanCandidate?.(
+        worker.artifacts?.message ?? "",
+        message,
+        ...(inspected ? [] : changeSources(changes)),
+      );
       await append({
         kind: "candidate.authorized",
         run: worker.id,
@@ -695,7 +722,6 @@ export class ReviewedIntegration {
       });
       let candidate: string;
       let diff: Uint8Array;
-      const message = workerCommitMessage(worker.id, worker.artifacts?.message);
       try {
         candidate = await this.#git.createCandidateTree(base, changes, message);
         diff = await this.#git.diff(base, candidate);
@@ -707,6 +733,7 @@ export class ReviewedIntegration {
         await append({ kind: "candidate.failed", cleanup });
         throw new Error("Could not create a review candidate");
       }
+      await this.#plan.scanCandidate?.(diff);
       const pin = { base, candidate, digest: sha256(diff) };
       await append({
         kind: "candidate.created",

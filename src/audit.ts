@@ -1,3 +1,4 @@
+import { CLAUDE_GROUP_PATH, CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import {
   CLAUDE_FAILURE_CODES,
   validClaudeHostname,
@@ -27,6 +28,13 @@ type AuditDetail =
   | { readonly volumeName: string; readonly reused?: boolean }
   | { readonly plainHosts: readonly string[] }
   | { readonly mode: "login" | "config-dir"; readonly group: string }
+  | {
+      readonly authMode: "api-key" | "config-dir";
+      readonly settingsDigest: string;
+      readonly managedPath: typeof CLAUDE_MANAGED_PATH;
+      readonly group?: string;
+      readonly groupPath?: typeof CLAUDE_GROUP_PATH;
+    }
   | { readonly code: ClaudeFailureCode };
 
 export type AuditInput = {
@@ -658,6 +666,32 @@ function parseAuditDetail(
     role === "Worker" ||
     role === "Planner" ||
     role === "Reviewer";
+  if (present && claudeRole && kind === "invocation.started") {
+    const { authMode, settingsDigest, managedPath, group, groupPath } =
+      dataFields(value, [
+        "authMode",
+        "settingsDigest",
+        "managedPath",
+        "group",
+        "groupPath",
+      ]);
+    if (
+      (authMode !== "api-key" && authMode !== "config-dir") ||
+      typeof settingsDigest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(settingsDigest) ||
+      managedPath !== CLAUDE_MANAGED_PATH ||
+      (authMode === "config-dir"
+        ? !validGroup(group) || groupPath !== CLAUDE_GROUP_PATH
+        : group !== undefined || groupPath !== undefined)
+    )
+      return invalidEvent();
+    return {
+      authMode,
+      settingsDigest,
+      managedPath,
+      ...(validGroup(group) ? { group, groupPath: CLAUDE_GROUP_PATH } : {}),
+    };
+  }
   if (
     present &&
     claudeRole &&

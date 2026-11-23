@@ -140,25 +140,35 @@ export function privateDirectory(path: string) {
 
 const sha256 = (data: string | Buffer) =>
   createHash("sha256").update(data).digest("hex");
-const tracked =
-  /^(?:settings(?:\.local)?\.json|hooks|plugins|commands|agents|CLAUDE\.md)$/i;
+const mutableFile =
+  /^(?:\.credentials\.json|\.claude\.json(?:\..*)?|.*\.lock(?:\.owner)?)$/;
+const mutableDirectories = new Set([
+  "backups",
+  "projects",
+  "sessions",
+  "todos",
+  "statsig",
+  "shell-snapshots",
+]);
 
 function integritySnapshot(path: string) {
-  const entries: [string, string][] = [];
+  const entries: [string, number, string][] = [];
   let total = 0;
-  function walk(dir: string, prefix: string) {
+  let visited = 0;
+  function walk(dir: string, prefix: string, mutable = false) {
     if (realpathSync(dir) !== dir) throw new ClaudeRunError("config-tampered");
     for (const name of readdirSync(dir).sort()) {
-      if (!prefix && !tracked.test(name)) continue;
-      if (entries.length >= 4096 || prefix.length + name.length > 1024)
+      if (++visited > 16384 || prefix.length + name.length > 1024)
         throw new ClaudeRunError("config-tampered");
       const relative = prefix + name;
       const file = join(dir, name);
       const info = lstatSync(file);
       if (info.isDirectory()) {
-        entries.push([relative, "directory"]);
-        walk(file, relative + "/");
+        const skip = mutable || (!prefix && mutableDirectories.has(name));
+        if (!skip) entries.push([relative, info.mode, "directory"]);
+        walk(file, relative + "/", skip);
       } else if (info.isFile() && info.nlink === 1) {
+        if (mutable || (!prefix && mutableFile.test(name))) continue;
         const fd = openSync(
           file,
           constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -180,7 +190,11 @@ function integritySnapshot(path: string) {
           const count = readSync(fd, bytes);
           if (count !== opened.size)
             throw new ClaudeRunError("config-tampered");
-          entries.push([relative, sha256(bytes.subarray(0, count))]);
+          entries.push([
+            relative,
+            opened.mode,
+            sha256(bytes.subarray(0, count)),
+          ]);
         } finally {
           closeSync(fd);
         }
@@ -251,7 +265,21 @@ export class CredentialsVolume {
       db.run(
         "CREATE TABLE IF NOT EXISTS baseline (name TEXT PRIMARY KEY, digest TEXT NOT NULL, hold INTEGER NOT NULL DEFAULT 0, version TEXT)",
       );
-      return db.transaction(() => effect(db)).immediate();
+      return db
+        .transaction(() => {
+          if (
+            !db
+              .query<{ name: string }>("PRAGMA table_info(lease)")
+              .all()
+              .some(({ name }) => name === "group_name")
+          )
+            db.run("ALTER TABLE lease ADD COLUMN group_name TEXT");
+          db.run(
+            "CREATE TABLE IF NOT EXISTS integrity_audit (at TEXT NOT NULL, group_name TEXT NOT NULL, event TEXT NOT NULL, evidence TEXT)",
+          );
+          return effect(db);
+        })
+        .immediate();
     } finally {
       db.close();
     }
@@ -398,34 +426,55 @@ export class CredentialsVolume {
       if (dead.length || quarantined || pending || mounted !== expectedMounted)
         throw new ClaudeRunError("credentials-detached");
       if (!mounted) this.#attach();
-      if (!active) db.run("INSERT INTO lease VALUES ('manual', 0)");
+      if (!active) db.run("INSERT INTO lease (id, pid) VALUES ('manual', 0)");
     });
   }
 
-  detach() {
+  detach(force = false) {
     this.#locked((db) => {
-      const { active, manual } = this.#leases(db);
-      if (active > Number(manual))
+      const { active, manual, dead, quarantined } = this.#leases(db);
+      const liveRuns =
+        active -
+        Number(manual) -
+        db
+          .query<{ id: string }>(
+            "SELECT id FROM lease WHERE id LIKE 'orphan-%'",
+          )
+          .all()
+          .filter(({ id }) => !dead.some((lease) => lease.id === id)).length;
+      if (liveRuns || ((dead.length || quarantined) && !force))
         throw new ClaudeRunError("credentials-detached");
       if (this.#mounted()) this.#detach();
       db.run("DELETE FROM lease");
     });
   }
 
-  acquire() {
+  acquire(group?: string) {
     const id = randomUUID();
     const pendingId = `pending-${id}`;
     this.#locked((db) => {
       const { dead, active, quarantined, pending } = this.#leases(db);
       if (dead.length || quarantined)
         throw new ClaudeRunError("credentials-detached");
-      if (pending) throw new ClaudeVolumeBusy();
+      if (
+        pending ||
+        db
+          .query(
+            "SELECT 1 FROM lease WHERE pid != 0 AND (? IS NULL OR group_name IS NULL OR group_name = ?) LIMIT 1",
+          )
+          .get(group ?? null, group ?? null)
+      )
+        throw new ClaudeVolumeBusy();
       const mounted = this.#mounted();
       const expectedMounted = active > 0;
       if (mounted !== expectedMounted)
         throw new ClaudeRunError("credentials-detached");
       if (!mounted) this.#attach();
-      db.run("INSERT INTO lease VALUES (?, ?)", [id, process.pid]);
+      db.run("INSERT INTO lease (id, pid, group_name) VALUES (?, ?, ?)", [
+        id,
+        process.pid,
+        group ?? null,
+      ]);
       db.run("DELETE FROM lease WHERE pid = 0");
     });
     const update = (from: string, to: string) =>
@@ -552,10 +601,9 @@ export class CredentialsVolume {
       const { active, quarantined, dead } = this.#leases(db);
       if (dead.length || quarantined || (phase === "accept" && active !== 1))
         throw new ClaudeRunError("credentials-detached");
-      const path = this.groupPath(name);
       let entries: ReturnType<typeof integritySnapshot> | undefined;
       try {
-        entries = integritySnapshot(path);
+        entries = integritySnapshot(this.groupPath(name));
       } catch {}
       const digest = entries && sha256(JSON.stringify(entries));
       const baseline = db
@@ -577,7 +625,7 @@ export class CredentialsVolume {
               group: name,
               phase,
               baseline: baseline?.digest ?? null,
-              entries: entries ?? null,
+              digest: digest ?? null,
             },
             null,
             2,
@@ -588,8 +636,20 @@ export class CredentialsVolume {
           "INSERT INTO baseline VALUES (?, ?, 1, NULL) ON CONFLICT(name) DO UPDATE SET hold=1",
           [name, baseline?.digest ?? ""],
         );
+        db.run("INSERT INTO integrity_audit VALUES (?, ?, ?, ?)", [
+          new Date().toISOString(),
+          name,
+          "integrity-hold",
+          evidence,
+        ]);
         return evidence;
       }
+      if (phase === "accept")
+        db.run("INSERT INTO integrity_audit VALUES (?, ?, ?, NULL)", [
+          new Date().toISOString(),
+          name,
+          "integrity-accepted",
+        ]);
       if (!baseline || phase === "accept")
         db.run(
           "INSERT INTO baseline VALUES (?, ?, 0, NULL) ON CONFLICT(name) DO UPDATE SET digest=excluded.digest, hold=0",

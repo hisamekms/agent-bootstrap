@@ -61,6 +61,7 @@ export interface MicrosandboxConfig {
    * equal it exactly. At most one entry, because `credentials` is a single
    * credential. Default: none. */
   readonly providers?: readonly SandboxProvider[];
+  readonly gatewayHosts?: readonly string[];
   /** Resolve the password for this binding on the host at create time. */
   readonly gatewayPassword?: (
     gateway: SandboxEgressGateway,
@@ -437,6 +438,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     if (config.providers && config.providers.length > 1) invalid();
     this.#config = {
       ...config,
+      ...(config.gatewayHosts
+        ? { gatewayHosts: Object.freeze([...config.gatewayHosts]) }
+        : {}),
       ...(config.providers
         ? {
             providers: Object.freeze(
@@ -590,7 +594,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       provider &&
       (port !== undefined ||
         !this.#config.credentials ||
-        !permitsProviderHeader(provider) ||
+        !permitsProviderHeader(provider, this.#config.gatewayHosts) ||
         typeof provider.host !== "string" ||
         !this.#config.providers?.some((allowed) =>
           sameProvider(allowed, provider),

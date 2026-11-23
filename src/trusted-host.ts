@@ -1,4 +1,7 @@
 import {
+  CLAUDE_GROUP_PATH,
+  CLAUDE_MANAGED_PATH,
+  claudeWorkerMessage,
   parseClaudeCodeResult,
   parseClaudeWorkerResult,
 } from "./claude-code.ts";
@@ -14,6 +17,8 @@ import {
   claudeNext,
 } from "./local-orchestrator/claude-errors.ts";
 import { ClaudeRunError } from "./local-orchestrator/credentials-volume.ts";
+import { readFileSync } from "node:fs";
+import type { CredentialScanner } from "./local-orchestrator/credential-scan.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { types } from "node:util";
 import type {
@@ -194,8 +199,9 @@ interface ClaudeGroupLease {
 }
 
 export interface ClaudeHostPolicy {
-  managedSettings(actor: ClaudeActor | "login"): string;
+  managedSettings(actor: ClaudeActor | "login", shell?: boolean): string;
   readonly configDir?: {
+    readonly scan: CredentialScanner;
     readonly egress: readonly string[];
     readonly loginEgress: readonly string[];
     readonly errors: readonly ClaudeErrorPattern[];
@@ -215,11 +221,14 @@ export interface TrustedHostOptions {
   ) => Promise<HostGateway>;
   readonly observers?: readonly HostObserver[];
   readonly claude?: ClaudeHostPolicy;
+  readonly gatewayHosts?: readonly string[];
 }
 
 export interface TrustedHostRunOptions {
   readonly allowUnauditedRun?: boolean;
   readonly hostServices?: readonly HostService[];
+  /** Host-owned inspection of the changed files in a collected tree. */
+  readonly inspectWorkerTree?: (tree: Uint8Array) => Promise<void>;
   /** Best-effort host callback for the last 66 KiB of Worker stderr. */
   readonly onWorkerStderr?: (bytes: Uint8Array, invocationId: string) => void;
 }
@@ -313,6 +322,7 @@ export class TrustedHost {
   readonly #observers: readonly HostObserver[];
   readonly #disabled: boolean;
   readonly #source = new SequenceSource("trusted-host");
+  readonly #gatewayHosts: readonly string[];
   readonly #gatewayCredentials = new Map<
     string,
     {
@@ -353,6 +363,7 @@ export class TrustedHost {
         throw new Error("Invalid audit mode");
       }
     }
+    this.#gatewayHosts = [...(options?.gatewayHosts ?? [])];
     const claude = options?.claude;
     const directory = claude?.configDir;
     if (
@@ -370,6 +381,7 @@ export class TrustedHost {
       ...(directory
         ? {
             configDir: {
+              scan: directory.scan.bind(directory),
               egress: Object.freeze([...directory.egress]),
               loginEgress: Object.freeze([...directory.loginEgress]),
               errors: directory.errors.map((pattern) => ({ ...pattern })),
@@ -868,10 +880,6 @@ export class TrustedHost {
     };
     if ("claudeMounts" in sandbox)
       throw new Error("Claude mounts are assigned by the trusted host");
-    if (sandbox.provider && !permitsProviderHeader(sandbox.provider))
-      throw new Error(
-        "Authorization substitution requires an operator gateway host",
-      );
 
     const claude =
       sandbox.claude && role !== "Verification" && role !== "Coordinator"
@@ -905,6 +913,14 @@ export class TrustedHost {
       throw new Error("Direct hostTcpPort requires disabled audit mode");
     if (!required && !this.#disabled && sandbox.provider !== undefined)
       throw new Error("Provider egress requires a configured audit mode");
+
+    if (
+      sandbox.provider &&
+      !permitsProviderHeader(sandbox.provider, this.#gatewayHosts)
+    )
+      throw new Error(
+        "Authorization substitution requires an operator gateway host",
+      );
 
     const context =
       input.context === undefined
@@ -1087,7 +1103,8 @@ export class TrustedHost {
     let group: string | undefined;
     let lease: ClaudeGroupLease | undefined;
     const report = (error: unknown) => {
-      code = error instanceof ClaudeRunError ? error.code : "config-invalid";
+      if (code !== "credential-leak")
+        code = error instanceof ClaudeRunError ? error.code : "config-invalid";
       outcome = "failed";
     };
     const note = (message: string) => {
@@ -1096,7 +1113,43 @@ export class TrustedHost {
       } catch {}
     };
     try {
-      await append({ kind: "invocation.started" });
+      let managed: string | undefined;
+      let settingsDigest: string | undefined;
+      if (claude) {
+        try {
+          group = input.loginGroup ?? directory?.groupFor(actor);
+          if (directory && (!group || !validGroup(group)))
+            throw new ClaudeRunError("config-invalid");
+          const shell =
+            "command" in input &&
+            "claudeShell" in input.command &&
+            input.command.claudeShell === true;
+          if (directory && shell) throw new ClaudeRunError("shell-disabled");
+          managed = claude.managedSettings(
+            input.loginGroup ? "login" : actor,
+            shell,
+          );
+          settingsDigest = createHash("sha256")
+            .update(readFileSync(managed))
+            .digest("hex");
+        } catch (error) {
+          report(error);
+          failure = { error };
+        }
+      }
+      await append({
+        kind: "invocation.started",
+        ...(settingsDigest
+          ? {
+              detail: {
+                authMode: directory ? "config-dir" : "api-key",
+                settingsDigest,
+                managedPath: CLAUDE_MANAGED_PATH,
+                ...(group ? { group, groupPath: CLAUDE_GROUP_PATH } : {}),
+              },
+            }
+          : {}),
+      });
       if (audit && context)
         await write(() => audit.appendExecutionContext(context));
       executionStarted = true;
@@ -1108,35 +1161,30 @@ export class TrustedHost {
           context,
         });
 
-      if (claude) {
+      if (managed && !failure) {
+        if (group) {
+          await authorize("sandbox.create");
+          createAuthorized = true;
+          await authorize("provider.egress");
+          providerGranted = true;
+        }
         try {
-          group = input.loginGroup ?? directory?.groupFor(actor);
-          if (directory && (!group || !validGroup(group)))
-            throw new ClaudeRunError("config-invalid");
+          if (directory) {
+            const files = sandbox.readOnlyFiles ?? [];
+            if (files.length)
+              await directory.scan(
+                ...files.flatMap(({ path, bytes }) => [path, bytes]),
+              );
+            if (group) lease = await directory.begin(group, ensureAudit);
+          }
+          sandbox.claudeMounts = Object.freeze({
+            managed,
+            ...(lease ? { group: lease.path } : {}),
+          });
         } catch (error) {
+          if (error instanceof HostAuditError) throw error;
           report(error);
           failure = { error };
-        }
-        if (!failure) {
-          if (group) {
-            await authorize("sandbox.create");
-            createAuthorized = true;
-            await authorize("provider.egress");
-            providerGranted = true;
-          }
-          try {
-            if (group) lease = await directory?.begin(group, ensureAudit);
-            sandbox.claudeMounts = Object.freeze({
-              managed: claude.managedSettings(
-                input.loginGroup ? "login" : actor,
-              ),
-              ...(lease ? { group: lease.path } : {}),
-            });
-          } catch (error) {
-            if (error instanceof HostAuditError) throw error;
-            report(error);
-            failure = { error };
-          }
         }
       }
 
@@ -1446,7 +1494,8 @@ export class TrustedHost {
         ).finally(() => clearInterval(monitor));
         ensureAudit();
         const durationMs = performance.now() - processStarted;
-        const { result, exit, kind } = process;
+        const { exit, kind } = process;
+        let { result } = process;
         outcome = process.outcome;
         failure = process.failure;
         value = process.value;
@@ -1486,6 +1535,25 @@ export class TrustedHost {
           operationId,
         );
         if (kind) emit("resource.limit_exceeded", { kind }, operationId);
+
+        if (directory?.scan && result) {
+          try {
+            const answer = parseClaudeCodeResult(result.stdout)?.text;
+            const workerAnswer =
+              role === "Worker"
+                ? parseClaudeWorkerResult(result.stderr)?.text
+                : undefined;
+            await directory.scan(
+              result.stdout,
+              result.stderr,
+              answer ?? "",
+              workerAnswer ?? "",
+            );
+          } catch (error) {
+            report(error);
+            result = undefined;
+          }
+        }
 
         if (role === "Worker" && result && input.options?.onWorkerStderr) {
           try {
@@ -1534,7 +1602,21 @@ export class TrustedHost {
             ensureAudit();
             try {
               const collected = await this.#sandbox.collect(current, spec);
-              const { files, tree, message } = collected;
+              const { files, tree } = collected;
+              const message =
+                directory && role === "Worker"
+                  ? (claudeWorkerMessage(result.stderr) ?? collected.message)
+                  : collected.message;
+              if (directory)
+                await directory.scan(
+                  message ?? "",
+                  ...files.flatMap(({ path, bytes }) => [path, bytes]),
+                );
+              if (directory && tree) {
+                if (input.options?.inspectWorkerTree)
+                  await input.options.inspectWorkerTree(tree);
+                else await directory.scan(tree);
+              }
               artifacts = {
                 files,
                 ...(tree ? { tree } : {}),
@@ -1548,7 +1630,8 @@ export class TrustedHost {
               };
             } catch (error) {
               if (error instanceof HostAuditError) throw error;
-              outcome = "failed";
+              if (error instanceof ClaudeRunError) report(error);
+              else outcome = "failed";
             }
             await finish("sandbox.collect", outcome);
           } else if (request !== "none") {

@@ -262,6 +262,7 @@ test("one required host routes provider bindings to isolated credentials", async
   >[0][] = [];
   const observed = await createObservedHost({
     ...f.options,
+    gatewayHosts: ["openai.invalid"],
     providerBindings: providers.map((provider) => ({
       provider,
       credentials: {

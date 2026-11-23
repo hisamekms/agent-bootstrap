@@ -584,14 +584,14 @@ export async function doctor(
             "credentials-volume",
             volumeStatus.stale ? "wrong" : image?.isFile() ? "ok" : "missing",
             volumeStatus.stale
-              ? "The Claude configuration volume has a stale attachment or lease."
+              ? "The Claude configuration volume has a stale attachment or lease. Confirm no VM is running before clearing it."
               : volumeStatus.mounted
                 ? "The Claude configuration volume is attached."
                 : image?.isFile()
                   ? "The Claude configuration volume attaches when a run begins."
                   : "The Claude configuration volume image is missing.",
             volumeStatus.stale
-              ? ["agent-bootstrap credentials detach"]
+              ? ["agent-bootstrap credentials detach --force"]
               : image?.isFile()
                 ? []
                 : ["agent-bootstrap credentials init"],

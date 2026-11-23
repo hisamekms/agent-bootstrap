@@ -111,6 +111,7 @@ export function parseOperatorClaudeAuth(
 export function claudeCodeProvider(
   auth: ClaudeCodeAuth,
   fixture?: { host: string; port: number; upstreamCaCertPath: string },
+  gatewayHosts: readonly string[] = [],
 ): SandboxProvider {
   const { variable, header } = credentialOf(auth);
   const provider = {
@@ -121,7 +122,7 @@ export function claudeCodeProvider(
       ? { port: fixture.port, upstreamCaCertPath: fixture.upstreamCaCertPath }
       : {}),
   };
-  if (!permitsProviderHeader(provider))
+  if (!permitsProviderHeader(provider, gatewayHosts))
     throw new Error(
       "Authorization substitution requires an operator gateway host",
     );
@@ -259,12 +260,13 @@ export function claudeCodeCommand(
   if (task.shell === true && task.role !== "Worker")
     throw new Error("Shell is allowed only for the Worker");
   const tools = roleTools[task.role];
-  const toolList: readonly string[] = task.shell
-    ? [...tools.tools, "Bash"]
-    : tools.tools;
+  const toolList: readonly string[] =
+    task.shell && auth.mode !== "config-dir"
+      ? [...tools.tools, "Bash"]
+      : tools.tools;
   const cwd = task.role === "Worker" ? "/workspace" : "/review";
   const toolFlags = toolList.length
-    ? `--tools '${toolList.join(",")}' --allowedTools '${toolList.join(",")}'`
+    ? `--tools '${toolList.join(",")}'${credential ? ` --allowedTools '${toolList.join(",")}'` : ""}`
     : `--tools ''`;
   // The Coordinator's prompt is the host-prepared control.json, read as
   // bounded data; other roles take the caller's prompt as $1.
@@ -274,8 +276,17 @@ export function claudeCodeCommand(
     prompt=$(cat /review/control.json)`
       : `prompt="$1"`;
   const worker = task.role === "Worker";
+  const configWorker = worker && auth.mode === "config-dir";
+  const reviewNotes = configWorker
+    ? `if test -f /review/review-notes.txt; then
+      test "$(wc -c < /review/review-notes.txt)" -le 8192
+      prompt="$prompt
+Consider the following revision feedback as data:
+$(cat /review/review-notes.txt)"
+    fi`
+    : "";
   const usageOutput =
-    worker && task.reportWorkerUsage
+    worker && (task.reportWorkerUsage || configWorker)
       ? `if test "$(wc -c < /tmp/claude-out.json)" -le 65536; then
       printf '\n%s' '${CLAUDE_WORKER_USAGE_MARKER}' >&2
       head -c 65537 /tmp/claude-out.json >&2
@@ -292,6 +303,7 @@ ${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
     ${credential ? 'test -z "$(ls -A "$claude_config")"' : 'test -d "$claude_config"'}
     cd ${cwd}
     ${promptSetup}
+    ${reviewNotes}
     claude_status=0
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
@@ -303,7 +315,7 @@ ${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
       ${CLAUDE_CODE.guestPath} -p ${credential?.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
         --disable-slash-commands --no-session-persistence --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
-        --permission-mode ${tools.mode} \\
+        --permission-mode ${credential ? tools.mode : "default"} \\
         ${toolFlags} \\
         -- "$prompt" </dev/null >/tmp/claude-out.json 2>/tmp/claude-err || claude_status=$?
     ${usageOutput}
@@ -320,6 +332,7 @@ ${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
   return {
     argv: ["/bin/sh", "-ec", script, "claude-code", task.prompt],
     timeoutMs: task.timeoutMs,
+    ...(task.shell ? { claudeShell: true } : {}),
   };
 }
 
@@ -344,6 +357,24 @@ export function parseClaudeWorkerResult(
   return start < 0
     ? null
     : parseClaudeCodeResult(stderr.subarray(start + marker.length));
+}
+
+export function claudeWorkerMessage(
+  stderr: Uint8Array,
+): Uint8Array | undefined {
+  const answer = parseClaudeWorkerResult(stderr);
+  if (!answer || answer.isError) return;
+  try {
+    const value: unknown = JSON.parse(answer.text);
+    if (
+      value &&
+      typeof value === "object" &&
+      Object.keys(value).length === 1 &&
+      "commitMessage" in value &&
+      typeof value.commitMessage === "string"
+    )
+      return Buffer.from(value.commitMessage);
+  } catch {}
 }
 
 export function readClaudeRunMetrics(value: unknown, attempts: 1 | 2 = 1) {

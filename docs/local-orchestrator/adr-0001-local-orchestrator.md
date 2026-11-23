@@ -228,13 +228,14 @@ applicable. Keep the audit outside VMs, beyond actor write access. This
 lets the operator trace a host decision from the conversation through
 execution and registration.
 
-### D11. Keep API keys at the credential boundary
+### D11. Support API-key and configuration directory modes
 
-All actors use Claude Code in the existing `operator-credential` mode
-with an API key. The guest sees only a placeholder. The existing
-credential boundary substitutes the real key only for the configured
-provider host, `api.anthropic.com`. The same restriction applies to the
-Researcher with public HTTPS access.
+In `api-key` mode, guests receive a placeholder. The host substitutes
+the Keychain API key into `x-api-key` for `api.anthropic.com`.
+In `config-dir` mode, the host mounts the actor group's configuration
+directory from the encrypted volume and the CLI manages its sign-in.
+The host serializes leases for the same group and checks directory
+integrity around each run. See [Claude Code authentication](../claude-code-auth.md).
 
 Use the same token accounting across actors. Future enforcement would
 need usage data early enough to stop work at the cap, including during

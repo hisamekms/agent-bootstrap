@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { CLAUDE_GROUP_PATH } from "../claude-code.ts";
 import type { ClaudeHostPolicy } from "../trusted-host.ts";
 import {
   type ClaudeActor,
@@ -14,23 +15,30 @@ import {
   privateDirectory,
 } from "./credentials-volume.ts";
 
+import { createCredentialScanner } from "./credential-scan.ts";
+
 export const orchestratorMcp = {
   type: "stdio",
   command: "/usr/bin/socat",
   args: ["STDIO", "VSOCK-CONNECT:2:5000"],
 } as const;
 
-export function managedClaudeSettings(actor: ClaudeActor | "login") {
+export function managedClaudeSettings(
+  actor: ClaudeActor | "login",
+  shell = false,
+) {
   const concierge = actor === "Concierge";
+  const scope = actor === "Executor" ? "/workspace" : "/review";
+  const fileTools = ["Read", "Glob", "Grep", "Edit", "Write"];
   const allow = concierge
     ? ["mcp__orchestrator"]
     : actor === "login"
       ? []
       : [
-          "Read",
-          "Glob",
-          "Grep",
-          ...(actor === "Executor" ? ["Edit", "Write"] : []),
+          ...fileTools
+            .slice(0, actor === "Executor" ? 5 : 3)
+            .map((tool) => `${tool}(/${scope}/**)`),
+          ...(actor === "Executor" && shell ? ["Bash"] : []),
         ];
   return {
     disableAllHooks: true,
@@ -42,7 +50,15 @@ export function managedClaudeSettings(actor: ClaudeActor | "login") {
     permissions: {
       disableBypassPermissionsMode: "disable",
       allow,
-      ...(concierge ? { deny: ["WebFetch", "Bash"] } : {}),
+      deny: [
+        ...[CLAUDE_GROUP_PATH, "/etc/claude-code"].flatMap((path) =>
+          fileTools.flatMap((tool) => [
+            `${tool}(/${path})`,
+            `${tool}(/${path}/**)`,
+          ]),
+        ),
+        ...(concierge ? ["WebFetch", "Bash"] : []),
+      ],
     },
   };
 }
@@ -55,10 +71,12 @@ export function createClaudePolicy(
   const config = effective.configDir;
   const volume = config && new CredentialsVolume(config, state);
   return {
-    managedSettings(actor) {
+    managedSettings(actor, shell) {
       const dir = join(state, "claude-policy");
       privateDirectory(dir);
-      const content = JSON.stringify(managedClaudeSettings(actor));
+      const content = JSON.stringify(
+        managedClaudeSettings(actor, !config && shell),
+      );
       const digest = createHash("sha256").update(content).digest("hex");
       const path = join(dir, `managed-${digest}.json`);
       // Publish only a complete file; concurrent runs may share the same policy.
@@ -77,6 +95,7 @@ export function createClaudePolicy(
             egress: config.egress,
             loginEgress: config.loginEgress,
             errors: config.errors,
+            scan: createCredentialScanner(config, state, note),
             groupFor(actor: ClaudeActor) {
               return (
                 Object.entries(config.groups).find(([, { actors }]) =>
@@ -92,7 +111,7 @@ export function createClaudePolicy(
               for (;;) {
                 ensureAudit();
                 try {
-                  lease = volume.acquire();
+                  lease = volume.acquire(group);
                   break;
                 } catch (error) {
                   if (

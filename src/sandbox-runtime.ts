@@ -78,10 +78,19 @@ export interface InteractiveSpec {
 
 export type InteractiveSandbox = InteractiveSpec | { readonly login: true };
 
-export function permitsProviderHeader(provider: SandboxProvider): boolean {
+export function permitsProviderHeader(
+  provider: SandboxProvider,
+  gatewayHosts: readonly string[] = [],
+): boolean {
+  if (provider.header === "x-api-key") return true;
   return (
-    provider.header === "x-api-key" ||
-    !/(?:^|\.)(?:anthropic\.com|claude\.(?:ai|com))\.?$/i.test(provider.host)
+    (provider.header === undefined || provider.header === "authorization") &&
+    typeof provider.host === "string" &&
+    /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+      provider.host,
+    ) &&
+    !/(?:^|\.)(?:anthropic\.com|claude\.(?:ai|com))$/.test(provider.host) &&
+    gatewayHosts.includes(provider.host)
   );
 }
 
@@ -184,6 +193,7 @@ export interface SandboxCommand {
   readonly argv: readonly string[];
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  readonly claudeShell?: true;
 }
 
 export interface ExecResult {

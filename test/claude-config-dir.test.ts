@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
 import {
@@ -27,6 +28,11 @@ import {
   classifyClaudeFailure,
   claudeNext,
 } from "../src/local-orchestrator/claude-errors.ts";
+import {
+  configuredCredentialScanner,
+  createCredentialScanner,
+  requireCredentialScan,
+} from "../src/local-orchestrator/credential-scan.ts";
 import { managedClaudeSettings } from "../src/local-orchestrator/claude-policy.ts";
 import {
   CredentialsVolume,
@@ -99,6 +105,7 @@ test("Claude configuration merges mode and fields with a private target override
     }),
     { mode: 0o600 },
   );
+  chmodSync(targetPath, 0o400);
   assert.equal(loadClaudeConfig(env).source, "user");
   assert.equal(loadClaudeConfig(env, target).source, "target");
   assert.equal(loadClaudeConfig(env, target).keychainService, "user-key");
@@ -107,6 +114,9 @@ test("Claude configuration merges mode and fields with a private target override
   assert.equal(effective.configDir?.volume.keychainService, "target-volume");
   assert.deepEqual(effective.configDir?.groups.lead?.actors, ["Concierge"]);
   assert.match(effective.warnings[0]!, /ignored/);
+  chmodSync(targetPath, 0o640);
+  assert.throws(() => loadClaudeConfig(env, target));
+  chmodSync(targetPath, 0o700);
   writeVerificationConfig(target, { profile: "bun", argv: ["bun", "test"] });
   assert.deepEqual(readVerificationConfig(target), {
     profile: "bun",
@@ -129,6 +139,8 @@ test("Claude configuration rejects invalid schema, credential values and unsafe 
     { configDir: { egress: ["127.0.0.1:443"] } },
     { configDir: { egress: ["example.test:80"] } },
     { configDir: { errors: [{ match: "[", code: "auth-required" }] } },
+    { configDir: { leakPatterns: ["["] } },
+    { configDir: { leakPatterns: ["x".repeat(161)] } },
     {
       configDir: {
         errors: [{ match: "x".repeat(161), code: "auth-required" }],
@@ -215,16 +227,21 @@ test("volume leases attach once, keep the passphrase on stdin, and detach after 
   assert.ok(create.args.includes("AES-256"));
   assert.ok(create.args.includes("APFS"));
 
-  const firstLease = volume.acquire();
+  const firstLease = volume.acquire("actors");
   firstLease.prepare();
   assert.throws(() => volume.acquire(), { code: "credentials-detached" });
   firstLease.ready();
   const releaseA = firstLease.release;
+  assert.throws(
+    () => new CredentialsVolume(config, root, runner).acquire("actors"),
+    { code: "credentials-detached" },
+  );
+  assert.throws(() => volume.detach(true), { code: "credentials-detached" });
   const { release: releaseB } = new CredentialsVolume(
     config,
     root,
     runner,
-  ).acquire();
+  ).acquire("lead");
   assert.deepEqual(volume.status(), { mounted: true, active: 2, stale: false });
   const attach = events.filter(({ args }) => args[0] === "attach");
   assert.equal(attach.length, 1);
@@ -242,7 +259,11 @@ test("volume leases attach once, keep the passphrase on stdin, and detach after 
   const path = volume.groupPath("actors");
   const notes: string[] = [];
   volume.integrity("actors", "before", (note) => notes.push(note));
-  writeFileSync(join(path, "untracked-cli-state"), "state");
+  writeFileSync(join(path, ".credentials.json"), "mutable state");
+  writeFileSync(join(path, ".claude.json.backup"), "mutable state");
+  writeFileSync(join(path, "state.lock.owner"), "mutable state");
+  mkdirSync(join(path, "sessions"));
+  writeFileSync(join(path, "sessions", "large"), Buffer.alloc(1024 * 1024 + 1));
   volume.integrity("actors", "after", (note) => notes.push(note), true);
   mkdirSync(join(path, "hooks"));
   writeFileSync(join(path, "hooks", "planted"), "fixture hook");
@@ -254,14 +275,39 @@ test("volume leases attach once, keep the passphrase on stdin, and detach after 
   const evidence = JSON.parse(
     readFileSync(notes[0]!.match(/in (.+)\.$/)![1]!, "utf8"),
   );
-  assert.deepEqual(
-    evidence.entries.map(([name]: [string]) => name),
-    ["hooks", "hooks/planted", "settings.json"],
-  );
+  assert.match(evidence.digest, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(evidence), /mutable state|fixture hook/);
   releaseA();
   assert.equal(volume.status().mounted, true);
   volume.integrity("actors", "accept", () => {});
   volume.integrity("actors", "before", () => {});
+  writeFileSync(join(path, "unexpected"), "new state");
+  assert.throws(() => volume.integrity("actors", "after", () => {}), {
+    code: "config-tampered",
+  });
+  volume.integrity("actors", "accept", () => {});
+  symlinkSync("large", join(path, "sessions", "link"));
+  assert.throws(() => volume.integrity("actors", "accept", () => {}), {
+    code: "config-tampered",
+  });
+  const { Database } = createRequire(import.meta.url)("bun:sqlite");
+  const lock = new Database(join(dirname(volume.mount), "lock.sqlite"), {
+    readonly: true,
+  });
+  try {
+    assert.deepEqual(
+      lock.query("SELECT event FROM integrity_audit ORDER BY rowid").all(),
+      [
+        { event: "integrity-hold" },
+        { event: "integrity-accepted" },
+        { event: "integrity-hold" },
+        { event: "integrity-accepted" },
+        { event: "integrity-hold" },
+      ],
+    );
+  } finally {
+    lock.close();
+  }
   releaseB();
   assert.deepEqual(volume.status(), {
     mounted: false,
@@ -275,14 +321,20 @@ test("volume leases attach once, keep the passphrase on stdin, and detach after 
   assert.throws(() => volume.attach(), { code: "credentials-detached" });
   volume.detach();
 
-  const pending = volume.acquire();
-  const shared = volume.acquire();
+  const pending = volume.acquire("actors");
+  const shared = volume.acquire("lead");
   pending.prepare();
   pending.quarantine();
   shared.release();
   assert.deepEqual(volume.status(), { mounted: true, active: 1, stale: true });
   assert.throws(() => volume.acquire(), { code: "credentials-detached" });
   assert.throws(() => volume.detach(), { code: "credentials-detached" });
+  volume.detach(true);
+  assert.deepEqual(volume.status(), {
+    mounted: false,
+    active: 0,
+    stale: false,
+  });
 });
 
 test("directory commands keep fixed guest controls and login opens without a provider binding", () => {
@@ -305,6 +357,36 @@ test("directory commands keep fixed guest controls and login opens without a pro
     assert.doesNotMatch(script, /ANTHROPIC_API_KEY|\$MSB_|--bare/);
   }
   const policy = managedClaudeSettings("Executor");
+  assert.deepEqual(policy.permissions.allow, [
+    "Read(//workspace/**)",
+    "Glob(//workspace/**)",
+    "Grep(//workspace/**)",
+    "Edit(//workspace/**)",
+    "Write(//workspace/**)",
+  ]);
+  for (const actor of ["Planner", "Reviewer"] as const)
+    assert.deepEqual(managedClaudeSettings(actor).permissions.allow, [
+      "Read(//review/**)",
+      "Glob(//review/**)",
+      "Grep(//review/**)",
+    ]);
+  for (const actor of [
+    "Planner",
+    "Reviewer",
+    "Executor",
+    "Concierge",
+    "login",
+  ] as const)
+    for (const tool of ["Read", "Glob", "Grep", "Edit", "Write"])
+      for (const path of ["/claude-config", "/etc/claude-code"])
+        assert.ok(
+          managedClaudeSettings(actor).permissions.deny.includes(
+            `${tool}(/${path}/**)`,
+          ),
+        );
+  assert.ok(
+    managedClaudeSettings("Executor", true).permissions.allow.includes("Bash"),
+  );
   assert.equal(policy.disableAllHooks, true);
   assert.equal(policy.allowManagedPermissionRulesOnly, true);
   assert.deepEqual(policy.allowedMcpServers, []);
@@ -345,4 +427,51 @@ test("Claude errors classify generic failures and bound operator regex execution
     claudeNext("credentials-detached"),
     "agent-bootstrap credentials attach",
   );
+});
+
+test("credential scans block credential shapes and operator patterns with fixed evidence", async (t) => {
+  const { root, config } = fixture(t);
+  const notes: string[] = [];
+  const scan = createCredentialScanner(
+    { ...config, leakPatterns: ["fixture-private-[0-9]+"] },
+    root,
+    (note) => notes.push(note),
+  );
+  await scan('+{"expiresAt":123}', "Public output");
+  for (const text of [
+    '+  "accessToken": "fixture-a",\n+  "refreshToken": "fixture-b",\n+  "expiresAt": 123',
+    "sk-ant-YMStp5zxuHQ_WMoM6iRSLxLzrjTS",
+    "fixture-private-123",
+  ]) {
+    await assert.rejects(scan(text), { code: "credential-leak" });
+    const path = notes.at(-1)!.replace("credential-leak evidence: ", "");
+    assert.equal(readFileSync(path, "utf8"), '{"code":"credential-leak"}\n');
+    assert.ok(!notes.join("\n").includes(text));
+  }
+});
+
+test("target screening persists after a directory launch overrides API-key mode", async (t) => {
+  const { root } = fixture(t);
+  const env = { XDG_CONFIG_HOME: root, XDG_STATE_HOME: root };
+  const note = () => {};
+  assert.equal(configuredCredentialScanner(root, note, env), undefined);
+  requireCredentialScan(root);
+  requireCredentialScan(root);
+  const scan = configuredCredentialScanner(root, note, env);
+  assert.ok(scan);
+  await assert.rejects(scan("sk-ant-Zew8qZHgxj2uI9yksWwEWP8AnaT"), {
+    code: "credential-leak",
+  });
+});
+
+test("failed evidence writes preserve the fixed refusal code", async (t) => {
+  const { root } = fixture(t);
+  const blocked = join(root, "not-a-directory");
+  writeFileSync(blocked, "");
+  const notes: string[] = [];
+  const scan = createCredentialScanner({}, blocked, (note) => notes.push(note));
+  await assert.rejects(scan("sk-ant-Fek8A13O5I6CyJCHuZmFL5k5vRu"), {
+    code: "credential-leak",
+  });
+  assert.deepEqual(notes, ["credential-leak evidence could not be written."]);
 });

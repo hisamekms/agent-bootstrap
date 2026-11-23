@@ -19,6 +19,8 @@ export const CLAUDE_FAILURE_CODES = [
   ...CLAUDE_PATTERN_CODES,
   "credentials-detached",
   "config-tampered",
+  "shell-disabled",
+  "credential-leak",
 ] as const;
 export type ClaudePatternCode = (typeof CLAUDE_PATTERN_CODES)[number];
 export type ClaudeFailureCode = (typeof CLAUDE_FAILURE_CODES)[number];
@@ -37,6 +39,7 @@ export interface ClaudeDirectoryConfig {
   >;
   readonly egress: readonly string[];
   readonly loginEgress: readonly string[];
+  readonly leakPatterns?: readonly string[];
   readonly errors: readonly ClaudeErrorPattern[];
 }
 
@@ -129,6 +132,25 @@ function patterns(value: unknown): ClaudeErrorPattern[] {
   });
 }
 
+function leakPatterns(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 16) reject();
+  return value.map((pattern) => {
+    if (
+      typeof pattern !== "string" ||
+      !pattern.length ||
+      pattern.length > 160 ||
+      looksLikeSecret(pattern)
+    )
+      reject();
+    try {
+      new RegExp(pattern, "i");
+    } catch {
+      reject();
+    }
+    return pattern;
+  });
+}
+
 function groups(value: unknown, warnings: Set<string>) {
   const parsed = Object.create(null) as Record<
     string,
@@ -193,7 +215,7 @@ function parseConfig(value: unknown, warnings: Set<string>, target = false) {
   }
   const claude =
     "claude" in root
-      ? object(root.claude, ["auth", "apiKey", "configDir"])
+      ? object(root.claude, ["auth", "apiKey", "configDir", "gateway"])
       : {};
   const api =
     "apiKey" in claude
@@ -209,9 +231,11 @@ function parseConfig(value: unknown, warnings: Set<string>, target = false) {
           "egress",
           "loginEgress",
           "errors",
+          "leakPatterns",
         ])
       : {};
   return {
+    gatewayHosts: "gateway" in claude ? hosts(claude.gateway) : undefined,
     auth: "auth" in claude ? parseClaudeAuthMode(claude.auth) : undefined,
     service: api.keychainService as string | undefined,
     volume: "volume" in dir ? volume(dir.volume) : {},
@@ -219,6 +243,8 @@ function parseConfig(value: unknown, warnings: Set<string>, target = false) {
     egress: "egress" in dir ? hosts(dir.egress) : undefined,
     loginEgress: "loginEgress" in dir ? hosts(dir.loginEgress) : undefined,
     errors: "errors" in dir ? patterns(dir.errors) : undefined,
+    leakPatterns:
+      "leakPatterns" in dir ? leakPatterns(dir.leakPatterns) : undefined,
   };
 }
 
@@ -237,7 +263,11 @@ export function userStateDirectory(env: NodeJS.ProcessEnv) {
   );
 }
 
-export function readPrivateConfig(path: string, limit = maxBytes): unknown {
+export function readPrivateConfig(
+  path: string,
+  limit = maxBytes,
+  target = false,
+): unknown {
   let fd: number;
   try {
     fd = openSync(
@@ -253,7 +283,7 @@ export function readPrivateConfig(path: string, limit = maxBytes): unknown {
     if (
       !info.isFile() ||
       info.uid !== process.getuid?.() ||
-      (info.mode & 0o7777) !== 0o600 ||
+      (target ? (info.mode & 0o077) !== 0 : (info.mode & 0o7777) !== 0o600) ||
       info.nlink !== 1
     )
       throw new ClaudeConfigError(unsafe);
@@ -275,8 +305,10 @@ export interface EffectiveClaudeConfig {
   readonly auth: ClaudeAuthMode;
   readonly source: "flag" | "target" | "user" | "default";
   readonly keychainService?: string;
+  readonly gatewayHosts?: readonly string[];
   readonly configDir?: ClaudeDirectoryConfig;
   readonly warnings: readonly string[];
+  readonly leakPatterns?: readonly string[];
 }
 
 export function loadClaudeConfig(
@@ -288,7 +320,11 @@ export function loadClaudeConfig(
   const user = parseConfig(readPrivateConfig(userConfigPath(env)), warnings);
   const target = parseConfig(
     targetDirectory
-      ? readPrivateConfig(join(targetDirectory, "config.json"), 256 * 1024)
+      ? readPrivateConfig(
+          join(targetDirectory, "config.json"),
+          256 * 1024,
+          true,
+        )
       : {},
     warnings,
     true,
@@ -301,6 +337,12 @@ export function loadClaudeConfig(
       : user.auth
         ? "user"
         : "default";
+  if (target.gatewayHosts !== undefined) reject();
+  const gatewayHosts = user.gatewayHosts;
+  const outgoingPatterns = [
+    ...(user.leakPatterns ?? []),
+    ...(target.leakPatterns ?? []),
+  ];
   if (auth === "api-key") {
     let keychainService = target.service ?? user.service;
     if (
@@ -322,6 +364,8 @@ export function loadClaudeConfig(
     return {
       auth,
       source,
+      ...(gatewayHosts ? { gatewayHosts } : {}),
+      ...(outgoingPatterns.length ? { leakPatterns: outgoingPatterns } : {}),
       ...(keychainService ? { keychainService } : {}),
       warnings: [...warnings],
     };
@@ -349,6 +393,7 @@ export function loadClaudeConfig(
       egress: target.egress ?? user.egress ?? [],
       loginEgress: target.loginEgress ?? user.loginEgress ?? [],
       errors: target.errors ?? user.errors ?? [],
+      leakPatterns: outgoingPatterns,
     },
   };
 }

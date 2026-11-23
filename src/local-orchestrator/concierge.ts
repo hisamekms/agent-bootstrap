@@ -1,3 +1,7 @@
+import {
+  requireCredentialScan,
+  type CredentialScanner,
+} from "./credential-scan.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
@@ -84,6 +88,7 @@ type ConciergeHost = Pick<
   Partial<Pick<TrustedHost, "runWorker" | "runVerification">>;
 
 export interface ConciergeDeps {
+  readonly scan?: CredentialScanner;
   readonly host: ConciergeHost;
   readonly store: OrchestratorStore;
   readonly snapshot: (
@@ -428,6 +433,12 @@ export async function startConcierge(
   const { repoRoot, target } = options;
   const bootstrapRoot = target?.bootstrapRoot ?? resolve(repoRoot);
   const stateVolume = target?.volume ?? conciergeVolumeName(repoRoot);
+  if (auth.mode === "config-dir") {
+    if (!deps.scan) throw new Error("Credential screening is required");
+    requireCredentialScan(
+      await prepareTargetDirectory(bootstrapRoot, target?.directory),
+    );
+  }
 
   const invocationId = randomUUID();
   const { id: sessionId } = store.startSession("Concierge", invocationId, true);
@@ -463,6 +474,7 @@ export async function startConcierge(
     const context = await conciergeContext(snapshot, target?.isDefault);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
+    const scan = deps.scan;
     const tasks =
       host.runWorker && host.runVerification
         ? createTaskExecutor({
@@ -471,6 +483,7 @@ export async function startConcierge(
               target?.directory,
             ),
             repoRoot,
+            ...(scan ? { scan } : {}),
             store,
             snapshotCommit: snapshot.commit,
             host: {
@@ -508,6 +521,7 @@ export async function startConcierge(
         : undefined;
 
     const runner = new ActorRunner({
+      ...(scan ? { scan } : {}),
       store,
       ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
       runPlanner: (...args) => {
@@ -554,6 +568,7 @@ export async function startConcierge(
       );
     };
     server = await (deps.listen ?? HostApiServer.listen)({
+      ...(scan ? { scan } : {}),
       store,
       socketPath: socket,
       sessionId,

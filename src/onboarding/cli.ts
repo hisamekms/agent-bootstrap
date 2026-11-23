@@ -269,7 +269,12 @@ export async function runBootstrap(
             `Run agent-bootstrap help ${command}.`,
           );
       } else if (
-        extra.length ||
+        (extra.length &&
+          !(
+            action === "detach" &&
+            extra.length === 1 &&
+            extra[0] === "--force"
+          )) ||
         !["status", "attach", "detach", "init"].includes(action ?? "")
       ) {
         return usage();
@@ -315,12 +320,15 @@ export async function runBootstrap(
       if (action === "status") {
         const status = volume.status();
         print(status);
-        if (status.stale) hint("agent-bootstrap credentials detach");
+        if (status.stale)
+          hint(
+            "Run agent-bootstrap doctor, then credentials detach --force after confirming no VM is running.",
+          );
         return 0;
       }
       if (action === "init") volume.init();
       if (action === "attach") volume.attach();
-      if (action === "detach") volume.detach();
+      if (action === "detach") volume.detach(extra[0] === "--force");
       if (verifying) {
         const { release } = volume.acquire();
         try {
