@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import {
   BUILD_SCRIPT,
   buildNetRules,
+  profileFiles,
   profilePackages,
   recipeFor,
   smokeTest,
@@ -138,10 +139,18 @@ async function main(): Promise<void> {
   try {
     const copyArgs: string[] = [];
     if (recipe.base.kind === "alpine") {
-      stage = "package verification";
+      stage = "Alpine input verification";
       await mkdir(join(work, "pkgs"), { mode: 0o700 });
-      for (const item of profilePackages(profile)) {
-        const source = join(root, recipe.base.packageDir, item.name);
+      const packageDir = recipe.base.packageDir;
+      const inputs = [
+        ...profilePackages(profile).map((item) => ({
+          ...item,
+          source: join(packageDir, item.name),
+        })),
+        ...profileFiles(profile),
+      ];
+      for (const item of inputs) {
+        const source = join(root, item.source);
         const target = join(work, "pkgs", item.name);
         await copyFile(source, target);
         if (sha256(await readFile(target)) !== item.sha256)

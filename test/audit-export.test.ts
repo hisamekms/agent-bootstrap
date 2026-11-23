@@ -408,8 +408,16 @@ test("exports Concierge create channels and volume reuse with the existing JSONL
     outcome: "ok",
     detail: { ...volume.detail, reused: true },
   });
+  audit.append({
+    invocationId: randomUUID(),
+    kind: "operation.requested",
+    operation: "sandbox.create",
+    role: "Verification",
+    profile: "bun",
+    image: policyId,
+  });
   exportAudit(db, obs, { now });
-  const [row, requested, allowed, finished] = lines(dir);
+  const [row, requested, allowed, finished, bun] = lines(dir);
   assert.equal(row?.schemaVersion, "agent-bootstrap.audit/v1");
   assert.equal(row?.actor, "Concierge");
   assert.deepEqual(row?.attributes, {
@@ -421,4 +429,5 @@ test("exports Concierge create channels and volume reuse with the existing JSONL
   assert.equal(finished?.operationId, requested?.operationId);
   assert.equal(allowed?.operationId, requested?.operationId);
   assert.deepEqual(finished?.attributes, { ...volume.detail, reused: true });
+  assert.deepEqual(bun?.attributes, { profile: "bun", image: policyId });
 });

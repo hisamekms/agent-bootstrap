@@ -72,7 +72,7 @@ import {
   WORKER_MESSAGE_PATH,
   type SandboxProvider,
 } from "../../src/sandbox-runtime.ts";
-import type { ProfileName } from "../../src/sandbox-profiles.ts";
+import { ROLE_PROFILES, type ProfileName } from "../../src/sandbox-profiles.ts";
 import { taskTrace } from "../../src/task-trace.ts";
 import { createTelemetry } from "../../src/telemetry.ts";
 
@@ -85,7 +85,7 @@ import { createTelemetry } from "../../src/telemetry.ts";
 //   M5_ACTORS          "Coordinator=codex,Worker=claude", "all=claude", ...
 //                      (default: all=codex)
 //   M5_TREE            1 for a repository tree candidate
-//   M5_PROFILE         Worker and Verification: base (default), db or browser
+//   M5_PROFILE         Worker and Verification: base (default), db, browser or bun
 //   M5_DEBUG_WORKER    1 in live mode saves Codex Worker stderr on CLI
 //                      failure to a sensitive, private local file
 //   M5_CLAUDE_BINARY   Claude Code binary (default: the pinned .local build)
@@ -539,9 +539,10 @@ async function main() {
   assert.ok(codexBinary && isAbsolute(codexBinary));
   const tree = process.env.M5_TREE === "1";
   const profile = process.env.M5_PROFILE ?? "base";
+  const allowedProfiles: readonly string[] = ROLE_PROFILES.Worker;
   assert.ok(
-    profile === "base" || profile === "db" || profile === "browser",
-    "M5_PROFILE must be base, db or browser",
+    allowedProfiles.includes(profile),
+    `M5_PROFILE must be one of ${allowedProfiles.join(", ")}`,
   );
   const profiles = profileCatalog(
     alpineImage,

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { types } from "node:util";
-import { PROFILE_NAMES, type ProfileName } from "../sandbox-profiles.ts";
+import { ROLE_PROFILES, type ProfileName } from "../sandbox-profiles.ts";
 
 export const ACTOR_KINDS = Object.freeze([
   "Concierge",
@@ -269,7 +269,7 @@ export function validatePolicies(value: unknown): PolicySet {
 }
 
 const budgetKeys = ["maxExecutionMs", "maxRetries", "maxTokens"] as const;
-const profiles = PROFILE_NAMES.filter((name) => name !== "concierge");
+const profiles = ROLE_PROFILES.Worker;
 
 function budgets(value: unknown): Budgets {
   const input = fields(value, budgetKeys);

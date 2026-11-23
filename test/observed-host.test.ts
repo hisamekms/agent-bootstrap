@@ -209,7 +209,7 @@ test("required mode creates the durably bound sandbox and samples its original h
     ],
   });
   t.after(() => observed.close());
-  assert.equal(observed.audit.schemaVersion, 6);
+  assert.equal(observed.audit.schemaVersion, 7);
   assert.deepEqual(Object.keys(observed.runtime), ["sampleResources"]);
   assert.deepEqual(f.calls, ["gateway.open", "gateway.close"]);
   const run = await observed.host.runWorker(

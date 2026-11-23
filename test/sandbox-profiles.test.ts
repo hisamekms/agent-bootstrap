@@ -88,11 +88,17 @@ test("has, get and imageDigest", () => {
 });
 
 test("role profiles are fixed and deeply frozen", () => {
-  assert.deepEqual(PROFILE_NAMES, ["base", "db", "browser", "concierge"]);
+  assert.deepEqual(PROFILE_NAMES, [
+    "base",
+    "db",
+    "browser",
+    "concierge",
+    "bun",
+  ]);
   for (const role of ["Coordinator", "Planner", "Reviewer"] as const)
     assert.deepEqual(ROLE_PROFILES[role], ["base"]);
   for (const role of ["Worker", "Verification"] as const)
-    assert.deepEqual(ROLE_PROFILES[role], ["base", "db", "browser"]);
+    assert.deepEqual(ROLE_PROFILES[role], ["base", "db", "browser", "bun"]);
   assert.deepEqual(ROLE_PROFILES.Concierge, ["concierge"]);
   assert.ok(Object.isFrozen(ROLE_PROFILES));
   for (const list of Object.values(ROLE_PROFILES))

@@ -3,6 +3,7 @@ import type { RoleHarness } from "../actors.ts";
 import { parseClaudeCodeResult } from "../claude-code.ts";
 import type { ExecutionContext } from "../execution-context.ts";
 import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
+import { ROLE_PROFILES } from "../sandbox-profiles.ts";
 import type { SandboxFile } from "../sandbox-runtime.ts";
 import type { ReviewerPlan, ReviewerRun } from "../trusted-host.ts";
 import {
@@ -121,7 +122,7 @@ const goalContract = {
         scope: {
           paths:
             "1..64 distinct repository-relative paths, trailing slash grants descendants",
-          profiles: "distinct sandbox profile names (base, db or browser)",
+          profiles: `distinct sandbox profile names (${ROLE_PROFILES.Worker.join(", ")})`,
           actors:
             "distinct actor names (Planner, Researcher, Executor or Reviewer)",
           maxTasks: "integer, 1..1000",
@@ -141,7 +142,7 @@ function taskContract(maxTasks: number) {
         {
           ...commonContract,
           actor: "Executor | Researcher",
-          profile: "base | db | browser",
+          profile: ROLE_PROFILES.Worker.join(" | "),
           paths:
             "1..64 distinct repository-relative paths for Executor, empty for Researcher",
           dependsOn:
