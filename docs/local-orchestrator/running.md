@@ -57,6 +57,34 @@ The default Claude Code permission mode is `auto`. If Claude Code reports
 that it cannot start in that mode, rerun with `--mode default`. The launcher
 also accepts `--mode acceptEdits` and `--mode plan`.
 
+## Troubleshooting
+
+### Claude Code cannot reach platform.claude.com
+
+If interactive Claude Code exits at startup with "Unable to connect to
+Anthropic services / Failed to connect to platform.claude.com: ENOTFOUND",
+check the network audit. A denied DNS lookup for `platform.claude.com` with
+reason `dns-not-allowlisted` means the checkout predates commit `41ea517`.
+That commit allows `platform.claude.com:443` for the Concierge only, without
+credential substitution. Update to a checkout that includes it, then rerun
+the launcher.
+
+```sh
+bun run spike/local-orchestrator/concierge.ts --run
+```
+
+### MCP tool calls return invalid-arguments
+
+If a Concierge MCP tool call such as `status` returns `invalid-arguments`,
+the Host API rejected MCP `_meta` in `tools/call` params. Commit `d45c1f8`
+fixed this. Update to a checkout that includes the fix and restart the
+launcher. To continue the conversation, use the same checkout and
+`MSB_HOME`.
+
+```sh
+bun run spike/local-orchestrator/concierge.ts --run --continue
+```
+
 ## Recover after a crash
 
 After confirming the launcher has stopped, run the operator CLI from a
