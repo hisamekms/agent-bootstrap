@@ -259,6 +259,28 @@ enforcement against a root guest is unproven.
    - no shell is available to an actor with a mount;
    - nothing is written to a `ro` directory.
 
+### V9 result, 2026-11-24
+
+Test 1 passed on Microsandbox 0.7.16, with the PoC flag on branch
+`poc/claude-ro-actors` (`spike/local-orchestrator/ro-probe.ts`). The
+guest ran as uid 0 with a `ro` directory at the group path.
+
+| Attempt                                                             | Result                          |
+| ------------------------------------------------------------------- | ------------------------------- |
+| Append to an existing file                                          | denied                          |
+| Create a file                                                       | denied                          |
+| `chmod` the mount root                                              | denied                          |
+| `mount -o remount,rw`, then create                                  | remount succeeds, create denied |
+| Mount the same virtiofs tag again `rw` at `/tmp/remnt`, then create | mount succeeds, create denied   |
+
+Inside the guest, the mount shows as `virtiofs` with options
+`rw,relatime`. The host's file server enforces the read-only mode, not
+the guest kernel. The guest's block devices (`vda`, `vdb`) are the VM's
+own disks and do not back the mount.
+
+Afterwards, every host file kept its modification time and size, and the
+host's before and after directory check passed on every run.
+
 ## Consequences
 
 - Benign tool writes cannot stop a run, because nothing inspects mount
