@@ -125,7 +125,7 @@ for (const failure of [undefined, ...failures]) {
             socketDir = dirname(options.socketPath);
             assert.match(
               options.socketPath,
-              /^\/private\/tmp\/lo-[^/]+\/h\.sock$/,
+              /^(?:\/private\/tmp|\/tmp|\/var\/folders\/.+)\/lo-[^/]+\/h\.sock$/,
             );
             assert.equal((await lstat(socketDir)).mode & 0o777, 0o700);
             step("listen");
