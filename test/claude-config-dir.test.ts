@@ -1,3 +1,8 @@
+import {
+  configRoot,
+  privatePath,
+  projectConfigDirectory,
+} from "../src/config/layers.ts";
 import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -67,9 +72,9 @@ test("Claude configuration merges mode and fields with a private target override
   const { root, config } = fixture(t);
   const env = { XDG_CONFIG_HOME: root };
   const user = userConfigPath(env);
-  mkdirSync(join(root, "agent-bootstrap"));
-  const target = join(root, "target");
-  mkdirSync(target);
+  mkdirSync(join(root, "agent-bootstrap"), { mode: 0o700 });
+  const target = projectConfigDirectory("target", env);
+  privatePath(target, configRoot(env), true);
   assert.deepEqual(loadClaudeConfig(env, target), {
     auth: "api-key",
     source: "default",
@@ -78,6 +83,7 @@ test("Claude configuration merges mode and fields with a private target override
   writeFileSync(
     user,
     JSON.stringify({
+      version: 1,
       claude: {
         auth: "config-dir",
         apiKey: { keychainService: "user-key" },
@@ -94,36 +100,64 @@ test("Claude configuration merges mode and fields with a private target override
     }),
     { mode: 0o600 },
   );
-  const targetPath = join(target, "config.json");
+  const targetPath = join(target, "local.json");
   writeFileSync(
     targetPath,
     JSON.stringify({
+      version: 1,
       claude: {
         auth: "api-key",
-        configDir: { volume: { keychainService: "target-volume" } },
+        model: "local-model",
       },
     }),
     { mode: 0o600 },
   );
-  chmodSync(targetPath, 0o400);
+  assert.equal(loadClaudeConfig(env, target).model, "local-model");
+  assert.equal(
+    loadClaudeConfig({ ...env, LO_CLAUDE_MODEL: "override-model" }, target)
+      .model,
+    "override-model",
+  );
   assert.equal(loadClaudeConfig(env).source, "user");
   assert.equal(loadClaudeConfig(env, target).source, "target");
   assert.equal(loadClaudeConfig(env, target).keychainService, "user-key");
   const effective = loadClaudeConfig(env, target, "config-dir");
   assert.equal(effective.source, "flag");
-  assert.equal(effective.configDir?.volume.keychainService, "target-volume");
+  assert.equal(
+    effective.configDir?.volume.keychainService,
+    config.volume.keychainService,
+  );
   assert.deepEqual(effective.configDir?.groups.lead?.actors, ["Concierge"]);
   assert.match(effective.warnings[0]!, /ignored/);
+  const local = readFileSync(targetPath, "utf8");
+  for (const [claude, key] of [
+    [{ configDir: { volume: {} } }, "claude.configDir.volume"],
+    [{ gateway: [] }, "claude.gateway"],
+  ] as const) {
+    writeFileSync(targetPath, JSON.stringify({ version: 1, claude }));
+    assert.throws(
+      () => loadClaudeConfig(env, target),
+      (error: Error) =>
+        error.message.includes(
+          `Invalid local configuration (${targetPath}): ${key}`,
+        ),
+    );
+  }
+  writeFileSync(targetPath, local);
   chmodSync(targetPath, 0o640);
   assert.throws(() => loadClaudeConfig(env, target));
-  chmodSync(targetPath, 0o700);
-  writeVerificationConfig(target, { profile: "bun", argv: ["bun", "test"] });
-  assert.deepEqual(readVerificationConfig(target), {
+  chmodSync(targetPath, 0o600);
+  writeVerificationConfig(
+    target,
+    { profile: "bun", argv: ["bun", "test"] },
+    env,
+  );
+  assert.deepEqual(readVerificationConfig(target, env), {
     profile: "bun",
     argv: ["bun", "test"],
   });
-  writeVerificationConfig(target, null);
-  assert.equal(readVerificationConfig(target), null);
+  writeVerificationConfig(target, null, env);
+  assert.equal(readVerificationConfig(target, env), null);
   assert.equal(loadClaudeConfig(env, target).source, "target");
 });
 
@@ -131,7 +165,7 @@ test("Claude configuration rejects invalid schema, credential values and unsafe 
   const { root, config } = fixture(t);
   const env = { XDG_CONFIG_HOME: root };
   const path = userConfigPath(env);
-  mkdirSync(join(root, "agent-bootstrap"));
+  mkdirSync(join(root, "agent-bootstrap"), { mode: 0o700 });
   for (const claude of [
     { apiKey: { keychainService: "sk-fixture-a1234567890" } },
     { apiKey: { value: "fixture" } },
@@ -157,20 +191,21 @@ test("Claude configuration rejects invalid schema, credential values and unsafe 
       },
     },
   ]) {
-    writeFileSync(path, JSON.stringify({ claude }), { mode: 0o600 });
-    assert.throws(() => loadClaudeConfig(env), {
-      message: "Invalid Claude configuration.",
+    writeFileSync(path, JSON.stringify({ version: 1, claude }), {
+      mode: 0o600,
     });
+    assert.throws(
+      () => loadClaudeConfig(env),
+      /Invalid user configuration .*: claude(?:[. ]|$)/,
+    );
   }
   writeFileSync(path, "{}");
   chmodSync(path, 0o640);
-  const message =
-    "Claude configuration must be a user-owned regular file with mode 0600.";
-  assert.throws(() => loadClaudeConfig(env), { message });
+  assert.throws(() => loadClaudeConfig(env), /mode 0600/);
   rmSync(path);
   writeFileSync(join(root, "valid"), "{}", { mode: 0o600 });
   symlinkSync(join(root, "valid"), path);
-  assert.throws(() => loadClaudeConfig(env), { message });
+  assert.throws(() => loadClaudeConfig(env), /without links/);
 });
 
 test("volume leases attach once, keep the passphrase on stdin, and detach after the last release", (t) => {

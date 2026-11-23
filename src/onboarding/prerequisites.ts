@@ -10,13 +10,20 @@ import {
   type ClaudeAuthMode,
 } from "../local-orchestrator/claude-config.ts";
 import { CredentialsVolume } from "../local-orchestrator/credentials-volume.ts";
+import { loadConfig, missing, privatePath } from "../config/layers.ts";
+import { ConfigError } from "../config/messages.ts";
+import {
+  driftWarning,
+  listProjects,
+  projectMissing,
+  repository,
+} from "../config/projects.ts";
 import { ALPINE_3_23, BUN_VERSION } from "../image-recipes.ts";
 import {
-  checkDirectory,
+  hasLegacyState,
+  rejectLegacyState,
   resolveTarget,
-  TargetError,
 } from "../local-orchestrator/target.ts";
-import { readVerificationConfig } from "../local-orchestrator/verification.ts";
 import {
   MISE_DUCKDB,
   MISE_FLAGS,
@@ -39,6 +46,7 @@ import {
 export type Status = "ok" | "missing" | "wrong" | "skipped";
 
 export interface Check {
+  effective?: Pick<ReturnType<typeof loadConfig>, "config" | "sources">;
   id: string;
   status: Status;
   detail: string;
@@ -110,11 +118,7 @@ export const systemHost: Host = {
 export const install = "bun install --frozen-lockfile --ignore-scripts";
 export const provisionKeychain =
   'security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w';
-export const configureClaude = [
-  'config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"',
-  'mkdir -p "$config_dir"',
-  `(umask 077; set -C; printf '%s\\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")`,
-];
+export const configureClaude = ["agent-bootstrap config edit"];
 const setup = "agent-bootstrap setup --allow-network";
 const msbHomeFix = ['mkdir -p "$HOME/.msb"', 'export MSB_HOME="$HOME/.msb"'];
 
@@ -340,82 +344,118 @@ export async function doctor(
   );
 
   let verifyProfile: string | undefined;
-  let targetDirectory: string | undefined;
-  if (path !== undefined || concierge) {
-    const target = await resolveTarget(path ?? root, root).catch(
-      (error: unknown) => error,
-    );
-    if (
-      target &&
-      typeof target === "object" &&
-      "directory" in target &&
-      typeof target.directory === "string"
-    ) {
+  let layers: ReturnType<typeof loadConfig> | undefined;
+  let configurationError = false;
+  try {
+    const legacyRecovery =
+      !concierge && path === undefined && (await hasLegacyState(root));
+    // Report pending migration while inspecting the user-owned volume.
+    if (legacyRecovery) {
+      add(
+        check(
+          "migration",
+          "wrong",
+          "Legacy local orchestrator state requires migration.",
+          ["agent-bootstrap migrate"],
+        ),
+      );
+    } else await rejectLegacyState(root);
+    const state = userStateDirectory(host.env);
+    try {
+      privatePath(state, state);
+    } catch (error) {
+      if (!missing(error)) throw error;
+    }
+    const projects = legacyRecovery ? [] : listProjects(host.env);
+    for (const project of projects) {
+      if (projectMissing(project))
+        add(
+          check(
+            `project-${project.name}`,
+            "wrong",
+            "The registered Git directory is missing.",
+            [`agent-bootstrap project move ${project.name} <path>`],
+            false,
+            true,
+          ),
+          !concierge,
+        );
+    }
+    let defaultRegistered = false;
+    if (path === undefined && !concierge && projects.length) {
+      try {
+        const { identity } = repository(root);
+        defaultRegistered = projects.some(
+          (project) => project.identity === identity,
+        );
+      } catch (error) {
+        if (!(error instanceof ConfigError)) throw error;
+      }
+    }
+    const target =
+      path !== undefined || concierge || defaultRegistered
+        ? await resolveTarget(path, root, host.env)
+        : undefined;
+    layers = loadConfig(host.env, target?.configDirectory);
+    if (target) {
       add(
         check(
           "target",
           "ok",
-          "Git worktree root has a local SHA-1 main commit.",
+          "Registered Git worktree root has a local SHA-1 main commit.",
         ),
       );
-      try {
-        await checkDirectory(target.directory).catch(
-          (error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") throw error;
+      const drift = driftWarning(target.project, layers.approved);
+      if (drift) add(check("configuration-drift", "skipped", drift), false);
+      if (!concierge && path !== undefined) {
+        const { config, sources } = layers;
+        add(
+          {
+            ...check(
+              "effective-configuration",
+              "ok",
+              "Effective configuration with its layer sources.",
+            ),
+            effective: { config, sources },
           },
-        );
-        targetDirectory = target.directory;
-        const verification = readVerificationConfig(target.directory);
-        verifyProfile = verification?.profile;
-        const valid =
-          !verifyProfile ||
-          verifyProfile === "base" ||
-          !!lock?.profiles[verifyProfile];
-        add(
-          check(
-            "verification",
-            !valid ? "wrong" : verification ? "ok" : "skipped",
-            !valid
-              ? "The configured Verification profile is not locked."
-              : verification
-                ? "Target verification configuration is valid."
-                : "Target has no verification configuration.",
-            ["agent-bootstrap help targets"],
-            false,
-            true,
-          ),
-          !valid,
-        );
-      } catch {
-        add(
-          check(
-            "verification",
-            "wrong",
-            "Target verification configuration could not be read safely.",
-            ["agent-bootstrap help targets"],
-            false,
-            true,
-          ),
+          false,
         );
       }
-    } else {
+      verifyProfile = layers.config.verification?.profile;
+      const valid =
+        !verifyProfile ||
+        verifyProfile === "base" ||
+        !!lock?.profiles[verifyProfile];
       add(
         check(
-          "target",
-          "wrong",
-          target instanceof TargetError
-            ? target.message
-            : "Target could not be inspected.",
+          "verification",
+          !valid ? "wrong" : verifyProfile ? "ok" : "skipped",
+          !valid
+            ? "The configured Verification profile is not locked."
+            : verifyProfile
+              ? "Target verification configuration is valid."
+              : "Target has no verification configuration.",
           ["agent-bootstrap help targets"],
           false,
           true,
         ),
-      );
-      add(
-        check("verification", "skipped", "A valid target is required."),
-        false,
+        !valid,
       );
     }
+  } catch (error) {
+    configurationError = true;
+    add(
+      error instanceof ConfigError
+        ? error.doctorCheck()
+        : check(
+            "configuration",
+            "wrong",
+            "Configuration could not be inspected.",
+            ["agent-bootstrap help targets"],
+            false,
+            true,
+          ),
+    );
   }
 
   const alternate = host.env.LO_CLAUDE_BINARY;
@@ -507,16 +547,8 @@ export async function doctor(
   }
 
   try {
-    if (path === undefined && !concierge) {
-      const target = await resolveTarget(undefined, root);
-      await checkDirectory(target.directory).catch(
-        (error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        },
-      );
-      targetDirectory = target.directory;
-    }
-    const effective = loadClaudeConfig(host.env, targetDirectory, override);
+    if (configurationError) throw new Error("configuration");
+    const effective = loadClaudeConfig(host.env, undefined, override, layers);
     add(
       check(
         "claude-auth",
@@ -609,16 +641,21 @@ export async function doctor(
       }
     }
   } catch (error) {
-    add(
-      check(
-        "claude-auth",
-        "wrong",
-        error instanceof ClaudeConfigError
-          ? error.message
-          : "Invalid Claude configuration.",
-        ["agent-bootstrap help setup"],
-      ),
-    );
+    if (!configurationError)
+      add(
+        error instanceof ConfigError
+          ? error.doctorCheck()
+          : check(
+              "claude-auth",
+              "wrong",
+              error instanceof ClaudeConfigError
+                ? error.message
+                : "Invalid configuration: claude.",
+              configureClaude,
+              false,
+              true,
+            ),
+      );
   }
   if (!concierge) {
     const duck = miseAvailable(checks)

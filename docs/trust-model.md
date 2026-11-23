@@ -106,3 +106,18 @@ scope, evidence and operational limits.
 M0 exercises the TypeScript contracts using fake ports and fixtures. Actual
 isolation, authorization, audit durability, restart behavior, and approval
 provenance require tests against the later runtimes.
+
+## Project configuration
+
+The host reads private user, approved, and local project settings from
+the XDG configuration directory. The project registry binds a name to a
+Git common directory, shared by its worktrees. Project state lives under
+the XDG state directory.
+
+A declaration at local `main` is a request from untrusted repository
+content. Approval reviews a bounded Git blob and records the pinned
+commit and blob IDs with its validated contents in the private approved
+file. A later commit can trigger a drift warning. The approved snapshot
+continues to supply its grants until the operator approves again.
+Verification stays offline. Declarations can only select profiles within
+the host allowlists and can request egress only for eligible actors.

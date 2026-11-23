@@ -19,6 +19,7 @@ bun install --frozen-lockfile --ignore-scripts && bun link
 agent-bootstrap doctor
 agent-bootstrap setup
 agent-bootstrap setup --allow-network
+agent-bootstrap project add /path/to/project
 agent-bootstrap doctor --target /path/to/project
 agent-bootstrap concierge --target /path/to/project
 ```
@@ -28,6 +29,12 @@ Follow the first doctor result to prepare mise, pinned Microsandbox, and a short
 Configure the Keychain service for default API-key mode and rerun doctor. The target
 must be a local Git worktree rooted at the supplied directory with a local
 `main` commit. Start Concierge from a terminal with OSC 52 access disabled.
+
+Use `agent-bootstrap config edit` for user settings and `config edit --project
+<name>` for project-local settings. To adopt requests committed on local
+`main`, review them with `agent-bootstrap project approve <name>`.
+Run `agent-bootstrap migrate` for legacy state and supply the original
+worktree paths for any legacy external targets.
 
 Use `agent-bootstrap help --agent` to give an AI agent the operating manual,
 or `agent-bootstrap help --json` for help topics and machine-readable command

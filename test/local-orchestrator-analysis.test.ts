@@ -1,15 +1,15 @@
+import { addProject } from "../src/config/projects.ts";
+import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import {
   copyFileSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
   statSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -270,22 +270,19 @@ test("exports a private consistent store snapshot and skips unchanged re-exports
   }
 });
 
-test("discovers the default target and previous target slugs without their worktrees", async () => {
+test("discovers registered targets after a worktree disappears", async () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), "lo-analysis-"));
   try {
-    const target = await resolveTarget(undefined, root);
+    const env = configEnv(root);
+    const checkout = initConfigRepo(join(root, "bootstrap"));
+    const other = initConfigRepo(join(root, "dagq-lite"));
+    addProject(checkout, undefined, env);
+    addProject(other, undefined, env);
+    const target = await resolveTarget(undefined, checkout, env);
+    rmSync(other, { recursive: true });
     assert.deepEqual(
       (await discoverAnalysisTargets(target)).map(({ slug }) => slug),
-      [target.slug],
-    );
-    const parent = join(target.directory, "targets");
-    await prepareTargetDirectory(root, join(parent, "dagq-lite-123456789abc"));
-    mkdirSync(join(parent, "ignored"));
-    symlinkSync(join(parent, "ignored"), join(parent, "symlink-123456789abc"));
-    writeFileSync(join(parent, "file-123456789abc"), "");
-    assert.deepEqual(
-      (await discoverAnalysisTargets(target)).map(({ slug }) => slug),
-      [target.slug, "dagq-lite-123456789abc"],
+      ["bootstrap", "dagq-lite"],
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -299,10 +296,20 @@ test("the non-interactive analyzer joins target-local audit and telemetry in Duc
   }
   const root = mkdtempSync(join(realpathSync(tmpdir()), "lo-analysis-"));
   try {
-    const target = await resolveTarget(undefined, root);
-    const other = "dagq-lite-0123456789ab";
-    const otherDirectory = join(target.directory, "targets", other);
-    await prepareTargetDirectory(root, otherDirectory);
+    const env = configEnv(root);
+    const checkout = initConfigRepo(join(root, "bootstrap"));
+    const other = "dagq-lite";
+    const otherRepo = initConfigRepo(join(root, other));
+    addProject(checkout, undefined, env);
+    addProject(otherRepo, undefined, env);
+    const target = await resolveTarget(undefined, checkout, env);
+    const { directory: otherDirectory } = await resolveTarget(
+      otherRepo,
+      checkout,
+      env,
+    );
+    await prepareTargetDirectory(checkout, target.directory, env);
+    await prepareTargetDirectory(checkout, otherDirectory, env);
     const state = join(target.directory, "state.db");
     const store = OrchestratorStore.open(state);
     const { planner, worker, goalId, taskId } = fixture(store);
@@ -441,7 +448,8 @@ SELECT CASE WHEN (SELECT count(*) FROM actor_runs) = 12
       code = await runCli(
         ["--all-targets", "analyze", "--out", out, "--sql", extra],
         io,
-        root,
+        checkout,
+        env,
       );
     } finally {
       audit.close();
@@ -474,7 +482,8 @@ SELECT CASE WHEN (SELECT count(*) FROM actor_runs) = 12
       await runCli(
         ["--all-targets", "denials", "--since", "2000-01-01", "--limit", "1"],
         io,
-        root,
+        checkout,
+        env,
       ),
       0,
       stderr,
@@ -486,7 +495,12 @@ SELECT CASE WHEN (SELECT count(*) FROM actor_runs) = 12
     );
     stdout = "";
     assert.equal(
-      await runCli(["denials", "--since", "2099-01-01T00:00+09:00"], io, root),
+      await runCli(
+        ["denials", "--since", "2099-01-01T00:00+09:00"],
+        io,
+        checkout,
+        env,
+      ),
       0,
       stderr,
     );

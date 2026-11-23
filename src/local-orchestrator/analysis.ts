@@ -21,6 +21,7 @@ import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
 import { exportAudit, exportAuditChecked } from "../audit-export.ts";
 import { MISE_DUCKDB as miseArgs, offlineMiseEnv } from "../mise-tools.ts";
+import { userStateDirectory } from "../config/layers.ts";
 import { checkPrivateDirectory } from "../private-journal.ts";
 import { exportOrchestrator, exportOrchestratorChecked } from "./export.ts";
 import {
@@ -188,12 +189,8 @@ export async function analyze(
           join(
             await prepareTargetDirectory(
               target.bootstrapRoot,
-              join(
-                target.bootstrapRoot,
-                ".local",
-                "local-orchestrator",
-                "analysis",
-              ),
+              join(userStateDirectory(target.env), "analysis"),
+              target.env,
             ),
             `${new Date().toISOString().replace(/[:.]/g, "-")}-`,
           ),
@@ -203,13 +200,18 @@ export async function analyze(
     throw new Error("Invalid DuckDB analysis directory");
 
   const scans: CredentialScanner[] = [];
-  for (const { slug, directory } of targets) {
+  for (const { slug, directory, configDirectory } of targets) {
     await checkDirectory(directory).catch((error: unknown) => {
       if (!missing(error)) throw error;
     });
-    const scan = configuredCredentialScanner(directory, (message) =>
-      io.stderr.write(message + "\n"),
+    const scan = configuredCredentialScanner(
+      directory,
+      (message) => io.stderr.write(message + "\n"),
+      target.env,
+      undefined,
+      configDirectory,
     );
+
     if (scan) scans.push(scan);
     const destination = join(out, slug);
     await privateDirectory(destination);

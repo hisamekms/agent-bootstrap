@@ -1,3 +1,6 @@
+import { loadConfig } from "../../src/config/layers.ts";
+import { ConfigError } from "../../src/config/messages.ts";
+import { driftWarning } from "../../src/config/projects.ts";
 import { GitIntegrationError } from "../../src/git-integration.ts";
 import { configuredCredentialScanner } from "../../src/local-orchestrator/credential-scan.ts";
 import { execFile } from "node:child_process";
@@ -34,10 +37,7 @@ import {
   prepareTargetDirectory,
   resolveTarget,
 } from "../../src/local-orchestrator/target.ts";
-import {
-  configuredVerification,
-  readVerificationConfig,
-} from "../../src/local-orchestrator/verification.ts";
+import { configuredVerification } from "../../src/local-orchestrator/verification.ts";
 import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../../src/mise-tools.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
 import { createObservedHost } from "../../src/observed-host.ts";
@@ -122,7 +122,7 @@ async function main(args: readonly string[]) {
   if (!(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY))
     throw new Error("Concierge --run requires an operator TTY");
 
-  const { MSB_HOME, LO_CLAUDE_MODEL, LO_CLAUDE_BINARY } = process.env;
+  const { MSB_HOME, LO_CLAUDE_BINARY } = process.env;
   if (!MSB_HOME || !isAbsolute(MSB_HOME))
     throw new Error(
       "Set MSB_HOME to a short absolute path with the pinned images preloaded",
@@ -134,12 +134,20 @@ async function main(args: readonly string[]) {
     throw new Error(
       "MSB_HOME must be at most 40 bytes after resolving symlinks",
     );
-  const model = LO_CLAUDE_MODEL ?? "claude-opus-5-5";
-  const options = { model, mode: flags.mode, continue: flags.continue };
   const target = await resolveTarget(flags.target ?? bootstrapCheckout);
-  const { bootstrapRoot, directory, repoRoot } = target;
+  const { bootstrapRoot, directory, repoRoot, configDirectory } = target;
+  const layers = loadConfig(process.env, configDirectory);
+  const warning = driftWarning(target.project, layers.approved);
+  if (warning) console.error(warning);
   await prepareTargetDirectory(bootstrapRoot, directory);
-  const effective = loadClaudeConfig(process.env, directory, flags.claudeAuth);
+  const effective = loadClaudeConfig(
+    process.env,
+    configDirectory,
+    flags.claudeAuth,
+    layers,
+  );
+  const model = effective.model ?? "claude-opus-5-5";
+  const options = { model, mode: flags.mode, continue: flags.continue };
   for (const warning of effective.warnings) console.error(warning);
   const login = flags.loginGroup;
   if (
@@ -182,12 +190,7 @@ async function main(args: readonly string[]) {
   if (!profiles.has("concierge"))
     throw new Error("The profile lock must include the Concierge image");
 
-  let verificationConfig: ReturnType<typeof readVerificationConfig>;
-  try {
-    verificationConfig = login ? null : readVerificationConfig(directory);
-  } catch {
-    throw new Error("Invalid target verification configuration");
-  }
+  const verificationConfig = login ? undefined : layers.config.verification;
   if (verificationConfig && !profiles.has(verificationConfig.profile))
     throw new Error(
       "The profile lock must include the configured Verification profile",
@@ -220,6 +223,8 @@ async function main(args: readonly string[]) {
         (note) => console.error(note),
         process.env,
         flags.claudeAuth,
+        configDirectory,
+        effective,
       ));
   const telemetry = createTelemetry(config.telemetry, config.directory);
   let store: OrchestratorStore | undefined;
@@ -350,12 +355,17 @@ if (import.meta.main) {
   try {
     await main(process.argv.slice(2));
   } catch (error) {
-    // Only fixed messages leave the launcher. Never echo subprocess errors.
-    console.error(
-      error instanceof Error && !("code" in error)
-        ? error.message
-        : "Concierge launcher failed",
-    );
-    process.exitCode = 1;
+    if (error instanceof ConfigError) {
+      console.error(`${error.message}\nnext: ${error.next}`);
+      process.exitCode = 1;
+    } else {
+      // Only fixed messages leave the launcher. Never echo subprocess errors.
+      console.error(
+        error instanceof Error && !("code" in error)
+          ? error.message
+          : "Concierge launcher failed",
+      );
+      process.exitCode = 1;
+    }
   }
 }

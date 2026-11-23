@@ -143,8 +143,9 @@ export const helpTopics = {
     purpose:
       "Select a repository and configure a pinned candidate verification command.",
     prerequisites:
-      "A SHA-1 Git worktree root with local main, outside .local, and a locked, installed verification profile.",
+      "A registered SHA-1 Git worktree root with local main and a locked, installed verification profile.",
     commands: [
+      `agent-bootstrap project add ${exampleTarget}`,
       `agent-bootstrap doctor --target ${exampleTarget}`,
       `${target} verification set --profile bun -- bun test`,
       `${target} verification show --json`,
@@ -152,9 +153,31 @@ export const helpTopics = {
       `${target} update-goal-base "$goal_id"`,
     ],
     output:
-      "Verification show returns its configuration or null. Set and clear require confirmation. Base updates require an eligible, untouched Goal and preview both commits.",
+      "Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Base updates require an eligible, untouched Goal and preview both commits.",
     next: "Launch with the same target. Keep verification configured until its integration proposals are resolved.",
     human: `The operator confirms verification changes and eligible base updates from a host TTY. ${humanRepo}`,
+  },
+  configuration: {
+    purpose:
+      "Register projects, review repository requests, and edit operator settings.",
+    prerequisites:
+      "A Git worktree root and an operator terminal for project approval.",
+    commands: [
+      `agent-bootstrap project add ${exampleTarget} --name dagq-lite`,
+      "agent-bootstrap project list",
+      "agent-bootstrap project show dagq-lite",
+      "agent-bootstrap project approve dagq-lite",
+      "agent-bootstrap config edit --project dagq-lite",
+      `agent-bootstrap doctor --target ${exampleTarget}`,
+      `agent-bootstrap project move dagq-lite ${exampleTarget}`,
+      "agent-bootstrap project remove dagq-lite",
+      "agent-bootstrap migrate",
+    ],
+    output:
+      "Doctor shows effective settings and their sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.",
+    next: "Use config edit for user settings. For legacy external targets, pass the original worktree paths to migrate.",
+    human:
+      "Read the approval diff and type the project name to accept the full declaration at local main.",
   },
   troubleshoot: {
     purpose:
@@ -305,7 +328,7 @@ export const onboardingOutputs = {
   doctor: {
     usage:
       "doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]",
-    json: "Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.",
+    json: "Array of { id, status, detail, fix, needsNetwork, needsHuman } with effective settings and sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.",
   },
   setup: {
     usage: "setup [--allow-network] [--yes] [--profiles] [--json]",
@@ -320,6 +343,19 @@ export const onboardingOutputs = {
     usage:
       "sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]",
     json: "A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.",
+  },
+  project: {
+    usage:
+      "project add <path> [--name <name>] | project list | project show <name> | project move <name> <path> | project remove <name> | project approve <name>",
+    json: "Project record, list of records, or a confirmation object.",
+  },
+  config: {
+    usage: "config edit [--project <name>]",
+    json: "{ edited: true } after the editor exits and file validation succeeds.",
+  },
+  migrate: {
+    usage: "migrate [<original-target-path>...]",
+    json: "{ projects, orphanedVolumes } with migrated project names and legacy Concierge volume names left for operator review.",
   },
   credentials: {
     usage:
