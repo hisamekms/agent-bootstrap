@@ -10,6 +10,8 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import {
@@ -44,7 +46,10 @@ const model = "claude-model.1";
 async function fixture<T>(
   run: (root: string, store: OrchestratorStore) => Promise<T>,
 ) {
-  const root = await mkdtemp("/private/tmp/lo-test-");
+  // macOS keeps the socket path short under /private/tmp; Linux CI has /tmp.
+  const root = await mkdtemp(
+    join(existsSync("/private/tmp") ? "/private/tmp" : tmpdir(), "lo-test-"),
+  );
   try {
     const store = OrchestratorStore.open(join(root, "state.db"));
     try {
