@@ -87,6 +87,8 @@ type ErrorCode =
   | "task-retry-changed"
   | "approval-forbidden"
   | "goal-inactive"
+  | "goal-base-ineligible"
+  | "goal-base-record-failed"
   | "task-constraints"
   | "context-mismatch"
   | "session-busy"
@@ -445,6 +447,7 @@ export class OrchestratorStore {
   readonly #db: Connection;
   #closed = false;
   #writeFailed = false;
+  #updatingGoalBase = false;
 
   private constructor(db: Connection) {
     this.#db = db;
@@ -576,7 +579,8 @@ export class OrchestratorStore {
 
   #write<T>(write: (at: string) => T): T {
     if (this.#closed) throw new OrchestratorStoreError("closed");
-    if (this.#writeFailed) throw new OrchestratorStoreError("write-failed");
+    if (this.#writeFailed || this.#updatingGoalBase)
+      throw new OrchestratorStoreError("write-failed");
     try {
       return this.#db
         .transaction(() => write(new Date().toISOString()))
@@ -1086,12 +1090,7 @@ export class OrchestratorStore {
     return this.#write((at) => {
       const task = taskRecord(required(this.#task(id)));
       if (!this.#ready(task)) return null;
-      const branchOwner = this.#db
-        .query<{ id: string }>(
-          "SELECT id FROM goals WHERE substr(id, 1, 8) = substr(?, 1, 8) ORDER BY rowid LIMIT 1",
-        )
-        .get(task.goalId);
-      if (branchOwner?.id !== task.goalId) {
+      if (!this.#ownsGoalBranch(task.goalId)) {
         this.#setTaskStatus(id, "failed", "branch-collision", at);
         return null;
       }
@@ -1542,6 +1541,87 @@ export class OrchestratorStore {
         this.#event(at, "goal.base-pinned", "goal", id, { baseCommit: value });
       }
     });
+  }
+
+  #ownsGoalBranch(id: string): boolean {
+    return (
+      this.#db
+        .query<{ id: string }>(
+          "SELECT id FROM goals WHERE substr(id, 1, 8) = substr(?, 1, 8) ORDER BY rowid LIMIT 1",
+        )
+        .get(id)?.id === id
+    );
+  }
+
+  #eligibleGoalBase(id: string): string {
+    const goal = this.#goal(id);
+    if (
+      goal?.status !== "active" ||
+      goal.baseCommit === null ||
+      !this.#ownsGoalBranch(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM tasks WHERE goal_id = ? AND status IN ('running', 'awaiting-integration', 'succeeded') LIMIT 1",
+        )
+        .get(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM proposals WHERE kind = 'integration' AND status = 'pending' AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
+        )
+        .get(id)
+    )
+      throw new OrchestratorStoreError("goal-base-ineligible");
+    return gitCommit(goal.baseCommit);
+  }
+
+  goalBaseForUpdate(goalId: string): string {
+    return this.#read(() => this.#eligibleGoalBase(identifier(goalId)));
+  }
+
+  async updateGoalBase(
+    goalId: string,
+    from: string,
+    to: string,
+    moveRef: () => Promise<void>,
+  ) {
+    const id = identifier(goalId);
+    gitCommit(from);
+    gitCommit(to);
+    if (this.#closed) throw new OrchestratorStoreError("closed");
+    if (this.#writeFailed || this.#updatingGoalBase)
+      throw new OrchestratorStoreError("write-failed");
+
+    // Hold the SQLite writer lock from the final eligibility check through
+    // the Git CAS and audit commit. This prevents a concurrent Task claim.
+    try {
+      this.#db.exec("BEGIN IMMEDIATE");
+    } catch {
+      throw new OrchestratorStoreError("write-failed");
+    }
+    this.#updatingGoalBase = true;
+    let moved = false;
+    try {
+      if (this.#eligibleGoalBase(id) !== from)
+        throw new OrchestratorStoreError("goal-base-ineligible");
+      await moveRef();
+      moved = true;
+      this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", to, id);
+      this.#event(new Date().toISOString(), "goal.base-updated", "goal", id, {
+        from,
+        to,
+      });
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch {
+        this.#writeFailed = true;
+      }
+      if (moved) throw new OrchestratorStoreError("goal-base-record-failed");
+      throw error;
+    } finally {
+      this.#updatingGoalBase = false;
+    }
   }
 
   endSession(sessionId: string): void {

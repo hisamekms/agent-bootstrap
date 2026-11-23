@@ -35,7 +35,7 @@ import {
   type IntegrationContent,
 } from "./model.ts";
 import { rawReviewerAnswer, taskReviewerOutput } from "./reviewer-answer.ts";
-import type { OrchestratorStore } from "./store.ts";
+import { OrchestratorStoreError, type OrchestratorStore } from "./store.ts";
 import {
   emptyTokenUsage,
   reportedUsage,
@@ -190,6 +190,44 @@ async function importGoalBase(
   ]);
   if (results.some((result) => result.status === "rejected"))
     throw new Error("Git pack import failed");
+}
+
+async function requireGoalBranchBase(
+  git: LocalGitIntegration,
+  from: string,
+): Promise<void> {
+  const head = await git.head().catch((error: unknown) => {
+    if (error instanceof GitIntegrationError && error.code === "invalid-object")
+      return null;
+    throw error;
+  });
+  if (head !== from) throw new OrchestratorStoreError("goal-base-ineligible");
+}
+
+export async function previewGoalBaseUpdate(
+  store: OrchestratorStore,
+  repoRoot: string,
+  directory: string,
+  goalId: string,
+) {
+  const from = store.goalBaseForUpdate(goalId);
+  const repository = join(directory, "repository.git");
+  const git = localGit(directory, goalBranch(goalId));
+  await requireGoalBranchBase(git, from);
+  const to = await localMainCommit(repoRoot);
+  return {
+    from,
+    to,
+    async apply() {
+      if ((await localMainCommit(repoRoot)) !== to)
+        throw new OrchestratorStoreError("goal-base-ineligible");
+      await requireGoalBranchBase(git, from);
+      await importGoalBase(repoRoot, repository, to);
+      await store.updateGoalBase(goalId, from, to, () =>
+        git.updateGoalBranch(from, to),
+      );
+    },
+  };
 }
 
 async function pinnedDiff(

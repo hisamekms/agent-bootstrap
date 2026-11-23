@@ -19,6 +19,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
 import { CLAUDE_WORKER_USAGE_MARKER } from "../src/claude-code.ts";
+import { LocalGitIntegration } from "../src/git-integration.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import { snapshotConciergeRepo } from "../src/local-orchestrator/concierge.ts";
 import {
@@ -530,6 +531,230 @@ function command(
   assert.equal(result.status, 0, String(result.stderr));
   return result.stdout;
 }
+
+function goalBaseFixture() {
+  const repoRoot = join(root, "source");
+  const directory = join(repoRoot, ".local", "local-orchestrator");
+  const bare = join(directory, "repository.git");
+  mkdirSync(bare, { recursive: true, mode: 0o700 });
+  const git = (args: string[]) =>
+    String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
+  const bareGit = (args: string[]) => git([`--git-dir=${bare}`, ...args]);
+  git(["init", "--template=", "--initial-branch=main"]);
+  git(["commit", "--allow-empty", "-m", "old main"]);
+  const base = git(["rev-parse", "HEAD"]);
+  const goalId = goal();
+  const ref = `refs/heads/${goalBranch(goalId)}`;
+  bareGit(["init", "--bare", "--template="]);
+  git(["push", bare, `${base}:${ref}`]);
+  store.recordGoalCommit(goalId, base, "base");
+  writeFileSync(join(repoRoot, "on-new-main"), "new main\n");
+  git(["add", "on-new-main"]);
+  git(["commit", "-m", "new main"]);
+  const next = git(["rev-parse", "HEAD"]);
+  git(["checkout", "-b", "work", base]);
+  const phrase = `update-goal-base ${goalId} ${next.slice(0, 12)}`;
+  const events = () =>
+    store
+      .listEvents({ subjectId: goalId, limit: 50 })
+      .filter(({ kind }) => kind === "goal.base-updated");
+  async function cli(
+    args: string[],
+    isTTY = true,
+    prompt: (question: string) => string = () => phrase,
+  ) {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const questions: string[] = [];
+    const code = await runCli(["--db", filename, "--repo", repoRoot, ...args], {
+      stdin: new PassThrough(),
+      stdout: { write: (text) => stdout.push(text) },
+      stderr: { write: (text) => stderr.push(text) },
+      isTTY,
+      prompt(question) {
+        questions.push(question);
+        return prompt(question);
+      },
+    });
+    return { code, stdout, stderr, questions };
+  }
+  return {
+    bare,
+    bareGit,
+    base,
+    cli,
+    directory,
+    events,
+    git,
+    goalId,
+    next,
+    phrase,
+    ref,
+    args: ["update-goal-base", goalId],
+    head: () => bareGit(["rev-parse", ref]),
+  };
+}
+
+test("update-goal-base confirms current local main, imports it and records the new base", async () => {
+  const f = goalBaseFixture();
+  const taskId = task(f.goalId);
+  assert.ok(store.claimTask(taskId));
+  store.failTask(taskId, "review-concern");
+  const before = store.getTask(taskId);
+  const nonTTY = await f.cli(f.args, false);
+  assert.equal(nonTTY.code, 1);
+  assert.match(nonTTY.stderr.join(""), /requires a terminal/);
+  assert.deepEqual(nonTTY.questions, []);
+  const wrong = await f.cli(f.args, true, () => "yes");
+  assert.match(wrong.stderr.join(""), /Confirmation did not match/);
+  assert.equal(f.head(), f.base);
+  assert.deepEqual(f.events(), []);
+
+  const result = await f.cli(f.args);
+  assert.equal(result.code, 0, result.stderr.join(""));
+  assert.deepEqual(result.questions, [`Type "${f.phrase}" to confirm: `]);
+  assert.equal(f.head(), f.next);
+  assert.equal(f.bareGit(["show", `${f.ref}:on-new-main`]), "new main");
+  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
+  assert.deepEqual(
+    f.events().map(({ data }) => data),
+    [{ from: f.base, to: f.next }],
+  );
+  const shown = await f.cli(["show", f.goalId], false);
+  assert.equal(JSON.parse(shown.stdout.join("")).baseCommit, f.next);
+  assert.deepEqual(store.getTask(taskId), before);
+  const retry = await f.cli(
+    ["retry-task", taskId],
+    true,
+    () => `retry-task ${taskId}`,
+  );
+  assert.equal(retry.code, 0, retry.stderr.join(""));
+  assert.equal(store.getTask(taskId)?.retries, 1);
+});
+
+test("update-goal-base refuses ineligible Goal and Task states with a fixed message", async () => {
+  const f = goalBaseFixture();
+  const taskId = task(f.goalId);
+  const db = new Database(filename);
+  async function refused(args = f.args) {
+    const result = await f.cli(args);
+    assert.equal(result.code, 1);
+    assert.deepEqual(result.stderr, ["Goal base update refused.\n"]);
+    assert.deepEqual(result.questions, []);
+  }
+  try {
+    await refused(["update-goal-base", randomUUID()]);
+    await refused(["update-goal-base", goal()]);
+    db.query("UPDATE goals SET status = 'done' WHERE id = ?").run(f.goalId);
+    await refused();
+    db.query("UPDATE goals SET status = 'active' WHERE id = ?").run(f.goalId);
+    for (const status of ["running", "awaiting-integration", "succeeded"]) {
+      db.query("UPDATE tasks SET status = ? WHERE id = ?").run(status, taskId);
+      await refused();
+    }
+    db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(taskId);
+    const { executor } = fixture();
+    await runner(executor).drain();
+    assert.equal(store.pendingIntegrations(f.goalId).length, 1);
+    db.query("UPDATE tasks SET status = 'failed' WHERE id = ?").run(taskId);
+    await refused();
+    assert.deepEqual(f.events(), []);
+    assert.equal(f.head(), f.base);
+  } finally {
+    db.close();
+  }
+});
+
+test("update-goal-base refuses a Task claim or ref change during confirmation", async () => {
+  const f = goalBaseFixture();
+  const taskId = task(f.goalId);
+  const claimed = await f.cli(f.args, true, () => {
+    assert.ok(store.claimTask(taskId));
+    return f.phrase;
+  });
+  assert.deepEqual(claimed.stderr, ["Goal base update refused.\n"]);
+  assert.equal(f.head(), f.base);
+  store.failTask(taskId, "review-concern");
+  const changedMain = await f.cli(f.args, true, () => {
+    f.git(["update-ref", "refs/heads/main", f.base, f.next]);
+    return f.phrase;
+  });
+  assert.deepEqual(changedMain.stderr, ["Goal base update refused.\n"]);
+  assert.equal(f.head(), f.base);
+  f.git(["update-ref", "refs/heads/main", f.next, f.base]);
+  f.git(["push", f.bare, `${f.next}:refs/heads/next`]);
+  const changed = await f.cli(f.args, true, () => {
+    f.bareGit(["update-ref", f.ref, f.next, f.base]);
+    return f.phrase;
+  });
+  assert.deepEqual(changed.stderr, ["Goal base update refused.\n"]);
+  assert.equal(f.head(), f.next);
+  const stale = await f.cli(f.args);
+  assert.deepEqual(stale.stderr, ["Goal base update refused.\n"]);
+  assert.deepEqual(stale.questions, []);
+  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+  assert.deepEqual(f.events(), []);
+});
+
+test("Goal branch CAS refuses a different head installed immediately before Git prepares the update", async () => {
+  const f = goalBaseFixture();
+  const winner = f.git(["commit-tree", `${f.base}^{tree}`, "-m", "winner"]);
+  f.git([
+    "push",
+    f.bare,
+    `${winner}:refs/heads/winner`,
+    `${f.next}:refs/heads/next`,
+  ]);
+  const binary = join(root, "racing-git");
+  writeFileSync(
+    binary,
+    `#!/bin/sh
+case " $* " in
+  *" update-ref --stdin "*) /usr/bin/git "$1" update-ref ${f.ref} ${winner} ${f.base} || exit 1 ;;
+esac
+exec /usr/bin/git "$@"
+`,
+    { mode: 0o700 },
+  );
+  const git = new LocalGitIntegration({
+    binary,
+    repository: f.bare,
+    stagingRoot: join(f.directory, "worktrees"),
+    branch: goalBranch(f.goalId),
+  });
+  await assert.rejects(
+    store.updateGoalBase(f.goalId, f.base, f.next, () =>
+      git.updateGoalBranch(f.base, f.next),
+    ),
+    { code: "stale-base" },
+  );
+  assert.equal(f.head(), winner);
+  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+  assert.deepEqual(f.events(), []);
+});
+
+test("update-goal-base reports recording failure after a successful ref move", async () => {
+  const f = goalBaseFixture();
+  const db = new Database(filename);
+  try {
+    db.exec(`
+      CREATE TRIGGER deny_base_update BEFORE INSERT ON events
+      WHEN NEW.kind = 'goal.base-updated'
+      BEGIN SELECT RAISE(ABORT, 'audit failure'); END
+    `);
+    const result = await f.cli(f.args);
+    assert.equal(result.code, 1);
+    assert.match(
+      result.stderr.join(""),
+      /branch update completed.*recording.*failed/,
+    );
+    assert.equal(f.head(), f.next);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+    assert.deepEqual(f.events(), []);
+  } finally {
+    db.close();
+  }
+});
 
 test("real Git composes tree mode, path rejection, verification, review and operator CLI", async () => {
   const repoRoot = join(root, "source");

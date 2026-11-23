@@ -917,6 +917,28 @@ export class LocalGitIntegration {
       await this.#compareAndSwap(this.#ref, base, null);
   }
 
+  /** Move a direct Goal branch only if it still points to the recorded base. */
+  async updateGoalBranch(from: string, to: string): Promise<void> {
+    if (!/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch))
+      throw new GitIntegrationError("invalid-input");
+    oid(from);
+    await this.#repository();
+    await this.#commit(to);
+    if ((await this.#reference(this.#ref)) !== from)
+      throw new GitIntegrationError("stale-base");
+    try {
+      await this.#compareAndSwap(this.#ref, to, from);
+    } catch (error) {
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "git-failed" &&
+        (await this.#reference(this.#ref)) !== from
+      )
+        throw new GitIntegrationError("stale-base");
+      throw error;
+    }
+  }
+
   async protectedPaths(
     base: string,
     candidate: string,

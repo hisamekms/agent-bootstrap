@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { GitIntegrationError } from "../git-integration.ts";
 import {
   ContractError,
   GATES,
@@ -17,7 +18,7 @@ import {
   OrchestratorStoreError,
   parseHumanDelegate,
 } from "./store.ts";
-import { candidateDiffStat } from "./tasks.ts";
+import { candidateDiffStat, previewGoalBaseUpdate } from "./tasks.ts";
 
 interface CliIo {
   stdin: NodeJS.ReadableStream;
@@ -38,6 +39,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--rep
   reconcile
   status
   retry-task <taskId>
+  update-goal-base <goalId>
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId|goalId|taskId>
@@ -51,7 +53,7 @@ type Command =
   | { kind: "status" | "policy-show" | "reconcile" }
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
-  | { kind: "show-execution" | "retry-task"; id: string }
+  | { kind: "show-execution" | "retry-task" | "update-goal-base"; id: string }
   | {
       kind: "approve" | "reject";
       id: string;
@@ -74,6 +76,7 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     case "show":
     case "show-execution":
     case "retry-task":
+    case "update-goal-base":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
       break;
     case "approve":
@@ -228,6 +231,23 @@ async function execute(
   directory: string | undefined,
 ): Promise<0 | 1> {
   switch (command.kind) {
+    case "update-goal-base": {
+      if (directory === undefined)
+        return refuse(io, "update-goal-base with --db requires --repo <root>.");
+      const { from, to, apply } = await previewGoalBaseUpdate(
+        store,
+        resolve(directory, "../.."),
+        directory,
+        command.id,
+      );
+      writeJson(io, { goalId: command.id, from, to });
+      const phrase = `update-goal-base ${command.id} ${to.slice(0, 12)}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      await apply();
+      writeJson(io, store.getGoal(command.id));
+      return 0;
+    }
     case "retry-task": {
       const task = store.getTask(command.id);
       if (!task) return refuse(io, "Task was not found.");
@@ -425,9 +445,14 @@ export async function runCli(
   }
 
   if (
-    ["approve", "reject", "policy-set", "reconcile", "retry-task"].includes(
-      command.kind,
-    ) &&
+    [
+      "approve",
+      "reject",
+      "policy-set",
+      "reconcile",
+      "retry-task",
+      "update-goal-base",
+    ].includes(command.kind) &&
     !io.isTTY
   )
     return refuse(io, "This command requires a terminal on stdin and stdout.");
@@ -461,6 +486,31 @@ export async function runCli(
       store.close();
     }
   } catch (error) {
+    if (command.kind === "update-goal-base") {
+      if (
+        (error instanceof OrchestratorStoreError &&
+          error.code === "goal-base-ineligible") ||
+        (error instanceof GitIntegrationError &&
+          ["stale-base", "unsafe-repository"].includes(error.code))
+      )
+        return refuse(io, "Goal base update refused.");
+      if (
+        error instanceof OrchestratorStoreError &&
+        error.code === "goal-base-record-failed"
+      )
+        return refuse(
+          io,
+          "Goal branch update completed, but recording the base and audit event failed. Inspect the branch and store before retrying.",
+        );
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "ambiguous-update"
+      )
+        return refuse(
+          io,
+          "Goal branch update outcome is unknown. Inspect the branch and store before retrying.",
+        );
+    }
     if (
       error instanceof OrchestratorStoreError &&
       error.code === "stale-digest"

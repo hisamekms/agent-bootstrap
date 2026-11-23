@@ -95,6 +95,34 @@ Use `show <taskId>` to see the current budgeted usage and the total
 across all attempts. Use the same `--db` as the launcher if you supplied
 a custom path.
 
+## Update an untouched Goal to local main
+
+Keep your local `main` current before starting the launcher. If an active
+Goal already has a pinned branch and its Tasks need changes from a newer
+local `main`, update it from a host terminal.
+
+```sh
+bun run src/local-orchestrator/cli.ts update-goal-base <goalId>
+```
+
+Use the full Goal ID. Review the two commit IDs, then type
+`update-goal-base <goalId> <first 12 hex of new base>` at the prompt. With
+a custom `--db <path>`, also pass `--repo <root>` for the checkout the
+launcher used. The command uses that checkout's local `main` and performs
+no network fetch.
+
+The Goal branch must still point to its recorded base. A running,
+awaiting-integration, or succeeded Task, or a pending integration proposal
+blocks the update. Failed Tasks stay failed. Use `retry-task <taskId>` to
+start a fresh budget window and a new attempt journal on the updated base.
+Use `show <goalId>` or `get_goal` to read the recorded `baseCommit`.
+
+The command first moves the Git ref with compare-and-swap, then commits
+the new base and its `goal.base-updated` event together in SQLite. If
+recording fails or the command is interrupted after the ref moves, Git and
+SQLite can disagree. Inspect the private Goal branch and the stored base
+and event before retrying.
+
 ## Review proposals
 
 Use another host terminal for approval. The Concierge can draft proposals
