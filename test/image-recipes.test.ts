@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import {
   BUILD_SCRIPT,
+  ALPINE_3_23,
   DEBIAN_FEATURES,
   DEBIAN_TRIXIE,
   FEATURES,
+  PROFILE_RECIPES,
   aptPackages,
   buildNetRules,
   smokeTest,
@@ -66,6 +69,18 @@ describe("image recipes", () => {
     assert.equal(recipeDigest("db"), first);
   });
 
+  test("db and browser recipe digests match the checked-in profile lock", () => {
+    const lock = parseProfileLock(
+      readFileSync(
+        new URL("../images/profiles.lock.json", import.meta.url),
+        "utf8",
+      ),
+    );
+    for (const name of ["db", "browser"]) {
+      assert.equal(recipeDigest(name), lock.profiles[name]?.recipeDigest, name);
+    }
+  });
+
   test("conflicting digests for one file are rejected", () => {
     const item = FEATURES.postgres.packages[0] as { name: string };
     const sqlite = FEATURES.sqlite.packages as unknown as {
@@ -94,6 +109,61 @@ describe("image recipes", () => {
       "git --version >/dev/null && echo git-ok",
     );
     assert.deepEqual(smoke.expected, ["1", "1", "git-ok"]);
+  });
+
+  test("concierge pins the offline vsock relay and Git packages", () => {
+    assert.deepEqual(PROFILE_RECIPES.concierge, {
+      base: ALPINE_3_23,
+      features: ["vsock-relay", "git"],
+      memoryMiB: 1024,
+      cpus: 2,
+    });
+    const packages = profilePackages("concierge");
+    const pins = new Map(packages.map(({ name, sha256 }) => [name, sha256]));
+    assert.equal(pins.size, packages.length);
+    const readlinePins = FEATURES.sqlite.packages.filter(({ name }) =>
+      /^(readline|libncursesw|ncurses-terminfo-base)-/.test(name),
+    );
+    assert.deepEqual(
+      readlinePins.map(({ name }) => name),
+      [
+        "readline-8.3.1-r0.apk",
+        "libncursesw-6.5_p20251123-r0.apk",
+        "ncurses-terminfo-base-6.5_p20251123-r0.apk",
+      ],
+    );
+    assert.deepEqual(
+      pins,
+      new Map([
+        [
+          "socat-1.8.1.3-r0.apk",
+          "e415cdf30d41bbf4053ab52eb71c55fb9f5c3b811cd53cf22182960888186cbf",
+        ],
+        [
+          "libssl3-3.5.9-r0.apk",
+          "cdb3762116994f767cd1da423fa8004bd36b2e3802e3a1343786a40f00a5030e",
+        ],
+        [
+          "libcrypto3-3.5.9-r0.apk",
+          "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+        ],
+        ...readlinePins.map(({ name, sha256 }) => [name, sha256] as const),
+        ...FEATURES.git.packages.map(
+          ({ name, sha256 }) => [name, sha256] as const,
+        ),
+      ]),
+    );
+    assert.deepEqual(buildNetRules("concierge"), []);
+  });
+
+  test("concierge smoke checks socat and Git", () => {
+    assert.deepEqual(smokeTest("concierge"), {
+      script: [
+        "socat -V >/dev/null && echo socat-ok",
+        "git --version >/dev/null && echo git-ok",
+      ].join("\n"),
+      expected: ["socat-ok", "git-ok"],
+    });
   });
 
   test("build script excludes runtime state and resets DNS config", () => {

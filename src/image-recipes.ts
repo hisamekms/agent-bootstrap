@@ -83,6 +83,21 @@ AGENT_BOOTSTRAP_EOF
 chmod 0755 /usr/local/bin/agent-bootstrap-postgres
 `;
 
+const READLINE_PACKAGES = [
+  pkg(
+    "readline-8.3.1-r0.apk",
+    "70d288a6c3d8daf19b10fb220120d2ebd6f154011c96ca5bc84923b658cb21f7",
+  ),
+  pkg(
+    "libncursesw-6.5_p20251123-r0.apk",
+    "7fe332c8af8b97579e89df56466f83f4abda5040a18e1842c07d684320bbef4b",
+  ),
+  pkg(
+    "ncurses-terminfo-base-6.5_p20251123-r0.apk",
+    "6952a6b39abaf7bbc498cb085f0f59bf23619b53b3f7328b08fe50c0198a2bd4",
+  ),
+] as const;
+
 export const FEATURES = {
   sqlite: {
     packages: [
@@ -90,18 +105,7 @@ export const FEATURES = {
         "sqlite-3.53.4-r0.apk",
         "55c5f9d617818f75d0cdfafdc8054629988e5a39422f19357e6f7d82ae429502",
       ),
-      pkg(
-        "readline-8.3.1-r0.apk",
-        "70d288a6c3d8daf19b10fb220120d2ebd6f154011c96ca5bc84923b658cb21f7",
-      ),
-      pkg(
-        "libncursesw-6.5_p20251123-r0.apk",
-        "7fe332c8af8b97579e89df56466f83f4abda5040a18e1842c07d684320bbef4b",
-      ),
-      pkg(
-        "ncurses-terminfo-base-6.5_p20251123-r0.apk",
-        "6952a6b39abaf7bbc498cb085f0f59bf23619b53b3f7328b08fe50c0198a2bd4",
-      ),
+      ...READLINE_PACKAGES,
     ],
   },
   postgres: {
@@ -217,6 +221,23 @@ export const FEATURES = {
       ),
     ],
   },
+  "vsock-relay": {
+    packages: [
+      pkg(
+        "socat-1.8.1.3-r0.apk",
+        "e415cdf30d41bbf4053ab52eb71c55fb9f5c3b811cd53cf22182960888186cbf",
+      ),
+      pkg(
+        "libssl3-3.5.9-r0.apk",
+        "cdb3762116994f767cd1da423fa8004bd36b2e3802e3a1343786a40f00a5030e",
+      ),
+      pkg(
+        "libcrypto3-3.5.9-r0.apk",
+        "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+      ),
+      ...READLINE_PACKAGES,
+    ],
+  },
 } as const satisfies Record<string, Feature>;
 
 export type FeatureName = keyof typeof FEATURES;
@@ -315,6 +336,12 @@ export const PROFILE_RECIPES: Readonly<
     base: DEBIAN_TRIXIE,
     features: ["sqlite", "postgres", "chromium", "git"],
     memoryMiB: 2048,
+    cpus: 2,
+  },
+  concierge: {
+    base: ALPINE_3_23,
+    features: ["vsock-relay", "git"],
+    memoryMiB: 1024,
     cpus: 2,
   },
 };
@@ -532,16 +559,26 @@ export function smokeTest(name: string): {
   expected: string[];
 } {
   const features: readonly string[] = recipeFor(name).features;
-  const script = [
-    'sqlite3 :memory: "select 1;"; url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"',
-  ];
-  const expected = ["1", "1"];
+  const script: string[] = [];
+  const expected: string[] = [];
+  if (features.includes("sqlite")) {
+    script.push('sqlite3 :memory: "select 1;"');
+    expected.push("1");
+  }
+  if (features.includes("postgres")) {
+    script.push('url=$(agent-bootstrap-postgres); psql "$url" -Atc "select 1"');
+    expected.push("1");
+  }
   if (features.includes("chromium")) {
     script.push(
       'out=$(agent-bootstrap-chromium --dump-dom "data:text/html,<p>browser-ok</p>" 2>/dev/null)',
       'case "$out" in *browser-ok*) echo browser-ok ;; esac',
     );
     expected.push("browser-ok");
+  }
+  if (features.includes("vsock-relay")) {
+    script.push("socat -V >/dev/null && echo socat-ok");
+    expected.push("socat-ok");
   }
   if (features.includes("git")) {
     script.push("git --version >/dev/null && echo git-ok");

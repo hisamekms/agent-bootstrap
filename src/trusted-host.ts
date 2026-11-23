@@ -41,10 +41,10 @@ import type {
   SandboxSpec,
 } from "./sandbox-runtime.ts";
 import { ProfileCatalog, ROLE_PROFILES } from "./sandbox-profiles.ts";
-import type { ProfileName, ProfileRole } from "./sandbox-profiles.ts";
 
 type Operation = NonNullable<AuditInput["operation"]>;
 type Outcome = NonNullable<AuditInput["outcome"]>;
+type AuditedProfile = NonNullable<AuditInput["profile"]>;
 
 const AUDIT_HEALTH_POLL_MS = 25;
 // Bump when the gateway policy evaluation or digest schema changes.
@@ -314,9 +314,13 @@ export class TrustedHost {
   }
 
   /** Resolves the requested profile before any audit write. */
-  #profileFor(role: ProfileRole, requested: unknown): ProfileName {
+  #profileFor(role: Role, requested: unknown): AuditedProfile {
     const profile = requested ?? "base";
-    if (!this.#profiles.has(profile) || !ROLE_PROFILES[role].includes(profile))
+    if (
+      !this.#profiles.has(profile) ||
+      profile === "concierge" ||
+      !ROLE_PROFILES[role].includes(profile)
+    )
       throw new Error("Sandbox profile not allowed");
     return profile;
   }

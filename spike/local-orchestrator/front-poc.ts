@@ -19,6 +19,7 @@ import {
   profileCatalog,
   PROFILE_LOCK_PATH,
 } from "../../src/profile-lock.ts";
+import type { ProfileCatalog } from "../../src/sandbox-profiles.ts";
 
 const checks = [
   "vsock",
@@ -68,6 +69,11 @@ export function parseCli(args: string[]) {
 }
 
 type Profile = { image: string; memoryMiB?: number; cpus?: number };
+
+export function profileForCheck(check: Check, catalog: ProfileCatalog) {
+  return check === "vsock" && catalog.has("concierge") ? "concierge" : "base";
+}
+
 export function createArgs(name: string, profile: Profile, feature: string[]) {
   return [
     "create",
@@ -839,7 +845,7 @@ async function main(args: string[]) {
       options?.dummy ? { ...host, FPOC_DUMMY: options.dummy } : host,
       options,
     );
-  const profile = profileCatalog(
+  const profiles = profileCatalog(
     ALPINE_3_23.reference,
     parseProfileLock(
       await readFile(
@@ -847,7 +853,7 @@ async function main(args: string[]) {
         "utf8",
       ),
     ),
-  ).get("base")!;
+  );
   const timestamp = new Date().toISOString();
   const root = fileURLToPath(
     new URL("../../.local/front-poc/", import.meta.url),
@@ -881,7 +887,9 @@ async function main(args: string[]) {
           evidence.push("Skipped after resource cleanup failed");
         }
       } else {
-        const vm = new Resources(runner, profile, evidence);
+        const profile = profileForCheck(name, profiles);
+        if (name === "vsock") evidence.push(`profile: ${profile}`);
+        const vm = new Resources(runner, profiles.get(profile), evidence);
         try {
           outcome = await runChecks[name]({
             run: runner,

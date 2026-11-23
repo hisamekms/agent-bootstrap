@@ -1,6 +1,6 @@
 import { SandboxRuntimeError } from "./sandbox-runtime.ts";
 
-export const PROFILE_NAMES = ["base", "db", "browser"] as const;
+export const PROFILE_NAMES = ["base", "db", "browser", "concierge"] as const;
 export type ProfileName = (typeof PROFILE_NAMES)[number];
 
 export interface SandboxProfile {
@@ -13,7 +13,12 @@ export interface SandboxProfile {
 }
 
 export type ProfileRole =
-  "Coordinator" | "Planner" | "Worker" | "Reviewer" | "Verification";
+  | "Coordinator"
+  | "Planner"
+  | "Worker"
+  | "Reviewer"
+  | "Verification"
+  | "Concierge";
 
 /** Which profiles each role may request. */
 export const ROLE_PROFILES: Readonly<
@@ -24,6 +29,7 @@ export const ROLE_PROFILES: Readonly<
   Reviewer: Object.freeze(["base"] as const),
   Worker: Object.freeze(["base", "db", "browser"] as const),
   Verification: Object.freeze(["base", "db", "browser"] as const),
+  Concierge: Object.freeze(["concierge"] as const),
 });
 
 const IMAGE = /^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:([a-f0-9]{64})$/;

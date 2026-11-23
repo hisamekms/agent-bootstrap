@@ -1,7 +1,7 @@
 # Sandbox profiles
 
-Status: the mechanism is implemented with only `base` configured
-(2026-11-22). The `db` and `browser` images are not built yet.
+The `base`, `db`, and `browser` images are configured. The `concierge`
+recipe is available for a local build.
 
 Some tasks need a database or a browser in the VM, and most do not. A
 **sandbox profile** names one VM environment: a digest-pinned image plus
@@ -11,23 +11,26 @@ which stays per adapter. Each VM still lives for one invocation.
 
 ## Profiles
 
-| Profile   | Image contents                             | Intended use                  |
-| --------- | ------------------------------------------ | ----------------------------- |
-| `base`    | The current minimal Alpine image           | Default for every role        |
-| `db`      | `base` plus SQLite and PostgreSQL          | Database tests and migrations |
-| `browser` | `db` plus headless Chromium and Playwright | End-to-end tests              |
+| Profile     | Image contents                             | Intended use                                |
+| ----------- | ------------------------------------------ | ------------------------------------------- |
+| `base`      | The current minimal Alpine image           | Default for existing trusted-host roles     |
+| `db`        | `base` plus SQLite and PostgreSQL          | Database tests and migrations               |
+| `browser`   | `db` plus headless Chromium and Playwright | End-to-end tests                            |
+| `concierge` | `base` plus socat and Git                  | Concierge MCP stdio relay and local history |
 
 Images are built ahead of time and pinned by digest, because a VM has no
-package network. The `db` and `browser` images are a later step: fetching
-their packages needs operator approval. The mechanism below ships first, with
-only `base` configured.
+package network. The Concierge runs with networking disabled. It uses socat
+to relay MCP stdio over the host-provided vsock connection and Git to read
+history from the read-only repository snapshot. The front PoC's vsock check
+uses `concierge` when it is locked and falls back to `base` otherwise. The
+check records the selected profile in its evidence.
 
 ## Contracts
 
 ### `src/sandbox-profiles.ts` (new)
 
 ```ts
-export const PROFILE_NAMES = ["base", "db", "browser"] as const;
+export const PROFILE_NAMES = ["base", "db", "browser", "concierge"] as const;
 export type ProfileName = (typeof PROFILE_NAMES)[number];
 export interface SandboxProfile {
   readonly image: string; // name@sha256:<64 hex>
@@ -35,13 +38,19 @@ export interface SandboxProfile {
   readonly cpus?: number; // integer 1..8; default: backend default
 }
 export type ProfileRole =
-  "Coordinator" | "Planner" | "Worker" | "Reviewer" | "Verification";
+  | "Coordinator"
+  | "Planner"
+  | "Worker"
+  | "Reviewer"
+  | "Verification"
+  | "Concierge";
 /** Which profiles each role may request. */
 export const ROLE_PROFILES: Readonly<
   Record<ProfileRole, readonly ProfileName[]>
 >;
 //   Coordinator, Planner, Reviewer: ["base"]
 //   Worker, Verification: ["base", "db", "browser"]
+//   Concierge: ["concierge"]
 export class ProfileCatalog {
   constructor(profiles: Partial<Record<ProfileName, SandboxProfile>>); // must include base; validates; deep-copies and freezes
   has(name: string): name is ProfileName;
@@ -157,15 +166,18 @@ needs a security review.
 Each profile is a set of **features**, and composition happens when the image
 is built. A request still names one profile.
 
-| Profile   | Base           | Features                                |
-| --------- | -------------- | --------------------------------------- |
-| `db`      | Alpine 3.23    | `sqlite`, `postgres`                    |
-| `browser` | Debian 13 slim | `sqlite`, `postgres`, `chromium`, `git` |
+| Profile     | Base           | Features                                |
+| ----------- | -------------- | --------------------------------------- |
+| `db`        | Alpine 3.23    | `sqlite`, `postgres`, `git`             |
+| `browser`   | Debian 13 slim | `sqlite`, `postgres`, `chromium`, `git` |
+| `concierge` | Alpine 3.23    | `vsock-relay`, `git`                    |
 
 A feature recipe lists pinned packages (file name and SHA-256) and an
 optional setup script. The `browser` profile has Debian variants of the
 `sqlite` and `postgres` recipes, because Playwright does not support Alpine.
-The `db` profile has no `git` yet (no pinned apk); that is a follow-up.
+The `vsock-relay` feature pins socat and its OpenSSL and readline
+dependencies. The `concierge` image smoke test runs `socat -V` and
+`git --version` in a VM with networking disabled.
 
 ### Build steps (Alpine)
 

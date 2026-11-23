@@ -6,6 +6,7 @@ import {
   createArgs,
   jobId,
   parseCli,
+  profileForCheck,
   Resources,
   secretObservation,
   ttyOutcome,
@@ -13,6 +14,11 @@ import {
   vsockOutcome,
   type CommandResult,
 } from "../spike/local-orchestrator/front-poc.ts";
+import {
+  lockEntry,
+  parseProfileLock,
+  profileCatalog,
+} from "../src/profile-lock.ts";
 
 const image = "localhost/fixture@sha256:" + "a".repeat(64);
 const success: CommandResult = {
@@ -36,6 +42,25 @@ test("the plan is the default and subsets retain the serial check order", () => 
   assert.throws(() => parseCli(["--only", "unknown"]), /Invalid --only/);
   assert.throws(() => parseCli(["--only"]), /Invalid --only/);
   assert.throws(() => parseCli(["--typo"]), /Usage/);
+});
+
+test("only the vsock check selects concierge when the image is locked", () => {
+  const baseOnly = profileCatalog(image);
+  const entry = lockEntry("concierge", "b".repeat(64));
+  const lock = parseProfileLock(
+    JSON.stringify({ version: 1, profiles: { concierge: entry } }),
+  );
+  const catalog = profileCatalog(image, lock);
+  const check = profileForCheck("vsock", catalog);
+  assert.equal(profileForCheck("vsock", baseOnly), "base");
+  assert.equal(check, "concierge");
+  assert.deepEqual(catalog.get(check), {
+    image: entry.image,
+    memoryMiB: 1024,
+    cpus: 2,
+  });
+  for (const name of parseCli([]).selected.filter((name) => name !== "vsock"))
+    assert.equal(profileForCheck(name, catalog), "base");
 });
 
 test("create uses the pinned image, no pulls, no network rules and profile resources", () => {
