@@ -242,7 +242,7 @@ interactive sessions. See D9 for the current advisory policy.
 | ----- | --------------------------------------------------------------------------------------------------------------- |
 | 1     | Concierge (VM, vsock, read-only mount, session continuation), Planner, approval CLI, Goal and Task registration |
 | 2     | Executor and Reviewer on the existing Worker and Reviewer paths, through the integration approval gate          |
-| 3     | Integration and the full end-to-end cycle. Start dagq-lite development on it.                                   |
+| 3     | [Implemented](stage3.md). Approved Task integration and local branch export. Live end-to-end evidence pending.  |
 | 4     | Researcher with public-internet policy, and replanning                                                          |
 
 The Stage 1 PoC covered:
@@ -273,10 +273,10 @@ pins its candidate independently.
 
 Stage 2 runs Executor, optional host-configured verification, and Reviewer.
 The host submits a digest-bound integration proposal after a passing
-review. Stage 3 will consume an approved proposal, check the pin and
-current base, and integrate into the Goal's work branch. Dependencies wait
-until Stage 3 records a successful integration. The human handles branch
-pushes and PRs to `main`. See [Stage 2](stage2.md).
+review. Stage 3 consumes approved proposals, checks the pin and current base, and
+integrates into the Goal's work branch. Dependencies wait for successful
+integration. The operator can export a local branch and handles branch
+pushes and PRs to `main`. See [Stage 3](stage3.md).
 
 ## Consequences
 

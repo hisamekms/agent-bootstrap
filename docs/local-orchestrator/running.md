@@ -69,11 +69,19 @@ bun run src/local-orchestrator/cli.ts reconcile
 
 The command displays the active sessions, queued or running executions,
 and running Tasks. Type `reconcile <count>` with the combined count shown
-in the prompt. The transaction ends the sessions and marks the executions
-and Tasks failed with code `interrupted`. The CLI prints the affected
+in the prompt. The transaction ends the sessions and marks unfinished executions and ordinary running Tasks
+failed with code `interrupted`. The CLI prints the affected
 records. Reconciliation performs no replay and leaves pending proposals
 available for operator review. If the preview changes before confirmation,
 run the command again to see the current records.
+
+For an interrupted or uncertain integration, reconciliation also checks the
+private Goal branch and integration journal. It records success when the ref
+is at the authorized candidate, or fails the Task with
+`integration-interrupted` when the ref is still at the approved base. If the
+ref points elsewhere, inspect it and its journal before continuing. With a
+custom `--db`, pass `--repo <root>` before `reconcile` so it can locate the
+launcher's private repository.
 
 ## Diagnose and retry a failed Task
 
@@ -143,3 +151,31 @@ State stays in `.local/local-orchestrator/state.db`. The runtime audit is
 in `.local/local-orchestrator/audit.sqlite` and OTLP files are under
 `.local/local-orchestrator/observability/`. Treat those records and the
 persistent Claude conversation volume as sensitive.
+
+## Approve and export a Goal branch
+
+Use `show <proposalId>` to inspect the pinned integration diff stat. Run
+`approve <proposalId>` and type `approve <first 12 hex of proposal digest>`.
+Use a host terminal. The stock launcher has no verification suite, so a
+human answer is required even when the Goal allows agent approval. The
+running launcher polls for decisions, and approved proposals can also be
+picked up on its next launch. Use `show <taskId>` to check for
+`succeeded` and `events --subject <taskId>` to see the integrated head.
+
+When the Goal branch is ready for handoff, run:
+
+```sh
+bun run src/local-orchestrator/cli.ts export-goal-branch <goalId> [--repo <checkout>]
+```
+
+Type `export-goal-branch <goalId> <first 12 hex of new head>` as shown.
+The trailing `--repo` selects a destination checkout. By default, the
+launcher checkout is also the destination. To locate a launcher in a
+different checkout, use the leading `--repo <launcher-root>` before the
+command. Supply the same leading `--db <path>` as the launcher if you
+set a custom database path.
+
+The branch is created or fast-forwarded locally. A divergent branch or
+one checked out in any worktree must be resolved before exporting.
+Review the exported branch, then push it and open a PR to `main`
+from your usual Git workflow.

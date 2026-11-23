@@ -67,7 +67,8 @@ type PlannerRequest = {
 type Job =
   | { id: string; kind: "planner"; input: PlannerRequest }
   | { id: string; kind: "approval"; proposalId: string }
-  | { id: string; kind: "task" };
+  | { id: string; kind: "task" }
+  | { id: string; kind: "integration" };
 
 type ReportedUsage = NonNullable<ReturnType<typeof reportedUsage>>;
 
@@ -349,6 +350,9 @@ export class ActorRunner {
                 job.id,
                 this.#deps.canScheduleTasks,
               );
+          } else if (job.kind === "integration") {
+            if (this.#deps.canScheduleTasks?.() !== false)
+              await this.#deps.tasks!.integrate!(job.id);
           } else {
             await this.#run(job);
           }
@@ -368,10 +372,18 @@ export class ActorRunner {
       this.#queue.length >= this.#maxQueued
     )
       return;
+    if (
+      tasks.integrate &&
+      !this.#queue.some(({ kind }) => kind === "integration")
+    ) {
+      const id = store.nextApprovedIntegration();
+      if (id) this.#queue.unshift({ id, kind: "integration" });
+    }
     for (const proposal of store.pendingIntegrations()) {
       if (this.#queue.length >= this.#maxQueued) break;
       if (
         proposal.policy !== "agent" ||
+        proposal.humanAnswerRequired ||
         !store.canRequestIntegrationApproval(proposal.id)
       )
         continue;
@@ -384,6 +396,7 @@ export class ActorRunner {
             "approval-forbidden",
             "invalid-transition",
             "goal-inactive",
+            "integration-uncertain",
           ].includes(error.code)
         )
           throw error;
@@ -409,6 +422,7 @@ export class ActorRunner {
     if (!goal) throw new OrchestratorStoreError("not-found");
     if (goal.status !== "active")
       throw new OrchestratorStoreError("goal-inactive");
+    this.#deps.store.assertGoalScheduling(id);
     return goal;
   }
 
@@ -438,7 +452,9 @@ export class ActorRunner {
     };
   }
 
-  async #run(job: Exclude<Job, { kind: "task" }>): Promise<void> {
+  async #run(
+    job: Exclude<Job, { kind: "task" | "integration" }>,
+  ): Promise<void> {
     const { store } = this.#deps;
     if (store.getExecution(job.id)?.status === "cancelled") return;
     store.startExecution(job.id);

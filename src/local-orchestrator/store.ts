@@ -12,6 +12,7 @@ import {
   fitsScope,
   freeze,
   gitCommit,
+  goalBranch,
   identifier,
   integer,
   oneOf,
@@ -90,10 +91,12 @@ type ErrorCode =
   | "goal-base-ineligible"
   | "goal-base-stale"
   | "goal-base-record-failed"
+  | "goal-export-record-failed"
   | "task-constraints"
   | "context-mismatch"
   | "session-busy"
-  | "reconcile-changed";
+  | "reconcile-changed"
+  | "integration-uncertain";
 
 export class OrchestratorStoreError extends Error {
   readonly code: ErrorCode;
@@ -369,7 +372,8 @@ function proposalAnswerRequirements(
       proposal.kind === "task" &&
       proposal.content.policies?.["task-registration"] === "human") ||
     (proposal.kind === "integration" &&
-      proposal.content.symlinks?.length !== 0);
+      (proposal.content.verified !== true ||
+        proposal.content.symlinks?.length !== 0));
   return {
     ...(policy === "agent" &&
       loosening.length > 0 && { humanApprovalRequired: true }),
@@ -907,7 +911,7 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("invalid-transition");
       const integration =
         proposal.kind === "integration" ? proposal.content : null;
-      if (integration) this.#checkIntegrationTask(integration);
+      if (integration) this.#checkIntegrationTask(integration, id);
       const task = proposal.kind === "task" ? proposal.content : undefined;
       const origin = proposal.source;
       if (answerer.kind === "agent") {
@@ -1048,6 +1052,7 @@ export class OrchestratorStore {
       task.status === "registered" &&
       task.content.actor === "Executor" &&
       this.#goal(task.goalId)?.status === "active" &&
+      !this.#goalIntegrationInProgress(task.goalId) &&
       task.content.dependsOn.every((id) => {
         const dependency = this.#task(id);
         return (
@@ -1081,9 +1086,14 @@ export class OrchestratorStore {
     status: TaskRow["status"],
     code: string | null,
     at: string,
+    proposalId?: string,
   ) {
     this.#run("UPDATE tasks SET status = ? WHERE id = ?", status, id);
-    this.#event(at, "task.status", "task", id, { status, code });
+    this.#event(at, "task.status", "task", id, {
+      status,
+      code,
+      ...(proposalId && { proposalId }),
+    });
   }
 
   claimTask(taskId: string) {
@@ -1183,6 +1193,222 @@ export class OrchestratorStore {
     });
   }
 
+  #integrationProgress(taskId: string) {
+    return this.#db
+      .query<{ proposalId: string | null; code: string | null }>(
+        `SELECT json_extract(data, '$.proposalId') AS proposalId, json_extract(data, '$.code') AS code
+         FROM events WHERE subject_kind = 'task' AND subject_id = ? AND kind = 'task.status'
+         ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(taskId);
+  }
+
+  #goalIntegrationInProgress(goalId: string) {
+    return this.#db
+      .query<{ id: string }>(
+        "SELECT id FROM tasks WHERE goal_id = ? AND status = 'running'",
+      )
+      .all(goalId)
+      .some(({ id }) => this.#integrationProgress(id)?.proposalId);
+  }
+
+  #latestIntegrationProposalId(taskId: string) {
+    return this.#db
+      .query<{ id: string }>(
+        `SELECT id FROM proposals WHERE kind = 'integration'
+       AND json_extract(content_json, '$.taskId') = ? ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(taskId)?.id;
+  }
+
+  assertGoalScheduling(goalId: string) {
+    this.#read(() => {
+      if (this.#goalIntegrationInProgress(identifier(goalId)))
+        throw new OrchestratorStoreError("integration-uncertain");
+    });
+  }
+
+  nextApprovedIntegration() {
+    return this.#read(() => {
+      const rows = this.#db
+        .query<{ id: string; goalId: string; taskId: string }>(
+          `SELECT proposals.id, tasks.id AS taskId, tasks.goal_id AS goalId FROM proposals
+         JOIN tasks ON tasks.id = json_extract(proposals.content_json, '$.taskId')
+         JOIN goals ON goals.id = tasks.goal_id
+         WHERE proposals.kind = 'integration' AND proposals.status = 'approved'
+           AND tasks.status = 'awaiting-integration' AND goals.status = 'active'
+         ORDER BY proposals.rowid`,
+        )
+        .all();
+      return rows.find(
+        ({ goalId, taskId, id }) =>
+          this.#latestIntegrationProposalId(taskId) === id &&
+          !this.#goalIntegrationInProgress(goalId),
+      )?.id;
+    });
+  }
+
+  #approvedIntegration(id: string) {
+    const proposal = proposalRecord(required(this.#proposal(id)));
+    if (proposal.kind !== "integration" || proposal.status !== "approved")
+      throw new OrchestratorStoreError("invalid-transition");
+    this.#checkIntegrationTask(proposal.content, proposal.id);
+    this.assertGoalScheduling(proposal.content.goalId);
+    const approval = this.#db
+      .query<{
+        id: string;
+        digest: string;
+        answererJson: string;
+        answererKind: Answerer["kind"];
+        policy: ApprovalPolicy["policy"];
+        decision: Decision;
+        gate: Gate;
+      }>(
+        "SELECT id, digest, answerer_json AS answererJson, answerer_kind AS answererKind, policy, decision, gate FROM approvals WHERE proposal_id = ?",
+      )
+      .get(id);
+    if (
+      approval?.decision !== "approve" ||
+      approval.gate !== "integration" ||
+      approval.digest !== proposal.digest ||
+      contentDigest(proposal.content) !== proposal.digest
+    )
+      throw new OrchestratorStoreError("stale-digest");
+    const answerer = parseAnswerer(JSON.parse(approval.answererJson));
+    if (
+      answerer.kind !== approval.answererKind ||
+      (answerer.kind === "agent" &&
+        (approval.policy !== "agent" ||
+          proposalAnswerRequirements(proposal, "agent", [])
+            .humanAnswerRequired))
+    )
+      throw new OrchestratorStoreError("approval-forbidden");
+    const task = taskRecord(required(this.#task(proposal.content.taskId)));
+    if (!this.#ownsGoalBranch(task.goalId))
+      throw new OrchestratorStoreError("context-mismatch");
+    return { proposal, task, approvalId: approval.id, answerer };
+  }
+
+  approvedIntegration(id: string) {
+    return this.#read(() =>
+      this.#db.transaction(() => this.#approvedIntegration(id)).deferred(),
+    );
+  }
+
+  beginIntegration(id: string, digest: string, approvalId: string) {
+    this.#write((at) => {
+      const current = this.#approvedIntegration(id);
+      if (
+        current.proposal.digest !== digest ||
+        current.approvalId !== approvalId
+      )
+        throw new OrchestratorStoreError("stale-digest");
+      this.#setTaskStatus(
+        current.task.id,
+        "running",
+        "integration-in-progress",
+        at,
+        id,
+      );
+    });
+  }
+
+  rejectApprovedIntegration(id: string, code: string) {
+    this.#write((at) => {
+      const proposal = proposalRecord(required(this.#proposal(id)));
+      if (proposal.kind !== "integration" || proposal.status !== "approved")
+        throw new OrchestratorStoreError("invalid-transition");
+      const task = required(this.#task(proposal.content.taskId));
+      if (
+        task.status !== "awaiting-integration" ||
+        this.#latestIntegrationProposalId(task.id) !== id
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      this.#setTaskStatus(task.id, "failed", identifier(code), at);
+    });
+  }
+
+  #integrationSucceeded(
+    at: string,
+    id: string,
+    content: IntegrationContent,
+    reconciled = false,
+  ) {
+    const { taskId, branch, base, candidate } = content;
+    this.#setTaskStatus(taskId, "succeeded", null, at);
+    this.#event(at, "task.integrated", "task", taskId, {
+      proposalId: id,
+      branch,
+      base,
+      head: candidate,
+      ...(reconciled && { reconciled }),
+    });
+  }
+
+  finishIntegration(
+    id: string,
+    outcome: "completed" | "denied" | "uncertain",
+    code: string,
+  ) {
+    this.#write((at) => {
+      const proposal = proposalRecord(required(this.#proposal(id)));
+      if (proposal.kind !== "integration" || proposal.status !== "approved")
+        throw new OrchestratorStoreError("invalid-transition");
+      const { taskId } = proposal.content;
+      if (
+        required(this.#task(taskId)).status !== "running" ||
+        this.#integrationProgress(taskId)?.proposalId !== id
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      if (outcome === "completed")
+        this.#integrationSucceeded(at, id, proposal.content);
+      else if (outcome === "uncertain")
+        this.#setTaskStatus(taskId, "running", "integration-uncertain", at, id);
+      else this.#setTaskStatus(taskId, "failed", identifier(code), at);
+    });
+  }
+
+  goalIntegrationHead(goalId: string) {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ head: string }>(
+            `SELECT json_extract(events.data, '$.head') AS head FROM events
+       JOIN tasks ON tasks.id = events.subject_id
+       WHERE events.kind = 'task.integrated' AND events.subject_kind = 'task' AND tasks.goal_id = ?
+       ORDER BY events.rowid DESC LIMIT 1`,
+          )
+          .get(identifier(goalId))?.head ?? null,
+    );
+  }
+
+  auditGoalExport(
+    goalId: string,
+    branch: string,
+    from: string | null,
+    to: string,
+    completed: boolean,
+  ) {
+    this.#write((at) => {
+      if (!this.#goal(goalId)) throw new OrchestratorStoreError("not-found");
+      if (!this.#ownsGoalBranch(goalId) || branch !== goalBranch(goalId))
+        throw new OrchestratorStoreError("context-mismatch");
+      if (!completed && this.#goalIntegrationInProgress(goalId))
+        throw new OrchestratorStoreError("integration-uncertain");
+      this.#event(
+        at,
+        completed ? "goal.exported" : "goal.export-authorized",
+        "goal",
+        goalId,
+        {
+          branch,
+          from: from === null ? null : gitCommit(from),
+          to: gitCommit(to),
+        },
+      );
+    });
+  }
+
   pendingIntegrations(goalId?: string) {
     const id = goalId === undefined ? undefined : identifier(goalId);
     return this.#read(() =>
@@ -1194,7 +1420,16 @@ export class OrchestratorStore {
         .all(id ?? null, id ?? null)
         .map((row) => {
           const proposal = proposalRecord(row);
-          return freeze({ ...proposal, ...this.#proposalGate(proposal) });
+          const gate = this.#proposalGate(proposal);
+          return freeze({
+            ...proposal,
+            ...gate,
+            ...proposalAnswerRequirements(
+              proposal,
+              gate.policy,
+              gate.loosening,
+            ),
+          });
         }),
     );
   }
@@ -1690,7 +1925,29 @@ export class OrchestratorStore {
     );
   }
 
-  reconcile(expected: Reconciliation) {
+  interruptedIntegrations(taskIds: readonly string[]) {
+    return this.#read(() =>
+      taskIds.flatMap((taskId) => {
+        const proposalId = this.#integrationProgress(taskId)?.proposalId;
+        if (!proposalId) return [];
+        const proposal = proposalRecord(required(this.#proposal(proposalId)));
+        if (
+          proposal.kind !== "integration" ||
+          proposal.content.taskId !== taskId
+        )
+          throw new OrchestratorStoreError("context-mismatch");
+        const task = taskRecord(required(this.#task(taskId)));
+        return [
+          { id: proposalId, content: proposal.content, retries: task.retries },
+        ];
+      }),
+    );
+  }
+
+  reconcile(
+    expected: Reconciliation,
+    integrationHeads: ReadonlyMap<string, string> = new Map(),
+  ) {
     return this.#write((at) => {
       const rows = this.#interrupted();
       if (JSON.stringify(rows) !== JSON.stringify(expected))
@@ -1726,8 +1983,26 @@ export class OrchestratorStore {
           { executionId: id },
         );
       }
+      const integrating = this.interruptedIntegrations(rows.tasks);
+      for (const { id, content } of integrating) {
+        const head = integrationHeads.get(id);
+        if (head === content.candidate)
+          this.#integrationSucceeded(at, id, content, true);
+        else if (head === content.base)
+          this.#setTaskStatus(
+            content.taskId,
+            "failed",
+            "integration-interrupted",
+            at,
+          );
+        else throw new OrchestratorStoreError("integration-uncertain");
+      }
+      const integrationTasks = new Set(
+        integrating.map(({ content }) => content.taskId),
+      );
       for (const id of rows.tasks)
-        this.#setTaskStatus(id, "failed", "interrupted", at);
+        if (!integrationTasks.has(id))
+          this.#setTaskStatus(id, "failed", "interrupted", at);
       return rows;
     });
   }
@@ -1769,8 +2044,14 @@ export class OrchestratorStore {
     return this.#taskPolicy(proposal.content, goal.content);
   }
 
-  #checkIntegrationTask(content: IntegrationContent) {
-    if (required(this.#task(content.taskId)).status !== "awaiting-integration")
+  #checkIntegrationTask(content: IntegrationContent, proposalId: string) {
+    const task = required(this.#task(content.taskId));
+    if (task.goalId !== content.goalId)
+      throw new OrchestratorStoreError("context-mismatch");
+    if (
+      task.status !== "awaiting-integration" ||
+      this.#latestIntegrationProposalId(task.id) !== proposalId
+    )
       throw new OrchestratorStoreError("invalid-transition");
     this.#activeGoal(content.goalId);
   }
@@ -1828,11 +2109,14 @@ export class OrchestratorStore {
             throw new OrchestratorStoreError("stale-digest");
           if (!permitsAgentAnswer(proposal.origin, proposal, "approve"))
             throw new OrchestratorStoreError("approval-forbidden");
-          if (proposal.kind === "integration")
-            this.#checkIntegrationTask(proposal.content);
+          if (proposal.kind === "integration") {
+            this.#checkIntegrationTask(proposal.content, proposal.id);
+            this.assertGoalScheduling(proposal.content.goalId);
+          }
           if (proposal.kind === "task") {
             const task = proposal.content;
             const goal = goalRecord(required(this.#goal(task.goalId)));
+            this.assertGoalScheduling(goal.id);
             const error = this.#taskApprovalError(task, goal);
             if (error) throw new OrchestratorStoreError(error);
           }
@@ -1888,6 +2172,7 @@ export class OrchestratorStore {
                 id: task.id,
                 goalId: task.goalId,
                 status: task.status,
+                ...this.#runningIntegrationState(task),
                 ...this.#taskWindowUsage(
                   task.id,
                   task.content.budgets.maxTokens,
@@ -1943,11 +2228,24 @@ export class OrchestratorStore {
     );
   }
 
+  #runningIntegrationState(task: Pick<TaskRow, "id" | "status">) {
+    const code =
+      task.status === "running"
+        ? this.#integrationProgress(task.id)?.code
+        : null;
+    return code === "integration-in-progress" ||
+      code === "integration-uncertain"
+      ? { code }
+      : {};
+  }
+
   getTask(taskId: string) {
     const id = identifier(taskId);
     return this.#read(() => {
       const row = this.#task(id);
-      return row ? taskRecord(row) : null;
+      return row
+        ? freeze({ ...taskRecord(row), ...this.#runningIntegrationState(row) })
+        : null;
     });
   }
 
@@ -2060,7 +2358,10 @@ export class OrchestratorStore {
             `SELECT ${taskColumns} FROM tasks WHERE goal_id = ? ORDER BY rowid`,
           )
           .all(id)
-          .map(taskRecord),
+          .map((row) => ({
+            ...taskRecord(row),
+            ...this.#runningIntegrationState(row),
+          })),
       ),
     );
   }

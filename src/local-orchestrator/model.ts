@@ -61,6 +61,7 @@ export interface IntegrationContent {
   readonly digest: string;
   readonly changedPaths: readonly string[];
   readonly symlinks?: readonly string[];
+  readonly verified?: boolean;
   readonly review: { readonly result: "pass"; readonly notes?: string };
 }
 
@@ -80,6 +81,7 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
     "digest",
     "changedPaths",
     "symlinks",
+    "verified",
     "review",
   ]);
   const goalId = identifier(input.goalId);
@@ -99,6 +101,9 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
   const symlinks = Object.hasOwn(input, "symlinks")
     ? unique(input.symlinks, 0, changedPaths.length, path)
     : undefined;
+  const verified = input.verified;
+  if (Object.hasOwn(input, "verified") && typeof verified !== "boolean")
+    throw new ContractError();
   const changed = new Set(changedPaths);
   if (symlinks?.some((name) => !changed.has(name))) throw new ContractError();
   return freeze({
@@ -110,6 +115,7 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
     digest: oid(input.digest, 64),
     changedPaths,
     ...(symlinks === undefined ? {} : { symlinks }),
+    ...(typeof verified === "boolean" ? { verified } : {}),
     review: {
       result: oneOf(review.result, ["pass"]),
       ...(Object.hasOwn(review, "notes")

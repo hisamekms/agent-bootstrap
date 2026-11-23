@@ -120,10 +120,8 @@ new request. An interrupted approval leaves the proposal pending for a
 human. Approval keeps the Task in `awaiting-integration`. Rejection
 fails it.
 
-The Stage 3 entry point, `integrateApprovedProposal`, currently throws
-`stage-3`. Stage 3 will check approval evidence
-and call the reviewed integration path before marking the Task
-`succeeded`. The human handles pushes and PRs to `main`.
+[Stage 3](stage3.md) consumes approved proposals and records integration
+outcomes. Verification and export rules are documented there.
 
 ## Distributed development
 

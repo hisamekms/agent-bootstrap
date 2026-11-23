@@ -28,7 +28,9 @@ export type GitIntegrationCode =
   | "git-failed"
   | "output-limit"
   | "unsupported-entry"
-  | "cleanup-failed";
+  | "cleanup-failed"
+  | "branch-checked-out"
+  | "non-fast-forward";
 
 export class GitIntegrationError extends Error {
   readonly code: GitIntegrationCode;
@@ -392,20 +394,23 @@ export class LocalGitIntegration {
     });
   }
 
-  async #reference(ref: string): Promise<string | null> {
+  async #reference(ref: string, checkout?: string): Promise<string | null> {
     const symbolic = (
-      await this.#git(["symbolic-ref", "--quiet", ref], undefined, true)
+      await this.#git(["symbolic-ref", "--quiet", ref], checkout, true)
     )
       .toString("utf8")
       .trim();
     if (symbolic) throw new GitIntegrationError("unsafe-repository");
     const entry = (
-      await this.#git([
-        "for-each-ref",
-        "--format=%(refname)%00%(symref)%00%(objectname)%00",
-        "--",
-        ref,
-      ])
+      await this.#git(
+        [
+          "for-each-ref",
+          "--format=%(refname)%00%(symref)%00%(objectname)%00",
+          "--",
+          ref,
+        ],
+        checkout,
+      )
     ).toString("utf8");
     if (entry === "") return null;
     const fields = entry.split("\0");
@@ -423,15 +428,17 @@ export class LocalGitIntegration {
     ref: string,
     next: string,
     previous: string | null,
+    checkout?: string,
   ): Promise<void> {
     // --no-deref alone can replace a symbolic ref whose referent matches the
     // old OID. Prepare locks this exact ref; inspect it while that lock is held
     // and commit only for a direct ref (or absence for candidate-pin creation).
-    await this.#git(["update-ref", "--stdin"], undefined, false, {
+    await this.#git(["update-ref", "--stdin"], checkout, false, {
       input: `start\noption no-deref\nupdate ${ref} ${next} ${previous ?? "0".repeat(40)}\nprepare\n`,
       validate: async () => {
-        if ((await this.#reference(ref)) !== previous)
+        if ((await this.#reference(ref, checkout)) !== previous)
           throw new GitIntegrationError("stale-base");
+        if (checkout) await this.#requireBranchNotCheckedOut(checkout);
       },
     });
   }
@@ -937,6 +944,98 @@ export class LocalGitIntegration {
         throw new GitIntegrationError("stale-base");
       throw error;
     }
+  }
+
+  async #requireBranchNotCheckedOut(checkout: string) {
+    const entries = (
+      await this.#git(["worktree", "list", "--porcelain", "-z"], checkout)
+    )
+      .toString("utf8")
+      .split("\0");
+    if (entries.includes(`branch ${this.#ref}`))
+      throw new GitIntegrationError("branch-checked-out");
+  }
+
+  /** Fetch a pinned Goal head and CAS only its corresponding local branch. */
+  async previewGoalExport(checkout: string) {
+    if (
+      !/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch) ||
+      !isAbsolute(checkout)
+    )
+      throw new GitIntegrationError("invalid-input");
+    const to = await this.head();
+    const [inside, format] = await Promise.all([
+      this.#git(["rev-parse", "--is-inside-work-tree"], checkout),
+      this.#git(["rev-parse", "--show-object-format"], checkout),
+    ]);
+    if (
+      inside.toString().trim() !== "true" ||
+      format.toString().trim() !== "sha1"
+    )
+      throw new GitIntegrationError("invalid-input");
+    const from = await this.#reference(this.#ref, checkout);
+    await this.#requireBranchNotCheckedOut(checkout);
+    if (from !== null) {
+      // The trusted source has the complete ancestry of 'to'. A local
+      // object missing there cannot be its ancestor.
+      const history = await this.#git([
+        "merge-base",
+        "--is-ancestor",
+        from,
+        to,
+      ]).then(
+        () => true,
+        (error: unknown) => {
+          if (
+            error instanceof GitIntegrationError &&
+            error.code === "git-failed"
+          )
+            return false;
+          throw error;
+        },
+      );
+      if (!history) throw new GitIntegrationError("non-fast-forward");
+    }
+    return {
+      from,
+      to,
+      branch: this.#config.branch,
+      apply: async () => {
+        if (
+          (await this.head()) !== to ||
+          (await this.#reference(this.#ref, checkout)) !== from
+        )
+          throw new GitIntegrationError("stale-base");
+        await this.#run(
+          [
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "--",
+            this.#config.repository,
+            to,
+          ],
+          {
+            cwd: checkout,
+            env: { GIT_ALLOW_PROTOCOL: "file" },
+            timeout: 120_000,
+          },
+        );
+        if ((await this.head()) !== to)
+          throw new GitIntegrationError("stale-base");
+        await this.#compareAndSwap(this.#ref, to, from, checkout);
+      },
+    };
   }
 
   async protectedPaths(

@@ -30,7 +30,10 @@ import {
 
 type Review = "pass" | "revise" | "concern";
 type Decision = "approve" | "reject";
-export type DecisionOptions = { acknowledgeProtected?: readonly string[] };
+export type DecisionOptions = {
+  acknowledgeProtected?: readonly string[];
+  approvalId?: string;
+};
 type Event = Parameters<IntegrationJournal["append"]>[1];
 type IntegrationGit = Pick<
   LocalGitIntegration,
@@ -391,7 +394,7 @@ function latestPin(events: IntegrationEvent[], target: string) {
 }
 
 /** Host-only authority. Worker, Reviewer and verification get separate VMs.
- * The caller of decide must be the authenticated local operator entry point. */
+ * The caller of decide must enforce the host approval policy. */
 export class ReviewedIntegration {
   readonly #git: IntegrationGit;
   readonly #host: Pick<
@@ -426,6 +429,7 @@ export class ReviewedIntegration {
       worker: copy(plan.worker),
       reviewer: copy(plan.reviewer),
       verification,
+      ...(plan.allowUnverified ? { allowUnverified: true } : {}),
       workerSandbox: roleSandbox(plan.workerSandbox),
       onWorkerStderr: plan.onWorkerStderr,
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
@@ -951,10 +955,14 @@ export class ReviewedIntegration {
       ...expected.pin,
       decision,
       ...(protectedDigest ? { protectedDigest } : {}),
+      ...(options?.approvalId ? { approvalId: options.approvalId } : {}),
     });
   }
 
-  async integrate(id?: string): Promise<"completed" | "denied" | "uncertain"> {
+  async integrate(
+    id?: string,
+    options?: { allowUnverified?: true },
+  ): Promise<"completed" | "denied" | "uncertain"> {
     const events = await this.#journal.read();
     const { pin, review } = latestPin(events, await this.#target());
     const last = events.at(-1);
@@ -993,7 +1001,11 @@ export class ReviewedIntegration {
       await append({ kind: "denied", reason: "evidence" });
       return "denied";
     }
-    if (!(await this.#verify(pin, diff, append, id))) {
+    const skipVerification =
+      !this.#plan.verification &&
+      this.#plan.allowUnverified &&
+      options?.allowUnverified;
+    if (!skipVerification && !(await this.#verify(pin, diff, append, id))) {
       await append({ kind: "denied", reason: "verification" });
       return "denied";
     }

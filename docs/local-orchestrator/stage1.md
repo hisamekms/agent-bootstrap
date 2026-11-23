@@ -228,9 +228,11 @@ and attempts emergency VM teardown.
 
 Fake CLI tests cover argument construction, channel validation, digest
 compatibility and attach deadlines. The prior PoC exercised vsock, mounts
-and initial TTY behavior individually. The combined gateway and interactive
-session path, guest environment wrapper, and live TTY resize still need
-real-VM verification.
+and initial TTY behavior individually. The
+[Stage 1 live runs](stage1-live.md) exercised the combined gateway and
+interactive session path, including the launcher environment wrapper,
+auto mode, vsock Host API calls, session continuation and Planner dispatch.
+Live TTY resize and credential rotation remain unverified.
 
 Follow-up work
 

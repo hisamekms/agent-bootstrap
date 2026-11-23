@@ -68,6 +68,8 @@ type EventDetails = {
   "human.decided": {
     /** Digest of the sorted protected paths the operator acknowledged. */
     readonly protectedDigest?: string;
+    /** Joins the host decision to its authenticated approval record. */
+    readonly approvalId?: string;
   };
 };
 type Event = {
@@ -108,11 +110,19 @@ function decode(value: unknown): IntegrationEvent {
     kind === "candidate.created" && Object.hasOwn(data, "messageDigest");
   const hasProtectedDigest =
     kind === "human.decided" && Object.hasOwn(data, "protectedDigest");
+  const hasApprovalId =
+    kind === "human.decided" && Object.hasOwn(data, "approvalId");
+  if (
+    hasApprovalId &&
+    (typeof data.approvalId !== "string" || !uuidPattern.test(data.approvalId))
+  )
+    throw new Error("Invalid integration event fields");
   const optional = [
     hasTests,
     hasProtectedCount,
     hasMessageDigest,
     hasProtectedDigest,
+    hasApprovalId,
   ].filter(Boolean).length;
   if (
     hasProtectedCount &&
