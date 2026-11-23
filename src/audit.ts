@@ -1,12 +1,22 @@
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { types } from "node:util";
 import { canonicalizeIp } from "./egress-policy.ts";
 import {
   type ExecutionContext,
   parseExecutionContext,
 } from "./execution-context.ts";
+import { isConciergeVolumeName } from "./sandbox-runtime.ts";
+
+type AuditDetail =
+  | {
+      readonly socketPath: string;
+      readonly vsockPort: number;
+      readonly snapshotDir: string;
+      readonly volumeName: string;
+    }
+  | { readonly volumeName: string; readonly reused?: boolean };
 
 export type AuditInput = {
   readonly invocationId: string;
@@ -23,6 +33,8 @@ export type AuditInput = {
     | "sandbox.collect"
     | "sandbox.destroy"
     | "provider.egress"
+    | "volume.create"
+    | "volume.remove"
     | "unknown";
   readonly outcome?:
     "ok" | "denied" | "failed" | "timed-out" | "cancelled" | "interrupted";
@@ -37,6 +49,8 @@ export type AuditInput = {
   readonly profile?: "base" | "db" | "browser" | "concierge";
   /** Schema v4. Lowercase hex SHA-256 digest of the sandbox image. */
   readonly image?: string;
+  /** Schema v6. Host-owned channel or session-volume evidence. */
+  readonly detail?: AuditDetail;
 };
 
 export interface AuditSink {
@@ -117,6 +131,8 @@ const operations = [
   "sandbox.collect",
   "sandbox.destroy",
   "provider.egress",
+  "volume.create",
+  "volume.remove",
   "unknown",
 ];
 const outcomes = [
@@ -145,6 +161,7 @@ const inputKeys = [
   "role",
   "profile",
   "image",
+  "detail",
 ];
 
 const auditSchema = [
@@ -488,7 +505,15 @@ const v5Additions = [
 const schemaV5 = [...schemaV4, ...v5Additions];
 const auditTableV6 = auditTableV4
   .replace("'Verification'))", "'Verification','Concierge'))")
-  .replace("'base','db','browser'", "'base','db','browser','concierge'");
+  .replace("'base','db','browser'", "'base','db','browser','concierge'")
+  .replace(
+    "'provider.egress','unknown'",
+    "'provider.egress','volume.create','volume.remove','unknown'",
+  )
+  .replace(
+    /\n    \)$/,
+    ",\n      detail TEXT CHECK (detail IS NULL OR json_valid(detail))\n    )",
+  );
 const schemaV6 = [
   { name: "audit_events", sql: auditTableV6 },
   ...schemaV5.slice(1),
@@ -588,7 +613,78 @@ function parseInput(value: unknown): AuditInput {
       kind !== "operation.denied")
   )
     throw new AuditStoreError("invalid-event");
-  return result as AuditInput;
+  const detail = parseAuditDetail(
+    Object.hasOwn(descriptors, "detail"),
+    descriptors.detail?.value,
+    result,
+  );
+  return { ...result, ...(detail ? { detail } : {}) } as AuditInput;
+}
+
+function parseAuditDetail(
+  present: boolean,
+  value: unknown,
+  event: {
+    kind: string;
+    operation?: string;
+    role?: string;
+    profile?: string;
+    outcome?: string;
+  },
+): AuditDetail | undefined {
+  const { kind, operation, role, profile, outcome } = event;
+  if (operation === "volume.create" || operation === "volume.remove") {
+    const recordsReuse =
+      operation === "volume.create" &&
+      kind === "operation.finished" &&
+      outcome === "ok";
+    const detail = dataFields(
+      value,
+      recordsReuse ? ["volumeName", "reused"] : ["volumeName"],
+    );
+    if (role !== "Concierge" || !isConciergeVolumeName(detail.volumeName))
+      return invalidEvent();
+    if (!recordsReuse) return { volumeName: detail.volumeName };
+    if (typeof detail.reused !== "boolean") return invalidEvent();
+    return { volumeName: detail.volumeName, reused: detail.reused };
+  }
+  if (
+    role === "Concierge" &&
+    profile === "concierge" &&
+    operation === "sandbox.create" &&
+    kind === "operation.requested"
+  ) {
+    const detail = dataFields(value, [
+      "socketPath",
+      "vsockPort",
+      "snapshotDir",
+      "volumeName",
+    ]);
+    const { socketPath, snapshotDir, volumeName } = detail;
+    if (
+      !isInteractiveAuditPath(socketPath) ||
+      Buffer.byteLength(socketPath) >= 100 ||
+      !isInteractiveAuditPath(snapshotDir) ||
+      !isConciergeVolumeName(volumeName)
+    )
+      return invalidEvent();
+    return {
+      socketPath,
+      vsockPort: integer(detail.vsockPort, 1024, 65535),
+      snapshotDir,
+      volumeName,
+    };
+  }
+  if (present) return invalidEvent();
+}
+
+function isInteractiveAuditPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    isAbsolute(value) &&
+    resolve(value) === value &&
+    !/[\0:=,\r\n]/.test(value)
+  );
 }
 
 function parseClaimInput(value: unknown): RequestClaimInput {
@@ -662,6 +758,9 @@ function parseRow(value: unknown): AuditEvent {
     // Absent on version 1-3 rows.
     ...(row.profile == null ? {} : { profile: row.profile }),
     ...(row.image == null ? {} : { image: row.image }),
+    ...(row.detail == null
+      ? {}
+      : { detail: JSON.parse(String(row.detail)) as unknown }),
   });
   return { ...input, ...rowMetadata(row) };
 }
@@ -1288,7 +1387,10 @@ export class SqliteAudit implements AuditSink {
             );
             database.exec(auditTableV6);
             database.exec(`
-              INSERT INTO audit_events SELECT * FROM audit_events_previous;
+              INSERT INTO audit_events
+                (sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image)
+                SELECT sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image
+                FROM audit_events_previous;
               INSERT INTO sqlite_sequence (name, seq)
                 SELECT 'audit_events', seq FROM sqlite_sequence
                 WHERE name = 'audit_events_previous'
@@ -1419,7 +1521,9 @@ export class SqliteAudit implements AuditSink {
     const input = parseInput(event);
     if (
       this.#version < 6 &&
-      (input.role === "Concierge" || input.profile === "concierge")
+      (input.role === "Concierge" ||
+        input.profile === "concierge" ||
+        input.detail !== undefined)
     )
       throw new AuditStoreError("invalid-event");
     // Older traces must never silently lose profile or verification evidence.
@@ -1439,6 +1543,9 @@ export class SqliteAudit implements AuditSink {
         role: input.role ?? null,
         ...(this.#version >= 4
           ? { profile: input.profile ?? null, image: input.image ?? null }
+          : {}),
+        ...(this.#version >= 6
+          ? { detail: input.detail ? JSON.stringify(input.detail) : null }
           : {}),
       }),
     );

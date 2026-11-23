@@ -12,7 +12,10 @@ import type {
 } from "./audit.ts";
 import type { EgressGatewayOptions } from "./egress-gateway.ts";
 import {
+  INTERACTIVE_MAX_LIFETIME_MS,
+  isConciergeVolumeName,
   SandboxRuntimeError,
+  terminalEnvEntries,
   WORKER_MESSAGE_LIMIT,
 } from "./sandbox-runtime.ts";
 import { EgressPolicy, type HostService } from "./egress-policy.ts";
@@ -34,6 +37,7 @@ import {
 } from "./runtime-events.ts";
 import type {
   CollectedArtifacts,
+  ConciergeVolumeBackend,
   ExecResult,
   ResourceSample,
   SandboxCommand,
@@ -129,7 +133,8 @@ export interface HostObservabilityAudit extends AuditSink {
 
 /** The adapter must use this ID for the actual backend sandbox and enforce
  * spec.expectedNetRuleDigest before creating it. */
-export interface BoundSandboxRuntime extends SandboxRuntime {
+export interface BoundSandboxRuntime
+  extends SandboxRuntime, Partial<ConciergeVolumeBackend> {
   createBound(spec: SandboxSpec, sandboxId: string): Promise<SandboxHandle>;
   netRuleDigest(spec: SandboxSpec): string;
 }
@@ -241,7 +246,7 @@ export class HostAuditError extends Error {
 /** Executes isolated roles. Only Worker may request bounded collection. */
 export class TrustedHost {
   readonly #audit: AuditSink;
-  readonly #sandbox: SandboxRuntime;
+  readonly #sandbox: SandboxRuntime & Partial<ConciergeVolumeBackend>;
   readonly #profiles: ProfileCatalog;
 
   readonly #required:
@@ -266,7 +271,7 @@ export class TrustedHost {
   /** Omitting options retains the existing mandatory audit for offline callers. */
   constructor(
     audit: AuditSink,
-    sandbox: SandboxRuntime,
+    sandbox: SandboxRuntime & Partial<ConciergeVolumeBackend>,
     profiles: ProfileCatalog,
     options?: TrustedHostOptions,
   ) {
@@ -503,7 +508,9 @@ export class TrustedHost {
       profile !== "concierge" ||
       !interactive?.vsock ||
       (maxLifetimeMs !== undefined &&
-        (!Number.isSafeInteger(maxLifetimeMs) || maxLifetimeMs < 1)) ||
+        (!Number.isSafeInteger(maxLifetimeMs) ||
+          maxLifetimeMs < 1 ||
+          maxLifetimeMs > INTERACTIVE_MAX_LIFETIME_MS)) ||
       provider?.host !== "api.anthropic.com" ||
       (provider.port ?? 443) !== 443 ||
       options?.hostServices?.length ||
@@ -524,11 +531,11 @@ export class TrustedHost {
     const sandbox: SandboxSpec = {
       profile,
       provider,
-      interactive: {
-        vsock: { ...interactive.vsock },
+      interactive: Object.freeze({
+        vsock: Object.freeze({ ...interactive.vsock }),
         stateVolume: interactive.stateVolume,
         snapshotDir: interactive.snapshotDir,
-      },
+      }),
       ...(tools ? { tools: tools.map((tool) => ({ ...tool })) } : {}),
       maxLifetimeMs: maxLifetimeMs ?? DEFAULT_CONCIERGE_LIFETIME_MS,
     };
@@ -545,6 +552,78 @@ export class TrustedHost {
     return outcome === "ok"
       ? { id, outcome, value: value as T }
       : { id, outcome };
+  }
+
+  async prepareConciergeVolume(name: string): Promise<{ reused: boolean }> {
+    return this.#conciergeVolume(name, "volume.create", async () => {
+      const reused = (await this.#sandbox.createVolume!(name))?.reused;
+      if (typeof reused !== "boolean")
+        throw new SandboxRuntimeError("backend-failure");
+      return { reused };
+    });
+  }
+
+  async removeConciergeVolume(name: string): Promise<void> {
+    await this.#conciergeVolume(name, "volume.remove", () =>
+      this.#sandbox.removeVolume!(name),
+    );
+  }
+
+  async #conciergeVolume<T extends { reused: boolean } | void>(
+    volumeName: string,
+    operation: "volume.create" | "volume.remove",
+    effect: () => Promise<T>,
+  ): Promise<T> {
+    if (!isConciergeVolumeName(volumeName))
+      throw new SandboxRuntimeError("invalid-input");
+    const audit = this.#required?.audit;
+    if (
+      !audit ||
+      (operation === "volume.create"
+        ? !this.#sandbox.createVolume
+        : !this.#sandbox.removeVolume)
+    )
+      throw new SandboxRuntimeError("unsupported");
+    const invocationId = randomUUID();
+    const ensureAudit = () => {
+      if (!audit.isV5Writable) throw new HostAuditError(invocationId);
+    };
+    const append = async (
+      event: Pick<AuditInput, "kind" | "outcome" | "detail">,
+    ) => {
+      ensureAudit();
+      try {
+        await audit.append({
+          ...event,
+          invocationId,
+          role: "Concierge",
+          operation,
+        });
+      } catch {
+        throw new HostAuditError(invocationId);
+      }
+      ensureAudit();
+    };
+    await append({ kind: "operation.requested", detail: { volumeName } });
+    await append({ kind: "operation.allowed", detail: { volumeName } });
+    ensureAudit();
+    let result: T;
+    try {
+      result = await effect();
+    } catch (error) {
+      await append({
+        kind: "operation.finished",
+        outcome: "failed",
+        detail: { volumeName },
+      });
+      throw error;
+    }
+    await append({
+      kind: "operation.finished",
+      outcome: "ok",
+      detail: { volumeName, ...(result ? { reused: result.reused } : {}) },
+    });
+    return result;
   }
 
   #readOnly(
@@ -782,10 +861,26 @@ export class TrustedHost {
         ? Promise.resolve()
         : write(() => this.#audit.append({ ...event, invocationId: id, role }));
     const authorize = async (operation: Operation, allowed = true) => {
+      const interactive = sandbox.interactive;
       await append({
         kind: "operation.requested",
         operation,
-        ...(operation === "sandbox.create" ? { profile, image } : {}),
+        ...(operation === "sandbox.create"
+          ? {
+              profile,
+              image,
+              ...(interactive
+                ? {
+                    detail: {
+                      socketPath: interactive.vsock.hostPath,
+                      vsockPort: interactive.vsock.port,
+                      snapshotDir: interactive.snapshotDir,
+                      volumeName: interactive.stateVolume,
+                    },
+                  }
+                : {}),
+            }
+          : {}),
       });
       await append(
         allowed
@@ -955,6 +1050,13 @@ export class TrustedHost {
         let accepting = true;
         let pending: Promise<{ exitCode: number | null }> | undefined;
         outcome = "ok";
+        let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
+        const lifetime = sandbox.maxLifetimeMs!;
+        const deadline = performance.now() + lifetime;
+        const expired = Symbol("interactive lifetime expired");
+        const expiry = new Promise<typeof expired>((resolve) => {
+          lifetimeTimer = setTimeout(() => resolve(expired), lifetime);
+        });
         const execute = async (command: TerminalCommand) => {
           await authorize("sandbox.exec");
           ensureAudit();
@@ -963,20 +1065,32 @@ export class TrustedHost {
           emit("process.started", { outcome: "started" }, operationId);
           let exitCode: number | null = null;
           let attachFailure: { error: unknown } | undefined;
+          let attachOutcome: "ok" | "failed" | "timed-out";
           try {
             // Observers run synchronously and may have changed audit health.
             ensureAudit();
-            ({ exitCode } = await input.attach(current, command));
-            outcome = exitCode === 0 ? "ok" : "failed";
+            if (performance.now() >= deadline)
+              throw new SandboxRuntimeError("lifetime-expired");
+            const result = await Promise.race([
+              input.attach(current, command),
+              expiry,
+            ]);
+            if (result === expired)
+              throw new SandboxRuntimeError("lifetime-expired");
+            ({ exitCode } = result);
+            attachOutcome = exitCode === 0 ? "ok" : "failed";
           } catch (error) {
             if (error instanceof HostAuditError) throw error;
             attachFailure = { error };
-            outcome =
+            attachOutcome =
               error instanceof SandboxRuntimeError &&
-              error.code === "lifetime-expired"
+              (error.code === "lifetime-expired" || error.code === "timed-out")
                 ? "timed-out"
                 : "failed";
           }
+          // Invocation severity is timed-out > failed > ok.
+          if (attachOutcome === "timed-out" || outcome === "ok")
+            outcome = attachOutcome;
           const exit =
             exitCode === null
               ? { exitCode, signal: null, guestReported: false as const }
@@ -988,12 +1102,12 @@ export class TrustedHost {
               ...exit,
             }),
           );
-          await finish("sandbox.exec", outcome);
+          await finish("sandbox.exec", attachOutcome);
           emit(
             "process.exited",
             {
               ...exit,
-              outcome: executionOutcome(outcome),
+              outcome: executionOutcome(attachOutcome),
               durationMs: performance.now() - started,
             },
             operationId,
@@ -1010,13 +1124,6 @@ export class TrustedHost {
             }
           }, AUDIT_HEALTH_POLL_MS);
         });
-        let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
-        const expiry = new Promise<"expired">((resolve) => {
-          lifetimeTimer = setTimeout(
-            () => resolve("expired"),
-            sandbox.maxLifetimeMs,
-          );
-        });
         const callback = async () => {
           try {
             ensureAudit();
@@ -1029,13 +1136,19 @@ export class TrustedHost {
                     ),
                   );
                 ensureAudit();
-                const request = {
-                  ...command,
-                  argv: Array.isArray(command.argv)
-                    ? [...command.argv]
-                    : command.argv,
-                  ...(command.env ? { env: { ...command.env } } : {}),
-                };
+                let request: TerminalCommand;
+                try {
+                  const { argv, env, workdir } = command;
+                  request = {
+                    argv: Array.isArray(argv) ? [...argv] : argv,
+                    ...(workdir === undefined ? {} : { workdir }),
+                    ...(env === undefined
+                      ? {}
+                      : { env: Object.fromEntries(terminalEnvEntries(env)) }),
+                  };
+                } catch (error) {
+                  return Promise.reject(error);
+                }
                 pending = execute(request).finally(() => {
                   pending = undefined;
                 });
@@ -1055,9 +1168,10 @@ export class TrustedHost {
             unavailable,
             expiry,
           ]);
-          if (result === "expired") {
+          if (result === expired) {
             accepting = false;
-            // The runtime stops an active terminal at its own VM deadline.
+            // The attach races the same deadline and can finish auditing even
+            // if the adapter has yet to stop its terminal client.
             await Promise.race([
               pending?.catch((error: unknown) => {
                 if (error instanceof HostAuditError) throw error;

@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -1352,8 +1353,9 @@ test("tree collection failures and oversized tars clean up", async (t) => {
 async function interactiveFixture(t: TestContext) {
   const f = await fixture(t);
   // A Unix-domain socket needs a much shorter pathname than the worktree.
-  const root = await mkdtemp("/tmp/lo-msb-");
-  const hostPath = join(root, "api.sock");
+  const root = await mkdtemp(join(await realpath("/tmp"), "lo-msb-"));
+  const socketDir = join(root, "socket");
+  const hostPath = join(socketDir, "api.sock");
   const snapshotDir = join(root, "snapshot");
   const server = createServer();
   t.after(async () => {
@@ -1361,7 +1363,8 @@ async function interactiveFixture(t: TestContext) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   });
-  await mkdir(snapshotDir);
+  await mkdir(snapshotDir, { mode: 0o700 });
+  await mkdir(socketDir, { mode: 0o700 });
   const socketAvailable = await new Promise<boolean>((resolve, reject) => {
     server.once("error", (error: NodeJS.ErrnoException) => {
       if (error.code === "EPERM") resolve(false);
@@ -1452,7 +1455,7 @@ test("interactive create hashes exact host channels without changing non-interac
     assert.deepEqual(
       await runtime.attachTerminal(handle, {
         argv: ["claude", "--continue"],
-        env: { HOME: "/state", TERM: "xterm-256color" },
+        env: { TERM: "xterm-256color", LO_SESSION: "session-1" },
         workdir: "/state",
       }),
       { exitCode: 7 },
@@ -1467,8 +1470,8 @@ test("interactive create hashes exact host channels without changing non-interac
       "--",
       "/usr/bin/env",
       "--",
-      "HOME=/state",
       "TERM=xterm-256color",
+      "LO_SESSION=session-1",
       "claude",
       "--continue",
     ]);
@@ -1484,8 +1487,11 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
   const { vsock, snapshotDir } = interactive;
   const linkedSnapshot = join(root, "snapshot-link");
   const linkedSocket = join(root, "socket-link");
+  const linkedRoot = `${root}-link`;
+  t.after(() => rm(linkedRoot, { force: true }));
   await symlink(snapshotDir, linkedSnapshot);
   await symlink(vsock.hostPath, linkedSocket);
+  await symlink(root, linkedRoot);
   const invalidSpecs: SandboxSpec[] = [
     { profile: "concierge" },
     { ...spec, profile: "base" },
@@ -1511,6 +1517,7 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
     ...[
       "relative",
       linkedSocket,
+      join(linkedRoot, "socket", "api.sock"),
       snapshotDir,
       ...[":", ",", "=", "\0", "\n"].map((c) => vsock.hostPath + c),
       "/" + "é".repeat(50),
@@ -1533,6 +1540,7 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
       "relative",
       vsock.hostPath,
       linkedSnapshot,
+      join(linkedRoot, "snapshot"),
       linkedSnapshot + "/",
       ...[":", ",", "="].map((c) => snapshotDir + c),
     ].map((snapshotDir) => ({
@@ -1542,6 +1550,22 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
   ];
   for (const invalidSpec of invalidSpecs)
     await assert.rejects(runtime.create(invalidSpec), /invalid-input/);
+  const unsafe = join(root, "unsafe");
+  const nested = join(unsafe, "nested");
+  await mkdir(nested, { recursive: true, mode: 0o700 });
+  await chmod(unsafe, 0o777);
+  await assert.rejects(
+    runtime.create({
+      ...spec,
+      interactive: { ...interactive, snapshotDir: nested },
+    }),
+    /invalid-input/,
+  );
+  for (const mode of [0o500, 0o710, 0o740, 0o701, 0o1700]) {
+    await chmod(snapshotDir, mode);
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  }
+  await chmod(snapshotDir, 0o700);
   if (socketAvailable) {
     await chmod(vsock.hostPath, 0o660);
     await assert.rejects(runtime.create(spec), /invalid-input/);
@@ -1552,6 +1576,31 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
     await assert.rejects(runtime.create(spec), /invalid-input/);
   }
   assert.deepEqual(await events(), []);
+});
+
+test("interactive create rechecks host paths after asynchronous credential and gateway setup", async (t) => {
+  const { config, spec, interactive, events, socketAvailable } =
+    await interactiveFixture(t);
+  if (!socketAvailable)
+    return t.skip("Unix socket bind is blocked by the execution sandbox");
+  let passwordRequested = false;
+  const runtime = new MicrosandboxRuntime({
+    ...config,
+    profiles: new ProfileCatalog({ base: { image }, concierge: { image } }),
+    providers: [spec.provider],
+    credentials: { withAccessToken: (consume) => consume("fixture-token") },
+    gatewayPassword: async () => {
+      passwordRequested = true;
+      await chmod(interactive.snapshotDir, 0o755);
+      return gatewayPassword;
+    },
+  });
+  await assert.rejects(runtime.create(spec), /invalid-input/);
+  assert.equal(passwordRequested, true);
+  assert.equal(
+    (await events()).some(({ args }) => args[0] === "create"),
+    false,
+  );
 });
 
 test("terminal validation, exclusive attach and deadline use the existing handle", async (t) => {
@@ -1574,7 +1623,15 @@ test("terminal validation, exclusive attach and deadline use the existing handle
     { argv: ["claude"], env: { lowercase: "x" } },
     { argv: ["claude"], env: { ANTHROPIC_API_KEY: "fixture" } },
     { argv: ["claude"], env: { DATABASE_PASSWORD: "fixture" } },
+    { argv: ["claude"], env: { HOME: "/state" } },
+    { argv: ["claude"], env: { PATH: "/bin" } },
+    { argv: ["claude"], env: { LO_: "fixture" } },
+    { argv: ["claude"], env: { LO_lowercase: "fixture" } },
+    { argv: ["claude"], env: { ["LO_" + "X".repeat(41)]: "fixture" } },
     { argv: ["claude"], env: { TERM: "x\0y" } },
+    { argv: ["claude"], env: { TERM: "x\ny" } },
+    { argv: ["claude"], env: { TERM: "x\ry" } },
+    { argv: ["claude"], env: { TERM: "é".repeat(513) } },
     { argv: ["ANTHROPIC_API_KEY=fixture", "claude"], env: { TERM: "x" } },
   ];
   for (const command of invalid)
@@ -1588,7 +1645,7 @@ test("terminal validation, exclusive attach and deadline use the existing handle
     runtime.attachTerminal(handle, { argv: ["claude"] }),
     /busy/,
   );
-  assert.deepEqual(await hanging, { exitCode: null });
+  await assert.rejects(hanging, /lifetime-expired/);
   assert.deepEqual((await events()).at(-1)?.args, [
     "exec",
     "-t",
@@ -1609,9 +1666,9 @@ test("volume create tolerates existing volumes and rejects other failures and in
   const { runtime, events, setMode } = await fixture(t);
   await assert.rejects(runtime.createVolume("-o"), /invalid-input/);
   await assert.rejects(runtime.removeVolume("lo-../../"), /invalid-input/);
-  await runtime.createVolume("lo-session");
+  assert.deepEqual(await runtime.createVolume("lo-session"), { reused: false });
   await setMode("volume-exists");
-  await runtime.createVolume("lo-session");
+  assert.deepEqual(await runtime.createVolume("lo-session"), { reused: true });
   await setMode("volume-fail");
   await assert.rejects(runtime.createVolume("lo-session"), /backend-failure/);
   await assert.rejects(runtime.removeVolume("lo-session"), /backend-failure/);

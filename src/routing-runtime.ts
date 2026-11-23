@@ -3,6 +3,7 @@ import {
   SandboxRuntimeError,
   type CollectedArtifacts,
   type CollectSpec,
+  type ConciergeVolumeBackend,
   type ExecResult,
   type ResourceSample,
   type SandboxCommand,
@@ -18,7 +19,7 @@ export interface RuntimeRoute {
   /** The one provider binding this runtime serves; omit for the route used
    * by specs without provider egress. */
   readonly provider?: SandboxProvider;
-  readonly runtime: SandboxRuntime;
+  readonly runtime: SandboxRuntime & Partial<ConciergeVolumeBackend>;
 }
 
 /**
@@ -128,7 +129,7 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     return owner.attachTerminal(handle, command);
   }
 
-  #volumeRuntime(): SandboxRuntime {
+  #volumeRuntime(): ConciergeVolumeBackend {
     // Volume operations have no handle. Prefer the Concierge provider's
     // backend, or require a unique volume backend in other deployments.
     const concierge = this.#routes.filter(
@@ -149,15 +150,15 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
       candidates.size !== 1
     )
       throw new SandboxRuntimeError("unsupported");
-    return runtime;
+    return runtime as ConciergeVolumeBackend;
   }
 
-  async createVolume(name: string): Promise<void> {
-    await this.#volumeRuntime().createVolume!(name);
+  async createVolume(name: string): Promise<{ reused: boolean }> {
+    return this.#volumeRuntime().createVolume(name);
   }
 
   async removeVolume(name: string): Promise<void> {
-    await this.#volumeRuntime().removeVolume!(name);
+    await this.#volumeRuntime().removeVolume(name);
   }
 
   collect(

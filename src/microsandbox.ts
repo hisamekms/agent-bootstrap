@@ -22,11 +22,14 @@ import {
 } from "./microsandbox-metrics.ts";
 import { PROFILE_NAMES, ProfileCatalog } from "./sandbox-profiles.ts";
 import {
+  INTERACTIVE_MAX_LIFETIME_MS,
+  isConciergeVolumeName,
   isSafeCredentialVariable,
   sameProvider,
   SandboxRuntimeError,
   WORKER_MESSAGE_LIMIT,
   WORKER_MESSAGE_PATH,
+  terminalEnvEntries,
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
@@ -78,7 +81,7 @@ export const MICROSANDBOX_LIMITS = {
   commandTimeoutMs: 240_000,
   defaultLifetimeMs: 120_000,
   maxLifetimeMs: 300_000,
-  interactiveMaxLifetimeMs: 12 * 60 * 60 * 1000,
+  interactiveMaxLifetimeMs: INTERACTIVE_MAX_LIFETIME_MS,
   backendTimeoutMs: 15_000,
   tools: 8,
   toolBytes: 512 * 1024 * 1024,
@@ -248,8 +251,7 @@ function providerArgs(
 }
 
 function checkVolumeName(name: string): void {
-  if (typeof name !== "string" || !/^lo-[a-z0-9][a-z0-9-]{0,62}$/.test(name))
-    invalid();
+  if (!isConciergeVolumeName(name)) invalid();
 }
 
 function interactiveArgs(spec: SandboxSpec): string[] {
@@ -301,18 +303,29 @@ function checkInteractivePaths(spec: InteractiveSpec): void {
     snapshotDir,
   } = spec;
   const uid = process.getuid?.();
+  if (uid === undefined) invalid();
+  // Check from the root down so lstat never traverses an unchecked parent.
+  const checkDir = (path: string, snapshot = false): void => {
+    const parent = dirname(path);
+    if (parent !== path) checkDir(parent);
+    const info = lstatSync(path, { throwIfNoEntry: false });
+    if (!info?.isDirectory()) invalid();
+    const mode = info.mode & 0o7777;
+    if (
+      snapshot
+        ? info.uid !== uid || mode !== 0o700
+        : (info.uid !== uid && info.uid !== 0) ||
+          ((mode & 0o022) !== 0 && !(info.uid === 0 && mode === 0o1777))
+    )
+      invalid();
+  };
+  checkDir(snapshotDir, true);
+  checkDir(dirname(hostPath));
   const socket = lstatSync(hostPath, { throwIfNoEntry: false });
-  const parent = lstatSync(dirname(hostPath), { throwIfNoEntry: false });
-  const snapshot = lstatSync(snapshotDir, { throwIfNoEntry: false });
   if (
-    uid === undefined ||
     !socket?.isSocket() ||
     socket.uid !== uid ||
-    (socket.mode & 0o7777) !== 0o600 ||
-    !parent?.isDirectory() ||
-    (parent.mode & 0o022) !== 0 ||
-    !snapshot?.isDirectory() ||
-    snapshot.uid !== uid
+    (socket.mode & 0o7777) !== 0o600
   )
     invalid();
 }
@@ -325,27 +338,14 @@ function terminalArgs(command: TerminalCommand): string[] {
     [...command.argv].some(
       (arg) => typeof arg !== "string" || arg.includes("\0"),
     ) ||
-    (command.env !== undefined &&
-      (!command.env ||
-        typeof command.env !== "object" ||
-        Array.isArray(command.env))) ||
     (command.workdir !== undefined &&
       command.workdir !== "/repo" &&
       command.workdir !== "/state")
   )
     invalid();
-  const assignments = Object.entries(command.env ?? {}).map(([name, value]) => {
-    if (
-      !/^[A-Z][A-Z0-9_]{0,63}$/.test(name) ||
-      /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTHORIZATION)(?:_|$)/.test(
-        name,
-      ) ||
-      typeof value !== "string" ||
-      value.includes("\0")
-    )
-      invalid();
-    return `${name}=${value}`;
-  });
+  const assignments = terminalEnvEntries(command.env).map(
+    ([name, value]) => `${name}=${value}`,
+  );
   if (!assignments.length) return [...command.argv];
   // env interprets leading NAME=value arguments as assignments, even after --.
   if (!command.argv[0] || command.argv[0].includes("=")) invalid();
@@ -608,7 +608,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
 
   async #createBackend(
     state: State,
-    args: readonly string[],
+    buildArgs: () => readonly string[],
     gateway?: SandboxEgressGateway,
     provider?: SandboxProvider,
     interactive?: InteractiveSpec,
@@ -632,6 +632,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           invalid();
         env[gateway.passwordEnv] = password;
       }
+      const args = buildArgs();
       if (interactive) checkInteractivePaths(interactive);
       // A failed CLI create can leave a partially created sandbox.
       state.removed = false;
@@ -834,7 +835,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         if (!info.isFile() || info.size > MICROSANDBOX_LIMITS.treeBytes)
           invalid();
       }
-      state = {
+      const current: State = {
         id: sandboxId,
         ...(bound
           ? { cleanupLabel: `agent-bootstrap-create=${randomUUID()}` }
@@ -846,14 +847,15 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         closed: false,
         removed: true,
       };
-      const createArgs = [
+      state = current;
+      const createArgs = () => [
         "create",
         "--name",
-        state.id,
+        current.id,
         ...(invocationId
           ? ["--label", `agent-bootstrap-invocation=${invocationId}`]
           : []),
-        ...(state.cleanupLabel ? ["--label", state.cleanupLabel] : []),
+        ...(current.cleanupLabel ? ["--label", current.cleanupLabel] : []),
         "--pull",
         "never",
         ...networkArgs,
@@ -1018,13 +1020,20 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const stop = () => {
       child.kill("SIGKILL");
     };
-    const timer = setTimeout(stop, Math.ceil(remaining));
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      stop();
+    }, Math.ceil(remaining));
     const finished = new Promise<{ exitCode: number | null }>(
       (resolve, reject) => {
         child.once("error", () =>
           reject(new SandboxRuntimeError("backend-failure")),
         );
-        child.once("close", (exitCode) => resolve({ exitCode }));
+        child.once("close", (exitCode) => {
+          if (expired) reject(new SandboxRuntimeError("lifetime-expired"));
+          else resolve({ exitCode });
+        });
       },
     ).finally(() => {
       clearTimeout(timer);
@@ -1036,7 +1045,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     return finished;
   }
 
-  async createVolume(name: string): Promise<void> {
+  async createVolume(name: string): Promise<{ reused: boolean }> {
     checkVolumeName(name);
     const result = await this.#run(
       ["volume", "create", name],
@@ -1048,6 +1057,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         !/already exists/i.test(result.stderr.toString("utf8")))
     )
       throw new SandboxRuntimeError(result.failure ?? "backend-failure");
+    return { reused: result.code !== 0 };
   }
 
   async removeVolume(name: string): Promise<void> {

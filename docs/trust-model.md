@@ -42,15 +42,35 @@ and reserves approval for the operator. Network egress reaches only
 placeholder. Claude Code settings, hooks, MCP and tool allowlists are
 auxiliary controls. The VM and trusted host enforce the boundary.
 
+The adapter checks each component of the socket and snapshot paths from the
+root using `lstat`, and repeats the checks immediately before launching VM
+creation. Ancestors must be real directories owned by the host uid or root
+without group or other write bits. Root-owned sticky directories with mode
+`1777`, such as `/private/tmp` (or a real `/tmp`), may be ancestors. On macOS,
+use `/private/tmp` directly because `/tmp` is a symlink. The snapshot directory
+itself must belong to the host uid and have mode `0700`. The remaining race
+between the final check and backend use requires a same-uid attacker
+(assuming trusted root). That attacker can already read the host user's data
+and is outside this threat model.
+
+The operator's terminal is a trust boundary. The guest controls the bytes
+sent to the terminal, including through a prompt-injected Concierge. OSC 52
+can write to the clipboard, OSC 8 can display deceptive links, and title
+escapes can alter the window title. Terminal report queries can return
+emulator or session information to the guest over terminal input. Disable
+OSC 52 clipboard access in the terminal emulator before attaching.
+
 ## Runtime observability
 
 SQLite v6 is the authoritative audit store. In required mode the trusted
-host records the sandbox binding and create-channel digest before creation, and the
+host records the sandbox binding and create-channel digest before creation,
+and records the interactive host channels in the create request's event detail. The
 host gateway records TCP and DNS decisions before the corresponding outbound
 connect or policy reply. Audit failure stops normal execution and triggers
 emergency teardown. JSONL and OTLP files are analysis copies with no tamper
 resistance against the host user or administrator. Treat the audit database
-and its export as sensitive because they hold raw guest-controlled DNS names.
+and its export as sensitive because they hold host paths and raw
+guest-controlled DNS names.
 Telemetry is best effort and leaves the audit unchanged.
 
 The Microsandbox 0.7.16 netstack and `--proxy` are part of the trusted

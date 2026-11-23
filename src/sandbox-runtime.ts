@@ -82,6 +82,34 @@ export interface TerminalCommand {
   readonly workdir?: "/repo" | "/state";
 }
 
+export const INTERACTIVE_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
+
+export function isConciergeVolumeName(name: unknown): name is string {
+  return typeof name === "string" && /^lo-[a-z0-9][a-z0-9-]{0,62}$/.test(name);
+}
+
+export function terminalEnvEntries(
+  env: TerminalCommand["env"],
+): [string, string][] {
+  if (env === undefined) return [];
+  if (!env || typeof env !== "object" || Array.isArray(env))
+    throw new SandboxRuntimeError("invalid-input");
+  const entries = Object.entries(env);
+  for (const [name, value] of entries) {
+    if (
+      (!["TERM", "COLORTERM", "LANG", "LC_ALL", "COLUMNS", "LINES"].includes(
+        name,
+      ) &&
+        !/^LO_[A-Z0-9_]{1,40}$/.test(name)) ||
+      typeof value !== "string" ||
+      /[\0\r\n]/.test(value) ||
+      Buffer.byteLength(value) > 1024
+    )
+      throw new SandboxRuntimeError("invalid-input");
+  }
+  return entries;
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -179,6 +207,12 @@ export interface SandboxSession {
   readonly finished: Promise<ExecResult["status"]>;
 }
 
+/** Host adapter capability. Callers authorize volume operations through TrustedHost. */
+export interface ConciergeVolumeBackend {
+  createVolume(name: string): Promise<{ reused: boolean }>;
+  removeVolume(name: string): Promise<void>;
+}
+
 export interface SandboxRuntime {
   /** Computes the network and interactive host-channel argv digest before the host authorizes create. */
   netRuleDigest?(spec: SandboxSpec): string;
@@ -195,8 +229,6 @@ export interface SandboxRuntime {
     handle: SandboxHandle,
     command: TerminalCommand,
   ): Promise<{ exitCode: number | null }>;
-  createVolume?(name: string): Promise<void>;
-  removeVolume?(name: string): Promise<void>;
   collect(
     handle: SandboxHandle,
     spec: CollectSpec,

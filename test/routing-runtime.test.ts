@@ -127,6 +127,7 @@ test("interactive terminals follow the handle and volume operations follow the C
     ...fake(name, calls),
     async createVolume(volume: string) {
       calls.push(`${name}:create-volume:${volume}`);
+      return { reused: true };
     },
     async removeVolume(volume: string) {
       calls.push(`${name}:remove-volume:${volume}`);
@@ -154,7 +155,9 @@ test("interactive terminals follow the handle and volume operations follow the C
     runtime.create({ provider: openai, profile: "concierge", interactive }),
     /unsupported/,
   );
-  await runtime.createVolume(interactive.stateVolume);
+  assert.deepEqual(await runtime.createVolume(interactive.stateVolume), {
+    reused: true,
+  });
   const handle = await runtime.create({
     provider: anthropic,
     profile: "concierge",
@@ -184,6 +187,7 @@ test("volume operations refuse a Concierge backend without volume support", asyn
         ...fake("openai", calls),
         async createVolume() {
           calls.push("wrong create");
+          return { reused: false };
         },
         async removeVolume() {
           calls.push("wrong remove");

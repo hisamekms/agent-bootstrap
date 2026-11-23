@@ -635,6 +635,12 @@ test("v5 upgrade preserves existing history, the sequence watermark and append-o
     role: "Concierge",
     profile: "concierge",
     image: digest,
+    detail: {
+      socketPath: "/fixture/api.sock",
+      vsockPort: 5000,
+      snapshotDir: "/fixture/repo",
+      volumeName: "lo-session",
+    },
   });
   audit.append({ ...started, role: "Reviewer" });
   const [, concierge, reviewer] = audit.read(invocationId);
