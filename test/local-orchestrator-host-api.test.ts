@@ -13,6 +13,7 @@ import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, beforeEach, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   HostApiServer,
   type ExecutionRequester,
@@ -145,6 +146,41 @@ function apiCalls() {
     .reverse();
 }
 
+async function queuePlanner(client: Awaited<ReturnType<typeof connect>>) {
+  const { isError, data } = await client.call("request_planner", {
+    mode: "goal-design",
+    brief: "Plan",
+  });
+  assert.equal(isError, false);
+  return data.executionId as string;
+}
+
+function waitRequest(id: string, timeoutSeconds?: number, requestId = 100) {
+  return wire("tools/call", requestId, {
+    name: "wait_execution",
+    arguments: { id, timeoutSeconds },
+  });
+}
+
+async function beginWait(
+  client: Awaited<ReturnType<typeof connect>>,
+  id: string,
+) {
+  client.socket.write(waitRequest(id) + wire("ping", 101));
+  assert.deepEqual(await client.reply(), {
+    jsonrpc: "2.0",
+    id: 101,
+    result: {},
+  });
+}
+
+async function waitReply(client: Awaited<ReturnType<typeof connect>>) {
+  const { id, result } = await client.reply();
+  assert.equal(id, 100);
+  assert.equal(result.isError, undefined);
+  return JSON.parse(result.content[0].text);
+}
+
 test("negotiates MCP versions, lists scoped tools and pipelines notifications", async () => {
   const client = await listen();
   assert.equal(statSync(options.socketPath).mode & 0o777, 0o600);
@@ -185,6 +221,7 @@ test("negotiates MCP versions, lists scoped tools and pipelines notifications", 
       "list_goals",
       "get_goal",
       "get_execution",
+      "wait_execution",
       "draft_goal",
       "draft_task",
       "request_planner",
@@ -195,6 +232,17 @@ test("negotiates MCP versions, lists scoped tools and pipelines notifications", 
     assert.equal(tool.inputSchema.additionalProperties, false);
     assert.equal(typeof tool.description, "string");
   }
+  const wait = result.tools.find(
+    ({ name }: { name: string }) => name === "wait_execution",
+  );
+  assert.match(wait.description, /request_planner/);
+  assert.deepEqual(wait.inputSchema.required, ["id"]);
+  assert.deepEqual(wait.inputSchema.properties.timeoutSeconds, {
+    type: "integer",
+    minimum: 1,
+    maximum: 60,
+    default: 30,
+  });
   assert.equal((await client.request("approve")).error.code, -32601);
   assert.deepEqual(await client.call("approve"), {
     isError: true,
@@ -492,6 +540,177 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   assert.ok(!JSON.stringify(calls).includes("Break it down"));
 });
 
+test(
+  "wait_execution returns a finished execution immediately",
+  { timeout: 2000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    store.startExecution(id);
+    store.finishExecution(id, "succeeded", { tasks: 1 });
+    assert.deepEqual(
+      await client.call("wait_execution", { id, timeoutSeconds: 60 }),
+      await client.call("get_execution", { id }),
+    );
+  },
+);
+
+test(
+  "wait_execution returns on completion and audits authorization and outcome",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    store.startExecution(id);
+    await beginWait(client, id);
+    const waitEvents = () =>
+      store
+        .listEvents({ subjectId: options.sessionId, limit: 100 })
+        .filter(
+          ({ data }) => (data as { tool?: string }).tool === "wait_execution",
+        )
+        .reverse();
+    const [authorized] = waitEvents();
+    assert.deepEqual(
+      waitEvents().map(({ kind }) => kind),
+      ["host-api.authorized"],
+    );
+    const result = { message: "result omitted from audit" };
+    store.finishExecution(id, "failed", result);
+    assert.deepEqual(await waitReply(client), { id, status: "failed", result });
+    const events = waitEvents();
+    assert.deepEqual(
+      events.map(({ kind }) => kind),
+      ["host-api.authorized", "host-api.call"],
+    );
+    const call = events[1]!;
+    assert.equal(call.executionId, id);
+    const authData = authorized!.data as { callId: string; durationMs: number };
+    assert.partialDeepStrictEqual(call.data, {
+      callId: authData.callId,
+      code: "ok",
+      outcome: "ok",
+    });
+    assert.ok(
+      (call.data as { durationMs: number }).durationMs > authData.durationMs,
+    );
+    assert.ok(!JSON.stringify(events).includes(result.message));
+  },
+);
+
+test(
+  "wait_execution times out with the current execution and waiting flag",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    assert.deepEqual(
+      await client.call("wait_execution", { id, timeoutSeconds: 1 }),
+      {
+        isError: false,
+        data: { id, status: "queued", result: null, waiting: true },
+      },
+    );
+    assert.ok(
+      (apiCalls().at(-1)!.data as { durationMs: number }).durationMs >= 1000,
+    );
+  },
+);
+
+test(
+  "wait_execution returns the current state when the session ends",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    store.startExecution(id);
+    await beginWait(client, id);
+    store.endSession(options.sessionId);
+    assert.deepEqual(await waitReply(client), {
+      id,
+      status: "running",
+      result: null,
+    });
+  },
+);
+
+test(
+  "a pipelined call is served during a wait and a second wait is denied",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    client.socket.write(waitRequest(id) + waitRequest(id, 60, 102));
+    const { id: requestId, result } = await client.reply();
+    assert.equal(requestId, 102);
+    assert.equal(result.isError, true);
+    assert.deepEqual(JSON.parse(result.content[0].text), {
+      code: "wait-in-progress",
+    });
+    assert.equal(
+      (await client.call("get_execution", { id })).data.status,
+      "queued",
+    );
+    store.startExecution(id);
+    store.finishExecution(id, "timed-out", {});
+    assert.deepEqual(await waitReply(client), {
+      id,
+      status: "timed-out",
+      result: {},
+    });
+  },
+);
+
+test(
+  "disconnect ends the wait and lets the Host API close promptly",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    await beginWait(client, id);
+    client.socket.destroy();
+    await client.closed;
+    // Observe cancellation before closing the server, which also stops an active wait.
+    for (let i = 0; i < 100 && apiCalls().length < 2; i++) await delay(10);
+    assert.equal(apiCalls().at(-1)?.executionId, id);
+    await server?.close();
+  },
+);
+
+test(
+  "closing the Host API ends and audits an active wait",
+  { timeout: 3000 },
+  async () => {
+    const client = await listen();
+    const id = await queuePlanner(client);
+    await beginWait(client, id);
+    await server?.close();
+    await client.closed;
+    assert.equal(apiCalls().at(-1)?.executionId, id);
+  },
+);
+
+test(
+  "wait_execution rejects invalid timeouts and reports unknown IDs",
+  { timeout: 2000 },
+  async () => {
+    const client = await listen();
+    for (const timeoutSeconds of [0, 61, 1.5, "1", null]) {
+      assert.deepEqual(
+        await client.call("wait_execution", { id: "unknown", timeoutSeconds }),
+        {
+          isError: true,
+          data: { code: "invalid-arguments" },
+        },
+      );
+    }
+    assert.deepEqual(await client.call("wait_execution", { id: "unknown" }), {
+      isError: true,
+      data: { code: "not-found" },
+    });
+  },
+);
+
 test("returns fixed tool errors without leaking input into responses or audit", async () => {
   const marker = "UNIQUE-PRIVATE-MARKER";
   const failingRequester = {
@@ -586,8 +805,14 @@ test("a failed authorization audit prevents reads, drafts and queueing", async (
     reads++;
     return getHostApiStatus();
   };
+  const getExecution = store.getExecution.bind(store);
+  store.getExecution = (id) => {
+    reads++;
+    return getExecution(id);
+  };
   for (const result of [
     await client.call("status"),
+    await client.call("wait_execution", { id: "unknown" }),
     await client.call("draft_goal", { content: goalContent }),
     await client.call("request_planner", {
       mode: "goal-design",

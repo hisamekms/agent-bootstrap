@@ -63,9 +63,9 @@ operator to approve.
 
 ## Follow-ups
 
-- Add a Host API tool that waits for an execution using a bounded long poll,
-  for example up to 60 seconds. The Concierge polled `get_execution` five times
-  while the Planner was running, then stopped.
+- Done. The Host API now offers `wait_execution` for up to 60 seconds. In run 3,
+  the Concierge polled `get_execution` five times while the Planner was running,
+  then stopped.
 - Consider documenting denied update, changelog, and plugin lookups as expected
   audit noise. They did not block the session.
 - Add the host PTY relay that filters terminal escapes, already listed in the
