@@ -134,8 +134,9 @@ to record who answered each gate.
 - Mount a read-only repository snapshot taken from the checkout.
   Keep session state on a named volume for continuation.
 - Expose a dedicated per-VM host Unix socket with `msb create --vsock`.
-  The host uses the socket identity as the client identity. The Host API
-  needs no network egress.
+  Use `socat` in the `concierge` profile as the guest relay to the Host
+  API over vsock (CID 2). The host uses the socket identity as the client
+  identity. The Host API needs no network egress.
 - Allow egress only to `api.anthropic.com`. The existing host gateway
   enforces this outside the VM.
 - Allow the Concierge to read, draft proposals, request actor executions
@@ -234,16 +235,19 @@ common cost budget across actors.
 | 3     | Integration and the full end-to-end cycle. Start dagq-lite development on it.                                   |
 | 4     | Researcher with public-internet policy, and replanning                                                          |
 
-Before Stage 1, run a PoC for:
+The Stage 1 PoC covered:
 
-- `msb --vsock` via `msb create --vsock`;
+- `msb create --vsock`;
+- read-only repository mounts;
 - `msb exec -t` TTY behavior;
-- named-volume session continuation;
+- named-volume persistence across VM recreation;
 - `msb exec -d` and `msb attach`;
 - `msb modify --secret` on a running VM.
 
-All five are unverified for this design. Stage 1 depends on evidence
-from the PoC before it can rely on them.
+See the [Concierge PoC evidence](front-poc.md). Live terminal resize and
+credential rotation at egress remain unverified. Recheck live resize
+with Claude Code in Stage 1. On credential expiry, recreate the VM and
+reuse the named volume to continue the session.
 
 The stages put the conversation and approval path first. The full
 development cycle can start dogfooding before research and replanning
@@ -270,8 +274,6 @@ are added.
   account for task counts and budgets.
 - **Approver model.** Decide whether the agent approver should use a
   different model or provider from the producing actor.
-- **Guest vsock client.** Confirm which client for `--vsock` is available
-  in the guest profile.
 
 ## Follow-ups
 

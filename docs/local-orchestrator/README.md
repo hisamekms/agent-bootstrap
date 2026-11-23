@@ -2,6 +2,8 @@
 
 Status: proposed (2026-11-23). See [ADR 0001](adr-0001-local-orchestrator.md).
 
+Stage 1 evidence is recorded in the [Concierge PoC](front-poc.md).
+
 | Stage | Content                                                                                                         |
 | ----- | --------------------------------------------------------------------------------------------------------------- |
 | 1     | Concierge (VM, vsock, read-only mount, session continuation), Planner, approval CLI, Goal and Task registration |
