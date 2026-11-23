@@ -72,28 +72,58 @@ Both paths use the same authorization, status and audit records.
 ### D5. Bind approvals to host state
 
 - **Goals.** The Concierge and Planner can only create Goal Proposals.
-  Registering a Goal requires human approval through a separate host
-  CLI path outside the guest and the actor API. The host authenticates the
-  operator and binds the approval to the content digest, including the
-  structured scope. Any change requires re-approval.
+  The `goal-registration` gate applies before the host registers a Goal.
+  The content digest includes the structured scope.
 - **Tasks.** The Planner creates Task Proposals. The host auto-registers a
   task only if it mechanically fits the approved Goal's structured scope.
   Examples include allowed repository paths, sandbox profiles and actors,
   a maximum task count, and time, retry and cost budgets. The host never
   interprets natural language to determine scope. Proposals outside scope
-  do not auto-register. The host enforces the approved grants and budgets
-  during execution and checks collected paths before integration.
-- **Integration.** Integration into `main` requires human approval.
-  Reuse the reviewed integration design and its pinned candidate and base
-  checks. See [repository environments](../repository-environments.md).
+  go through the `task-registration` gate. In-scope auto-registration
+  has no gate.
+- **Integration.** The `integration` gate applies to changes entering
+  `main`. Reuse the reviewed integration design. See
+  [repository environments](../repository-environments.md).
 
-No actor holds approval authority. Record who answered each human gate,
-whether the operator or an agent acting for them. This provenance is
-already a [dagq-lite follow-up](../observability/guarantees.md#dagq-lite-follow-ups).
-An answer from an agent cannot satisfy a gate that requires human approval.
+Each gate has an approval policy of `human` or `agent`. The host resolves
+the effective policy using Task override > Goal override > Goal-creation
+request > project default.
+Project defaults start at `human` for all gates. Only the operator CLI
+can change them. Store them in host-side project configuration outside
+both actor-writable workspaces and the repository that actors change.
 
-The operator approves a bounded Goal once and can let in-scope tasks
-proceed. The separate CLI path keeps approval authority with the host.
+Any source can tighten a policy from `agent` to `human`. A request or
+override that loosens a policy from `human` to `agent` is part of the
+content to approve. The host applies the loosening only after that content
+is approved under the prior `human` policy. A request relayed by the
+Concierge cannot loosen a policy on its own because the host cannot
+distinguish the operator's words from the Concierge's. With a `human`
+default, a Goal proposal requesting `integration: agent` needs human
+Goal approval. After that approval, the Goal's integrations may be
+agent-approved.
+
+For a `human` gate, the host authenticates the operator through a separate
+CLI path outside the guest and the actor API. An agent answer cannot
+satisfy a gate whose effective policy is `human`. For an `agent` gate,
+the host starts a dedicated Reviewer execution in `approval` mode. The
+Concierge and the actor that produced the proposal or candidate are
+ineligible to answer. The approval execution receives only the
+digest-bound content and returns a structured verdict. The host binds
+each approval to the content digest. Any content change requires
+re-approval.
+
+The host authorizes registration and integration. It checks scope fit,
+budgets and required verification results regardless of the answerer.
+For integration, it checks the pinned candidate and rejects stale bases.
+The host enforces approved grants and budgets during execution and checks
+collected paths before integration.
+
+For every gate answer, the host records the gate, effective policy and
+its source (`default`, `request`, `goal` or `task`), answerer kind
+(`human` or `agent`), approval execution ID and model for agent answers,
+content digest and decision. This fulfils the
+[dagq-lite follow-up](../observability/guarantees.md#dagq-lite-follow-ups)
+to record who answered each gate.
 
 ### D6. Run the Concierge as the front UI
 
@@ -221,8 +251,10 @@ are added.
 
 - The host owns scheduling, scope checks and lifecycle state for local work.
   The model roles operate within grants issued by the host.
-- The operator uses the host CLI for Goal approval and the existing reviewed
-  integration gate for changes to `main`.
+- The operator answers gates with a `human` policy through the host CLI.
+  Opting into `agent` approval can speed up autonomous development loops.
+  A compromised or mistaken approval execution can approve bad work.
+  Mechanical checks, digest binding, budgets and the audit bound that risk.
 - The Concierge design depends on the Stage 1 prerequisites. Research
   egress and replanning arrive in Stage 4.
 - Keep the layer small enough to retire when dagq-lite can develop itself.
@@ -234,6 +266,8 @@ are added.
   audit-only handling and human confirmation before sending the request.
 - **Goal scope schema.** Define the field types, path matching and how to
   account for task counts and budgets.
+- **Approver model.** Decide whether the agent approver should use a
+  different model or provider from the producing actor.
 - **Guest vsock client.** Confirm which client for `--vsock` is available
   in the guest profile.
 
