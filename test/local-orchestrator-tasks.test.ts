@@ -594,6 +594,29 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         calls.push("review");
         invocationIds.push(id!);
         assert.equal(plan.command.timeoutMs, 240_000);
+        const [instructions, data, noteLimit, contract] =
+          plan.command.argv[4]!.split("\n");
+        assert.match(
+          instructions!,
+          /\/review\/candidate\.diff and \/review\/candidate\.message/,
+        );
+        assert.match(instructions!, /Do not edit anything/);
+        assert.doesNotMatch(
+          plan.command.argv[4]!,
+          /\/workspace|commit message|review-notes|\/tmp\/agent-bootstrap/,
+        );
+        assert.deepEqual(JSON.parse(data!), {
+          title: "Task",
+          description: attack,
+          acceptance: ["Valid docs"],
+          paths: ["docs/"],
+        });
+        assert.equal(noteLimit, "Keep revision notes within 2048 UTF-8 bytes.");
+        assert.equal(
+          contract,
+          'Reply with only one JSON object, no code fences, no other text: {"review":"pass"} or {"review":"revise","notes":"..."} with notes at most 1500 characters.',
+        );
+        assert.ok(plan.command.argv[4]!.endsWith(contract!));
         assert.ok(
           plan.sandbox.readOnlyFiles?.find(
             (file) => file.path === "candidate.diff",
@@ -604,7 +627,8 @@ test("real Git composes tree mode, path rejection, verification, review and oper
           outcome: "ok",
           response: Buffer.from(
             JSON.stringify({
-              result: '{"review":"pass","notes":"Looks good"}',
+              result:
+                '  ```json\n{"review":"pass","notes":"Looks good"}\n```\n',
               usage: {
                 input_tokens: 5,
                 output_tokens: 6,
@@ -689,6 +713,99 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   );
   assert.equal(store.getProposal(proposal.id)?.status, "approved");
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+});
+
+test("strict review concerns retain raw answers and operator retries start fresh journals", async () => {
+  const repoRoot = join(root, "source");
+  const directory = join(root, "runtime");
+  mkdirSync(repoRoot);
+  mkdirSync(directory, { mode: 0o700 });
+  const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
+  git(["init", "--template=", "--initial-branch=main"]);
+  const docs = join(repoRoot, "docs");
+  mkdirSync(docs);
+  const file = join(docs, "a.md");
+  writeFileSync(file, "before\n");
+  git(["add", "."]);
+  git(["commit", "-m", "initial"]);
+  writeFileSync(file, "after\n");
+  const tree = Buffer.from(
+    command("/usr/bin/tar", repoRoot, [
+      "--format",
+      "ustar",
+      "-cf",
+      "-",
+      "docs",
+    ]),
+  );
+  const taskId = task(goal());
+  const prose = 'Here is the verdict: {"review":"pass"}'.padEnd(4094, "x");
+  const longNotes = JSON.stringify({
+    review: "revise",
+    notes: "é".repeat(1100),
+  });
+  const answers = [prose + "😀", longNotes, '\n```\n{"review":"pass"}\n```  '];
+  const reviewerIds: string[] = [];
+  const claudeResult = (result: string) =>
+    JSON.stringify({
+      result,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    });
+  const executor = createTaskExecutor({
+    repoRoot,
+    directory,
+    worker: () => harness,
+    reviewer: harness,
+    host: {
+      async runWorker(_plan, id, _context, options) {
+        options?.onWorkerStderr?.(
+          Buffer.from("\n" + CLAUDE_WORKER_USAGE_MARKER + claudeResult("done")),
+          id!,
+        );
+        return { id: id!, outcome: "ok", artifacts: { files: [], tree } };
+      },
+      async runReviewer(_plan, id) {
+        const answer = answers[reviewerIds.length]!;
+        reviewerIds.push(id!);
+        return {
+          id: id!,
+          outcome: "ok",
+          response: Buffer.from(claudeResult(answer)),
+        };
+      },
+      async runVerification() {
+        throw new Error("unexpected verification");
+      },
+    },
+  });
+  const work = runner(executor);
+  for (const [index, rawAnswer] of [prose, longNotes].entries()) {
+    await work.drain();
+    assert.deepEqual(failure(taskId), {
+      status: "failed",
+      code: "review-concern",
+    });
+    assert.partialDeepStrictEqual(store.getExecution(reviewerIds[index]!), {
+      status: "failed",
+      result: { review: "concern", rawAnswer },
+    });
+    store.retryTask(taskId, index);
+  }
+  await work.drain();
+  assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+  const lastReview = store.getExecution(reviewerIds[2]!);
+  assert.partialDeepStrictEqual(lastReview, {
+    status: "succeeded",
+    result: { review: "pass" },
+  });
+  assert.equal(Object.hasOwn(lastReview?.result as object, "rawAnswer"), false);
+  assert.equal(store.taskTokens(taskId), 12);
+  assert.equal(store.getExecution(reviewerIds[0]!)?.status, "failed");
 });
 
 test("opens a populated Stage 1 database and migrates its proposal and task checks", async () => {
@@ -902,9 +1019,8 @@ test("missing Task usage stops execution and an existing token balance carries i
   });
   store.startExecution(prior.id);
   store.finishExecution(prior.id, "failed", { tokens: 49 });
-  const db = new Database(filename);
-  db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(rerun);
-  db.close();
+  store.failTask(rerun, "host-error");
+  store.retryTask(rerun, 0);
   const next = fixture({
     async worker(_id, _revise, observed) {
       observed.tokens = 2;
@@ -935,7 +1051,7 @@ test("a failed integration approval allows one retry and fails closed on missing
             result:
               calls.length === 1
                 ? "invalid verdict"
-                : '{"decision":"approve","reasons":[]}',
+                : "another invalid verdict",
             ...(calls.length === 2
               ? {}
               : {
@@ -956,11 +1072,15 @@ test("a failed integration approval allows one retry and fails closed on missing
   assert.equal(calls.length, 2);
   assert.partialDeepStrictEqual(store.getExecution(calls[0]!), {
     status: "failed",
-    result: { code: "contract-violation", tokens: 5 },
+    result: {
+      code: "contract-violation",
+      tokens: 5,
+      rawAnswer: "invalid verdict",
+    },
   });
   assert.partialDeepStrictEqual(store.getExecution(calls[1]!), {
     status: "failed",
-    result: { code: "usage-unavailable" },
+    result: { code: "usage-unavailable", rawAnswer: "another invalid verdict" },
   });
   const [proposal] = store.pendingIntegrations();
   assert.ok(proposal);

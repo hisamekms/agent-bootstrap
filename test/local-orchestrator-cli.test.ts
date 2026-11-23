@@ -598,3 +598,111 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
   });
   assert.ok(store.startSession("Concierge", "new", true));
 });
+
+test("retry-task confirms on a terminal, records retries and rejects ineligible states", async () => {
+  const proposal = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const registered = store.proposeTask(
+    {
+      goalId,
+      title: "Task",
+      description: "",
+      acceptance: ["Done"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["docs/"],
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    origin,
+  );
+  assert.equal(registered.status, "registered");
+  const id = registered.taskId;
+  const args = ["retry-task", id];
+  const phrase = `retry-task ${id}`;
+  const tty = { isTTY: true, answer: () => phrase };
+  assert.equal((await cli(args, tty)).code, 1);
+  assert.ok(store.claimTask(id));
+  assert.equal((await cli(args, tty)).code, 1);
+  store.failTask(id, "review-concern");
+  const nonTTY = await cli(args);
+  assert.match(nonTTY.stderr, /requires a terminal/);
+  assert.deepEqual(nonTTY.questions, []);
+  const wrong = await cli(args, { ...tty, answer: () => "yes" });
+  assert.equal(wrong.code, 1);
+  assert.equal(store.getTask(id)?.status, "failed");
+
+  const auditDb = new Database(filename);
+  try {
+    auditDb
+      .query(
+        "CREATE TRIGGER deny_retry BEFORE INSERT ON events WHEN NEW.kind = 'task.retried' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
+      )
+      .run();
+    assert.equal((await cli(args, tty)).code, 1);
+    assert.equal(store.getTask(id)?.status, "failed");
+    assert.equal(store.getTask(id)?.retries, 0);
+    auditDb.query("DROP TRIGGER deny_retry").run();
+  } finally {
+    auditDb.close();
+  }
+
+  for (let retries = 1; retries <= 3; retries++) {
+    const result = await cli(args, tty);
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      id,
+      status: "registered",
+      retries,
+    });
+    assert.equal(store.readyTasks(1, [])[0]?.id, id);
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: id, limit: 1 })[0],
+      {
+        kind: "task.retried",
+        data: { retries, origin: "operator" },
+      },
+    );
+    assert.ok(store.claimTask(id));
+    store.failTask(id, "review-concern");
+  }
+  assert.match((await cli(args, tty)).stderr, /retry limit/);
+  assert.throws(() => store.retryTask(id, 3), { code: "task-retry-limit" });
+  assert.equal(store.getTask(id)?.status, "failed");
+  assert.equal(store.getTask(id)?.retries, 3);
+
+  const db = new Database(filename);
+  try {
+    for (const status of ["awaiting-integration", "succeeded", "cancelled"]) {
+      db.query("UPDATE tasks SET status = ? WHERE id = ?").run(status, id);
+      assert.match((await cli(args, tty)).stderr, /Only failed Tasks/);
+      assert.throws(() => store.retryTask(id, 3), {
+        code: "invalid-transition",
+      });
+      assert.equal(store.getTask(id)?.status, status);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("show-execution escapes raw reviewer answers for the terminal", async () => {
+  const { id } = store.createExecution({
+    actor: "Reviewer",
+    mode: "approval",
+    requestedBy: { kind: "host" },
+  });
+  const rawAnswer = "untrusted\u001b[31m\u009b\u202e";
+  store.startExecution(id);
+  store.finishExecution(id, "failed", { rawAnswer });
+  const result = await cli(["show-execution", id]);
+  assert.equal(result.code, 0);
+  assert.equal(JSON.parse(result.stdout).result.rawAnswer, rawAnswer);
+  for (const control of ["\u001b", "\u009b", "\u202e"])
+    assert.equal(result.stdout.includes(control), false);
+});

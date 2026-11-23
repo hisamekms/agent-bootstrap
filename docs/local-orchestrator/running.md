@@ -71,6 +71,24 @@ records. Reconciliation performs no replay and leaves pending proposals
 available for operator review. If the preview changes before confirmation,
 run the command again to see the current records.
 
+## Diagnose and retry a failed Task
+
+Use the Reviewer execution ID from the Concierge status or operator
+events to inspect a failed review or invalid agent approval verdict.
+When available, the execution result contains a bounded `rawAnswer`.
+The CLI escapes terminal control characters in that model text.
+
+```sh
+bun run src/local-orchestrator/cli.ts show-execution <executionId>
+bun run src/local-orchestrator/cli.ts retry-task <taskId>
+```
+
+For a failed Task, type `retry-task <taskId>` with the full ID at the host
+terminal prompt. The scheduler can pick up the registered Task during an
+active Concierge session or the next launch. Each Task allows three
+operator retries. Previous runs continue to count toward its token
+budget. Use the same `--db` as the launcher if you supplied a custom path.
+
 ## Review proposals
 
 Use another host terminal for approval. The Concierge can draft proposals

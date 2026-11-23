@@ -682,10 +682,18 @@ test("Reviewer rejects an invalid verdict without retrying or deciding the propo
   enableGoalAgentApproval();
   const proposal = store.proposeGoal(goal, plannerOrigin);
   let calls = 0;
+  const prefix = 'Verdict: {"decision":"approve","reasons":[]}'.padEnd(
+    4095,
+    "x",
+  );
   const work = runner({
     runReviewer: async (_, id) => {
       calls++;
-      return response(id, { decision: "approve", reasons: ["x".repeat(501)] });
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(JSON.stringify({ result: prefix + "😀" })),
+      };
     },
   });
   const id = await work.requestApproval(proposal.id);
@@ -693,7 +701,7 @@ test("Reviewer rejects an invalid verdict without retrying or deciding the propo
   assert.equal(calls, 1);
   assert.partialDeepStrictEqual(store.getExecution(id), {
     status: "failed",
-    result: { code: "contract-violation" },
+    result: { code: "contract-violation", rawAnswer: prefix },
   });
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
 });

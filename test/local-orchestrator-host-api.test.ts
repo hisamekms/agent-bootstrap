@@ -542,16 +542,29 @@ test("handles split UTF-8 and exercises each tool against the real store", async
 });
 
 test(
-  "wait_execution returns a finished execution immediately",
+  "wait_execution and get_execution omit operator-only diagnostics",
   { timeout: 2000 },
   async () => {
     const client = await listen();
-    const id = await queuePlanner(client);
+    const { id } = store.createExecution({
+      actor: "Reviewer",
+      mode: "approval",
+      requestedBy: { kind: "host" },
+    });
     store.startExecution(id);
-    store.finishExecution(id, "succeeded", { tasks: 1 });
+    store.finishExecution(id, "failed", {
+      code: "contract-violation",
+      rawAnswer: "untrusted reviewer text",
+    });
+    const current = await client.call("get_execution", { id });
+    assert.deepEqual(current.data, {
+      id,
+      status: "failed",
+      result: { code: "contract-violation" },
+    });
     assert.deepEqual(
       await client.call("wait_execution", { id, timeoutSeconds: 60 }),
-      await client.call("get_execution", { id }),
+      current,
     );
   },
 );

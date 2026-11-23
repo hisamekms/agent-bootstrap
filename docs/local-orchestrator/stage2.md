@@ -14,8 +14,9 @@ On the first eligible Task, the host imports the source checkout's local
 creates `lo/goal-<first 8 hex of goalId>` there. The bare repository keeps
 the existing Git integration adapter's strict configuration checks and
 the host-pinned candidates. It uses only local objects. The per-Task
-integration journal lives under `integrations/<taskId>/` and host staging
-lives under `worktrees/` alongside the database.
+integration journal lives under `integrations/<taskId>/`. Each operator
+retry uses a fresh journal in `integrations/<taskId>/retry-<number>/`.
+Host staging lives under `worktrees/` alongside the database.
 
 The Executor uses the existing Worker plan in tree mode. The Task title,
 description, acceptance criteria and paths travel as a single prompt
@@ -29,6 +30,15 @@ revision. Verification failures and Reviewer requests for changes share
 the same retry budget, capped at three revisions. Every Executor Task
 that reaches review uses an automatic Reviewer run. Planners may mention
 review in acceptance criteria and can create Executor or Researcher Tasks.
+
+The Reviewer gets the Task fields as data and reads the candidate diff
+and message in `/review/`. Its prompt ends with the JSON answer contract
+and asks for at most 1500 characters of revision notes. The host accepts
+Claude result text enclosed in a single plain or JSON Markdown fence.
+Prose around the verdict yields a concern. The shared byte limit for
+review notes still applies. Review concerns and unparseable agent approval
+verdicts retain the first 4 KiB of available raw answer text on a UTF-8
+boundary in the execution result.
 
 Host callers can provide a verification suite to `startConcierge`. The
 stock launcher explicitly opts into review without a suite. Each Worker,
@@ -53,7 +63,12 @@ Concierge session, unfinished executions or a running Task. After the
 launcher has stopped, use the terminal-only `reconcile` command to close
 out the displayed records in one audited transaction. Reconciliation
 ends sessions and marks unfinished executions and running Tasks
-`failed` with code `interrupted`. It leaves interrupted work terminal.
+`failed` with code `interrupted`. An operator can use the terminal-only
+`retry-task <taskId>` command to re-register a failed Task. The host
+records each retry as `task.retried` in the same transaction and allows
+up to three per Task. The scheduler applies the usual eligibility checks.
+Prior executions and token usage remain part of the Task's history and
+budget.
 
 A passing review creates one `integration` proposal and atomically sets
 the Task to `awaiting-integration`. The proposal binds the branch, base,

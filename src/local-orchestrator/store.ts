@@ -76,6 +76,8 @@ type ErrorCode =
   | "not-found"
   | "stale-digest"
   | "invalid-transition"
+  | "task-retry-limit"
+  | "task-retry-changed"
   | "approval-forbidden"
   | "goal-inactive"
   | "task-constraints"
@@ -116,6 +118,7 @@ type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
 
 const applicationId = 0x4c4f5231;
 const schemaVersion = 3;
+export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
     id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
     content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
@@ -269,6 +272,7 @@ type TaskRow = RegisteredRow & {
     | "failed"
     | "cancelled";
   attempts: number;
+  retries: number;
 };
 type ExecutionRow = {
   id: string;
@@ -297,7 +301,9 @@ const proposalColumns =
   "id, kind, content_json AS contentJson, digest, source_json AS sourceJson, status, created_at AS createdAt, decided_at AS decidedAt";
 const registeredColumns =
   "id, proposal_id AS proposalId, content_json AS contentJson, digest, status, created_at AS createdAt";
-const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts`;
+const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts,
+  (SELECT count(*) FROM events WHERE subject_id = tasks.id AND subject_kind = 'task'
+    AND kind = 'task.retried') AS retries`;
 const executionColumns =
   "id, actor, mode, requested_by_json AS requestedByJson, goal_id AS goalId, task_id AS taskId, status, result_json AS resultJson, started_at AS startedAt, finished_at AS finishedAt";
 const eventColumns =
@@ -1074,6 +1080,27 @@ export class OrchestratorStore {
       if (required(this.#task(id)).status !== "running")
         throw new OrchestratorStoreError("invalid-transition");
       this.#setTaskStatus(id, "failed", reason, at);
+    });
+  }
+
+  retryTask(taskId: string, expectedRetries: number) {
+    const id = identifier(taskId);
+    return this.#write((at) => {
+      const task = required(this.#task(id));
+      if (task.status !== "failed")
+        throw new OrchestratorStoreError("invalid-transition");
+      if (task.retries !== expectedRetries)
+        throw new OrchestratorStoreError("task-retry-changed");
+      if (task.retries >= MAX_TASK_RETRIES)
+        throw new OrchestratorStoreError("task-retry-limit");
+      const status = "registered";
+      const retries = task.retries + 1;
+      this.#setTaskStatus(id, status, null, at);
+      this.#event(at, "task.retried", "task", id, {
+        retries,
+        origin: "operator",
+      });
+      return { id, status, retries } as const;
     });
   }
 

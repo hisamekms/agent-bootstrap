@@ -12,6 +12,7 @@ import {
   type Policy,
 } from "./model.ts";
 import {
+  MAX_TASK_RETRIES,
   OrchestratorStore,
   OrchestratorStoreError,
   parseHumanDelegate,
@@ -36,6 +37,8 @@ const maxFieldLength = 4000;
 const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--repo <root>] <command>
   reconcile
   status
+  retry-task <taskId>
+  show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId>
   approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
@@ -48,6 +51,7 @@ type Command =
   | { kind: "status" | "policy-show" | "reconcile" }
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
+  | { kind: "show-execution" | "retry-task"; id: string }
   | {
       kind: "approve" | "reject";
       id: string;
@@ -68,6 +72,8 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
         return { kind, status: oneOf(args[1], statuses) };
       break;
     case "show":
+    case "show-execution":
+    case "retry-task":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
       break;
     case "approve":
@@ -222,6 +228,25 @@ async function execute(
   directory: string | undefined,
 ): Promise<0 | 1> {
   switch (command.kind) {
+    case "retry-task": {
+      const task = store.getTask(command.id);
+      if (!task) return refuse(io, "Task was not found.");
+      if (task.status !== "failed")
+        return refuse(io, "Only failed Tasks can be retried.");
+      if (task.retries >= MAX_TASK_RETRIES)
+        return refuse(io, "Task retry limit reached.");
+      const phrase = `retry-task ${task.id}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      writeJson(io, store.retryTask(task.id, task.retries));
+      return 0;
+    }
+    case "show-execution": {
+      const execution = store.getExecution(command.id);
+      if (!execution) return refuse(io, "Execution was not found.");
+      writeJson(io, execution);
+      return 0;
+    }
     case "reconcile": {
       const rows = store.reconciliationPreview();
       const count =
@@ -368,7 +393,9 @@ export async function runCli(
   }
 
   if (
-    ["approve", "reject", "policy-set", "reconcile"].includes(command.kind) &&
+    ["approve", "reject", "policy-set", "reconcile", "retry-task"].includes(
+      command.kind,
+    ) &&
     !io.isTTY
   )
     return refuse(io, "This command requires a terminal on stdin and stdout.");
@@ -414,6 +441,15 @@ export async function runCli(
       return refuse(
         io,
         "The reconciliation list changed. Run reconcile again.",
+      );
+    if (
+      command.kind === "retry-task" &&
+      error instanceof OrchestratorStoreError &&
+      ["invalid-transition", "task-retry-changed"].includes(error.code)
+    )
+      return refuse(
+        io,
+        "Task changed. Run retry-task again to check its status.",
       );
     return refuse(io, "Local orchestrator command failed.");
   }

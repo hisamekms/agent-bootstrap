@@ -16,6 +16,7 @@ import {
   type GoalContent,
   type TaskContent,
 } from "./model.ts";
+import { rawReviewerAnswer } from "./reviewer-answer.ts";
 import { OrchestratorStoreError, type OrchestratorStore } from "./store.ts";
 import { reportedTokens, runTask, type TaskExecutor } from "./tasks.ts";
 
@@ -661,15 +662,20 @@ export class ActorRunner {
         : null;
     const tokens = reportedTokens(result);
     const usage = tokens === undefined ? {} : { tokens };
-    if (task && tokens === undefined)
-      return {
-        status: run.outcome === "timed-out" ? "timed-out" : "failed",
-        result: { code: "usage-unavailable" },
-      };
-    if (run.outcome === "timed-out")
-      return { status: "timed-out", result: { code: "timed-out", ...usage } };
+    const missingUsage = task !== null && tokens === undefined;
+    const timedOut = run.outcome === "timed-out";
     if (run.outcome !== "ok" || result?.isError)
-      return { status: "failed", result: { code: "actor-failed", ...usage } };
+      return {
+        status: timedOut ? "timed-out" : "failed",
+        result: {
+          code: missingUsage
+            ? "usage-unavailable"
+            : timedOut
+              ? "timed-out"
+              : "actor-failed",
+          ...usage,
+        },
+      };
     if (
       task &&
       tokens !== undefined &&
@@ -685,11 +691,18 @@ export class ActorRunner {
       verdict = approvalVerdict(parseAnswer(harness, run.response));
     } catch (error) {
       if (!(error instanceof ContractError)) throw error;
+      const rawAnswer = rawReviewerAnswer(harness, run.response);
       return {
         status: "failed",
-        result: { code: "contract-violation", ...usage },
+        result: {
+          code: missingUsage ? "usage-unavailable" : "contract-violation",
+          ...usage,
+          ...(rawAnswer === undefined ? {} : { rawAnswer }),
+        },
       };
     }
+    if (missingUsage)
+      return { status: "failed", result: { code: "usage-unavailable" } };
     store.decide(proposalId, {
       digest: proposal.digest,
       decision: verdict.decision,

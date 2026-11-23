@@ -125,9 +125,21 @@ function isTool(value: unknown): value is Tool {
 
 function readExecution(store: OrchestratorStore, id: string) {
   const execution = store.getExecution(id);
-  return (
-    execution && { id, status: execution.status, result: execution.result }
-  );
+  if (!execution) return null;
+  const { status, result } = execution;
+  if (
+    result &&
+    typeof result === "object" &&
+    Object.hasOwn(result, "rawAnswer")
+  ) {
+    // Raw reviewer diagnostics are for the operator CLI.
+    const { rawAnswer: _rawAnswer, ...visible } = result as Record<
+      string,
+      unknown
+    >;
+    return { id, status, result: visible };
+  }
+  return { id, status, result };
 }
 
 async function waitForExecution(
