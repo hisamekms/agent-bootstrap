@@ -18,7 +18,8 @@ import {
 } from "./model.ts";
 import { rawReviewerAnswer } from "./reviewer-answer.ts";
 import { OrchestratorStoreError, type OrchestratorStore } from "./store.ts";
-import { reportedTokens, runTask, type TaskExecutor } from "./tasks.ts";
+import { runTask, type TaskExecutor } from "./tasks.ts";
+import { reportedUsage } from "./token-usage.ts";
 
 type PlannerCall = (
   plan: ReviewerPlan,
@@ -40,7 +41,10 @@ export interface RunnerDeps {
   /** Model configured for the Reviewer in the harness. */
   readonly model: string;
   /** Host-selected files with paths relative to the repository root. */
-  readonly context: () => Promise<readonly SandboxFile[]>;
+  readonly context: (
+    commit: string | null,
+    goalRepository: boolean,
+  ) => Promise<readonly SandboxFile[]>;
   readonly limits?: {
     maxQueued?: number;
     plannerTimeoutMs?: number;
@@ -64,6 +68,8 @@ type Job =
   | { id: string; kind: "planner"; input: PlannerRequest }
   | { id: string; kind: "approval"; proposalId: string }
   | { id: string; kind: "task" };
+
+type ReportedUsage = NonNullable<ReturnType<typeof reportedUsage>>;
 
 type Completion = {
   status: "succeeded" | "failed" | "timed-out";
@@ -101,8 +107,10 @@ const commonContract = {
 };
 const budgetContract = {
   maxExecutionMs: "integer, 1..3600000",
-  maxRetries: "integer, 0..10",
-  maxTokens: "integer, 1..10000000",
+  maxRetries:
+    "integer, 0..10. Executor Tasks allow up to three revision cycles. Size maxTokens to cover the revisions you allow.",
+  maxTokens:
+    "integer, 1..10000000 budgeted tokens. Allow about 60,000 for one Executor + Reviewer pair, plus more for revisions and agent approval. Budgeted tokens count input, output, cache creation and one tenth of cache reads (rounded up per run). Goal scope budgets bound each Task.",
 };
 const goalContract = {
   answer: {
@@ -435,6 +443,10 @@ export class ActorRunner {
     if (store.getExecution(job.id)?.status === "cancelled") return;
     store.startExecution(job.id);
     let attempts = 0;
+    const actorUsage: ReportedUsage[] = [];
+    const recordUsage = (usage: ReportedUsage) => {
+      actorUsage.push(usage);
+    };
     let completion: Completion = {
       status: "failed",
       result: { code: "host-error" },
@@ -442,10 +454,14 @@ export class ActorRunner {
     try {
       completion =
         job.kind === "planner"
-          ? await this.#runPlanner(job, () => {
-              attempts++;
-            })
-          : await this.#runApproval(job);
+          ? await this.#runPlanner(
+              job,
+              () => {
+                attempts++;
+              },
+              recordUsage,
+            )
+          : await this.#runApproval(job, recordUsage);
     } catch (error) {
       const code =
         error instanceof RunnerError || error instanceof OrchestratorStoreError
@@ -458,6 +474,18 @@ export class ActorRunner {
         store.finishExecution(job.id, completion.status, {
           ...completion.result,
           ...(job.kind === "planner" ? { attempts } : {}),
+          ...(actorUsage.length === 0
+            ? {}
+            : {
+                tokens: Math.min(
+                  Number.MAX_SAFE_INTEGER,
+                  actorUsage.reduce((sum, run) => sum + run.tokens, 0),
+                ),
+                usage:
+                  job.kind === "planner"
+                    ? actorUsage.map((run) => run.usage)
+                    : actorUsage[0]!.usage,
+              }),
         });
       }
     }
@@ -466,19 +494,31 @@ export class ActorRunner {
   async #runPlanner(
     { id, input }: Extract<Job, { kind: "planner" }>,
     onAttempt: () => void,
+    recordUsage: (usage: ReportedUsage) => void,
   ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { mode, brief, goalId } = input;
     const goal = goalId === undefined ? undefined : this.#activeGoal(goalId);
     const tasks = goal ? store.listTasks(goal.id) : [];
     const maxTasks = goal?.content.scope.maxTasks ?? 0;
-    const context = await this.#deps.context();
+    const planningGoal = mode === "goal-design" ? undefined : goal;
+    const base =
+      planningGoal?.baseCommit ??
+      (planningGoal && !planningGoal.planningCommit
+        ? await this.#deps.tasks?.existingBase?.(planningGoal.id)
+        : null);
+    const commit =
+      base ??
+      planningGoal?.planningCommit ??
+      store.sessionSnapshotCommit(input.sessionId);
+    const context = await this.#deps.context(commit, base != null);
     if (context.length >= MICROSANDBOX_LIMITS.files)
       throw new RunnerError("file-limits");
     const files = boundedFiles([
       jsonFile("request.json", {
         mode,
         brief,
+        ...(commit === null ? {} : { repositoryCommit: commit }),
         ...(goal
           ? {
               goal: { id: goal.id, content: goal.content },
@@ -498,8 +538,6 @@ export class ActorRunner {
     ]);
     const plan = this.#plan("Planner", files);
     const existingIds = new Set(tasks.map((task) => task.id));
-    const tokens = { input: 0, output: 0 };
-    let hasUsage = false;
     let code = "actor-failed";
     for (let attempt = 0; attempt < 2; attempt++) {
       if (store.getExecution(id)?.status !== "running")
@@ -515,19 +553,16 @@ export class ActorRunner {
             });
       if (run.id !== invocationId)
         return { status: "failed", result: { code: "host-error" } };
+      const usage =
+        harness.harness === "claude"
+          ? reportedUsage(parseClaudeCodeResult(run.response))
+          : undefined;
+      if (usage !== undefined) recordUsage(usage);
       if (run.outcome === "timed-out")
         return { status: "timed-out", result: { code: "timed-out" } };
       if (run.outcome !== "ok") {
         code = "actor-failed";
         continue;
-      }
-
-      const usage = parseClaudeCodeResult(run.response);
-      const total = reportedTokens(usage);
-      if (usage?.outputTokens != null && total !== undefined) {
-        hasUsage = true;
-        tokens.input += total - usage.outputTokens;
-        tokens.output += usage.outputTokens;
       }
 
       let drafts: { goal: GoalContent } | { tasks: TaskDraft[] };
@@ -544,28 +579,29 @@ export class ActorRunner {
       }
       if (store.getExecution(id)?.status !== "running")
         return { status: "failed", result: { code: "invalid-transition" } };
-      const proposals = this.#submit(id, drafts);
-      return {
-        status: "succeeded",
-        result: {
-          proposals,
-          ...(hasUsage &&
-          Number.isSafeInteger(tokens.input) &&
-          Number.isSafeInteger(tokens.output)
-            ? { tokens }
-            : {}),
-        },
-      };
+      if (planningGoal && commit !== null)
+        store.recordGoalCommit(
+          planningGoal.id,
+          commit,
+          base == null ? "planning" : "base",
+        );
+      const proposals = this.#submit(id, input.sessionId, drafts);
+      return { status: "succeeded", result: { proposals } };
     }
     return { status: "failed", result: { code } };
   }
 
-  #submit(id: string, drafts: { goal: GoalContent } | { tasks: TaskDraft[] }) {
+  #submit(
+    id: string,
+    sessionId: string,
+    drafts: { goal: GoalContent } | { tasks: TaskDraft[] },
+  ) {
     const { store } = this.#deps;
     const origin = {
       kind: "actor",
       actor: "Planner",
       executionId: id,
+      sessionId,
     } as const;
     if ("goal" in drafts) {
       const { id, digest, gate, policy } = store.proposeGoal(
@@ -610,10 +646,10 @@ export class ActorRunner {
     });
   }
 
-  async #runApproval({
-    id,
-    proposalId,
-  }: Extract<Job, { kind: "approval" }>): Promise<Completion> {
+  async #runApproval(
+    { id, proposalId }: Extract<Job, { kind: "approval" }>,
+    recordUsage: (usage: ReportedUsage) => void,
+  ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { proposal, goalId } = this.#approvalSnapshot(proposalId);
     const files = [
@@ -641,7 +677,7 @@ export class ActorRunner {
         path: "candidate.diff",
         bytes: await this.#deps.tasks.diff(proposal.content),
       });
-      if (store.taskTokens(task.id) > task.content.budgets.maxTokens)
+      if (store.taskBudgetTokens(task.id) > task.content.budgets.maxTokens)
         return { status: "failed", result: { code: "budget-exceeded" } };
       if (this.#deps.canScheduleTasks?.() === false)
         return { status: "failed", result: { code: "session-ended" } };
@@ -657,11 +693,10 @@ export class ActorRunner {
     if (run.id !== id)
       return { status: "failed", result: { code: "host-error" } };
     const result =
-      task && harness.harness === "claude"
-        ? parseClaudeCodeResult(run.response)
-        : null;
-    const tokens = reportedTokens(result);
-    const usage = tokens === undefined ? {} : { tokens };
+      harness.harness === "claude" ? parseClaudeCodeResult(run.response) : null;
+    const usage = reportedUsage(result);
+    if (usage !== undefined) recordUsage(usage);
+    const tokens = usage?.tokens;
     const missingUsage = task !== null && tokens === undefined;
     const timedOut = run.outcome === "timed-out";
     if (run.outcome !== "ok" || result?.isError)
@@ -673,17 +708,16 @@ export class ActorRunner {
             : timedOut
               ? "timed-out"
               : "actor-failed",
-          ...usage,
         },
       };
     if (
       task &&
       tokens !== undefined &&
-      store.taskTokens(task.id) + tokens > task.content.budgets.maxTokens
+      store.taskBudgetTokens(task.id) + tokens > task.content.budgets.maxTokens
     )
       return {
         status: "failed",
-        result: { code: "budget-exceeded", ...usage },
+        result: { code: "budget-exceeded" },
       };
 
     let verdict: ReturnType<typeof approvalVerdict>;
@@ -696,7 +730,6 @@ export class ActorRunner {
         status: "failed",
         result: {
           code: missingUsage ? "usage-unavailable" : "contract-violation",
-          ...usage,
           ...(rawAnswer === undefined ? {} : { rawAnswer }),
         },
       };
@@ -708,6 +741,6 @@ export class ActorRunner {
       decision: verdict.decision,
       answerer: { kind: "agent", executionId: id, model: this.#deps.model },
     });
-    return { status: "succeeded", result: { ...verdict, ...usage } };
+    return { status: "succeeded", result: verdict };
   }
 }

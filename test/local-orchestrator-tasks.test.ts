@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -17,6 +20,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
 import { CLAUDE_WORKER_USAGE_MARKER } from "../src/claude-code.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
+import { snapshotConciergeRepo } from "../src/local-orchestrator/concierge.ts";
 import {
   contentDigest,
   goalBranch,
@@ -352,7 +356,10 @@ test("agent policy requests dedicated approval with the candidate diff under the
     actor: "Reviewer",
     mode: "approval",
     status: "succeeded",
-    result: { tokens: 10 },
+    result: {
+      tokens: 8,
+      usage: { input: 1, output: 2, cacheRead: 3, cacheCreation: 4 },
+    },
   });
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
 });
@@ -487,6 +494,15 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   writeFileSync(join(repoRoot, "only-on-work"), "ignored\n");
   git(["add", "."]);
   git(["commit", "-m", "work only"]);
+  const advancedMain = git([
+    "commit-tree",
+    base + "^{tree}",
+    "-p",
+    base,
+    "-m",
+    "main advanced",
+  ]);
+  git(["update-ref", "refs/heads/main", advancedMain, base]);
 
   const directory = join(repoRoot, ".local", "local-orchestrator");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -501,6 +517,8 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   const calls: string[] = [];
   const invocationIds: string[] = [];
   const executor = createTaskExecutor({
+    store,
+    snapshotCommit: base,
     repoRoot,
     directory,
     worker: () =>
@@ -656,7 +674,15 @@ test("real Git composes tree mode, path rejection, verification, review and oper
     symlinks: ["docs/link"],
     review: { notes: "Looks good" },
   });
-  assert.equal(git(["rev-parse", "main"]), base);
+  assert.equal(git(["rev-parse", "main"]), advancedMain);
+  assert.equal(store.getGoal(goalId)?.baseCommit, base);
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: goalId, limit: 1 })[0],
+    {
+      kind: "goal.base-pinned",
+      data: { baseCommit: base },
+    },
+  );
   const branch = String(
     command(
       "/usr/bin/git",
@@ -676,9 +702,24 @@ test("real Git composes tree mode, path rejection, verification, review and oper
       taskId,
       actor: "Reviewer",
       mode: "verification",
+      result: { tokens: 0 },
     });
   }
-  assert.equal(store.taskTokens(taskId), 34);
+  for (const index of [0, 1, 3]) {
+    assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
+      result: {
+        tokens: 6,
+        usage: { input: 1, output: 1, cacheRead: 2, cacheCreation: 3 },
+      },
+    });
+  }
+  assert.partialDeepStrictEqual(store.getExecution(invocationIds[5]!), {
+    result: {
+      tokens: 13,
+      usage: { input: 5, output: 6, cacheRead: 1, cacheCreation: 1 },
+    },
+  });
+  assert.equal(store.taskTokens(taskId), 31);
   let output = "";
   const io = {
     stdin: new PassThrough(),
@@ -691,6 +732,15 @@ test("real Git composes tree mode, path rejection, verification, review and oper
     isTTY: true,
     prompt: () => `approve ${proposal.digest.slice(0, 12)}`,
   };
+  assert.equal(await runCli(["--db", filename, "show", goalId], io), 0);
+  assert.equal(JSON.parse(output).baseCommit, base);
+  output = "";
+  assert.equal(await runCli(["--db", filename, "show", taskId], io), 0);
+  assert.partialDeepStrictEqual(JSON.parse(output), {
+    budgetTokens: 31,
+    totalTokens: 31,
+  });
+  output = "";
   assert.equal(await runCli(["--db", filename, "show", proposal.id], io), 1);
   assert.equal(
     await runCli(
@@ -713,6 +763,29 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   );
   assert.equal(store.getProposal(proposal.id)?.status, "approved");
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+
+  command("/usr/bin/git", join(directory, "repository.git"), [
+    "update-ref",
+    "refs/heads/" + goalBranch(goalId),
+    proposal.content.candidate,
+    base,
+  ]);
+  await assert.rejects(executor.open(store.getTask(taskId)!), {
+    message: "goal-base-mismatch",
+  });
+
+  renameSync(join(repoRoot, ".git"), join(root, "retired-git"));
+  const pinned = await snapshotConciergeRepo(
+    repoRoot,
+    randomUUID(),
+    base,
+    true,
+  );
+  assert.equal(pinned.commit, base);
+  assert.equal(
+    readFileSync(join(pinned.dir, "docs", "a.md"), "utf8"),
+    "before\n",
+  );
 });
 
 test("strict review concerns retain raw answers and operator retries start fresh journals", async () => {
@@ -757,6 +830,7 @@ test("strict review concerns retain raw answers and operator retries start fresh
       },
     });
   const executor = createTaskExecutor({
+    store,
     repoRoot,
     directory,
     worker: () => harness,
@@ -994,7 +1068,7 @@ test("out-of-scope symlink targets fail before review and in-scope links require
   assert.equal(approve(proposal).status, "approved");
 });
 
-test("missing Task usage stops execution and an existing token balance carries into a rerun", async () => {
+test("missing Task usage stops execution and retries reset the budget but preserve history", async () => {
   const goalId = goal();
   const unknown = task(goalId);
   const missing = fixture({
@@ -1009,7 +1083,8 @@ test("missing Task usage stops execution and an existing token balance carries i
   });
   assert.deepEqual(missing.calls, []);
 
-  const rerun = task(goalId);
+  const rerunGoal = goal({ integration: "agent" });
+  const rerun = task(rerunGoal);
   assert.ok(store.claimTask(rerun));
   const prior = store.createExecution({
     actor: "Executor",
@@ -1018,22 +1093,48 @@ test("missing Task usage stops execution and an existing token balance carries i
     requestedBy: { kind: "host" },
   });
   store.startExecution(prior.id);
-  store.finishExecution(prior.id, "failed", { tokens: 49 });
+  store.finishExecution(prior.id, "failed", { tokens: 51 });
   store.failTask(rerun, "host-error");
+  assert.equal(store.taskBudgetTokens(rerun), 51);
   store.retryTask(rerun, 0);
+  assert.equal(store.taskBudgetTokens(rerun), 0);
   const next = fixture({
     async worker(_id, _revise, observed) {
       observed.tokens = 2;
       return pin;
     },
   });
-  await runner(next.executor).drain();
-  assert.deepEqual(failure(rerun), {
-    status: "failed",
-    code: "budget-exceeded",
+  const work = runner(next.executor, {
+    async runReviewer(_plan, id) {
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(
+          JSON.stringify({
+            result: '{"decision":"approve","reasons":[]}',
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_read_input_tokens: 409,
+              cache_creation_input_tokens: 0,
+            },
+          }),
+        ),
+      };
+    },
   });
-  assert.equal(store.taskTokens(rerun), 51);
-  assert.deepEqual(next.calls, []);
+  await work.drain();
+  assert.equal(store.getTask(rerun)?.status, "awaiting-integration");
+  const approved = store
+    .listProposals({ status: "approved" })
+    .find(
+      (proposal) =>
+        proposal.kind === "integration" && proposal.content.taskId === rerun,
+    );
+  assert.ok(approved);
+  assert.equal(store.taskBudgetTokens(rerun), 45);
+  assert.equal(store.taskTokens(rerun), 96);
+  assert.deepEqual(next.calls, ["review"]);
 });
 
 test("a failed integration approval allows one retry and fails closed on missing usage", async () => {
@@ -1074,7 +1175,8 @@ test("a failed integration approval allows one retry and fails closed on missing
     status: "failed",
     result: {
       code: "contract-violation",
-      tokens: 5,
+      tokens: 3,
+      usage: { input: 1, output: 1, cacheRead: 3, cacheCreation: 0 },
       rawAnswer: "invalid verdict",
     },
   });
@@ -1087,5 +1189,46 @@ test("a failed integration approval allows one retry and fails closed on missing
   await assert.rejects(work.requestApproval(proposal.id), {
     code: "invalid-transition",
   });
-  assert.equal(store.taskTokens(taskId), 5);
+  assert.equal(store.taskTokens(taskId), 3);
+});
+
+test("approval keeps usage when a human answers while the Reviewer runs", async () => {
+  const taskId = task(goal({ integration: "agent" }));
+  const { executor } = fixture();
+  let approvalId: string | undefined;
+  const work = runner(executor, {
+    async runReviewer(_plan, id) {
+      approvalId = id;
+      const [proposal] = store.pendingIntegrations();
+      assert.ok(proposal);
+      assert.equal(approve(proposal).status, "approved");
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(
+          JSON.stringify({
+            result: '{"decision":"approve","reasons":[]}',
+            usage: {
+              input_tokens: 1,
+              output_tokens: 2,
+              cache_read_input_tokens: 31,
+              cache_creation_input_tokens: 4,
+            },
+          }),
+        ),
+      };
+    },
+  });
+  await work.drain();
+  assert.ok(approvalId);
+  assert.partialDeepStrictEqual(store.getExecution(approvalId), {
+    status: "failed",
+    result: {
+      code: "invalid-transition",
+      tokens: 11,
+      usage: { input: 1, output: 2, cacheRead: 31, cacheCreation: 4 },
+    },
+  });
+  assert.equal(store.taskBudgetTokens(taskId), 11);
+  assert.equal(store.taskTokens(taskId), 11);
 });

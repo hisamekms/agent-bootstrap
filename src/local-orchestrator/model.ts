@@ -183,6 +183,15 @@ function string(value: unknown, min: number, max: number): string {
   return value;
 }
 
+export function gitCommit(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value)
+  )
+    throw new ContractError();
+  return value;
+}
+
 export function identifier(value: unknown): string {
   const id = string(value, 1, 200);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/.test(id)) throw new ContractError();

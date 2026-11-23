@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir } from "node:fs/promises";
+import { lstat, mkdir, readdir } from "node:fs/promises";
 import { isAbsolute, join, posix } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -28,9 +28,15 @@ import {
 import { WORKER_MESSAGE_PATH } from "../sandbox-runtime.ts";
 import type { TrustedHost } from "../trusted-host.ts";
 import type { ProfileName } from "../sandbox-profiles.ts";
-import { allowsPath, goalBranch, type IntegrationContent } from "./model.ts";
+import {
+  allowsPath,
+  gitCommit,
+  goalBranch,
+  type IntegrationContent,
+} from "./model.ts";
 import { rawReviewerAnswer, taskReviewerOutput } from "./reviewer-answer.ts";
 import type { OrchestratorStore } from "./store.ts";
+import { reportedUsage, type TokenUsage } from "./token-usage.ts";
 
 type Task = NonNullable<ReturnType<OrchestratorStore["claimTask"]>>;
 type TaskHost = Pick<
@@ -41,6 +47,7 @@ type ActorResult = {
   outcome?: string;
   invocationId?: string;
   tokens?: number;
+  usage?: TokenUsage;
   isError?: boolean;
 };
 type CandidateChange = {
@@ -69,6 +76,7 @@ export interface TaskFlow {
 
 export interface TaskExecutor {
   open(task: Task): Promise<TaskFlow>;
+  existingBase?(goalId: string): Promise<string | null>;
   diff(content: IntegrationContent): Promise<Uint8Array>;
 }
 
@@ -122,38 +130,39 @@ function processExit(child: ReturnType<typeof spawn>) {
   });
 }
 
-/** Import the exact local main commit using a clean bare Git configuration.
- * The source checkout supplies objects only. No remotes, hooks or alternates
- * are installed in the integration repository. */
-async function importMain(
+/** Resolve the direct local main ref without consulting remote refs. */
+export async function localMainCommit(repoRoot: string): Promise<string> {
+  const { stdout } = await git(repoRoot, [
+    "for-each-ref",
+    "--format=%(refname)%00%(symref)%00%(objectname)%00%(objecttype)",
+    "--",
+    "refs/heads/main",
+  ]);
+  const [ref, symbolic, base, type] = stdout.trim().split("\0");
+  if (ref !== "refs/heads/main" || symbolic !== "" || type !== "commit")
+    throw new Error("Invalid local main");
+  return gitCommit(base);
+}
+
+/** Import a pinned commit using a clean bare Git configuration. */
+async function importGoalBase(
   repoRoot: string,
   repository: string,
-): Promise<string> {
-  const [{ stdout: head }, { stdout: objectPath }] = await Promise.all([
-    git(repoRoot, [
-      "for-each-ref",
-      "--format=%(refname)%00%(symref)%00%(objectname)",
-      "--",
-      "refs/heads/main",
-    ]),
-    git(repoRoot, [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "objects",
-    ]),
+  base: string,
+): Promise<void> {
+  const { stdout: objectPath } = await git(repoRoot, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "objects",
   ]);
-  const [ref, symbolic, base] = head.trim().split("\0");
   const objects = objectPath.replace(/\n$/, "");
   if (
-    ref !== "refs/heads/main" ||
-    symbolic !== "" ||
-    !base ||
     !/^[a-f0-9]{40}$/.test(base) ||
     !isAbsolute(objects) ||
     objects.includes("\n")
   )
-    throw new Error("Invalid local main");
+    throw new Error("Invalid Goal base");
   const options = {
     cwd: repository,
     timeout: 120_000,
@@ -177,7 +186,6 @@ async function importMain(
   ]);
   if (results.some((result) => result.status === "rejected"))
     throw new Error("Git pack import failed");
-  return base;
 }
 
 async function pinnedDiff(
@@ -201,35 +209,36 @@ export async function candidateDiffStat(
 
 class TaskError extends Error {}
 
-export function reportedTokens(
-  result: ReturnType<typeof parseClaudeCodeResult>,
-): number | undefined {
-  if (
-    result?.inputTokens == null ||
-    result.outputTokens == null ||
-    result.cacheReadInputTokens == null ||
-    result.cacheCreationInputTokens == null
-  )
-    return undefined;
-  return Math.min(
-    Number.MAX_SAFE_INTEGER,
-    result.inputTokens +
-      result.outputTokens +
-      result.cacheReadInputTokens +
-      result.cacheCreationInputTokens,
-  );
-}
-
 export function createTaskExecutor(options: {
   repoRoot: string;
   directory: string;
+  store: OrchestratorStore;
+  snapshotCommit?: string;
   host: TaskHost;
   worker: (profile: ProfileName) => RoleHarness;
   reviewer: RoleHarness;
   verification?: Verification;
 }): TaskExecutor {
-  const { directory, repoRoot, host, verification } = options;
+  const { directory, repoRoot, store, host, verification } = options;
   return {
+    async existingBase(goalId) {
+      try {
+        await lstat(join(directory, "repository.git"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+      try {
+        return await localGit(directory, goalBranch(goalId)).head();
+      } catch (error) {
+        if (
+          error instanceof GitIntegrationError &&
+          error.code === "invalid-object"
+        )
+          return null;
+        throw error;
+      }
+    },
     async open(task) {
       const branch = goalBranch(task.goalId);
       const git = localGit(directory, branch);
@@ -244,8 +253,14 @@ export function createTaskExecutor(options: {
       await privateDirectory(join(directory, "worktrees"));
       await privateDirectory(repository);
       // Init is idempotent. An existing repository is checked by LocalGitIntegration.
+      const goal = store.getGoal(task.goalId);
+      if (!goal) throw new Error("Goal missing");
       try {
-        await git.head();
+        const head = await git.head();
+        if (goal.baseCommit === null)
+          store.recordGoalCommit(goal.id, head, "base");
+        else if (head !== goal.baseCommit)
+          throw new TaskError("goal-base-mismatch");
       } catch (error) {
         if (
           !(error instanceof GitIntegrationError) ||
@@ -267,7 +282,16 @@ export function createTaskExecutor(options: {
           );
         }
         await git.targetId();
-        await git.initializeGoalBranch(await importMain(repoRoot, repository));
+        const base =
+          goal.baseCommit ??
+          goal.planningCommit ??
+          options.snapshotCommit ??
+          (await localMainCommit(repoRoot));
+        await importGoalBase(repoRoot, repository, base);
+        store.recordGoalCommit(goal.id, base, "base");
+        await git.initializeGoalBranch(base);
+        if ((await git.head()) !== base)
+          throw new TaskError("goal-base-mismatch");
       }
 
       const journal = new IntegrationJournal(attemptRoot, task.id);
@@ -323,8 +347,7 @@ export function createTaskExecutor(options: {
             reviewerResult.invocationId = run.id;
             if (reviewer.harness === "claude") {
               const result = parseClaudeCodeResult(run.response);
-              const tokens = reportedTokens(result);
-              if (tokens !== undefined) reviewerResult.tokens = tokens;
+              Object.assign(reviewerResult, reportedUsage(result));
               if (result?.isError) reviewerResult.isError = true;
             }
             return run;
@@ -333,6 +356,8 @@ export function createTaskExecutor(options: {
             const run = await host.runVerification(...args);
             verificationResult.outcome = run.outcome;
             verificationResult.invocationId = run.id;
+            // Verification runs a credential-free suite and consumes no model tokens.
+            verificationResult.tokens = 0;
             if (run.id !== args[1])
               throw new Error("Verification invocation mismatch");
             return run;
@@ -348,8 +373,7 @@ export function createTaskExecutor(options: {
             ? {
                 onWorkerStderr(bytes: Uint8Array) {
                   const result = parseClaudeWorkerResult(bytes);
-                  const tokens = reportedTokens(result);
-                  if (tokens !== undefined) workerResult.tokens = tokens;
+                  Object.assign(workerResult, reportedUsage(result));
                   if (result?.isError) workerResult.isError = true;
                 },
               }
@@ -414,7 +438,7 @@ export async function runTask(
   if (!task) return;
   const { budgets, paths } = task.content;
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
-  let tokens = store.taskTokens(task.id);
+  let tokens = store.taskBudgetTokens(task.id);
   let code = "host-error";
   const begin = (actor: "Executor" | "Reviewer", mode: TaskRunMode) => {
     const { id: execution } = store.createExecution({
@@ -457,11 +481,14 @@ export async function runTask(
         observed.isError
       )
         failure = "actor-failed";
-      if (observed.tokens !== undefined) tokens += observed.tokens;
-      else if (observed.outcome !== undefined || completion)
+      if (
+        observed.tokens === undefined &&
+        (observed.outcome !== undefined || completion)
+      )
         failure = "usage-unavailable";
-      if (tokens > budgets.maxTokens) failure = "budget-exceeded";
     }
+    if (observed.tokens !== undefined) tokens += observed.tokens;
+    if (tokens > budgets.maxTokens) failure = "budget-exceeded";
     store.finishExecution(
       executionId,
       timedOut ? "timed-out" : failure ? "failed" : "succeeded",
@@ -469,6 +496,7 @@ export async function runTask(
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
         ...(observed.tokens === undefined ? {} : { tokens: observed.tokens }),
+        ...(observed.usage === undefined ? {} : { usage: observed.usage }),
         ...(observed.invocationId && observed.invocationId !== executionId
           ? { invocationId: observed.invocationId }
           : {}),

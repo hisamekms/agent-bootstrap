@@ -9,11 +9,23 @@ has succeeded. Planner jobs, Executor and Reviewer runs, optional
 verification, and agent approvals share one actor slot alongside the
 Concierge. Researcher Tasks are reserved for a later stage.
 
-On the first eligible Task, the host imports the source checkout's local
-`main` into the private `.local/local-orchestrator/repository.git` and
-creates `lo/goal-<first 8 hex of goalId>` there. The bare repository keeps
-the existing Git integration adapter's strict configuration checks and
-the host-pinned candidates. It uses only local objects. The per-Task
+Goals are designed and executed against local `main`. Update local
+`main` before starting a Concierge session, for example after merging
+PRs. The launcher pins its commit for the Concierge snapshot and
+records it in the session row and the `session.snapshot` event.
+Planner context for new Goals comes from that snapshot. When planning
+Tasks for an existing Goal, the Planner uses that Goal's pinned commit
+even if local `main` has since advanced.
+
+On the first eligible Task, the host imports the pinned commit into
+`.local/local-orchestrator/repository.git`, records it as the Goal's
+`baseCommit` and creates `lo/goal-<first 8 hex of goalId>`. Use
+`show <goalId>` or `get_goal` to see the base. A Goal created before
+commit tracking uses its existing branch if present, or the session's
+snapshot when the host first plans or runs a Task for it. Once the Goal
+base is imported, the Planner can read it from the private repository.
+The bare repository keeps the existing Git integration adapter's strict
+configuration checks and the host-pinned candidates. It uses only local objects. The per-Task
 integration journal lives under `integrations/<taskId>/`. Each operator
 retry uses a fresh journal in `integrations/<taskId>/retry-<number>/`.
 Host staging lives under `worktrees/` alongside the database.
@@ -49,9 +61,15 @@ credential-free Verification role. Only an immediately preceding
 pre-review verification pass for the same pin allows review to proceed.
 An interrupted integration stays terminal.
 
-The host counts Claude input, output, cache-read input and cache-creation
-input tokens. Tasks start from the recorded SQLite total, and approval
-runs share the same budget. Worker stdout carries the collect request.
+The host computes budgeted tokens for each Claude run as
+`input + output + cache_creation + ceil(cache_read / 10)`. Execution
+results retain the four raw usage counts when available. Planner results
+keep one raw usage entry per reported attempt. Executor, Reviewer and
+integration approval runs share the Task's budget. The credential-free
+verification suite counts as zero model tokens. The Planner contract
+suggests about 60,000 budgeted tokens for one Executor and Reviewer pair,
+with more for revisions and agent approval. Worker stdout carries the
+collect request.
 The opt-in guest command puts a marker and the complete Claude JSON result
 at the end of stderr when the result fits in 64 KiB. The host receives the
 last 66 KiB, parses the marked result for `usage` and `is_error` and
@@ -67,8 +85,10 @@ ends sessions and marks unfinished executions and running Tasks
 `retry-task <taskId>` command to re-register a failed Task. The host
 records each retry as `task.retried` in the same transaction and allows
 up to three per Task. The scheduler applies the usual eligibility checks.
-Prior executions and token usage remain part of the Task's history and
-budget.
+Each event records a budget reset. Only executions queued after the
+latest retry event count toward the Task's current budget. The CLI
+`show <taskId>` and `get_goal` show both the current window and the
+lifetime total. Older results retain their originally recorded counts.
 
 A passing review creates one `integration` proposal and atomically sets
 the Task to `awaiting-integration`. The proposal binds the branch, base,

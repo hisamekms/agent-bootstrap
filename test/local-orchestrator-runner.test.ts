@@ -132,10 +132,18 @@ function enableGoalAgentApproval() {
 test("Planner keeps the brief and context in files, records usage and submits a pending goal", async () => {
   let calledId: string | undefined;
   const repoText = "Untrusted repository instruction";
+  const originalSession = store.startSession(
+    "Concierge",
+    "runtime-original",
+  ).id;
+  const input = { ...goalRequest, sessionId: originalSession };
+  const base = "a".repeat(40);
+  store.recordSessionSnapshot(originalSession, base);
   const work = runner({
-    context: async () => [
-      { path: "src/main.ts", bytes: Buffer.from(repoText) },
-    ],
+    context: async (commit) => {
+      assert.equal(commit, base);
+      return [{ path: "src/main.ts", bytes: Buffer.from(repoText) }];
+    },
     limits: { plannerTimeoutMs: 1234 },
     runPlanner: async (plan, id) => {
       calledId = id;
@@ -151,12 +159,17 @@ test("Planner keeps the brief and context in files, records usage and submits a 
       assert.partialDeepStrictEqual(JSON.parse(file(plan, "request.json")), {
         mode: "goal-design",
         brief: goalRequest.brief,
+        repositoryCommit: base,
       });
+      const { budgets } = JSON.parse(file(plan, "request.json")).contract.answer
+        .goals[0].scope;
+      assert.match(budgets.maxTokens, /60,000.*Executor \+ Reviewer/);
+      assert.match(budgets.maxRetries, /three revision cycles/);
       assert.equal(file(plan, "repo/src/main.ts"), repoText);
       return response(id, { goals: [goal] });
     },
   });
-  const id = await work.requestPlanner(goalRequest);
+  const id = await work.requestPlanner(input);
   assert.partialDeepStrictEqual(store.getExecution(id), {
     status: "queued",
     actor: "Planner",
@@ -164,7 +177,7 @@ test("Planner keeps the brief and context in files, records usage and submits a 
     requestedBy: {
       kind: "actor",
       actor: "Concierge",
-      sessionId: goalRequest.sessionId,
+      sessionId: originalSession,
     },
   });
   await work.drain();
@@ -175,7 +188,11 @@ test("Planner keeps the brief and context in files, records usage and submits a 
     status: "pending",
     kind: "goal",
     content: goal,
-    source: { ...plannerOrigin, executionId: id },
+    source: {
+      ...plannerOrigin,
+      executionId: id,
+      sessionId: originalSession,
+    },
   });
   assert.partialDeepStrictEqual(store.getExecution(id), {
     status: "succeeded",
@@ -191,9 +208,84 @@ test("Planner keeps the brief and context in files, records usage and submits a 
         },
       ],
       attempts: 1,
-      tokens: { input: 15, output: 5 },
+      tokens: 19,
+      usage: [{ input: 10, output: 5, cacheRead: 2, cacheCreation: 3 }],
     },
   });
+  store.endSession(originalSession);
+  const newSession = store.startSession("Concierge", "runtime-new").id;
+  store.recordSessionSnapshot(newSession, "b".repeat(40));
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  assert.ok(goalId);
+  assert.equal(store.getGoal(goalId)?.planningCommit, base);
+  const decomposition = runner({
+    context: async (commit) => {
+      assert.equal(commit, base);
+      return [];
+    },
+    runPlanner: async (plan, id) => {
+      const request = JSON.parse(file(plan, "request.json"));
+      assert.equal(request.repositoryCommit, base);
+      assert.match(
+        request.contract.answer.tasks[0].budgets.maxTokens,
+        /60,000/,
+      );
+      return response(id, { tasks: [task] });
+    },
+  });
+  const planned = await decomposition.requestPlanner({
+    ...input,
+    mode: "task-decomposition",
+    sessionId: newSession,
+    goalId,
+  });
+  await decomposition.drain();
+  assert.equal(store.getExecution(planned)?.status, "succeeded");
+});
+
+test("Planner keeps using the private base when decomposing a legacy Goal", async () => {
+  const goalId = registerGoal();
+  const sessionId = store.startSession("Concierge", "runtime").id;
+  store.recordSessionSnapshot(sessionId, "a".repeat(40));
+  const base = "b".repeat(40);
+  let lookups = 0;
+  const work = runner({
+    canScheduleTasks: () => false,
+    tasks: {
+      async existingBase() {
+        lookups++;
+        return base;
+      },
+      async open() {
+        throw new Error("unexpected Task run");
+      },
+      async diff() {
+        throw new Error("unexpected diff");
+      },
+    },
+    context: async (commit, goalRepository) => {
+      assert.equal(commit, base);
+      assert.equal(goalRepository, true);
+      return [];
+    },
+    runPlanner: async (_, id) => response(id, { tasks: [task] }),
+  });
+  for (const mode of ["task-decomposition", "replanning"] as const) {
+    const id = await work.requestPlanner({
+      ...goalRequest,
+      mode,
+      goalId,
+      sessionId,
+    });
+    await work.drain();
+    assert.equal(store.getExecution(id)?.status, "succeeded");
+    assert.equal(store.getGoal(goalId)?.baseCommit, base);
+  }
+  assert.equal(lookups, 1);
 });
 
 test("Planner submits decomposition in order, resolving existing IDs and registered or pending batch references", async () => {
@@ -457,6 +549,11 @@ test("Planner discards answers over 64 KiB after harness extraction", async () =
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "contract-violation",
     attempts: 2,
+    tokens: 38,
+    usage: [
+      { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
+      { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
+    ],
   });
   assert.equal(store.listProposals().length, 0);
 });
@@ -522,7 +619,12 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
   await work.drain();
   assert.partialDeepStrictEqual(store.getExecution(id), {
     status: "succeeded",
-    result: { decision: "approve", reasons: ["Fits the goal"] },
+    result: {
+      decision: "approve",
+      reasons: ["Fits the goal"],
+      tokens: 19,
+      usage: { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
+    },
   });
   assert.equal(store.getProposal(proposal.id)?.status, "approved");
   assert.equal(store.listTasks(goalId)[0]?.proposalId, proposal.id);
@@ -674,6 +776,8 @@ test("Reviewer rechecks policy before recording an in-flight verdict", async () 
   await work.drain();
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "approval-forbidden",
+    tokens: 19,
+    usage: { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
   });
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
 });

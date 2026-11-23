@@ -11,6 +11,7 @@ import {
   fields,
   fitsScope,
   freeze,
+  gitCommit,
   identifier,
   integer,
   oneOf,
@@ -117,7 +118,7 @@ type Decision = "approve" | "reject";
 type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 3;
+const schemaVersion = 4;
 export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
     id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
@@ -146,7 +147,8 @@ const schema = `
   CREATE TABLE goals (
     id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
     content_json TEXT NOT NULL, digest TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'done', 'cancelled')), created_at TEXT NOT NULL
+    status TEXT NOT NULL CHECK (status IN ('active', 'done', 'cancelled')), created_at TEXT NOT NULL,
+    planning_commit TEXT, base_commit TEXT
   ) STRICT;
   CREATE TABLE tasks (${taskColumnsSql}) STRICT;
   CREATE INDEX tasks_goal ON tasks(goal_id);
@@ -167,7 +169,8 @@ const schema = `
   CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
   CREATE TABLE actor_sessions (
     id TEXT PRIMARY KEY, actor TEXT NOT NULL, runtime_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT
+    status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT,
+    snapshot_commit TEXT
   ) STRICT;
   CREATE TABLE events (
     id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
@@ -261,7 +264,11 @@ type RegisteredRow = {
   digest: string;
   createdAt: string;
 };
-type GoalRow = RegisteredRow & { status: "active" | "done" | "cancelled" };
+type GoalRow = RegisteredRow & {
+  status: "active" | "done" | "cancelled";
+  planningCommit: string | null;
+  baseCommit: string | null;
+};
 type TaskRow = RegisteredRow & {
   goalId: string;
   status:
@@ -301,6 +308,7 @@ const proposalColumns =
   "id, kind, content_json AS contentJson, digest, source_json AS sourceJson, status, created_at AS createdAt, decided_at AS decidedAt";
 const registeredColumns =
   "id, proposal_id AS proposalId, content_json AS contentJson, digest, status, created_at AS createdAt";
+const goalColumns = `${registeredColumns}, planning_commit AS planningCommit, base_commit AS baseCommit`;
 const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts,
   (SELECT count(*) FROM events WHERE subject_id = tasks.id AND subject_kind = 'task'
     AND kind = 'task.retried') AS retries`;
@@ -496,7 +504,6 @@ export class OrchestratorStore {
               connection.exec(`
                 CREATE INDEX tasks_goal ON tasks(goal_id);
                 CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
-                PRAGMA user_version=${schemaVersion};
               `);
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
@@ -506,11 +513,20 @@ export class OrchestratorStore {
                 INSERT INTO next_integration_approval_runs SELECT * FROM integration_approval_runs;
                 DROP TABLE integration_approval_runs;
                 ALTER TABLE next_integration_approval_runs RENAME TO integration_approval_runs;
-                PRAGMA user_version=${schemaVersion};
               `);
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
-            } else if (version !== schemaVersion) throw new Error();
+            } else if (version !== 3 && version !== schemaVersion) {
+              throw new Error();
+            }
+            if (version !== schemaVersion) {
+              connection.exec(`
+                ALTER TABLE actor_sessions ADD COLUMN snapshot_commit TEXT;
+                ALTER TABLE goals ADD COLUMN planning_commit TEXT;
+                ALTER TABLE goals ADD COLUMN base_commit TEXT;
+                PRAGMA user_version=${schemaVersion};
+              `);
+            }
           }
         })
         .immediate();
@@ -741,7 +757,7 @@ export class OrchestratorStore {
 
   #goal(id: string) {
     return this.#db
-      .query<GoalRow>(`SELECT ${registeredColumns} FROM goals WHERE id = ?`)
+      .query<GoalRow>(`SELECT ${goalColumns} FROM goals WHERE id = ?`)
       .get(id);
   }
 
@@ -990,14 +1006,19 @@ export class OrchestratorStore {
         );
         return freeze({ status, taskId });
       }
+      const planningCommit =
+        origin.kind === "actor" && origin.sessionId
+          ? this.#sessionSnapshotCommit(origin.sessionId)
+          : null;
       const goalId = randomUUID();
       this.#run(
-        "INSERT INTO goals VALUES (?, ?, ?, ?, 'active', ?)",
+        "INSERT INTO goals VALUES (?, ?, ?, ?, 'active', ?, ?, NULL)",
         goalId,
         id,
         row.contentJson,
         row.digest,
         at,
+        planningCommit,
       );
       this.#event(
         at,
@@ -1099,6 +1120,7 @@ export class OrchestratorStore {
       this.#event(at, "task.retried", "task", id, {
         retries,
         origin: "operator",
+        budgetReset: true,
       });
       return { id, status, retries } as const;
     });
@@ -1377,7 +1399,7 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("session-busy");
       const id = randomUUID();
       this.#run(
-        "INSERT INTO actor_sessions VALUES (?, ?, ?, 'active', ?, NULL)",
+        "INSERT INTO actor_sessions VALUES (?, ?, ?, 'active', ?, NULL, NULL)",
         id,
         kind,
         runtime,
@@ -1392,6 +1414,69 @@ export class OrchestratorStore {
         { sessionId: id },
       );
       return freeze({ id, status: "active" as const });
+    });
+  }
+
+  #sessionSnapshotCommit(id: string): string | null {
+    return (
+      this.#db
+        .query<{ snapshotCommit: string | null }>(
+          "SELECT snapshot_commit AS snapshotCommit FROM actor_sessions WHERE id = ?",
+        )
+        .get(id)?.snapshotCommit ?? null
+    );
+  }
+
+  sessionSnapshotCommit(sessionId: string): string | null {
+    return this.#read(() => this.#sessionSnapshotCommit(identifier(sessionId)));
+  }
+
+  recordSessionSnapshot(sessionId: string, commit: string): void {
+    const id = identifier(sessionId);
+    const snapshotCommit = gitCommit(commit);
+    this.#write((at) => {
+      this.#run(
+        "UPDATE actor_sessions SET snapshot_commit = ? WHERE id = ? AND actor = 'Concierge' AND status = 'active' AND snapshot_commit IS NULL",
+        snapshotCommit,
+        id,
+      );
+      this.#event(
+        at,
+        "session.snapshot",
+        "session",
+        id,
+        { snapshotCommit },
+        { sessionId: id },
+      );
+    });
+  }
+
+  recordGoalCommit(
+    goalId: string,
+    commit: string,
+    kind: "planning" | "base",
+  ): void {
+    const id = identifier(goalId);
+    const value = gitCommit(commit);
+    this.#write((at) => {
+      const { planningCommit, baseCommit } = required(this.#goal(id));
+      const pinned = baseCommit ?? planningCommit;
+      if (pinned !== null && pinned !== value)
+        throw new OrchestratorStoreError("context-mismatch");
+      if (kind === "planning" ? pinned !== null : baseCommit !== null) return;
+      if (kind === "planning") {
+        this.#run(
+          "UPDATE goals SET planning_commit = ? WHERE id = ?",
+          value,
+          id,
+        );
+        this.#event(at, "goal.planning-pinned", "goal", id, {
+          planningCommit: value,
+        });
+      } else {
+        this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", value, id);
+        this.#event(at, "goal.base-pinned", "goal", id, { baseCommit: value });
+      }
     });
   }
 
@@ -1673,9 +1758,7 @@ export class OrchestratorStore {
     return this.#read(() =>
       freeze(
         this.#db
-          .query<GoalRow>(
-            `SELECT ${registeredColumns} FROM goals ORDER BY rowid`,
-          )
+          .query<GoalRow>(`SELECT ${goalColumns} FROM goals ORDER BY rowid`)
           .all()
           .map(goalRecord),
       ),
@@ -1698,6 +1781,28 @@ export class OrchestratorStore {
             "SELECT total(json_extract(result_json, '$.tokens')) AS tokens FROM executions WHERE task_id = ?",
           )
           .get(identifier(taskId))!.tokens,
+    );
+  }
+
+  /** Audit order defines the window even when events share a timestamp. */
+  taskBudgetTokens(taskId: string): number {
+    const id = identifier(taskId);
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ tokens: number }>(
+            `
+            SELECT total(json_extract(executions.result_json, '$.tokens')) AS tokens
+            FROM executions
+            LEFT JOIN events AS queued ON queued.subject_id = executions.id
+              AND queued.subject_kind = 'execution' AND queued.kind = 'execution.queued'
+            WHERE executions.task_id = ? AND coalesce(queued.rowid, 0) > coalesce((
+              SELECT max(rowid) FROM events
+              WHERE subject_id = ? AND subject_kind = 'task' AND kind = 'task.retried'
+            ), -1)
+          `,
+          )
+          .get(id, id)!.tokens,
     );
   }
 

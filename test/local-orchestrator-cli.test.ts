@@ -207,6 +207,7 @@ test("show matches store details after the project policy changes", async () => 
     ...proposal,
     effectivePolicy,
     policySource,
+    baseCommit: null,
   });
 });
 
@@ -665,7 +666,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
       store.listEvents({ subjectId: id, limit: 1 })[0],
       {
         kind: "task.retried",
-        data: { retries, origin: "operator" },
+        data: { retries, origin: "operator", budgetReset: true },
       },
     );
     assert.ok(store.claimTask(id));

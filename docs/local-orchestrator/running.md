@@ -25,6 +25,10 @@ for details.
 
 ## Start or resume
 
+Update local `main` before starting a session, for example after merging
+PRs. The launcher pins local `main` for the Concierge snapshot and new
+Goal planning, regardless of the branch checked out at launch.
+
 From the repository root, preview the launch with the first command. The
 second command starts an audited session with egress to
 `api.anthropic.com:443` and `platform.claude.com:443`. The platform host
@@ -86,8 +90,10 @@ bun run src/local-orchestrator/cli.ts retry-task <taskId>
 For a failed Task, type `retry-task <taskId>` with the full ID at the host
 terminal prompt. The scheduler can pick up the registered Task during an
 active Concierge session or the next launch. Each Task allows three
-operator retries. Previous runs continue to count toward its token
-budget. Use the same `--db` as the launcher if you supplied a custom path.
+operator retries. Each retry starts a fresh token budget window.
+Use `show <taskId>` to see the current budgeted usage and the total
+across all attempts. Use the same `--db` as the launcher if you supplied
+a custom path.
 
 ## Review proposals
 

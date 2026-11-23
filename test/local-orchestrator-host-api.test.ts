@@ -445,12 +445,22 @@ test("handles split UTF-8 and exercises each tool against the real store", async
     policy: "human",
     loosening: ["integration"],
   });
+  const baseCommit = "a".repeat(40);
+  store.recordGoalCommit(goalId, baseCommit, "base");
   assert.partialDeepStrictEqual(
     (await client.call("get_goal", { id: goalId })).data,
     {
       id: goalId,
       content: goalContent,
-      tasks: [{ id: task.data.taskId, content: { ...taskContent, goalId } }],
+      baseCommit,
+      tasks: [
+        {
+          id: task.data.taskId,
+          content: { ...taskContent, goalId },
+          budgetTokens: 0,
+          totalTokens: 0,
+        },
+      ],
     },
   );
   const planned = await client.call("request_planner", {

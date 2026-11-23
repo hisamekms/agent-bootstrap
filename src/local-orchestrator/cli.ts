@@ -40,7 +40,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--rep
   retry-task <taskId>
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
-  show <proposalId>
+  show <proposalId|goalId|taskId>
   approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   policy show
@@ -309,6 +309,22 @@ async function execute(
     case "show":
     case "approve":
     case "reject": {
+      if (command.kind === "show") {
+        const goal = store.getGoal(command.id);
+        if (goal) {
+          writeJson(io, goal);
+          return 0;
+        }
+        const task = store.getTask(command.id);
+        if (task) {
+          writeJson(io, {
+            ...task,
+            budgetTokens: store.taskBudgetTokens(task.id),
+            totalTokens: store.taskTokens(task.id),
+          });
+          return 0;
+        }
+      }
       const proposal = store.getProposalDetails(command.id, {
         includeDelegation: command.kind === "show",
       });
@@ -324,6 +340,17 @@ async function execute(
       }
       writeJson(io, {
         ...displayProposal(proposal),
+        ...(command.kind === "show" &&
+        proposal.kind === "goal" &&
+        proposal.status === "approved"
+          ? {
+              baseCommit:
+                store
+                  .listGoals()
+                  .find((goal) => goal.proposalId === proposal.id)
+                  ?.baseCommit ?? null,
+            }
+          : {}),
         ...(diffStat === undefined ? {} : { diffStat }),
       });
       if (command.kind === "show") return 0;
