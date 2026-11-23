@@ -61,20 +61,31 @@ credential-free Verification role. Only an immediately preceding
 pre-review verification pass for the same pin allows review to proceed.
 An interrupted integration stays terminal.
 
+Token budgets are advisory as of the 2026-11-23 operator decision. The
+host enforces time and retry limits and will revisit token enforcement
+when enough real usage data is available. The Planner records
+`maxTokens` for comparison and suggests about 60,000 budgeted tokens for
+one Executor and Reviewer pair, with more for revisions and agent approval.
+
 The host computes budgeted tokens for each Claude run as
-`input + output + cache_creation + ceil(cache_read / 10)`. Execution
-results retain the four raw usage counts when available. Planner results
-keep one raw usage entry per reported attempt. Executor, Reviewer and
-integration approval runs share the Task's budget. The credential-free
-verification suite counts as zero model tokens. The Planner contract
-suggests about 60,000 budgeted tokens for one Executor and Reviewer pair,
-with more for revisions and agent approval. Worker stdout carries the
-collect request.
-The opt-in guest command puts a marker and the complete Claude JSON result
-at the end of stderr when the result fits in 64 KiB. The host receives the
-last 66 KiB, parses the marked result for `usage` and `is_error` and
-persists the token count. An actor run with missing, invalid or oversized
-usage stops a budgeted Task with `usage-unavailable`.
+`input + output + cache_creation + ceil(cache_read / 10)`. It records
+`tokens`, the four raw usage counts and the reference `maxTokens` for
+each execution. Task executions use the Task's reference. Other
+goal-scoped executions use the Goal's reference, and unscoped
+executions report `maxTokens: null`. Planner results retain raw counts
+per reported attempt. Credential-free verification counts as zero.
+Executor, verification, review and integration approval executions also
+contribute to the Task's current retry window, which reports budgeted
+tokens, totals for the raw counts and the Task's reference.
+
+The opt-in worker command writes the Claude JSON result and a marker at
+the end of stderr when the result fits in 64 KiB. The host parses the end of
+stderr for `usage` and `is_error`. Missing, invalid or oversized usage is
+recorded as `usage: "unavailable"` and execution continues according to
+its outcome. Where available, known subtotals are retained. An
+`overBudget` flag reports the comparison when usage is complete or the
+known subtotal exceeds the reference. The host emits an advisory
+`task.budget-exceeded` event on the first crossing in each retry window.
 
 The exclusive launcher refuses to start while its database has an active
 Concierge session, unfinished executions or a running Task. After the
@@ -86,9 +97,12 @@ ends sessions and marks unfinished executions and running Tasks
 records each retry as `task.retried` in the same transaction and allows
 up to three per Task. The scheduler applies the usual eligibility checks.
 Each event records a budget reset. Only executions queued after the
-latest retry event count toward the Task's current budget. The CLI
-`show <taskId>` and `get_goal` show both the current window and the
-lifetime total. Older results retain their originally recorded counts.
+latest retry event count toward the current window. The CLI
+`show <taskId>` and Host API `get_goal` show both the current window and
+the lifetime token total. CLI and Host API `status` show usage for recent
+Tasks and executions. CLI `show-execution` shows the execution's usage
+and budget comparison. Older results retain their originally recorded
+counts.
 
 A passing review creates one `integration` proposal and atomically sets
 the Task to `awaiting-integration`. The proposal binds the branch, base,
@@ -101,9 +115,8 @@ tree. Use `--repo` to identify the launcher's repository when specifying
 a custom `--db`.
 
 For an eligible agent gate, the host gives the pinned diff to a dedicated
-Reviewer in `approval` mode. A failed approval within the Task's known
-token budget allows one new request. An interrupted approval or an
-unknown or exceeded token budget leaves the proposal pending for a
+Reviewer in `approval` mode. A failed or timed-out approval allows one
+new request. An interrupted approval leaves the proposal pending for a
 human. Approval keeps the Task in `awaiting-integration`. Rejection
 fails it.
 

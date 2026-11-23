@@ -108,9 +108,9 @@ const commonContract = {
 const budgetContract = {
   maxExecutionMs: "integer, 1..3600000",
   maxRetries:
-    "integer, 0..10. Executor Tasks allow up to three revision cycles. Size maxTokens to cover the revisions you allow.",
+    "integer, 0..10. Executor Tasks allow up to three revision cycles. Include revisions in the token estimate.",
   maxTokens:
-    "integer, 1..10000000 budgeted tokens. Allow about 60,000 for one Executor + Reviewer pair, plus more for revisions and agent approval. Budgeted tokens count input, output, cache creation and one tenth of cache reads (rounded up per run). Goal scope budgets bound each Task.",
+    "integer, 1..10000000 budgeted tokens. Allow about 60,000 for one Executor + Reviewer pair, plus more for revisions and agent approval. Budgeted tokens count input, output, cache creation and one tenth of cache reads (rounded up per run). Token budgets are advisory and recorded for comparison.",
 };
 const goalContract = {
   answer: {
@@ -443,8 +443,8 @@ export class ActorRunner {
     if (store.getExecution(job.id)?.status === "cancelled") return;
     store.startExecution(job.id);
     let attempts = 0;
-    const actorUsage: ReportedUsage[] = [];
-    const recordUsage = (usage: ReportedUsage) => {
+    const actorUsage: (ReportedUsage | undefined)[] = [];
+    const recordUsage = (usage?: ReportedUsage) => {
       actorUsage.push(usage);
     };
     let completion: Completion = {
@@ -471,21 +471,26 @@ export class ActorRunner {
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {
+        const reported = actorUsage.filter((run) => run !== undefined);
+        const usage =
+          job.kind === "planner"
+            ? reported.map((run) => run.usage)
+            : reported[0]?.usage;
+        const unavailable =
+          reported.length === 0 ||
+          reported.length !== (job.kind === "planner" ? attempts : 1);
         store.finishExecution(job.id, completion.status, {
           ...completion.result,
           ...(job.kind === "planner" ? { attempts } : {}),
-          ...(actorUsage.length === 0
-            ? {}
-            : {
-                tokens: Math.min(
+          tokens:
+            reported.length === 0
+              ? null
+              : Math.min(
                   Number.MAX_SAFE_INTEGER,
-                  actorUsage.reduce((sum, run) => sum + run.tokens, 0),
+                  reported.reduce((sum, run) => sum + run.tokens, 0),
                 ),
-                usage:
-                  job.kind === "planner"
-                    ? actorUsage.map((run) => run.usage)
-                    : actorUsage[0]!.usage,
-              }),
+          usage: unavailable ? "unavailable" : usage,
+          ...(unavailable && reported.length > 0 ? { rawUsage: usage } : {}),
         });
       }
     }
@@ -494,7 +499,7 @@ export class ActorRunner {
   async #runPlanner(
     { id, input }: Extract<Job, { kind: "planner" }>,
     onAttempt: () => void,
-    recordUsage: (usage: ReportedUsage) => void,
+    recordUsage: (usage?: ReportedUsage) => void,
   ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { mode, brief, goalId } = input;
@@ -557,7 +562,7 @@ export class ActorRunner {
         harness.harness === "claude"
           ? reportedUsage(parseClaudeCodeResult(run.response))
           : undefined;
-      if (usage !== undefined) recordUsage(usage);
+      recordUsage(usage);
       if (run.outcome === "timed-out")
         return { status: "timed-out", result: { code: "timed-out" } };
       if (run.outcome !== "ok") {
@@ -648,7 +653,7 @@ export class ActorRunner {
 
   async #runApproval(
     { id, proposalId }: Extract<Job, { kind: "approval" }>,
-    recordUsage: (usage: ReportedUsage) => void,
+    recordUsage: (usage?: ReportedUsage) => void,
   ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { proposal, goalId } = this.#approvalSnapshot(proposalId);
@@ -677,8 +682,6 @@ export class ActorRunner {
         path: "candidate.diff",
         bytes: await this.#deps.tasks.diff(proposal.content),
       });
-      if (store.taskBudgetTokens(task.id) > task.content.budgets.maxTokens)
-        return { status: "failed", result: { code: "budget-exceeded" } };
       if (this.#deps.canScheduleTasks?.() === false)
         return { status: "failed", result: { code: "session-ended" } };
     }
@@ -694,30 +697,12 @@ export class ActorRunner {
       return { status: "failed", result: { code: "host-error" } };
     const result =
       harness.harness === "claude" ? parseClaudeCodeResult(run.response) : null;
-    const usage = reportedUsage(result);
-    if (usage !== undefined) recordUsage(usage);
-    const tokens = usage?.tokens;
-    const missingUsage = task !== null && tokens === undefined;
+    recordUsage(reportedUsage(result));
     const timedOut = run.outcome === "timed-out";
     if (run.outcome !== "ok" || result?.isError)
       return {
         status: timedOut ? "timed-out" : "failed",
-        result: {
-          code: missingUsage
-            ? "usage-unavailable"
-            : timedOut
-              ? "timed-out"
-              : "actor-failed",
-        },
-      };
-    if (
-      task &&
-      tokens !== undefined &&
-      store.taskBudgetTokens(task.id) + tokens > task.content.budgets.maxTokens
-    )
-      return {
-        status: "failed",
-        result: { code: "budget-exceeded" },
+        result: { code: timedOut ? "timed-out" : "actor-failed" },
       };
 
     let verdict: ReturnType<typeof approvalVerdict>;
@@ -729,13 +714,11 @@ export class ActorRunner {
       return {
         status: "failed",
         result: {
-          code: missingUsage ? "usage-unavailable" : "contract-violation",
+          code: "contract-violation",
           ...(rawAnswer === undefined ? {} : { rawAnswer }),
         },
       };
     }
-    if (missingUsage)
-      return { status: "failed", result: { code: "usage-unavailable" } };
     store.decide(proposalId, {
       digest: proposal.digest,
       decision: verdict.decision,

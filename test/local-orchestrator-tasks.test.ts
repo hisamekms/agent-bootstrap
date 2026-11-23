@@ -334,12 +334,6 @@ test("agent policy requests dedicated approval with the candidate diff under the
         response: Buffer.from(
           JSON.stringify({
             result: '{"decision":"approve","reasons":[]}',
-            usage: {
-              input_tokens: 1,
-              output_tokens: 2,
-              cache_read_input_tokens: 3,
-              cache_creation_input_tokens: 4,
-            },
           }),
         ),
       };
@@ -357,8 +351,9 @@ test("agent policy requests dedicated approval with the candidate diff under the
     mode: "approval",
     status: "succeeded",
     result: {
-      tokens: 8,
-      usage: { input: 1, output: 2, cacheRead: 3, cacheCreation: 4 },
+      tokens: null,
+      usage: "unavailable",
+      maxTokens: 50,
     },
   });
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
@@ -405,7 +400,7 @@ test("revision and path violations share the retry cap", async () => {
   assert.equal(store.pendingIntegrations().length, 0);
 });
 
-test("concerns, actor failures and cumulative token usage stop the task", async () => {
+test("review concerns and timeouts still stop the task", async () => {
   const goalId = goal();
   const concerned = task(goalId);
   await runner(
@@ -430,29 +425,86 @@ test("concerns, actor failures and cumulative token usage stop the task", async 
       },
     }).executor,
   ).drain();
-  assert.deepEqual(failure(timedOut), {
-    status: "failed",
-    code: "usage-unavailable",
+  assert.deepEqual(failure(timedOut), { status: "failed", code: "timed-out" });
+  assert.partialDeepStrictEqual(store.getHostApiStatus().recentExecutions[0], {
+    status: "timed-out",
+    usage: "unavailable",
+    maxTokens: 50,
   });
+});
 
-  const capped = task(goalId);
-  const { executor } = fixture({
-    async worker(_id, _revise, observed) {
-      observed.tokens = 30;
+test("crossing the Task token budget emits one advisory and allows verification, review and approval", async () => {
+  const taskId = task(goal({ integration: "agent" }));
+  const { executor, calls } = fixture({
+    async worker(_id, _revision, observed) {
+      observed.tokens = 51;
+      observed.usage = {
+        input: 45,
+        output: 1,
+        cacheCreation: 2,
+        cacheRead: 30,
+      };
       return pin;
     },
+    async verify() {
+      calls.push("verify");
+      return true;
+    },
     async review(_id, observed) {
+      calls.push("review");
       observed.tokens = 21;
+      observed.usage = { input: 20, output: 1, cacheCreation: 0, cacheRead: 0 };
       return { ...pin, review: "pass" };
     },
   });
-  await runner(executor).drain();
-  assert.deepEqual(failure(capped), {
-    status: "failed",
-    code: "budget-exceeded",
+  const work = runner(executor, {
+    async runReviewer(_plan, id) {
+      calls.push("approve");
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(
+          JSON.stringify({
+            result: '{"decision":"approve","reasons":[]}',
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 3,
+            },
+          }),
+        ),
+      };
+    },
   });
-  assert.equal(store.taskTokens(capped), 51);
+  await work.drain();
+  assert.deepEqual(calls, ["verify", "review", "approve"]);
+  assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
   assert.equal(store.pendingIntegrations().length, 0);
+  assert.deepEqual(store.taskUsage(taskId), {
+    tokens: 75,
+    maxTokens: 50,
+    overBudget: true,
+    usage: { input: 66, output: 3, cacheCreation: 2, cacheRead: 33 },
+  });
+  const advisories = store
+    .listEvents({ subjectId: taskId, limit: 20 })
+    .filter(({ kind }) => kind === "task.budget-exceeded");
+  assert.equal(advisories.length, 1);
+  const workerUsage = {
+    tokens: 51,
+    maxTokens: 50,
+    overBudget: true,
+    usage: { input: 45, output: 1, cacheCreation: 2, cacheRead: 30 },
+  };
+  assert.deepEqual(advisories[0]?.data, workerUsage);
+  assert.partialDeepStrictEqual(
+    store.getExecution(advisories[0]!.executionId!),
+    {
+      status: "succeeded",
+      result: workerUsage,
+    },
+  );
 });
 
 function command(
@@ -1068,7 +1120,7 @@ test("out-of-scope symlink targets fail before review and in-scope links require
   assert.equal(approve(proposal).status, "approved");
 });
 
-test("missing Task usage stops execution and retries reset the budget but preserve history", async () => {
+test("missing Task usage is advisory and retries reset the window but preserve history", async () => {
   const goalId = goal();
   const unknown = task(goalId);
   const missing = fixture({
@@ -1077,11 +1129,19 @@ test("missing Task usage stops execution and retries reset the budget but preser
     },
   });
   await runner(missing.executor).drain();
-  assert.deepEqual(failure(unknown), {
-    status: "failed",
-    code: "usage-unavailable",
+  assert.equal(store.getTask(unknown)?.status, "awaiting-integration");
+  assert.deepEqual(missing.calls, ["review"]);
+  assert.partialDeepStrictEqual(store.taskUsage(unknown), {
+    tokens: 0,
+    maxTokens: 50,
+    usage: "unavailable",
   });
-  assert.deepEqual(missing.calls, []);
+  assert.equal(store.taskUsage(unknown).overBudget, undefined);
+  assert.partialDeepStrictEqual(store.getHostApiStatus().recentExecutions[1], {
+    status: "succeeded",
+    tokens: null,
+    usage: "unavailable",
+  });
 
   const rerunGoal = goal({ integration: "agent" });
   const rerun = task(rerunGoal);
@@ -1137,7 +1197,65 @@ test("missing Task usage stops execution and retries reset the budget but preser
   assert.deepEqual(next.calls, ["review"]);
 });
 
-test("a failed integration approval allows one retry and fails closed on missing usage", async () => {
+test("a late completion contributes to its original retry window", () => {
+  const taskId = task(goal());
+  const begin = () => {
+    const { id } = store.createExecution({
+      actor: "Executor",
+      mode: "task",
+      taskId,
+      requestedBy: { kind: "host" },
+    });
+    store.startExecution(id);
+    return id;
+  };
+  const finish = (id: string, tokens: number) =>
+    store.finishExecution(id, "succeeded", {
+      tokens,
+      usage: { input: tokens, output: 0, cacheCreation: 0, cacheRead: 0 },
+    });
+  assert.ok(store.claimTask(taskId));
+  finish(begin(), 50);
+  assert.equal(store.taskUsage(taskId).overBudget, false);
+  const late = begin();
+  store.failTask(taskId, "host-error");
+  store.retryTask(taskId, 0);
+  assert.ok(store.claimTask(taskId));
+  const current = begin();
+  finish(current, 51);
+  finish(late, 2);
+  finish(begin(), 1);
+
+  assert.equal(store.taskUsage(taskId).tokens, 52);
+  assert.deepEqual(
+    store
+      .listEvents({ subjectId: taskId, limit: 20 })
+      .filter(({ kind }) => kind === "task.budget-exceeded")
+      .map(({ executionId, data }) => ({ executionId, data })),
+    [
+      {
+        executionId: late,
+        data: {
+          tokens: 52,
+          maxTokens: 50,
+          overBudget: true,
+          usage: { input: 52, output: 0, cacheCreation: 0, cacheRead: 0 },
+        },
+      },
+      {
+        executionId: current,
+        data: {
+          tokens: 51,
+          maxTokens: 50,
+          overBudget: true,
+          usage: { input: 51, output: 0, cacheCreation: 0, cacheRead: 0 },
+        },
+      },
+    ],
+  );
+});
+
+test("a failed integration approval allows one retry even with missing usage", async () => {
   const taskId = task(goal({ integration: "agent" }));
   const { executor } = fixture();
   const calls: string[] = [];
@@ -1149,11 +1267,8 @@ test("a failed integration approval allows one retry and fails closed on missing
         outcome: "ok",
         response: Buffer.from(
           JSON.stringify({
-            result:
-              calls.length === 1
-                ? "invalid verdict"
-                : "another invalid verdict",
-            ...(calls.length === 2
+            result: "invalid verdict",
+            ...(calls.length === 1
               ? {}
               : {
                   usage: {
@@ -1175,14 +1290,19 @@ test("a failed integration approval allows one retry and fails closed on missing
     status: "failed",
     result: {
       code: "contract-violation",
-      tokens: 3,
-      usage: { input: 1, output: 1, cacheRead: 3, cacheCreation: 0 },
+      tokens: null,
+      usage: "unavailable",
       rawAnswer: "invalid verdict",
     },
   });
   assert.partialDeepStrictEqual(store.getExecution(calls[1]!), {
     status: "failed",
-    result: { code: "usage-unavailable", rawAnswer: "another invalid verdict" },
+    result: {
+      code: "contract-violation",
+      tokens: 3,
+      usage: { input: 1, output: 1, cacheRead: 3, cacheCreation: 0 },
+      rawAnswer: "invalid verdict",
+    },
   });
   const [proposal] = store.pendingIntegrations();
   assert.ok(proposal);

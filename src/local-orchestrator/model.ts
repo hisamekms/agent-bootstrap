@@ -395,7 +395,7 @@ export function taskLimitReasons(
   registeredTaskCount: number,
 ): string[] {
   const reasons: string[] = [];
-  for (const key of budgetKeys) {
+  for (const key of ["maxExecutionMs", "maxRetries"] as const) {
     if (task.budgets[key] > goal.scope.budgets[key]) reasons.push(key);
   }
   if (registeredTaskCount >= goal.scope.maxTasks) reasons.push("maxTasks");

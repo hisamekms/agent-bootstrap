@@ -36,7 +36,11 @@ import {
 } from "./model.ts";
 import { rawReviewerAnswer, taskReviewerOutput } from "./reviewer-answer.ts";
 import type { OrchestratorStore } from "./store.ts";
-import { reportedUsage, type TokenUsage } from "./token-usage.ts";
+import {
+  emptyTokenUsage,
+  reportedUsage,
+  type TokenUsage,
+} from "./token-usage.ts";
 
 type Task = NonNullable<ReturnType<OrchestratorStore["claimTask"]>>;
 type TaskHost = Pick<
@@ -356,8 +360,6 @@ export function createTaskExecutor(options: {
             const run = await host.runVerification(...args);
             verificationResult.outcome = run.outcome;
             verificationResult.invocationId = run.id;
-            // Verification runs a credential-free suite and consumes no model tokens.
-            verificationResult.tokens = 0;
             if (run.id !== args[1])
               throw new Error("Verification invocation mismatch");
             return run;
@@ -438,7 +440,6 @@ export async function runTask(
   if (!task) return;
   const { budgets, paths } = task.content;
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
-  let tokens = store.taskBudgetTokens(task.id);
   let code = "host-error";
   const begin = (actor: "Executor" | "Reviewer", mode: TaskRunMode) => {
     const { id: execution } = store.createExecution({
@@ -481,22 +482,19 @@ export async function runTask(
         observed.isError
       )
         failure = "actor-failed";
-      if (
-        observed.tokens === undefined &&
-        (observed.outcome !== undefined || completion)
-      )
-        failure = "usage-unavailable";
     }
-    if (observed.tokens !== undefined) tokens += observed.tokens;
-    if (tokens > budgets.maxTokens) failure = "budget-exceeded";
     store.finishExecution(
       executionId,
       timedOut ? "timed-out" : failure ? "failed" : "succeeded",
       {
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
-        ...(observed.tokens === undefined ? {} : { tokens: observed.tokens }),
-        ...(observed.usage === undefined ? {} : { usage: observed.usage }),
+        tokens: mode === "verification" ? 0 : (observed.tokens ?? null),
+        usage:
+          mode === "verification"
+            ? emptyTokenUsage
+            : (observed.usage ??
+              (observed.tokens === 0 ? emptyTokenUsage : "unavailable")),
         ...(observed.invocationId && observed.invocationId !== executionId
           ? { invocationId: observed.invocationId }
           : {}),
@@ -506,10 +504,6 @@ export async function runTask(
   }
 
   try {
-    if (tokens > budgets.maxTokens) {
-      store.failTask(task.id, "budget-exceeded");
-      return;
-    }
     const flow = await executor.open(task);
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (!canContinue()) {

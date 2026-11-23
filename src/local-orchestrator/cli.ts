@@ -280,6 +280,7 @@ async function execute(
             : { title: proposal.content.title }),
           ...proposalPolicy(requireProposalDetails(store, proposal.id)),
         }));
+      const { recentExecutions, recentTasks } = store.getHostApiStatus();
       writeJson(io, {
         counts: {
           goals: goals.length,
@@ -291,6 +292,8 @@ async function execute(
           pending: pending.length,
         },
         pending,
+        recentExecutions,
+        recentTasks,
       });
       return 0;
     }
@@ -317,9 +320,11 @@ async function execute(
         }
         const task = store.getTask(command.id);
         if (task) {
+          const usage = store.taskUsage(task.id);
           writeJson(io, {
             ...task,
-            budgetTokens: store.taskBudgetTokens(task.id),
+            ...usage,
+            budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
           });
           return 0;

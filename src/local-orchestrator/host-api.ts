@@ -216,11 +216,15 @@ function prepareTool(
         return (
           goal && {
             ...goal,
-            tasks: store.listTasks(id).map((task) => ({
-              ...task,
-              budgetTokens: store.taskBudgetTokens(task.id),
-              totalTokens: store.taskTokens(task.id),
-            })),
+            tasks: store.listTasks(id).map((task) => {
+              const usage = store.taskUsage(task.id);
+              return {
+                ...task,
+                ...usage,
+                budgetTokens: usage.tokens,
+                totalTokens: store.taskTokens(task.id),
+              };
+            }),
             pendingIntegrations: store.pendingIntegrations(id),
           }
         );

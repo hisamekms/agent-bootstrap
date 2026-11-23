@@ -164,6 +164,7 @@ test("Planner keeps the brief and context in files, records usage and submits a 
       const { budgets } = JSON.parse(file(plan, "request.json")).contract.answer
         .goals[0].scope;
       assert.match(budgets.maxTokens, /60,000.*Executor \+ Reviewer/);
+      assert.match(budgets.maxTokens, /advisory.*recorded for comparison/);
       assert.match(budgets.maxRetries, /three revision cycles/);
       assert.equal(file(plan, "repo/src/main.ts"), repoText);
       return response(id, { goals: [goal] });
@@ -403,8 +404,35 @@ test("Planner retries a failed actor invocation and succeeds", async () => {
   assert.equal(calls, 2);
   assert.partialDeepStrictEqual(store.getExecution(id), {
     status: "succeeded",
-    result: { attempts: 2 },
+    result: {
+      attempts: 2,
+      tokens: 19,
+      usage: "unavailable",
+      rawUsage: [{ input: 10, output: 5, cacheRead: 2, cacheCreation: 3 }],
+      maxTokens: null,
+    },
   });
+});
+
+test("Planner continues after exceeding the Goal's token reference", async () => {
+  const goalId = registerGoal({
+    ...goal,
+    scope: { ...goal.scope, budgets: { ...budgets, maxTokens: 10 } },
+  });
+  const work = runner({
+    runPlanner: async (_, id) => response(id, { tasks: [task] }),
+  });
+  const id = await work.requestPlanner({
+    ...goalRequest,
+    mode: "task-decomposition",
+    goalId,
+  });
+  await work.drain();
+  assert.partialDeepStrictEqual(store.getExecution(id), {
+    status: "succeeded",
+    result: { tokens: 19, maxTokens: 10, overBudget: true },
+  });
+  assert.equal(store.listTasks(goalId).length, 1);
 });
 
 test("Planner records a timeout and drains the following execution", async () => {
@@ -549,6 +577,7 @@ test("Planner discards answers over 64 KiB after harness extraction", async () =
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "contract-violation",
     attempts: 2,
+    maxTokens: null,
     tokens: 38,
     usage: [
       { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
@@ -776,6 +805,7 @@ test("Reviewer rechecks policy before recording an in-flight verdict", async () 
   await work.drain();
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "approval-forbidden",
+    maxTokens: null,
     tokens: 19,
     usage: { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },
   });

@@ -447,6 +447,12 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   });
   const baseCommit = "a".repeat(40);
   store.recordGoalCommit(goalId, baseCommit, "base");
+  const taskUsage = {
+    tokens: 0,
+    maxTokens: 500,
+    usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+    overBudget: false,
+  };
   assert.partialDeepStrictEqual(
     (await client.call("get_goal", { id: goalId })).data,
     {
@@ -457,6 +463,7 @@ test("handles split UTF-8 and exercises each tool against the real store", async
         {
           id: task.data.taskId,
           content: { ...taskContent, goalId },
+          ...taskUsage,
           budgetTokens: 0,
           totalTokens: 0,
         },
@@ -500,7 +507,18 @@ test("handles split UTF-8 and exercises each tool against the real store", async
       },
     ],
     recentExecutions: [
-      { id, actor: "Planner", mode: "task-decomposition", status: "succeeded" },
+      {
+        id,
+        actor: "Planner",
+        mode: "task-decomposition",
+        status: "succeeded",
+        tokens: null,
+        maxTokens: 500,
+        usage: "unavailable",
+      },
+    ],
+    recentTasks: [
+      { id: task.data.taskId, goalId, status: "registered", ...taskUsage },
     ],
   });
   const calls = apiCalls();

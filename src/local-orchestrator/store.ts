@@ -31,6 +31,12 @@ import {
   type TaskContent,
 } from "./model.ts";
 
+import {
+  compareTokenBudget,
+  emptyTokenUsage,
+  readTokenReport,
+} from "./token-usage.ts";
+
 export type Operator = { kind: "operator" };
 export type Origin =
   | Operator
@@ -1208,9 +1214,7 @@ export class OrchestratorStore {
       return (
         runs.length === 1 &&
         (first.status === "failed" || first.status === "timed-out") &&
-        !["interrupted", "usage-unavailable", "budget-exceeded"].includes(
-          first.code ?? "",
-        )
+        first.code !== "interrupted"
       );
     });
   }
@@ -1342,6 +1346,24 @@ export class OrchestratorStore {
     });
   }
 
+  #executionMaxTokens(row: ExecutionRow): number | null {
+    if (row.taskId !== null)
+      return taskRecord(required(this.#task(row.taskId))).content.budgets
+        .maxTokens;
+    if (row.goalId !== null)
+      return goalRecord(required(this.#goal(row.goalId))).content.scope.budgets
+        .maxTokens;
+    return null;
+  }
+
+  #executionUsage(row: ExecutionRow, result: unknown) {
+    const finished = row.startedAt !== null && row.finishedAt !== null;
+    return compareTokenBudget(
+      readTokenReport(result, finished),
+      this.#executionMaxTokens(row),
+    );
+  }
+
   finishExecution(
     executionId: string,
     status: FinalExecutionStatus,
@@ -1358,21 +1380,63 @@ export class OrchestratorStore {
         !(row.status === "queued" && next === "cancelled")
       )
         throw new OrchestratorStoreError("invalid-transition");
+      const recorded: unknown =
+        resultJson === null ? null : JSON.parse(resultJson);
+      const report = this.#executionUsage(row, recorded);
+      const taskId = row.taskId;
+      const maxTokens = report.maxTokens;
+      const previousTokens =
+        taskId !== null &&
+        maxTokens !== null &&
+        report.tokens !== null &&
+        report.tokens > 0
+          ? this.#taskWindowUsage(taskId, maxTokens, id).tokens
+          : null;
+      const usageResult =
+        recorded &&
+        typeof recorded === "object" &&
+        Object.hasOwn(recorded, "usage")
+          ? canonicalJson({ ...recorded, ...report }, 256 * 1024)
+          : resultJson;
       this.#run(
         "UPDATE executions SET status = ?, result_json = ?, finished_at = ? WHERE id = ?",
         next,
-        resultJson,
+        usageResult,
         at,
         id,
       );
+      const correlation = {
+        ...parseOrigin(JSON.parse(row.requestedByJson)),
+        executionId: id,
+      };
       this.#event(
         at,
         "execution.finished",
         "execution",
         id,
         { status: next },
-        { ...parseOrigin(JSON.parse(row.requestedByJson)), executionId: id },
+        correlation,
       );
+
+      if (
+        taskId !== null &&
+        maxTokens !== null &&
+        report.tokens !== null &&
+        previousTokens !== null &&
+        previousTokens <= maxTokens &&
+        previousTokens + report.tokens > maxTokens
+      ) {
+        const window = this.#taskWindowUsage(taskId, maxTokens, id);
+        if (window.overBudget)
+          this.#event(
+            at,
+            "task.budget-exceeded",
+            "task",
+            taskId,
+            window,
+            correlation,
+          );
+      }
     });
   }
 
@@ -1712,17 +1776,31 @@ export class OrchestratorStore {
                 policy,
               };
             });
-          const recentExecutions = this.#db
-            .query<Pick<ExecutionRow, "id" | "actor" | "mode" | "status">>(
-              "SELECT id, actor, mode, status FROM executions ORDER BY rowid DESC LIMIT 20",
+          const recentExecutions = this.#recentExecutions();
+          const recentTasks = this.#db
+            .query<TaskRow>(
+              `SELECT ${taskColumns} FROM tasks ORDER BY rowid DESC LIMIT 20`,
             )
-            .all();
+            .all()
+            .map((row) => {
+              const task = taskRecord(row);
+              return {
+                id: task.id,
+                goalId: task.goalId,
+                status: task.status,
+                ...this.#taskWindowUsage(
+                  task.id,
+                  task.content.budgets.maxTokens,
+                ),
+              };
+            });
           return freeze({
             goals: counts("goals"),
             tasks: counts("tasks"),
             proposals: counts("proposals"),
             pendingProposals,
             recentExecutions,
+            recentTasks,
           });
         })
         .deferred(),
@@ -1784,26 +1862,93 @@ export class OrchestratorStore {
     );
   }
 
-  /** Audit order defines the window even when events share a timestamp. */
-  taskBudgetTokens(taskId: string): number {
-    const id = identifier(taskId);
-    return this.#read(
-      () =>
-        this.#db
-          .query<{ tokens: number }>(
-            `
-            SELECT total(json_extract(executions.result_json, '$.tokens')) AS tokens
-            FROM executions
-            LEFT JOIN events AS queued ON queued.subject_id = executions.id
-              AND queued.subject_kind = 'execution' AND queued.kind = 'execution.queued'
-            WHERE executions.task_id = ? AND coalesce(queued.rowid, 0) > coalesce((
-              SELECT max(rowid) FROM events
-              WHERE subject_id = ? AND subject_kind = 'task' AND kind = 'task.retried'
-            ), -1)
-          `,
-          )
-          .get(id, id)!.tokens,
+  /** Queue order assigns each execution to a retry window, even if it finishes late. */
+  #taskWindowUsage(
+    taskId: string,
+    maxTokens: number,
+    executionId: string | null = null,
+  ) {
+    const rows = this.#db
+      .query<Pick<ExecutionRow, "resultJson">>(
+        `
+      WITH anchor AS (
+        SELECT CASE WHEN ?2 IS NULL THEN (SELECT max(rowid) FROM events) ELSE
+          (SELECT rowid FROM events WHERE subject_id = ?2 AND subject_kind = 'execution' AND kind = 'execution.queued')
+        END AS position
+      ), bounds AS (
+        SELECT coalesce(max(CASE WHEN events.rowid <= position THEN events.rowid END), -1) AS lower,
+          min(CASE WHEN events.rowid > position THEN events.rowid END) AS upper
+        FROM anchor JOIN events
+          ON subject_id = ?1 AND subject_kind = 'task' AND kind = 'task.retried'
+      )
+      SELECT executions.result_json AS resultJson
+      FROM executions CROSS JOIN bounds
+      LEFT JOIN events AS queued ON queued.subject_id = executions.id
+        AND queued.subject_kind = 'execution' AND queued.kind = 'execution.queued'
+      WHERE executions.task_id = ?1 AND executions.started_at IS NOT NULL
+        AND executions.finished_at IS NOT NULL
+        AND coalesce(queued.rowid, 0) > lower AND (upper IS NULL OR queued.rowid < upper)
+    `,
+      )
+      .all(taskId, executionId);
+    let tokens = 0;
+    let unavailable = false;
+    const raw = { ...emptyTokenUsage };
+    for (const { resultJson } of rows) {
+      const report = readTokenReport(
+        resultJson === null ? null : JSON.parse(resultJson),
+        true,
+      );
+      tokens += report.tokens ?? 0;
+      unavailable ||= report.usage === "unavailable";
+      const usage = report.rawUsage ?? report.usage;
+      if (usage && usage !== "unavailable" && !Array.isArray(usage)) {
+        raw.input += usage.input;
+        raw.output += usage.output;
+        raw.cacheCreation += usage.cacheCreation;
+        raw.cacheRead += usage.cacheRead;
+      }
+    }
+    return compareTokenBudget(
+      unavailable
+        ? ({ tokens, usage: "unavailable", rawUsage: raw } as const)
+        : { tokens, usage: raw },
+      maxTokens,
     );
+  }
+
+  taskUsage(taskId: string) {
+    const id = identifier(taskId);
+    return this.#read(() => {
+      const task = required(this.#task(id));
+      return freeze(
+        this.#taskWindowUsage(id, taskRecord(task).content.budgets.maxTokens),
+      );
+    });
+  }
+
+  taskBudgetTokens(taskId: string): number {
+    return this.taskUsage(taskId).tokens;
+  }
+
+  #recentExecutions() {
+    return this.#db
+      .query<ExecutionRow>(
+        `SELECT ${executionColumns} FROM executions ORDER BY rowid DESC LIMIT 20`,
+      )
+      .all()
+      .map((row) => {
+        const { id, actor, mode, status } = row;
+        const result: unknown =
+          row.resultJson === null ? null : JSON.parse(row.resultJson);
+        return {
+          id,
+          actor,
+          mode,
+          status,
+          ...this.#executionUsage(row, result),
+        };
+      });
   }
 
   listTasks(goalId: string) {
@@ -1831,6 +1976,7 @@ export class OrchestratorStore {
       return freeze({
         ...execution,
         requestedBy: parseOrigin(JSON.parse(requestedByJson)),
+        tokenUsage: this.#executionUsage(row, result),
         result,
       });
     });

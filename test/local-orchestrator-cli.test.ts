@@ -96,6 +96,8 @@ test("status reports counts and pending gates, and show and proposals include co
   assert.equal(status.code, 0);
   assert.deepEqual(JSON.parse(status.stdout), {
     counts: { goals: 0, tasks: 0, proposals: 1, pending: 1 },
+    recentTasks: [],
+    recentExecutions: [],
     pending: [
       {
         id,
@@ -693,17 +695,37 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
 });
 
 test("show-execution escapes raw reviewer answers for the terminal", async () => {
+  const proposed = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposed.id, {
+    digest: proposed.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  assert.ok(goalId);
   const { id } = store.createExecution({
     actor: "Reviewer",
     mode: "approval",
     requestedBy: { kind: "host" },
+    goalId,
   });
   const rawAnswer = "untrusted\u001b[31m\u009b\u202e";
   store.startExecution(id);
-  store.finishExecution(id, "failed", { rawAnswer });
+  const usage = {
+    tokens: 501,
+    usage: { input: 500, output: 1, cacheCreation: 0, cacheRead: 0 },
+  };
+  store.finishExecution(id, "failed", { rawAnswer, ...usage });
   const result = await cli(["show-execution", id]);
   assert.equal(result.code, 0);
-  assert.equal(JSON.parse(result.stdout).result.rawAnswer, rawAnswer);
+  const report = { ...usage, maxTokens: 500, overBudget: true };
+  assert.partialDeepStrictEqual(JSON.parse(result.stdout), {
+    result: { rawAnswer, ...report },
+    tokenUsage: report,
+  });
+  const status = await cli(["status"]);
+  assert.partialDeepStrictEqual(JSON.parse(status.stdout), {
+    recentExecutions: [{ id, ...report }],
+  });
   for (const control of ["\u001b", "\u009b", "\u202e"])
     assert.equal(result.stdout.includes(control), false);
 });

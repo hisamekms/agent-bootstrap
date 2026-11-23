@@ -123,9 +123,9 @@ operator-provided authorization reference. The decision event marks the
 delegation and identifies the agent and session.
 
 The host authorizes registration and integration. It checks scope fit,
-budgets and required verification results regardless of the answerer.
+time and retry limits, and required verification results regardless of the answerer.
 For integration, it checks the pinned candidate and rejects stale bases.
-The host enforces approved grants and budgets during execution and checks
+The host enforces approved grants and time and retry limits during execution and checks
 collected paths before integration.
 
 For every gate answer, the host records the gate, effective policy and
@@ -190,9 +190,14 @@ The host detects abnormal exits, timeouts, failures, contract violations
 and review rejections. It retries routine failures within limits and
 triggers Planner replanning when needed once that stage is available.
 
-The host caps retries, time and cost. When a cap is hit, it stops and
-reports through the Concierge. This gives recoverable failures a path
-forward and keeps persistent failures within the approved budget.
+The host caps retries and time. When a cap is hit, it stops and reports
+through the Concierge.
+
+Operator decision (2026-11-23). Token budgets remain advisory until enough
+real usage data is available to revisit enforcement. The host records raw
+usage, budgeted tokens and the reference limit for each execution and Task
+retry window. It records when usage is unavailable and audits the first
+known crossing of the reference limit in each window.
 
 The host also caps concurrent VMs. The long-lived Concierge VM runs
 alongside actor VMs, so the initial cap is the Concierge plus one actor
@@ -227,12 +232,9 @@ credential boundary substitutes the real key only for the configured
 provider host, `api.anthropic.com`. The same restriction applies to the
 Researcher with public HTTPS access.
 
-Use token usage to account for cost caps. Enforcement needs usage data
-early enough to stop work at the cap, including during interactive
-sessions.
-
-This reuses the existing host credential path and lets the host apply a
-common cost budget across actors.
+Use the same token accounting across actors. Future enforcement would
+need usage data early enough to stop work at the cap, including during
+interactive sessions. See D9 for the current advisory policy.
 
 ### D12. Stage the work
 
@@ -283,7 +285,7 @@ pushes and PRs to `main`. See [Stage 2](stage2.md).
 - The operator answers gates with a `human` policy through the host CLI.
   Opting into `agent` approval can speed up autonomous development loops.
   A compromised or mistaken approval execution can approve bad work.
-  Mechanical checks, digest binding, budgets and the audit bound that risk.
+  Mechanical checks, digest binding, time and retry limits, and the audit bound that risk.
 - The Concierge design depends on the Stage 1 prerequisites. Research
   egress and replanning arrive in Stage 4.
 - Keep the layer small enough to retire when dagq-lite can develop itself.
