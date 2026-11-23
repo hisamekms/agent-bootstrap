@@ -1,3 +1,4 @@
+import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./credentials-volume.ts";
 import { execFile, spawn } from "node:child_process";
@@ -641,7 +642,9 @@ export async function runTask(
       failure = completion.code;
     } catch (error) {
       failure =
-        error instanceof ClaudeRunError
+        error instanceof ClaudeRunError ||
+        (error instanceof GitIntegrationError &&
+          error.code === "unsafe-input-symlink")
           ? error.code
           : observed.outcome === "ok" && mode === "task"
             ? "candidate-failed"
@@ -664,6 +667,9 @@ export async function runTask(
       {
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
+        ...(failure === "unsafe-input-symlink"
+          ? { next: unsafeInputSymlinkNext }
+          : {}),
         ...(observed.revision === undefined
           ? {}
           : { revision: observed.revision }),

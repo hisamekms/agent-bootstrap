@@ -14,9 +14,11 @@
   `bun lint` (Oxlint), `bun typecheck`, `bun run build`, and `bun test`.
   `bun verify` runs acceptance checks without rewriting source. Tests use local
   fixtures and require no provider credentials.
-- For the M1 spike, invoke only the pinned Microsandbox tool with
-  `mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- msb`.
-  This keeps global tool resolution and activation hooks out of the spike.
+- Use `agent-bootstrap sandbox shell --json` to plan a VM experiment and
+  `agent-bootstrap sandbox shell --run` from a TTY to start it. Use
+  `--allow <host:port>` for explicitly authorized destinations. Do not run
+  `msb` directly for experiments. The product uses the pinned Microsandbox
+  0.7.16 backend with mise configuration and activation hooks disabled.
 - `src/contracts.ts` owns agent contracts. `src/sandbox-runtime.ts` owns the
   provider-neutral sandbox port, `src/microsandbox.ts` owns the first adapter,
   and `src/credentials.ts` defines the trusted-host credential boundary.

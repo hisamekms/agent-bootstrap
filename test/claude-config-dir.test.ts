@@ -442,6 +442,7 @@ test("credential scans block credential shapes and operator patterns with fixed 
     '+  "accessToken": "fixture-a",\n+  "refreshToken": "fixture-b",\n+  "expiresAt": 123',
     "sk-ant-YMStp5zxuHQ_WMoM6iRSLxLzrjTS",
     "fixture-private-123",
+    "prefixsk-ant-YMStp5zxuHQ_WMoM6iRSLxLzrjTS",
   ]) {
     await assert.rejects(scan(text), { code: "credential-leak" });
     const path = notes.at(-1)!.replace("credential-leak evidence: ", "");

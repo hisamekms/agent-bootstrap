@@ -33,6 +33,8 @@ import type {
 } from "./audit.ts";
 import type { EgressGatewayOptions } from "./egress-gateway.ts";
 import {
+  DEBUG_SHELL_LIFETIME_MS,
+  isDebugMount,
   INTERACTIVE_MAX_LIFETIME_MS,
   isConciergeVolumeName,
   permitsProviderHeader,
@@ -40,7 +42,12 @@ import {
   terminalEnvEntries,
   WORKER_MESSAGE_LIMIT,
 } from "./sandbox-runtime.ts";
-import { EgressPolicy, type HostService } from "./egress-policy.ts";
+import {
+  EgressPolicy,
+  gatewayPolicyDigest,
+  type HostPort,
+  type HostService,
+} from "./egress-policy.ts";
 import {
   parseExecutionContext,
   type ExecutionContext,
@@ -59,6 +66,7 @@ import {
 } from "./runtime-events.ts";
 import type {
   CollectedArtifacts,
+  DebugMount,
   ConciergeVolumeBackend,
   ExecResult,
   ResourceSample,
@@ -70,7 +78,11 @@ import type {
   SandboxSpec,
   TerminalCommand,
 } from "./sandbox-runtime.ts";
-import { ProfileCatalog, ROLE_PROFILES } from "./sandbox-profiles.ts";
+import {
+  ProfileCatalog,
+  ROLE_PROFILES,
+  type ProfileName,
+} from "./sandbox-profiles.ts";
 
 type Operation = NonNullable<AuditInput["operation"]>;
 type Outcome = NonNullable<AuditInput["outcome"]>;
@@ -81,8 +93,6 @@ const DEFAULT_CONCIERGE_LIFETIME_MS = 120_000;
 const CONCIERGE_EXTRA_EGRESS = [
   { hostname: "platform.claude.com", port: 443 },
 ] as const;
-// Bump when the gateway policy evaluation or digest schema changes.
-const GATEWAY_POLICY_VERSION = 1;
 
 export interface WorkerPlan {
   readonly sandbox: SandboxSpec;
@@ -225,7 +235,6 @@ export interface TrustedHostOptions {
 }
 
 export interface TrustedHostRunOptions {
-  readonly allowUnauditedRun?: boolean;
   readonly hostServices?: readonly HostService[];
   /** Host-owned inspection of the changed files in a collected tree. */
   readonly inspectWorkerTree?: (tree: Uint8Array) => Promise<void>;
@@ -241,6 +250,7 @@ type Invoke = {
   readonly context: ExecutionContext | undefined;
   readonly options: TrustedHostRunOptions | undefined;
   readonly loginGroup?: string;
+  readonly debugEgress?: readonly HostPort[];
 } & (
   | {
       readonly command: SandboxCommand;
@@ -578,6 +588,44 @@ export class TrustedHost {
       : { id, outcome };
   }
 
+  async runSandboxShell(
+    profile: ProfileName,
+    allow: readonly HostPort[],
+    mounts: readonly DebugMount[],
+    id: string = randomUUID(),
+  ): Promise<{ id: string; outcome: Outcome }> {
+    const attach = this.#sandbox.attachTerminal?.bind(this.#sandbox);
+    if (
+      !this.#required ||
+      !attach ||
+      !this.#profiles.has(profile) ||
+      allow.length > 64 ||
+      allow.some(({ port }) => port !== 80 && port !== 443) ||
+      mounts.length > 16 ||
+      mounts.some((mount) => !isDebugMount(mount))
+    )
+      throw new Error("Invalid audited sandbox shell plan");
+    const { outcome } = await this.#invoke({
+      id,
+      role: "Verification",
+      sandbox: {
+        profile,
+        debugMounts: mounts.map((mount) => ({ ...mount })),
+        maxLifetimeMs: DEBUG_SHELL_LIFETIME_MS,
+      },
+      context: parseExecutionContext({
+        executionId: id,
+        attributes: { purpose: "sandbox-shell" },
+      }),
+      options: undefined,
+      debugEgress: allow,
+      attach,
+      use: (terminal: ConciergeTerminal) =>
+        terminal.attach({ argv: ["/bin/sh"], workdir: "/" }),
+    });
+    return { id, outcome };
+  }
+
   async runConcierge<T>(
     plan: ConciergePlan,
     id: string,
@@ -874,10 +922,12 @@ export class TrustedHost {
     const required = this.#required;
     const audit = required?.audit;
     if (this.#disabled)
-      requireAudited(input.sandbox, { audit: { mode: "disabled" } }, options);
+      requireAudited(input.sandbox, { audit: { mode: "disabled" } });
     const sandbox = { ...input.sandbox } as {
       -readonly [K in keyof SandboxSpec]: SandboxSpec[K];
     };
+    if ("debugMounts" in sandbox && input.debugEgress === undefined)
+      throw new Error("Debug mounts require the operator sandbox shell");
     if ("claudeMounts" in sandbox)
       throw new Error("Claude mounts are assigned by the trusted host");
 
@@ -904,13 +954,13 @@ export class TrustedHost {
         ]
       : [];
     if (this.#disabled)
-      requireAudited(sandbox, { audit: { mode: "disabled" } }, options);
+      requireAudited(sandbox, { audit: { mode: "disabled" } });
     if (role !== "Concierge" && sandbox.interactive !== undefined)
       throw new Error("Only Concierge may use an interactive sandbox");
     if ("egressGateway" in sandbox || "expectedNetRuleDigest" in sandbox)
       throw new Error("Gateway bindings are assigned by the trusted host");
-    if (!this.#disabled && "hostTcpPort" in sandbox)
-      throw new Error("Direct hostTcpPort requires disabled audit mode");
+    if ("hostTcpPort" in sandbox)
+      throw new Error("Direct hostTcpPort is unsupported");
     if (!required && !this.#disabled && sandbox.provider !== undefined)
       throw new Error("Provider egress requires a configured audit mode");
 
@@ -937,7 +987,10 @@ export class TrustedHost {
       "command" in input
         ? { ...input.command, argv: [...input.command.argv] }
         : undefined;
-    const profile = this.#profileFor(role, sandbox.profile);
+    const profile =
+      input.debugEgress !== undefined
+        ? sandbox.profile!
+        : this.#profileFor(role, sandbox.profile);
     const image = this.#profiles.imageDigest(profile);
     const provider = sandbox.provider;
     const hostServices =
@@ -950,9 +1003,14 @@ export class TrustedHost {
       ? { hostname: provider.host, port: provider.port ?? 443 }
       : undefined;
     const policy =
-      audit && (providerBinding || hostServices?.length || plainHosts.length)
+      audit &&
+      (input.debugEgress ||
+        providerBinding ||
+        hostServices?.length ||
+        plainHosts.length)
         ? new EgressPolicy({
             allow: [
+              ...(input.debugEgress ?? []),
               ...(providerBinding ? [providerBinding] : []),
               ...(role === "Concierge" && !directory
                 ? CONCIERGE_EXTRA_EGRESS
@@ -963,19 +1021,7 @@ export class TrustedHost {
             ...(hostServices ? { hostServices } : {}),
           })
         : undefined;
-    const gatewayPolicyDigest = policy
-      ? createHash("sha256")
-          .update(
-            JSON.stringify({
-              version: GATEWAY_POLICY_VERSION,
-              allow: policy.allow,
-              allowIps: policy.allowIps,
-              hostServices: policy.hostServices,
-              providerBinding: policy.providerBinding ?? null,
-            }),
-          )
-          .digest("hex")
-      : undefined;
+    const policyDigest = policy && gatewayPolicyDigest(policy);
     const sandboxId = audit ? `bootstrap-${randomUUID()}` : undefined;
 
     let handle: SandboxHandle | undefined;
@@ -1264,11 +1310,11 @@ export class TrustedHost {
                 sandboxId,
                 runtimeKind: "microsandbox",
                 netRuleDigest: digest,
-                ...(policy && gatewayPolicyDigest
+                ...(policy && policyDigest
                   ? {
                       egressMode: "gateway",
                       gatewayPolicyId: policy.policyId,
-                      gatewayPolicyDigest,
+                      gatewayPolicyDigest: policyDigest,
                     }
                   : { egressMode: "none" }),
               }),
@@ -1320,7 +1366,7 @@ export class TrustedHost {
 
       if (!failure && handle && "attach" in input) {
         const current = handle;
-        const conciergeAudit = audit!; // runConcierge requires an audited host.
+        const terminalAudit = audit!; // Terminal entry points require an audited host.
         let accepting = true;
         let pending: Promise<{ exitCode: number | null }> | undefined;
         outcome = "ok";
@@ -1370,7 +1416,7 @@ export class TrustedHost {
               ? { exitCode, signal: null, guestReported: false as const }
               : { exitCode, signal: null, guestReported: true as const };
           await write(() =>
-            conciergeAudit.appendProcessResult({
+            terminalAudit.appendProcessResult({
               invocationId: id,
               operation: "sandbox.exec",
               ...exit,

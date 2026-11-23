@@ -470,7 +470,7 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
       join(repoRoot, "docs/local-orchestrator/stage1.md"),
       "docs",
     );
-    await symlink("../state.db", join(repoRoot, "README.md"));
+    await symlink("AGENTS.md", join(repoRoot, "README.md"));
     git(
       "add",
       "AGENTS.md",
@@ -528,6 +528,31 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
     assert.ok(!snapshot.files.includes(".local/secret"));
     assert.ok(!snapshot.files.includes("docs/local-orchestrator/feature.md"));
     assert.equal(snapshot.commit, git("rev-parse", "refs/heads/main").trim());
+    for (const target of ["../outside", "/absolute"]) {
+      await rm(join(repoRoot, "README.md"));
+      await symlink(target, join(repoRoot, "README.md"));
+      git("add", "README.md");
+      git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "unsafe link",
+      );
+      await assert.rejects(
+        snapshotConciergeRepo(
+          repoRoot,
+          randomUUID(),
+          git("rev-parse", "HEAD").trim(),
+        ),
+        {
+          code: "unsafe-input-symlink",
+          message: /Replace absolute or escaping symlinks/,
+        },
+      );
+    }
   });
 });
 

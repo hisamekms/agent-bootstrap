@@ -82,7 +82,7 @@ On macOS the long repository path exceeded the 104-byte Unix socket limit.
 A short disposable `MSB_HOME` allowed the same cached image to boot. The CLI
 discarded guest stdout on timeout, so the fixture uses scratch markers and
 checks the timeout diagnostic and elapsed time. The
-[network smoke test](../spike/m1/network-smoke.ts) sets up a
+historical network smoke test set up a
 loopback-only HTTP canary and compares two guests against the same IP and TCP
 port. It checks the host-side request count as well as the guest result. The
 first attempts stopped before guest launch because the host could not start
@@ -102,7 +102,6 @@ mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- msb --version
 export MSB_HOME="$(mktemp -d /private/tmp/ab-msb.XXXXXX)"
 mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- msb image pull docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd
 mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- sh sandbox-smoke.sh
-mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- bun network-smoke.ts
 ```
 
 An earlier unscoped mise execution loaded global tool configuration and
@@ -134,7 +133,7 @@ exercised.
 
 ### Codex guest tool round trip
 
-The [tool smoke test](../spike/m1/codex-tool-smoke.ts) ran the same verified
+The historical tool smoke test ran the same verified
 Codex binary in a disposable VM. The guest could reach just the fixture HTTP
 server's loopback TCP port. The simulated provider drove two app-server
 `item/tool/call` requests. The host allowed the in-memory read and denied the
@@ -143,11 +142,10 @@ call IDs. A second turn interrupted a live simulated provider request. The
 test resumed the same thread in the same app-server process and completed
 another turn with prior context. A synthetic usage notification was observed.
 
-Use the binary and cached image from the previous checks:
-
-```sh
-mise --no-config --no-env --no-hooks exec microsandbox@0.7.16 -- bun codex-tool-smoke.ts /absolute/path/to/codex
-```
+The direct-network M1 fixtures were retired. Their source is preserved at
+commit `de26b1409fe8`. For current network tests see the
+[network audit evidence](observability/phase1-evidence.md). For operator
+experiments use `agent-bootstrap sandbox shell`.
 
 The exchange uses an experimental app-server API, fixture tool decisions,
 and synthetic usage. It verifies tool visibility over JSONL for that path.

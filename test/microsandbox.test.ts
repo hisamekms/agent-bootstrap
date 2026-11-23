@@ -39,6 +39,13 @@ const gateway = {
   passwordEnv: "GATEWAY_FIXTURE_SECRET",
 };
 
+async function createBound(runtime: MicrosandboxRuntime, spec: SandboxSpec) {
+  return runtime.createBound(
+    { ...spec, expectedNetRuleDigest: runtime.netRuleDigest(spec) },
+    `bootstrap-${randomUUID()}`,
+  );
+}
+
 type Event = {
   args: string[];
   envKeys: string[];
@@ -569,7 +576,7 @@ test("two concurrent fake sandboxes have distinct copies with no cross-worker wr
   await assertCleanup(f, 2);
 });
 
-test("tools and the host port reach the backend only after a host digest check", async (t) => {
+test("tools reach the offline backend after a host digest check, and direct ports are refused", async (t) => {
   const f = await fixture(t);
   const tool = join(f.home, "..", "tool.bin");
   await writeFile(tool, "fixture tool");
@@ -577,12 +584,12 @@ test("tools and the host port reach the backend only after a host digest check",
   const sha256 = createHash("sha256").update("fixture tool").digest("hex");
   const handle = await f.runtime.create({
     tools: [{ hostPath: tool, guestPath: "/tmp/tool", sha256 }],
-    hostTcpPort: 4242,
   });
   const create = (await f.events()).find(({ args }) => args[0] === "create");
   assert.ok(create);
   const args = create.args.join(" ");
-  assert.match(args, /--no-net --net-rule allow@host:tcp:4242 /);
+  assert.match(args, /--no-net /);
+  assert.ok(!create.args.includes("--net-rule"));
   // The backend copies the verified staging copy, not the caller's path.
   const copy = create.args[create.args.indexOf("--copy-file") + 1] ?? "";
   assert.ok(copy.startsWith(f.stagingRoot) && copy.endsWith(":/tmp/tool"));
@@ -620,7 +627,7 @@ test("tools and the host port reach the backend only after a host digest check",
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
   await assert.rejects(
-    f.runtime.create({ hostTcpPort: 70_000 }),
+    f.runtime.create({ hostTcpPort: 4242 }),
     (error: SandboxRuntimeError) => error.code === "invalid-input",
   );
   // Only the version probe for the digest mismatch reached the backend.
@@ -677,10 +684,16 @@ test("a session streams bounded lines, holds the handle busy and stops on close"
 test("provider egress passes the credential only to the create process", async (t) => {
   const f = await fixture(t);
   const token = "fixture-provider-token-value";
-  const runtime = f.withCredentials(token);
+  const runtime = f.withCredentials(token, () => gatewayPassword);
   const env = "AGENT_BOOTSTRAP_TOKEN";
   const provider = { host: "api.openai.com", secretEnv: env };
-  const handle = await runtime.create({ provider });
+  for (const spec of [{ provider }, { provider, egressGateway: gateway }])
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  assert.deepEqual(await f.events(), []);
+  const handle = await createBound(runtime, {
+    provider,
+    egressGateway: gateway,
+  });
   await runtime
     .exec(handle, { argv: ["fixture-cat", "missing"], timeoutMs: 1000 })
     .catch(() => {});
@@ -689,7 +702,7 @@ test("provider egress passes the credential only to the create process", async (
   assert.ok(create);
   assert.match(
     create.args.join(" "),
-    /--no-net --net-rule allow@dns --net-rule allow@api\.openai\.com:tcp:443 --tls-intercept --secret AGENT_BOOTSTRAP_TOKEN:headers=authorization@api\.openai\.com --secret-violation-action block /,
+    /--proxy socks5:\/\/127\.0\.0\.1:18190 .* --tls-intercept --secret AGENT_BOOTSTRAP_TOKEN:headers=authorization@api\.openai\.com --secret-violation-action block /,
   );
   assert.ok(create.envKeys.includes(env));
   for (const event of events.filter(({ args }) => args[0] !== "create"))
@@ -703,7 +716,10 @@ test("provider egress passes the credential only to the create process", async (
   );
   // A failing credential provider stops create with a fixed diagnostic.
   await assert.rejects(
-    f.withCredentials("throw").create({ provider }),
+    createBound(
+      f.withCredentials("throw", () => gatewayPassword),
+      { provider, egressGateway: gateway },
+    ),
     (error: Error) =>
       error instanceof SandboxRuntimeError &&
       !error.message.includes("fixture-credential-failure"),
@@ -719,7 +735,7 @@ test("provider egress passes the credential only to the create process", async (
     { host: "api.openai.com", secretEnv: "agent_bootstrap_token" },
   ])
     await assert.rejects(
-      runtime.create({ provider: bad }),
+      createBound(runtime, { provider: bad, egressGateway: gateway }),
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
   await assert.rejects(
@@ -734,7 +750,7 @@ test("provider egress passes the credential only to the create process", async (
     { ...provider, upstreamCaCertPath: "/tmp/other-ca.pem" },
   ])
     await assert.rejects(
-      runtime.create({ provider: rebind }),
+      createBound(runtime, { provider: rebind, egressGateway: gateway }),
       (error: SandboxRuntimeError) => error.code === "invalid-input",
     );
 });
@@ -746,6 +762,7 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
     home: f.home,
     stagingRoot: f.stagingRoot,
     profiles,
+    gatewayPassword: () => gatewayPassword,
     providers: [
       {
         host: "host.microsandbox.internal",
@@ -761,7 +778,8 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
       },
     },
   });
-  const handle = await runtime.create({
+  const handle = await createBound(runtime, {
+    egressGateway: gateway,
     provider: {
       host: "host.microsandbox.internal",
       secretEnv: "ANTHROPIC_API_KEY",
@@ -774,7 +792,7 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
   assert.ok(create);
   assert.match(
     create.args.join(" "),
-    /--net-rule allow@dns --net-rule allow@host:tcp:8443 --tls-intercept --tls-intercept-port 8443 --tls-upstream-ca-cert-for host\.microsandbox\.internal=\/tmp\/fixture-ca\.pem --secret ANTHROPIC_API_KEY:headers=x-api-key@host\.microsandbox\.internal --secret-violation-action block /,
+    /--proxy socks5:\/\/127\.0\.0\.1:18190 .* --tls-intercept --tls-intercept-port 8443 --tls-upstream-ca-cert-for host\.microsandbox\.internal=\/tmp\/fixture-ca\.pem --secret ANTHROPIC_API_KEY:headers=x-api-key@host\.microsandbox\.internal --secret-violation-action block /,
   );
   assert.ok(create.envKeys.includes("ANTHROPIC_API_KEY"));
   assert.doesNotMatch(
@@ -789,7 +807,8 @@ test("Anthropic-style provider egress uses x-api-key, a custom port and an upstr
     { upstreamCaCertPath: "/tmp/a=b.pem" },
   ])
     await assert.rejects(
-      runtime.create({
+      createBound(runtime, {
+        egressGateway: gateway,
         provider: {
           host: "host.microsandbox.internal",
           secretEnv: "ANTHROPIC_API_KEY",
@@ -1042,12 +1061,12 @@ test("gateway password and backend diagnostics stay out of errors", async (t) =>
       throw new SandboxRuntimeError(gatewayPassword);
     },
   });
-  await assert.rejects(unavailable.create(spec), failure);
+  await assert.rejects(createBound(unavailable, spec), failure);
   const invalidPassword = new MicrosandboxRuntime({
     ...f.config,
     gatewayPassword: () => "",
   });
-  await assert.rejects(invalidPassword.create(spec), /invalid-input/);
+  await assert.rejects(createBound(invalidPassword, spec), /invalid-input/);
   assert.equal(
     (await f.events()).some(({ args }) => args[0] === "create"),
     false,
@@ -1058,7 +1077,7 @@ test("gateway password and backend diagnostics stay out of errors", async (t) =>
     gatewayPassword: () => gatewayPassword,
   });
   await f.setMode("gateway-create-failure");
-  await assert.rejects(runtime.create(spec), failure);
+  await assert.rejects(createBound(runtime, spec), failure);
   await assertCleanup(f);
 });
 
@@ -1423,7 +1442,7 @@ test("interactive create hashes exact host channels without changing non-interac
     "--mount-dir",
     `${interactive.snapshotDir}:/repo:ro`,
   ];
-  const handle = await runtime.create({
+  const handle = await createBound(runtime, {
     ...spec,
     maxLifetimeMs: MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs,
   });
@@ -1552,13 +1571,13 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
     })),
   ];
   for (const invalidSpec of invalidSpecs)
-    await assert.rejects(runtime.create(invalidSpec), /invalid-input/);
+    await assert.rejects(createBound(runtime, invalidSpec), /invalid-input/);
   const unsafe = join(root, "unsafe");
   const nested = join(unsafe, "nested");
   await mkdir(nested, { recursive: true, mode: 0o700 });
   await chmod(unsafe, 0o777);
   await assert.rejects(
-    runtime.create({
+    createBound(runtime, {
       ...spec,
       interactive: { ...interactive, snapshotDir: nested },
     }),
@@ -1566,17 +1585,17 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
   );
   for (const mode of [0o500, 0o710, 0o740, 0o701, 0o1700]) {
     await chmod(snapshotDir, mode);
-    await assert.rejects(runtime.create(spec), /invalid-input/);
+    await assert.rejects(createBound(runtime, spec), /invalid-input/);
   }
   await chmod(snapshotDir, 0o700);
   if (socketAvailable) {
     await chmod(vsock.hostPath, 0o660);
-    await assert.rejects(runtime.create(spec), /invalid-input/);
+    await assert.rejects(createBound(runtime, spec), /invalid-input/);
     await chmod(vsock.hostPath, 0o600);
     await chmod(root, 0o720);
-    await assert.rejects(runtime.create(spec), /invalid-input/);
+    await assert.rejects(createBound(runtime, spec), /invalid-input/);
   } else {
-    await assert.rejects(runtime.create(spec), /invalid-input/);
+    await assert.rejects(createBound(runtime, spec), /invalid-input/);
   }
   assert.deepEqual(await events(), []);
 });
@@ -1598,7 +1617,7 @@ test("interactive create rechecks host paths after asynchronous credential and g
       return gatewayPassword;
     },
   });
-  await assert.rejects(runtime.create(spec), /invalid-input/);
+  await assert.rejects(createBound(runtime, spec), /invalid-input/);
   assert.equal(passwordRequested, true);
   assert.equal(
     (await events()).some(({ args }) => args[0] === "create"),
@@ -1617,7 +1636,7 @@ test("terminal validation, exclusive attach and deadline use the existing handle
     /unsupported/,
   );
   await runtime.destroy(plain);
-  const handle = await runtime.create({ ...spec, maxLifetimeMs: 1500 });
+  const handle = await createBound(runtime, { ...spec, maxLifetimeMs: 1500 });
   const invalid: TerminalCommand[] = [
     { argv: [] },
     { argv: Array<string>(65).fill("x") },
@@ -1713,7 +1732,7 @@ test("create checks gateway availability after asynchronous provider credential 
     },
   });
   await assert.rejects(
-    runtime.create({ provider, egressGateway: gateway }),
+    createBound(runtime, { provider, egressGateway: gateway }),
     /backend-failure/,
   );
   assert.equal(
@@ -1745,7 +1764,7 @@ test("Claude configuration and managed settings create mounts without a provider
       claudeMounts: { managed, group },
       egressGateway: gateway,
     } as const;
-    const handle = await runtime.create(spec);
+    const handle = await createBound(runtime, spec);
     try {
       const create = (await events())
         .filter(({ args }) => args[0] === "create")

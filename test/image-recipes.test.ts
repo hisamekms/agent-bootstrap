@@ -9,7 +9,7 @@ import {
   FEATURES,
   PROFILE_RECIPES,
   aptPackages,
-  buildNetRules,
+  buildEgress,
   smokeTest,
   profileFiles,
   profilePackages,
@@ -159,7 +159,7 @@ describe("image recipes", () => {
         ),
       ]),
     );
-    assert.deepEqual(buildNetRules("concierge"), []);
+    assert.deepEqual(buildEgress("concierge"), []);
   });
 
   test("concierge smoke checks socat and Git", () => {
@@ -195,7 +195,7 @@ describe("image recipes", () => {
     } finally {
       pin.sha256 = original;
     }
-    assert.deepEqual(buildNetRules("bun"), []);
+    assert.deepEqual(buildEgress("bun"), []);
     const script = BUILD_SCRIPT("bun");
     assert.match(script, /busybox unzip -p .* > \/usr\/local\/bin\/bun/);
     assert.match(script, /sha256sum -c -\nchmod 0755 \/usr\/local\/bin\/bun/);
@@ -394,11 +394,10 @@ describe("browser recipe (Debian snapshot)", () => {
   });
 
   test("egress is limited to DNS and the snapshot host", () => {
-    assert.deepEqual(buildNetRules("browser"), [
-      "allow@dns",
-      "allow@snapshot.debian.org:tcp:80",
+    assert.deepEqual(buildEgress("browser"), [
+      { hostname: "snapshot.debian.org", port: 80 },
     ]);
-    assert.deepEqual(buildNetRules("db"), []);
+    assert.deepEqual(buildEgress("db"), []);
     assert.throws(() => profilePackages("browser"), /not an Alpine/);
     assert.throws(() => aptPackages("db"), /not a Debian/);
   });

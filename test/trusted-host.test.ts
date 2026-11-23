@@ -1439,7 +1439,7 @@ test("required host refuses invalid setup, mismatched context and direct host po
   assert.deepEqual(calls, []);
 });
 
-test("disabled mode requires per-run agent and host-port opt-in and makes no audit writes", async () => {
+test("disabled mode refuses agent and host-port runs and allows offline fixtures", async () => {
   const { runtime, calls } = adapter("");
   let writes = 0;
   const host = new TrustedHost(
@@ -1454,16 +1454,16 @@ test("disabled mode requires per-run agent and host-port opt-in and makes no aud
       config: { ...requiredConfig, audit: { mode: "disabled" } },
     },
   );
-  await assert.rejects(
-    host.runWorker(providerPlan),
-    /explicit allowUnauditedRun/,
-  );
+  await assert.rejects(host.runWorker(providerPlan), /require durable audit/);
   const direct = { ...plan, sandbox: { ...plan.sandbox, hostTcpPort: 4242 } };
-  await assert.rejects(host.runWorker(direct), /explicit allowUnauditedRun/);
+  await assert.rejects(host.runWorker(direct), /require durable audit/);
   assert.deepEqual(calls, []);
-  const result = await host.runWorker(direct, undefined, undefined, {
-    allowUnauditedRun: true,
-  });
+  const attemptedOptOut = { allowUnauditedRun: true, hostServices: [] };
+  await assert.rejects(
+    host.runWorker(providerPlan, undefined, undefined, attemptedOptOut),
+    /require durable audit/,
+  );
+  const result = await host.runWorker(plan);
   assert.equal(result.outcome, "ok");
   assert.deepEqual(calls, ["create", "exec", "destroy"]);
   assert.equal(writes, 0);

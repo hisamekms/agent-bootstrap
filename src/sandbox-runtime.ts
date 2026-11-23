@@ -128,6 +128,26 @@ export function terminalEnvEntries(
   return entries;
 }
 
+export const DEBUG_SHELL_LIFETIME_MS = 300_000;
+
+export interface DebugMount {
+  readonly host: string;
+  readonly guest: string;
+  readonly readOnly: boolean;
+}
+
+export function isDebugMount(mount: DebugMount): boolean {
+  return (
+    /^\/[^:\0\r\n]+$/.test(mount.host) &&
+    !/[\0\r\n]/.test(mount.guest) &&
+    /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(
+      mount.guest,
+    ) &&
+    !/^\/(?:dev|proc|sys|run|workspace)(?:\/|$)/.test(mount.guest) &&
+    typeof mount.readOnly === "boolean"
+  );
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -145,7 +165,7 @@ export interface SandboxSpec {
     readonly tree: string;
   };
   readonly tools?: readonly SandboxTool[];
-  /** Direct TCP to this host port. Mutually exclusive with the gateway. */
+  /** Legacy fixture field. Real runtimes reject direct host egress. */
   readonly hostTcpPort?: number;
   readonly egressGateway?: SandboxEgressGateway;
   /** Network and interactive host-channel argv digest recorded before create. */
@@ -157,6 +177,8 @@ export interface SandboxSpec {
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
   readonly interactive?: InteractiveSandbox;
+  /** Operator-only terminal mounts, including an empty list for a bare shell. */
+  readonly debugMounts?: readonly DebugMount[];
   /** The host assigns and validates paths for Claude runs. */
   readonly claude?: true;
   readonly claudeMounts?: { readonly managed: string; readonly group?: string };

@@ -383,7 +383,7 @@ test("close drains a pending gateway before closing the audit", async (t) => {
   );
 });
 
-test("disabled mode skips gateway startup and retains the per-run opt-in", async (t) => {
+test("disabled mode skips gateway startup and refuses unaudited agent specs", async (t) => {
   const f = await fixture(t);
   const observed = await createObservedHost({
     ...f.options,
@@ -397,7 +397,56 @@ test("disabled mode skips gateway startup and retains the per-run opt-in", async
       ...plan,
       sandbox: { tools: [] },
     }),
-    /allowUnauditedRun/,
+    /require durable audit/,
   );
   assert.deepEqual(await f.events(), []);
+});
+
+test("operator shell uses a bounded audited terminal with no provider or credential mounts", async (t) => {
+  const f = await fixture(t);
+  let opened = 0;
+  const observed = await createObservedHost({
+    ...f.options,
+    async openGateway(options) {
+      assert.deepEqual(
+        options.policy.allow,
+        opened++ === 0 ? [] : [{ hostname: "example.net", port: 80 }],
+      );
+      return f.options.openGateway(options);
+    },
+  });
+  t.after(() => observed.close());
+  const mount = join(f.options.msb.home, "..", "mount");
+  await mkdir(mount);
+  const run = await observed.host.runSandboxShell(
+    "base",
+    [{ hostname: "example.net", port: 80 }],
+    [{ host: mount, guest: "/inspect", readOnly: true }],
+  );
+  assert.equal(run.outcome, "ok");
+  const execution = observed.audit.readExecution(run.id);
+  assert.equal(execution.sandboxBindings[0]?.egressMode, "gateway");
+  assert.equal(
+    execution.executionContexts[0]?.attributes?.purpose,
+    "sandbox-shell",
+  );
+  assert.equal(execution.processResults[0]?.exitCode, 0);
+  assert.equal(execution.auditEvents.at(-1)?.outcome, "ok");
+  const events = await f.events();
+  const create = events.find(({ args }) => args[0] === "create")!;
+  assert.ok(create.durableBinding);
+  assert.equal(create.args[create.args.indexOf("--max-duration") + 1], "300s");
+  assert.ok(create.args.includes(`${mount}:/inspect:ro`));
+  for (const arg of [
+    "--secret",
+    "--tls-intercept",
+    "--vsock",
+    "--mount-named",
+    "--mount-file",
+  ])
+    assert.ok(!create.args.includes(arg));
+  assert.deepEqual(
+    events.find(({ args }) => args[0] === "exec")?.args.slice(-2),
+    ["--", "/bin/sh"],
+  );
 });

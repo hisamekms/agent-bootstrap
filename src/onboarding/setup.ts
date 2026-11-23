@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { buildSandboxPlan } from "../image-build-sandbox.ts";
 import { ALPINE_3_23, recipeFor } from "../image-recipes.ts";
 import { offlineMiseEnv } from "../mise-tools.ts";
 import {
@@ -18,7 +19,11 @@ import {
   type Host,
 } from "./prerequisites.ts";
 
-export async function setupPlan(root: string, extended: boolean) {
+export async function setupPlan(
+  root: string,
+  extended: boolean,
+  env = process.env,
+) {
   const selected = extended ? allProfiles : defaultProfiles;
   const lock = await readLock(root);
   const inputs = artifacts(selected);
@@ -31,6 +36,7 @@ export async function setupPlan(root: string, extended: boolean) {
       name,
       image: entry.image,
       base: recipe.base.reference,
+      build: buildSandboxPlan(name, env),
       ...(recipe.base.kind === "debian-snapshot" && {
         packageSource: `http://snapshot.debian.org/archive/debian/${recipe.base.snapshot}/`,
         releasePins: recipe.base.inRelease,
@@ -145,7 +151,7 @@ export async function applySetup(
   }
 
   const built: string[] = [];
-  for (const { name, image } of builds) {
+  for (const { name, image, build } of builds) {
     const result = await host.command(
       process.execPath,
       [
@@ -154,13 +160,17 @@ export async function applySetup(
         "--locked",
         name,
       ],
-      { ...offlineMiseEnv(host.env), MSB_HOME: home },
+      {
+        ...offlineMiseEnv(host.env),
+        MSB_HOME: home,
+        XDG_STATE_HOME: host.env.XDG_STATE_HOME,
+      },
       2_700_000,
     );
     if (result.code !== 0 || (await imageStatus(host, home, image)) !== "ok")
       throw new SetupError(
         "A profile build failed or differs from the checked-in digest.",
-        `Inspect the ${name} build and its pinned inputs before retrying. See agent-bootstrap help setup.`,
+        `Inspect the ${name} build audit at ${build.auditPath} and its pinned inputs before retrying. See agent-bootstrap help setup.`,
       );
     built.push(name);
   }

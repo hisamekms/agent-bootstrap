@@ -56,7 +56,7 @@ security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 ```
 
 **Expected output**  
-Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. The optional browser build pulls a pinned Debian base and uses the existing Debian snapshot recipe over HTTP with signed and hash-pinned release metadata. A digest mismatch stops setup before the image is published under its locked reference.
+Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. Build VMs use an audited gateway limited to recipe destinations. The browser build uses a pinned Debian base and signed, hash-pinned snapshot metadata. Setup lists the build audit database and allowlist for each profile. A digest mismatch stops setup before the image is published under its locked reference.
 
 **Next action**  
 API-key mode is the default. Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.
@@ -217,10 +217,12 @@ agent-bootstrap --target /path/to/project reconcile
 agent-bootstrap --target /path/to/project show-execution "$execution_id" --json
 agent-bootstrap --target /path/to/project retry-task "$task_id"
 agent-bootstrap concierge --target /path/to/project --continue --mode default
+agent-bootstrap sandbox shell --json
+agent-bootstrap sandbox shell --profile base --run
 ```
 
 **Expected output**  
-Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. Doctor reports the effective authentication mode and its source.
+Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. For unsafe-input-symlink, replace absolute or escaping links with relative links inside the repository and retry with the corrected commit. Doctor reports the effective authentication mode and its source.
 
 **Next action**  
 Check status for the new attempt. If integration remains uncertain, inspect the private ref and integration journal before retrying.
@@ -239,10 +241,11 @@ An operator who controls Keychain, target selection, terminal settings, and gate
 agent-bootstrap --target /path/to/project policy show --json
 agent-bootstrap --target /path/to/project proposals --status pending --json
 agent-bootstrap setup --json
+agent-bootstrap sandbox shell --allow example.com:443 --json
 ```
 
 **Expected output**  
-Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement.
+Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.
 
 **Next action**  
 Review the proposed paths, verification result, digest, and policy before answering each gate.
@@ -296,6 +299,7 @@ The operator signs in from the Claude Code CLI.
 - `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap setup [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
 - `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
+- `agent-bootstrap sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]` → A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.
 - `agent-bootstrap credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]` → { mounted, active, stale } for status or { status } after a completed action.
 - `agent-bootstrap login --group <name> [--target <path>] [--claude-auth <mode>] [--json]` → { status } after a successful interactive session. Transcript goes to stderr in JSON mode.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }

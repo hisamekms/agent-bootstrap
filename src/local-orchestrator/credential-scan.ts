@@ -29,7 +29,7 @@ function builtInMatch(input: string): boolean {
     /"expiresAt"\s*:\s*(?:"[^"\r\n]+"|\d+)/i.test(text)
   )
     return true;
-  return /\b(?:sk-ant-|bearer\s+)[a-z0-9_./+=-]{24,}/i.test(text);
+  return /(?:sk-ant-|bearer\s+)[a-z0-9_./+=-]{24,}/i.test(text);
 }
 
 async function customMatch(text: string[], patterns: readonly string[]) {

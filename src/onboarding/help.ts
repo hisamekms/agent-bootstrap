@@ -56,7 +56,7 @@ export const helpTopics = {
       provisionKeychain,
     ],
     output:
-      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. The optional browser build pulls a pinned Debian base and uses the existing Debian snapshot recipe over HTTP with signed and hash-pinned release metadata. A digest mismatch stops setup before the image is published under its locked reference.",
+      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. Build VMs use an audited gateway limited to recipe destinations. The browser build uses a pinned Debian base and signed, hash-pinned snapshot metadata. Setup lists the build audit database and allowlist for each profile. A digest mismatch stops setup before the image is published under its locked reference.",
     next: "API-key mode is the default. Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.",
     human:
       "Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.",
@@ -167,9 +167,11 @@ export const helpTopics = {
       `${target} show-execution "$execution_id" --json`,
       `${target} retry-task "$task_id"`,
       `${launch} --continue --mode default`,
+      "agent-bootstrap sandbox shell --json",
+      "agent-bootstrap sandbox shell --profile base --run",
     ],
     output:
-      "Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. Doctor reports the effective authentication mode and its source.",
+      "Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. For unsafe-input-symlink, replace absolute or escaping links with relative links inside the repository and retry with the corrected commit. Doctor reports the effective authentication mode and its source.",
     next: "Check status for the new attempt. If integration remains uncertain, inspect the private ref and integration journal before retrying.",
     human: "The operator confirms reconciliation and retries from a host TTY.",
   },
@@ -182,9 +184,10 @@ export const helpTopics = {
       `${target} policy show --json`,
       `${target} proposals --status pending --json`,
       "agent-bootstrap setup --json",
+      "agent-bootstrap sandbox shell --allow example.com:443 --json",
     ],
     output:
-      "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement.",
+      "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.",
     next: "Review the proposed paths, verification result, digest, and policy before answering each gate.",
     human: `${humanRepo} ${humanGate} Keep API keys in Keychain. In config-dir mode, processes inside a Claude VM can read the mounted group directory. Researcher and verification receive neither the directory nor its egress policy.`,
   },
@@ -312,6 +315,11 @@ export const onboardingOutputs = {
     usage:
       "concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]",
     json: "{ status, next } after an interactive TTY session. Transcript goes to stderr.",
+  },
+  sandbox: {
+    usage:
+      "sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]",
+    json: "A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.",
   },
   credentials: {
     usage:

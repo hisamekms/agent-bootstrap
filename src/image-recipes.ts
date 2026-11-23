@@ -619,13 +619,14 @@ export function BUILD_SCRIPT(name: string): string {
   ].join("\n");
 }
 
-/** Where the build VM may connect, as `msb create --net-rule` values. */
-export function buildNetRules(name: string): string[] {
+/** The recipe's complete network allowlist for the build gateway. */
+export function buildEgress(
+  name: string,
+): { hostname: string; port: number }[] {
   const { base } = recipeFor(name);
   if (base.kind === "alpine") return [];
-  const [host, port] = base.egress.split(":");
-  // The allow@dns rule is unscoped and permits queries for any name.
-  return ["allow@dns", `allow@${host}:tcp:${port}`];
+  const [hostname, port] = base.egress.split(":");
+  return [{ hostname: hostname!, port: Number(port) }];
 }
 
 /** A shell script run in a VM of the finished image, and the exact output

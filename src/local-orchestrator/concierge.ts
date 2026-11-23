@@ -29,6 +29,8 @@ import {
   type ClaudeCodeAuth,
   type ClaudeCodeInstall,
 } from "../claude-code.ts";
+import { GitIntegrationError } from "../git-integration.ts";
+import { isSafeSymlinkTarget } from "../workspace-tree.ts";
 import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
 import {
   INTERACTIVE_MAX_LIFETIME_MS,
@@ -255,6 +257,39 @@ export async function snapshotConciergeRepo(
         { cwd: metadata, env: gitEnv, timeout: 15_000, maxBuffer: 4096 },
       );
       const env = { ...gitEnv, GIT_OBJECT_DIRECTORY: objects };
+      const gitOptions = {
+        cwd: metadata,
+        env,
+        timeout: 15_000,
+        maxBuffer: 8 * 1024 * 1024,
+      };
+      const { stdout: listing } = await runFile(
+        git,
+        ["ls-tree", "-r", "-l", "-z", base],
+        gitOptions,
+      );
+      const files: string[] = [];
+      for (const entry of listing.split("\0")) {
+        if (!entry) continue;
+        const tab = entry.indexOf("\t");
+        if (tab < 0) throw new Error("Concierge tree listing failed");
+        const path = entry.slice(tab + 1);
+        if (/^\.local(?:\/|$)/i.test(path)) continue;
+        files.push(path);
+        if (!entry.startsWith("120000 ")) continue;
+        const link = /^120000 blob ([a-f0-9]{40}|[a-f0-9]{64}) +(\d+)$/.exec(
+          entry.slice(0, tab),
+        );
+        if (!link || Number(link[2]) > 4096)
+          throw new GitIntegrationError("unsafe-input-symlink");
+        const { stdout: bytes } = await runFile(
+          git,
+          ["cat-file", "blob", link[1]!],
+          { ...gitOptions, encoding: "buffer", maxBuffer: 4096 },
+        );
+        if (!isSafeSymlinkTarget(path, bytes))
+          throw new GitIntegrationError("unsafe-input-symlink");
+      }
       const archive = spawn(
         git,
         [
@@ -292,23 +327,7 @@ export async function snapshotConciergeRepo(
       if (results.some(({ status }) => status === "rejected"))
         throw new Error("Concierge archive failed");
       await privateSubdirectories(dir);
-      const { stdout: listing } = await runFile(
-        git,
-        ["ls-tree", "-r", "-z", "--name-only", base],
-        {
-          cwd: metadata,
-          env,
-          timeout: 15_000,
-          maxBuffer: 8 * 1024 * 1024,
-        },
-      );
-      return {
-        dir,
-        commit: base,
-        files: listing
-          .split("\0")
-          .filter((path) => path && !/^\.local(?:\/|$)/i.test(path)),
-      };
+      return { dir, commit: base, files };
     } finally {
       await rm(metadata, { recursive: true, force: true });
     }

@@ -27,6 +27,11 @@ import {
 } from "./help.ts";
 import { doctor, systemHost, type Host } from "./prerequisites.ts";
 import {
+  parseSandboxShell,
+  runSandboxShell,
+  sandboxShellPlan,
+} from "./sandbox-shell.ts";
+import {
   applySetup,
   authorizedAgentWarning,
   SetupError,
@@ -182,6 +187,43 @@ export async function runBootstrap(
       return first ? 3 : 0;
     }
 
+    if (command === "sandbox") {
+      let options: ReturnType<typeof parseSandboxShell>;
+      try {
+        options = parseSandboxShell(rest);
+        if (json && options.run) return usage();
+      } catch {
+        return usage();
+      }
+      if (options.run && !io.conciergeTTY)
+        return fail(
+          1,
+          "Sandbox shell requires an operator terminal.",
+          "Run agent-bootstrap sandbox shell --run from a TTY.",
+        );
+      try {
+        const prepared = await sandboxShellPlan(root, host.env, options);
+        print(prepared.plan);
+        if (options.run) {
+          const { id, outcome } = await runSandboxShell(host, prepared);
+          print({ id, outcome });
+          if (outcome !== "ok")
+            return fail(
+              1,
+              "Sandbox shell did not complete successfully.",
+              "Check the invocation in the audit database shown above.",
+            );
+        }
+        return 0;
+      } catch {
+        return fail(
+          1,
+          "Sandbox shell could not be prepared or run.",
+          "Check the profile, MSB_HOME, mount directories and audit path. See agent-bootstrap help troubleshoot.",
+        );
+      }
+    }
+
     if (command === "setup") {
       if (
         rest.length !== new Set(rest).size ||
@@ -193,15 +235,17 @@ export async function runBootstrap(
       const allowNetwork = rest.includes("--allow-network");
       const yes = rest.includes("--yes");
       if (yes) io.stderr.write(`${authorizedAgentWarning}\n`);
-      const plan = await setupPlan(root, rest.includes("--profiles")).catch(
-        () => {
-          throw new SetupError(
-            "The setup plan could not load the required profile lock.",
-            "Restore the checked-in lock and matching recipes.",
-            3,
-          );
-        },
-      );
+      const plan = await setupPlan(
+        root,
+        rest.includes("--profiles"),
+        host.env,
+      ).catch(() => {
+        throw new SetupError(
+          "The setup plan could not load the required profile lock.",
+          "Restore the checked-in lock and matching recipes.",
+          3,
+        );
+      });
       if (allowNetwork && !yes) {
         if (!io.isTTY)
           return fail(

@@ -240,28 +240,18 @@ export function parseObservabilityConfig(
   } satisfies ObservabilityConfig);
 }
 
-/** An unaudited agent run requires an opt-in from the caller for this run. */
+/** Disabled audit permits only offline fixture-style runs. */
 export function requireAudited(
   spec: SandboxSpec,
   config: Pick<ObservabilityConfig, "audit">,
-  options?: { readonly allowUnauditedRun?: boolean },
 ): void {
   if (config.audit.mode !== "disabled") return;
   if (types.isProxy(spec)) throw new TypeError("Invalid sandbox spec");
-  if (!(
+  if (
     "provider" in spec ||
     "tools" in spec ||
     "repository" in spec ||
     "hostTcpPort" in spec
-  ))
-    return;
-
-  const optIn =
-    options && !types.isProxy(options)
-      ? Object.getOwnPropertyDescriptor(options, "allowUnauditedRun")
-      : undefined;
-  if (optIn && Object.hasOwn(optIn, "value") && optIn.value === true) return;
-  throw new Error(
-    "Agent runs require audit or explicit allowUnauditedRun: true",
-  );
+  )
+    throw new Error("Agent runs require durable audit");
 }

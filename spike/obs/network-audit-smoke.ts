@@ -125,7 +125,6 @@ class Scope {
   async observed(
     options: {
       limits?: Limits | ((id: string) => Limits | undefined);
-      mode?: "required" | "disabled";
       debianBase?: boolean;
       upstream?: number;
       token?: string;
@@ -146,7 +145,7 @@ class Scope {
       config: {
         directory: join(this.root, "observability"),
         telemetry: { enabled: false },
-        audit: { mode: options.mode ?? "required" },
+        audit: { mode: "required" },
       },
       auditPath: this.auditPath,
       msb: { binary: this.binary, home: this.home, stagingRoot },
@@ -1295,17 +1294,15 @@ const limits: Case = async (scope) => {
 
 const overhead: Case = async (scope) => {
   const fixture = register(scope, await tcpFixture("reply"));
-  async function measure(mode: "required" | "disabled") {
-    const observed = await scope.observed({ mode, debianBase: true });
-    const id = randomUUID();
-    scope.ids.add(id);
-    const audited = mode === "required";
-    const port = audited ? 18080 : fixture.port;
-    const script =
-      guestPerl +
-      String.raw`
+  const observed = await scope.observed({ debianBase: true });
+  const id = randomUUID();
+  scope.ids.add(id);
+  const port = 18080;
+  const script =
+    guestPerl +
+    String.raw`
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC usleep);
-my $ip = $ARGV[0] eq "direct" ? gateway() : $ARGV[0];
+my $ip = $ARGV[0];
 for (1 .. 100) {
   my $start = clock_gettime(CLOCK_MONOTONIC);
   check(tcp($ip, $ARGV[1]) eq "${canary}", "latency canary");
@@ -1313,76 +1310,62 @@ for (1 .. 100) {
   usleep(75000);
 }
 `;
-    const result = await observed.host.runReviewer(
-      {
-        sandbox: audited ? {} : { hostTcpPort: port },
-        command: {
-          argv: perl(script, audited ? serviceIp : "direct", port),
-          timeoutMs: 45_000,
-        },
+  const result = await observed.host.runReviewer(
+    {
+      sandbox: {},
+      command: {
+        argv: perl(script, serviceIp, port),
+        timeoutMs: 45_000,
       },
-      id,
-      undefined,
-      audited
-        ? { hostServices: [service(fixture.port)] }
-        : { allowUnauditedRun: true },
-    );
-    assert.equal(result.outcome, "ok");
-    assert.ok(result.response, "Latency samples missing");
-    const samples = new TextDecoder()
-      .decode(result.response)
-      .trim()
-      .split("\n")
-      .map(Number);
-    assert.equal(samples.length, 100);
-    assert.ok(
-      samples.every((sample) => Number.isFinite(sample) && sample > 0),
-      "Invalid latency sample",
-    );
-    const history = scope.read(id);
-    if (audited) {
-      scopedEvidence(scope, id, history);
-      exitOk(history);
-      assert.equal(
-        history.networkEvents.filter(
-          (row) =>
-            row.phase === "decided" &&
-            row.decision === "allow" &&
-            row.channel === "host-service" &&
-            row.destinationIp === serviceIp &&
-            row.destinationPort === port,
-        ).length,
-        100,
-      );
-      assert.equal(
-        history.networkEvents.filter(
-          (row) =>
-            row.phase === "finished" &&
-            row.result === "connected" &&
-            row.bytesReceived >= canary.length,
-        ).length,
-        100,
-      );
-    } else {
-      // Disabled audit is the latency baseline: the guest exit was checked
-      // above (result.outcome), and nothing may be written to the audit.
-      assert.equal(history.auditEvents.length, 0, "Disabled audit wrote rows");
-      assert.equal(history.networkEvents.length, 0);
-    }
-    const sorted = samples.toSorted((a, b) => a - b);
-    await observed.close();
-    return {
-      executionId: id,
-      samples: samples.length,
-      p50Ms: sorted[49]!,
-      p95Ms: sorted[94]!,
-    };
-  }
-  const direct = await measure("disabled");
+    },
+    id,
+    undefined,
+    { hostServices: [service(fixture.port)] },
+  );
+  assert.equal(result.outcome, "ok");
+  assert.ok(result.response, "Latency samples missing");
+  const samples = new TextDecoder()
+    .decode(result.response)
+    .trim()
+    .split("\n")
+    .map(Number);
+  assert.equal(samples.length, 100);
+  assert.ok(
+    samples.every((sample) => Number.isFinite(sample) && sample > 0),
+    "Invalid latency sample",
+  );
+  const history = scope.read(id);
+  scopedEvidence(scope, id, history);
+  exitOk(history);
+  assert.equal(
+    history.networkEvents.filter(
+      (row) =>
+        row.phase === "decided" &&
+        row.decision === "allow" &&
+        row.channel === "host-service" &&
+        row.destinationIp === serviceIp &&
+        row.destinationPort === port,
+    ).length,
+    100,
+  );
+  assert.equal(
+    history.networkEvents.filter(
+      (row) =>
+        row.phase === "finished" &&
+        row.result === "connected" &&
+        row.bytesReceived >= canary.length,
+    ).length,
+    100,
+  );
+  const sorted = samples.toSorted((a, b) => a - b);
   assert.equal(fixture.connections, 100);
-  const gateway = await measure("required");
-  assert.equal(fixture.connections, 200);
-  return { direct, gateway, p50OverheadMs: gateway.p50Ms - direct.p50Ms };
+  await observed.close();
+  return {
+    executionId: id,
+    samples: samples.length,
+    p50Ms: sorted[49]!,
+    p95Ms: sorted[94]!,
+  };
 };
 
 const cases: Record<string, { run: Case; rows: string[] }> = {
@@ -1400,7 +1383,7 @@ const cases: Record<string, { run: Case; rows: string[] }> = {
   forced: { run: forced, rows: ["N-26"] },
   crashed: { run: crashed, rows: ["N-26"] },
   limits: { run: limits, rows: ["sec-1-limits"] },
-  overhead: { run: overhead, rows: ["gateway-overhead"] },
+  overhead: { run: overhead, rows: ["gateway-latency"] },
 };
 
 function report(data: Evidence) {

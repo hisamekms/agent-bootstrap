@@ -13,12 +13,13 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BUILD_SCRIPT,
-  buildNetRules,
   profileFiles,
   profilePackages,
   recipeFor,
   smokeTest,
 } from "../../src/image-recipes.ts";
+import { withBuildSandbox } from "../../src/image-build-sandbox.ts";
+import type { ProfileName } from "../../src/sandbox-profiles.ts";
 import { checkDirectory } from "../../src/local-orchestrator/target.ts";
 import { MISE_MSB, offlineMiseEnv } from "../../src/mise-tools.ts";
 import {
@@ -45,7 +46,12 @@ let msb = "";
 let msbHome = "";
 let locked = false;
 
-function run(args: string[], timeoutMs: number): Promise<string> {
+function run(
+  args: string[],
+  timeoutMs: number,
+  extraEnv?: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       locked ? "mise" : msb,
@@ -54,8 +60,11 @@ function run(args: string[], timeoutMs: number): Promise<string> {
         env: {
           ...(locked ? offlineMiseEnv(process.env) : { PATH: "/usr/bin:/bin" }),
           MSB_HOME: msbHome,
+          MSB_BACKEND: "local",
+          ...extraEnv,
         },
         encoding: "utf8",
+        signal,
         killSignal: "SIGKILL",
         timeout: timeoutMs,
         maxBuffer: 16 * 1024 * 1024,
@@ -70,40 +79,12 @@ const MINUTE = 60_000;
 // archive in memory (a few GiB peak), which is acceptable for a spike.
 const MAX_ROOTFS_BYTES = 4 * 1024 ** 3;
 
-/** Create a no-network sandbox, run `use`, and always remove it. */
-async function withSandbox<T>(
-  image: string,
-  memoryMiB: number,
-  extra: string[],
-  use: (name: string) => Promise<T>,
-): Promise<T> {
-  const name = `agent-bootstrap-build-${randomBytes(8).toString("hex")}`;
-  try {
-    await run(
-      [
-        "create",
-        "--name",
-        name,
-        "--pull",
-        "never",
-        "--no-net",
-        "--memory",
-        `${memoryMiB}M`,
-        "--max-duration",
-        "900s",
-        ...extra,
-        image,
-      ],
-      5 * MINUTE,
-    );
-    return await use(name);
-  } finally {
-    await run(["stop", name], MINUTE).catch(() => undefined);
-    await run(["rm", "--force", name], MINUTE);
-  }
-}
-
-function guestExec(name: string, script: string, timeoutMs: number) {
+function guestExec(
+  run: (args: string[], timeoutMs: number) => Promise<string>,
+  name: string,
+  script: string,
+  timeoutMs: number,
+) {
   return run(
     [
       "exec",
@@ -138,6 +119,16 @@ async function main(): Promise<void> {
   msb = binary;
   msbHome = home;
   const recipe = recipeFor(profile);
+  stage = "backend version";
+  if ((await run(["--version"], MINUTE)).trim() !== "msb 0.7.16")
+    throw new Error("Microsandbox 0.7.16 required");
+  const vm = {
+    profile: profile as ProfileName,
+    memoryMiB: recipe.memoryMiB,
+    cpus: recipe.cpus,
+    env: process.env,
+    run,
+  };
   const expected = locked
     ? parseProfileLock(await readFile(join(root, PROFILE_LOCK_PATH), "utf8"))
         .profiles[profile]
@@ -152,15 +143,15 @@ async function main(): Promise<void> {
   const work = await mkdtemp(join(root, ".local", "images-"));
   let temporaryImage: string | undefined;
   try {
-    const copyArgs: string[] = [];
+    let packageDir: string | undefined;
     if (recipe.base.kind === "alpine") {
       stage = "Alpine input verification";
       await mkdir(join(work, "pkgs"), { mode: 0o700 });
-      const packageDir = recipe.base.packageDir;
+      const pinnedPackages = recipe.base.packageDir;
       const inputs = [
         ...profilePackages(profile).map((item) => ({
           ...item,
-          source: join(packageDir, item.name),
+          source: join(pinnedPackages, item.name),
         })),
         ...profileFiles(profile),
       ];
@@ -171,7 +162,7 @@ async function main(): Promise<void> {
         if (sha256(await readFile(target)) !== item.sha256)
           throw new Error(`digest mismatch for ${item.name}`);
       }
-      copyArgs.push("--copy-dir", `${join(work, "pkgs")}:/tmp/pkgs`);
+      packageDir = join(work, "pkgs");
     }
     let packages: string[] | undefined;
 
@@ -190,17 +181,13 @@ async function main(): Promise<void> {
     const base = readOciLayout(await readFile(join(work, "base.tar")));
 
     stage = "build VM";
-    await withSandbox(
-      recipe.base.reference,
-      recipe.memoryMiB,
-      [
-        "--cpus",
-        String(recipe.cpus),
-        ...copyArgs,
-        ...buildNetRules(profile).flatMap((rule) => ["--net-rule", rule]),
-      ],
-      async (name) => {
-        await guestExec(name, BUILD_SCRIPT(profile), 10 * MINUTE);
+    await withBuildSandbox({
+      ...vm,
+      image: recipe.base.reference,
+      digest: recipe.base.reference.slice(-64),
+      ...(packageDir === undefined ? {} : { packageDir }),
+      use: async (name, run) => {
+        await guestExec(run, name, BUILD_SCRIPT(profile), 10 * MINUTE);
         stage = "root filesystem export";
         await run(
           ["copy", `${name}:/tmp/rootfs.tar`, join(work, "rootfs.tar")],
@@ -219,7 +206,7 @@ async function main(): Promise<void> {
             .sort();
         }
       },
-    );
+    });
 
     stage = "image assembly";
     const rootfsPath = join(work, "rootfs.tar");
@@ -266,12 +253,13 @@ async function main(): Promise<void> {
 
     stage = "smoke test";
     const smoke = smokeTest(profile);
-    const output = await withSandbox(
-      smokeReference,
-      recipe.memoryMiB,
-      [],
-      (name) => guestExec(name, smoke.script, 5 * MINUTE),
-    );
+    const output = await withBuildSandbox({
+      ...vm,
+      image: smokeReference,
+      digest,
+      smoke: true,
+      use: (name, run) => guestExec(run, name, smoke.script, 5 * MINUTE),
+    });
     const lines = output.split("\n").filter((l) => l !== "");
     if (lines.join("\n") !== smoke.expected.join("\n"))
       throw new Error("smoke test output differs");
@@ -341,6 +329,7 @@ try {
   await main();
 } catch (error) {
   console.error(`Image build stopped at ${stage}.`);
-  if (process.env["IMAGE_DEBUG"] === "1") console.error(error);
+  if (process.env["IMAGE_DEBUG"] === "1")
+    console.error(error instanceof Error ? error.name : "Unknown error");
   process.exit(1);
 }

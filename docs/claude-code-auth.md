@@ -59,7 +59,9 @@ list (`hostname:443`). IP literals and Anthropic domains are excluded. The API e
   size budget blocks the output. A rejection records a private evidence
   path and the fixed code `credential-leak` without copying the match.
   A target that has used configuration-directory mode continues to screen
-  later operator output and exports when the launch mode changes.
+  later operator output and exports when the launch mode changes. Screening
+  is defence in depth. Encoding or splitting a value can bypass pattern
+  matching.
 
 `credentials init` creates a small AES-256 encrypted APFS image and saves
 a randomly generated passphrase in Keychain. The launcher attaches it

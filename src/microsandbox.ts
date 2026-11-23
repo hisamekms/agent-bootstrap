@@ -23,6 +23,8 @@ import {
 } from "./microsandbox-metrics.ts";
 import { PROFILE_NAMES, ProfileCatalog } from "./sandbox-profiles.ts";
 import {
+  DEBUG_SHELL_LIFETIME_MS,
+  isDebugMount,
   INTERACTIVE_MAX_LIFETIME_MS,
   isConciergeVolumeName,
   isSafeCredentialVariable,
@@ -220,24 +222,10 @@ function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
   });
 }
 
-/** Backend arguments for credentialed provider egress. The host-gateway
- * name maps to the backend's `host` target; other names are domain rules. */
-function providerArgs(
-  provider: SandboxProvider,
-  throughGateway: boolean,
-): string[] {
+/** Backend arguments for provider substitution over the gateway. */
+function providerArgs(provider: SandboxProvider): string[] {
   const port = provider.port ?? 443;
-  const target =
-    provider.host === "host.microsandbox.internal" ? "host" : provider.host;
   return [
-    ...(throughGateway
-      ? []
-      : [
-          "--net-rule",
-          "allow@dns",
-          "--net-rule",
-          `allow@${target}:tcp:${port}`,
-        ]),
     "--tls-intercept",
     ...(port !== 443 ? ["--tls-intercept-port", String(port)] : []),
     ...(provider.upstreamCaCertPath
@@ -257,10 +245,34 @@ function checkVolumeName(name: string): void {
   if (!isConciergeVolumeName(name)) invalid();
 }
 
+function debugArgs(spec: SandboxSpec): string[] {
+  if (spec.debugMounts === undefined) return [];
+  if (
+    !spec.egressGateway ||
+    spec.provider ||
+    spec.claude ||
+    spec.claudeMounts ||
+    spec.interactive ||
+    spec.tools ||
+    spec.repository ||
+    spec.files ||
+    spec.readOnlyFiles ||
+    spec.maxLifetimeMs !== DEBUG_SHELL_LIFETIME_MS ||
+    spec.debugMounts.length > 16 ||
+    spec.debugMounts.some((mount) => !isDebugMount(mount))
+  )
+    invalid();
+  return spec.debugMounts.flatMap(({ host, guest, readOnly }) => [
+    "--mount-dir",
+    `${host}:${guest}${readOnly ? ":ro" : ""}`,
+  ]);
+}
+
 function interactiveArgs(spec: SandboxSpec): string[] {
   const { interactive } = spec;
   if (interactive === undefined) {
-    if (spec.profile === "concierge") invalid();
+    if (spec.profile === "concierge" && spec.debugMounts === undefined)
+      invalid();
     return [];
   }
   if (
@@ -414,7 +426,25 @@ function terminalArgs(command: TerminalCommand): string[] {
   return ["/usr/bin/env", "--", ...assignments, ...command.argv];
 }
 
-function digestNetworkArgs(args: readonly string[]): string {
+export function networkArgs(gateway?: SandboxEgressGateway): string[] {
+  return gateway
+    ? [
+        "--no-net",
+        "--net-rule",
+        GATEWAY_NET_RULES,
+        "--dns-nameserver",
+        `127.0.0.1:${gateway.dnsPort}`,
+        "--proxy",
+        `socks5://127.0.0.1:${gateway.socksPort}`,
+        "--socks5-username",
+        gateway.username,
+        "--socks5-password-env",
+        gateway.passwordEnv,
+      ]
+    : ["--no-net"];
+}
+
+export function digestNetworkArgs(args: readonly string[]): string {
   // JSON preserves the exact argument boundaries and order.
   return createHash("sha256").update(JSON.stringify(args)).digest("hex");
 }
@@ -581,8 +611,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   }
 
   #network(spec: SandboxSpec): NetworkConfig {
-    const port = spec.hostTcpPort;
-    if (port !== undefined) boundedInteger(port, 65_535);
+    if ("hostTcpPort" in spec) invalid();
     const requestedProvider = spec.provider;
     if (
       requestedProvider !== undefined &&
@@ -592,8 +621,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const provider = requestedProvider ? { ...requestedProvider } : undefined;
     if (
       provider &&
-      (port !== undefined ||
-        !this.#config.credentials ||
+      (!this.#config.credentials ||
         !permitsProviderHeader(provider, this.#config.gatewayHosts) ||
         typeof provider.host !== "string" ||
         !this.#config.providers?.some((allowed) =>
@@ -619,10 +647,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       invalid();
     const binding = spec.egressGateway;
     let gateway: SandboxEgressGateway | undefined;
-    const args = ["--no-net"];
     if (binding !== undefined) {
       if (
-        port !== undefined ||
         !this.#config.gatewayPassword ||
         binding === null ||
         typeof binding !== "object"
@@ -645,22 +671,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       )
         invalid();
       gateway = Object.freeze({ socksPort, dnsPort, username, passwordEnv });
-      args.push(
-        "--net-rule",
-        GATEWAY_NET_RULES,
-        "--dns-nameserver",
-        `127.0.0.1:${dnsPort}`,
-        "--proxy",
-        `socks5://127.0.0.1:${socksPort}`,
-        "--socks5-username",
-        username,
-        "--socks5-password-env",
-        passwordEnv,
-      );
-    } else if (port !== undefined) {
-      args.push("--net-rule", `allow@host:tcp:${port}`);
     }
-    if (provider) args.push(...providerArgs(provider, gateway !== undefined));
+    if (provider && !gateway) invalid();
+    const args = networkArgs(gateway);
+    if (provider) args.push(...providerArgs(provider));
     return { args, gateway, provider };
   }
 
@@ -670,6 +684,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       ...this.#network(spec).args,
       ...interactiveArgs(spec),
       ...claudeMountArgs(spec),
+      ...debugArgs(spec),
     ]);
   }
 
@@ -718,6 +733,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   async create(
     spec: SandboxSpec,
   ): Promise<SandboxHandle & { readonly netRuleDigest: string }> {
+    if (spec.egressGateway !== undefined || spec.debugMounts !== undefined)
+      invalid();
     return this.#create(spec, `bootstrap-${randomUUID()}`, false);
   }
 
@@ -791,6 +808,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const channels = [
       ...interactiveArgs(interactive ? { ...spec, interactive } : spec),
       ...claudeMountArgs(spec),
+      ...debugArgs(spec),
     ];
     boundedInteger(
       lifetime,
@@ -912,7 +930,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           : {}),
         directory,
         deadline: performance.now() + lifetime,
-        interactive: requestedInteractive !== undefined,
+        interactive:
+          requestedInteractive !== undefined || spec.debugMounts !== undefined,
         busy: false,
         closed: false,
         removed: true,

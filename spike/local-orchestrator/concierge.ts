@@ -1,3 +1,4 @@
+import { GitIntegrationError } from "../../src/git-integration.ts";
 import { configuredCredentialScanner } from "../../src/local-orchestrator/credential-scan.ts";
 import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
@@ -298,6 +299,11 @@ async function main(args: readonly string[]) {
     );
     if (result.outcome !== "ok" || result.exitCode !== 0) process.exitCode = 1;
   } catch (error) {
+    if (
+      error instanceof GitIntegrationError &&
+      error.code === "unsafe-input-symlink"
+    )
+      throw new Error(error.message);
     if (
       error instanceof OrchestratorStoreError &&
       error.code === "session-busy"

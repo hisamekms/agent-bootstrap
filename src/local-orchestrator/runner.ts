@@ -1,3 +1,5 @@
+import { GitIntegrationError } from "../git-integration.ts";
+import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./credentials-volume.ts";
 import { randomUUID } from "node:crypto";
@@ -506,7 +508,14 @@ export class ActorRunner {
         error instanceof OrchestratorStoreError
           ? error.code
           : "host-error";
-      completion = { status: "failed", result: { code } };
+      completion =
+        error instanceof GitIntegrationError &&
+        error.code === "unsafe-input-symlink"
+          ? {
+              status: "failed",
+              result: { code: error.code, next: unsafeInputSymlinkNext },
+            }
+          : { status: "failed", result: { code } };
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {

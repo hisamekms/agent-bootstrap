@@ -160,6 +160,7 @@ describe("agent-bootstrap", () => {
       "doctor",
       "setup",
       "concierge",
+      "sandbox",
       "credentials",
       "login",
       "status",
@@ -524,4 +525,64 @@ describe("agent-bootstrap", () => {
     assert.equal((await stat(join(root, item.path))).mode & 0o777, 0o600);
     assert.ok(!(await readdir(root)).includes("executed"));
   });
+});
+
+test("sandbox shell renders a credential-free gateway plan and validates options without host commands", async () => {
+  const root = await fixture();
+  const { host, calls } = fakeHost(root);
+  host.env.XDG_STATE_HOME = root;
+  const { code, stdout } = await invoke(
+    [
+      "sandbox",
+      "shell",
+      "--json",
+      "--profile",
+      "bun",
+      "--allow",
+      "Example.NET:443",
+      "--mount-dir",
+      "/test:/inspect:ro",
+    ],
+    root,
+    host,
+  );
+  assert.equal(code, 0);
+  const plan = JSON.parse(stdout);
+  assert.equal(plan.profile, "bun");
+  assert.equal(plan.egress, "gateway");
+  assert.equal(plan.maxLifetimeMs, 300_000);
+  assert.deepEqual(plan.allow, [{ hostname: "example.net", port: 443 }]);
+  assert.deepEqual(plan.mounts, [
+    { host: "/test", guest: "/inspect", readOnly: true },
+  ]);
+  assert.equal(
+    plan.auditPath,
+    join(root, "agent-bootstrap", "sandbox-shell", "audit.sqlite"),
+  );
+  for (const flags of [
+    ["--allow", "1.2.3.4:443"],
+    ["--allow", "bad-.net:443"],
+    ["--allow", "example.net:22"],
+    ["--allow", "example.net:443\n"],
+    ["--allow", "*.example.net:443"],
+    ["--profile", "unknown"],
+    ["--mount-dir", "relative:/inspect"],
+    ["--mount-dir", "/test:/proc"],
+    ["--mount-dir", "/test:/x/../y"],
+    ["--mount-dir", "/test:/x:rw"],
+    ["--mount-dir", "/one:/x", "--mount-dir", "/two:/x/y"],
+    ["--run"],
+  ]) {
+    const result = await invoke(
+      ["sandbox", "shell", "--json", ...flags],
+      root,
+      host,
+    );
+    assert.equal(result.code, 2, flags.join(" "));
+  }
+  assert.equal(
+    (await invoke(["sandbox", "shell", "--run"], root, host)).code,
+    1,
+  );
+  assert.deepEqual(calls, []);
 });

@@ -100,12 +100,6 @@ class ObservedRuntime extends MicrosandboxRuntime {
 
   override async createBound(spec: SandboxSpec, sandboxId: string) {
     this.#assertOpen();
-    if (
-      this.#required &&
-      (spec.hostTcpPort !== undefined ||
-        (spec.provider !== undefined && spec.egressGateway === undefined))
-    )
-      throw new Error("Audited gateway required for sandbox egress");
     const handle = await super.createBound(spec, sandboxId);
     this.#onCreated(spec, handle);
     return handle;

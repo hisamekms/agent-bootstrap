@@ -156,6 +156,9 @@ export function foldTreePath(path: string): string {
   return path.normalize("NFC").toLowerCase();
 }
 
+export const unsafeInputSymlinkNext =
+  "Replace absolute or escaping symlinks with relative links inside the repository, then retry using the corrected commit.";
+
 export function isSafeSymlinkTarget(path: string, bytes: Uint8Array): boolean {
   // Keep the blob bytes intact. Git and tar use '/' as the directory separator.
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_PATH_BYTES) return false;
