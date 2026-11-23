@@ -100,7 +100,9 @@ Concierge cannot loosen a policy on its own because the host cannot
 distinguish the operator's words from the Concierge's. With a `human`
 default, a Goal proposal requesting `integration: agent` needs human
 Goal approval. After that approval, the Goal's integrations may be
-agent-approved.
+agent-approved. A Task Proposal that loosens any policy never
+auto-registers, even when it fits the scope. It goes through the
+`task-registration` gate under the prior policy.
 
 For a `human` gate, the host authenticates the operator through a separate
 CLI path outside the guest and the actor API. An agent answer cannot
