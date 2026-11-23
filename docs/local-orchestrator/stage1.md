@@ -57,3 +57,44 @@ Host API and operator CLI own caller authentication and role permissions.
 The host supplies the execution ID when it submits an agent's answer.
 Scheduling and budget consumption will use the stored execution and task
 records.
+
+## Host API
+
+The host binds one Unix socket per Concierge session. Use a new absolute
+path shorter than 100 UTF-8 bytes under a host-owned directory with mode
+`0700`. The socket uses mode `0600` and accepts one client at a time. In
+the Concierge VM, the stdio MCP command is
+`socat STDIO VSOCK-CONNECT:2:<port>`. Microsandbox maps the socket to that
+port with `--vsock <hostSocket>:<port>`.
+
+The server accepts MCP versions `2024-11-05`, `2025-03-26`,
+`2025-06-18` and `2025-11-25`. It offers `2025-11-25` for an
+unrecognized version. Messages are one UTF-8 JSON-RPC object per line. The
+default line limit is 1 MiB, configurable up to 4 MiB. The server closes on
+an oversized line or after three parse or invalid-request errors.
+
+The socket identifies the Concierge session. The host checks that the
+session is active on each request. The tools read state, draft goal and
+task proposals, and queue Planner executions. The Concierge polls
+`get_execution` with the returned ID. The `status` tool counts all rows
+by status and returns up to 20 of the newest pending proposals and 20 of
+the newest executions. The operator approves proposals through the host
+CLI. In-scope tasks can auto-register under the ordinary store rules, and
+agents are ineligible to approve Concierge-origin proposals.
+
+The store records accepted connections and disconnections against the
+session ID. For each admitted tool call, it commits a `host-api.authorized`
+event before reading tool data, drafting a proposal or calling the
+execution requester. Each call produces one `host-api.call` outcome
+event when the audit store is available, including denials and tool
+errors. A host-generated call ID joins authorization to outcome.
+The records include the session, known tool name, duration and fixed
+outcome code as applicable. Successful execution requests and lookups
+also carry the execution ID. Arguments and tool output stay out of these
+records.
+
+A failed authorization audit stops the call. A draft commits with its
+own store event, and the execution requester owns the transaction for
+queueing. The API records the final outcome before replying. If that
+write fails, the caller receives `audit-unavailable`. Any proposal or
+execution already committed stays in the store.

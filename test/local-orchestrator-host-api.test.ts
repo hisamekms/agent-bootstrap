@@ -1,0 +1,587 @@
+import assert from "node:assert/strict";
+import { once } from "node:events";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { createConnection, type Socket } from "node:net";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { afterEach, beforeEach, test } from "node:test";
+import {
+  HostApiServer,
+  type ExecutionRequester,
+  type HostApiOptions,
+} from "../src/local-orchestrator/host-api.ts";
+import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
+
+const budgets = { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 500 };
+const goalContent = {
+  title: "Goal 🛠",
+  description: "Goal description\nSecond line",
+  acceptance: ["Pass"],
+  scope: {
+    paths: ["src/x/"],
+    profiles: ["base"],
+    actors: ["Executor"],
+    maxTasks: 3,
+    budgets,
+  },
+};
+const taskContent = {
+  title: "Task",
+  description: "",
+  acceptance: ["Pass"],
+  actor: "Executor",
+  profile: "base",
+  paths: ["src/x/a.ts"],
+  dependsOn: [],
+  budgets,
+};
+
+let folder: string;
+let store: OrchestratorStore;
+let options: HostApiOptions;
+let server: HostApiServer | undefined;
+let sockets: Socket[];
+let plannerCalls: Parameters<ExecutionRequester["requestPlanner"]>[0][];
+
+beforeEach(() => {
+  // A short prefix leaves room for the socket on platforms with short sun_path.
+  folder = mkdtempSync("/tmp/lo-api-");
+  store = OrchestratorStore.open(join(folder, "state.sqlite"));
+  server = undefined;
+  sockets = [];
+  plannerCalls = [];
+  options = {
+    store,
+    socketPath: join(folder, "mcp.sock"),
+    sessionId: store.startSession("Concierge", "test-runtime").id,
+    requester: {
+      async requestPlanner(input) {
+        plannerCalls.push(input);
+        return store.createExecution({
+          actor: "Planner",
+          mode: input.mode,
+          ...(input.goalId === undefined ? {} : { goalId: input.goalId }),
+          requestedBy: {
+            kind: "actor",
+            actor: "Concierge",
+            sessionId: input.sessionId,
+          },
+        }).id;
+      },
+    },
+  };
+});
+
+afterEach(async () => {
+  try {
+    for (const socket of sockets) socket.destroy();
+    await server?.close();
+  } finally {
+    store.close();
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+function wire(method: string, id?: number, params?: object) {
+  return JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+}
+
+async function connect() {
+  const socket = createConnection(options.socketPath);
+  sockets.push(socket);
+  const closed = new Promise<void>((resolve) =>
+    socket.once("close", () => resolve()),
+  );
+  const lines = createInterface({ input: socket })[Symbol.asyncIterator]();
+  await once(socket, "connect");
+  let id = 0;
+  return {
+    socket,
+    closed,
+    async reply() {
+      const next = await lines.next();
+      assert.equal(next.done, false, "Expected a JSON-RPC response");
+      return JSON.parse(next.value);
+    },
+    async request(method: string, params?: object) {
+      socket.write(wire(method, ++id, params));
+      const reply = await this.reply();
+      assert.equal(reply.id, id);
+      assert.equal(reply.jsonrpc, "2.0");
+      return reply;
+    },
+    async call(name: string, args?: object) {
+      const { result } = await this.request("tools/call", {
+        name,
+        arguments: args,
+      });
+      assert.equal(result.content.length, 1);
+      assert.equal(result.content[0].type, "text");
+      return {
+        isError: result.isError === true,
+        data: JSON.parse(result.content[0].text),
+      };
+    },
+  };
+}
+
+async function listen(overrides: Partial<HostApiOptions> = {}) {
+  server = await HostApiServer.listen({ ...options, ...overrides });
+  return connect();
+}
+
+function apiCalls() {
+  return store
+    .listEvents({ subjectId: options.sessionId, limit: 100 })
+    .filter(({ kind }) => kind === "host-api.call")
+    .reverse();
+}
+
+test("negotiates MCP versions, lists scoped tools and pipelines notifications", async () => {
+  const client = await listen();
+  assert.equal(statSync(options.socketPath).mode & 0o777, 0o600);
+  for (const version of [
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "future",
+  ]) {
+    const { result } = await client.request("initialize", {
+      protocolVersion: version,
+    });
+    assert.deepEqual(result, {
+      protocolVersion: version === "future" ? "2025-11-25" : version,
+      capabilities: { tools: {} },
+      serverInfo: { name: "local-orchestrator", version: "0.1.0" },
+    });
+  }
+
+  client.socket.write(
+    wire("notifications/initialized") +
+      wire("unknown/notification") +
+      wire("ping", 100),
+  );
+  assert.deepEqual(await client.reply(), {
+    jsonrpc: "2.0",
+    id: 100,
+    result: {},
+  });
+  const { result } = await client.request("tools/list");
+  assert.deepEqual(
+    result.tools.map((tool: { name: string }) => tool.name),
+    [
+      "status",
+      "list_proposals",
+      "get_proposal",
+      "list_goals",
+      "get_goal",
+      "get_execution",
+      "draft_goal",
+      "draft_task",
+      "request_planner",
+    ],
+  );
+  for (const tool of result.tools) {
+    assert.equal(tool.inputSchema.type, "object");
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    assert.equal(typeof tool.description, "string");
+  }
+  assert.equal((await client.request("approve")).error.code, -32601);
+  assert.deepEqual(await client.call("approve"), {
+    isError: true,
+    data: { code: "unknown-tool" },
+  });
+});
+
+test("refuses existing paths, invalid configuration and non-Concierge sessions", async () => {
+  writeFileSync(options.socketPath, "keep");
+  await assert.rejects(HostApiServer.listen(options), /already exists/);
+  assert.equal(readFileSync(options.socketPath, "utf8"), "keep");
+  rmSync(options.socketPath);
+  for (const socketPath of ["relative.sock", join(folder, "🛠".repeat(40))]) {
+    await assert.rejects(
+      HostApiServer.listen({ ...options, socketPath }),
+      /Invalid Host API socket path/,
+    );
+  }
+  await assert.rejects(
+    HostApiServer.listen({ ...options, maxLineBytes: 4 * 1024 * 1024 + 1 }),
+  );
+  await assert.rejects(
+    HostApiServer.listen({
+      ...options,
+      sessionId: store.startSession("Planner", "planner-runtime").id,
+    }),
+    /inactive/,
+  );
+  chmodSync(folder, 0o755);
+  await assert.rejects(HostApiServer.listen(options), /private parent/);
+});
+
+test("rejects a second client and audits each accepted connection", async () => {
+  const first = await listen();
+  await first.request("ping");
+  await assert.rejects(HostApiServer.listen(options), /already exists/);
+  const rejected = await connect();
+  await rejected.closed;
+  await first.request("ping");
+  first.socket.end();
+  await first.closed;
+  const replacement = await connect();
+  await replacement.request("ping");
+  await server?.close();
+  await replacement.closed;
+  assert.equal(existsSync(options.socketPath), false);
+  assert.deepEqual(
+    store
+      .listEvents({ subjectId: options.sessionId, limit: 10 })
+      .map(({ kind }) => kind),
+    [
+      "host-api.disconnected",
+      "host-api.connected",
+      "host-api.disconnected",
+      "host-api.connected",
+      "session.started",
+    ],
+  );
+});
+
+test("drops oversized lines even before receiving a newline", async () => {
+  const client = await listen({ maxLineBytes: 64 });
+  client.socket.write("🛠".repeat(16));
+  client.socket.write("a");
+  await client.closed;
+  assert.equal(apiCalls().length, 0);
+});
+
+test("returns fixed protocol errors and disconnects after the third", async () => {
+  const client = await listen();
+  client.socket.write('{"broken"\n42\n[]\n' + wire("ping", 10));
+  for (const code of [-32700, -32600, -32600]) {
+    assert.partialDeepStrictEqual(await client.reply(), {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code },
+    });
+  }
+  await client.closed;
+});
+
+test("handles split UTF-8 and exercises each tool against the real store", async () => {
+  const client = await listen();
+  const draft = Buffer.from(
+    wire("tools/call", 100, {
+      name: "draft_goal",
+      arguments: { content: goalContent },
+    }),
+  );
+  const split = draft.indexOf(Buffer.from("🛠")) + 1;
+  client.socket.write(draft.subarray(0, split));
+  client.socket.write(draft.subarray(split));
+  const receipt = JSON.parse((await client.reply()).result.content[0].text);
+  assert.partialDeepStrictEqual(receipt, {
+    gate: "goal-registration",
+    policy: "human",
+    loosening: [],
+    message: "The operator approves this proposal with the host CLI.",
+  });
+  const pending = await client.call("list_proposals", { status: "pending" });
+  assert.deepEqual(pending.data, [
+    {
+      id: receipt.id,
+      kind: "goal",
+      title: goalContent.title,
+      status: "pending",
+    },
+  ]);
+  assert.partialDeepStrictEqual(
+    (await client.call("get_proposal", { id: receipt.id })).data,
+    {
+      content: goalContent,
+      digest: receipt.digest,
+      gate: receipt.gate,
+      policy: receipt.policy,
+      status: "pending",
+      origin: {
+        kind: "actor",
+        actor: "Concierge",
+        sessionId: options.sessionId,
+      },
+    },
+  );
+  const { goalId } = store.decide(receipt.id, {
+    digest: receipt.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  assert.ok(goalId);
+  assert.deepEqual((await client.call("list_goals")).data, [
+    { id: goalId, title: goalContent.title, status: "active" },
+  ]);
+
+  const task = await client.call("draft_task", {
+    content: { ...taskContent, goalId },
+  });
+  assert.partialDeepStrictEqual(task.data, {
+    status: "registered",
+    gate: null,
+    policy: null,
+    loosening: [],
+  });
+  const pendingTask = await client.call("draft_task", {
+    content: { ...taskContent, goalId, policies: { integration: "agent" } },
+  });
+  assert.partialDeepStrictEqual(pendingTask.data, {
+    status: "pending",
+    gate: "task-registration",
+    policy: "human",
+    loosening: ["integration"],
+  });
+  assert.partialDeepStrictEqual(
+    (await client.call("get_goal", { id: goalId })).data,
+    {
+      id: goalId,
+      content: goalContent,
+      tasks: [{ id: task.data.taskId, content: { ...taskContent, goalId } }],
+    },
+  );
+  const planned = await client.call("request_planner", {
+    mode: "task-decomposition",
+    goalId,
+    brief: "Break it down",
+  });
+  assert.deepEqual(plannerCalls, [
+    {
+      mode: "task-decomposition",
+      goalId,
+      brief: "Break it down",
+      sessionId: options.sessionId,
+    },
+  ]);
+  const id = planned.data.executionId;
+  store.startExecution(id);
+  store.finishExecution(id, "succeeded", { tasks: 1 });
+  assert.deepEqual((await client.call("get_execution", { id })).data, {
+    id,
+    status: "succeeded",
+    result: { tasks: 1 },
+  });
+
+  const { data: status } = await client.call("status");
+  assert.deepEqual(status, {
+    goals: { active: 1 },
+    tasks: { registered: 1 },
+    proposals: { approved: 1, pending: 1, registered: 1 },
+    pendingProposals: [
+      {
+        id: pendingTask.data.id,
+        kind: "task",
+        title: "Task",
+        gate: "task-registration",
+        policy: "human",
+      },
+    ],
+    recentExecutions: [
+      { id, actor: "Planner", mode: "task-decomposition", status: "succeeded" },
+    ],
+  });
+  const calls = apiCalls();
+  assert.deepEqual(
+    calls.map(({ data }) => (data as { tool: string }).tool),
+    [
+      "draft_goal",
+      "list_proposals",
+      "get_proposal",
+      "list_goals",
+      "draft_task",
+      "draft_task",
+      "get_goal",
+      "request_planner",
+      "get_execution",
+      "status",
+    ],
+  );
+  for (const call of calls) {
+    assert.equal(call.sessionId, options.sessionId);
+    assert.partialDeepStrictEqual(call.data, { outcome: "ok", code: "ok" });
+    assert.equal(
+      typeof (call.data as { durationMs: number }).durationMs,
+      "number",
+    );
+  }
+  assert.equal(
+    calls.find(
+      ({ data }) => (data as { tool: string }).tool === "request_planner",
+    )?.executionId,
+    id,
+  );
+  const events = store
+    .listEvents({ subjectId: options.sessionId, limit: 100 })
+    .toReversed();
+  for (const call of calls) {
+    const { callId } = call.data as { callId: string };
+    const authorization = events.findIndex(
+      ({ kind, data }) =>
+        kind === "host-api.authorized" &&
+        (data as { callId: string }).callId === callId,
+    );
+    assert.ok(
+      authorization >= 0 &&
+        authorization < events.findIndex(({ id }) => id === call.id),
+    );
+  }
+  assert.ok(!JSON.stringify(calls).includes("Break it down"));
+});
+
+test("returns fixed tool errors without leaking input into responses or audit", async () => {
+  const marker = "UNIQUE-PRIVATE-MARKER";
+  const failingRequester = {
+    async requestPlanner() {
+      throw new Error(marker);
+    },
+  };
+  const client = await listen({ requester: failingRequester });
+  client.socket.write(
+    wire("tools/call", undefined, {
+      name: "draft_goal",
+      arguments: { content: goalContent },
+    }) + wire("ping", 100),
+  );
+  assert.equal((await client.reply()).id, 100);
+  assert.deepEqual(store.listProposals(), []);
+  const calls = [
+    await client.call(marker),
+    await client.call("status", { note: marker }),
+    await client.call("draft_goal", { content: { title: marker } }),
+    await client.call("get_goal", { id: marker }),
+    await client.call("draft_task", {
+      content: { ...taskContent, goalId: marker },
+    }),
+    await client.call("request_planner", {
+      mode: "replanning",
+      brief: marker.repeat(1000),
+    }),
+    await client.call("request_planner", { mode: "replanning", brief: marker }),
+  ];
+  assert.deepEqual(
+    calls.map(({ isError, data }) => isError && data.code),
+    [
+      "unknown-tool",
+      "invalid-arguments",
+      "invalid-arguments",
+      "not-found",
+      "tool-failed",
+      "invalid-arguments",
+      "tool-failed",
+    ],
+  );
+  assert.deepEqual(
+    apiCalls().map(({ data }) => (data as { outcome: string }).outcome),
+    [
+      "denied",
+      "denied",
+      "denied",
+      "denied",
+      "error",
+      "error",
+      "denied",
+      "error",
+    ],
+  );
+  assert.ok(!JSON.stringify(calls).includes(marker));
+  assert.ok(
+    !JSON.stringify(
+      store.listEvents({ subjectId: options.sessionId, limit: 100 }),
+    ).includes(marker),
+  );
+});
+
+test("an ended session returns an audited denial and closes the connection", async () => {
+  const client = await listen();
+  await client.request("ping");
+  store.endSession(options.sessionId);
+  assert.deepEqual(await client.call("draft_goal", { content: goalContent }), {
+    isError: true,
+    data: { code: "session-inactive" },
+  });
+  await client.closed;
+  assert.deepEqual(store.listProposals(), []);
+  assert.partialDeepStrictEqual(apiCalls()[0]?.data, {
+    outcome: "denied",
+    code: "session-inactive",
+    tool: "draft_goal",
+  });
+});
+
+test("a failed authorization audit prevents reads, drafts and queueing", async () => {
+  const client = await listen();
+  await client.request("ping");
+  const recordApiCall = store.recordApiCall.bind(store);
+  store.recordApiCall = (id, event) => {
+    if (event.kind === "authorized") throw new Error("audit write failed");
+    recordApiCall(id, event);
+  };
+  let reads = 0;
+  const getHostApiStatus = store.getHostApiStatus.bind(store);
+  store.getHostApiStatus = () => {
+    reads++;
+    return getHostApiStatus();
+  };
+  for (const result of [
+    await client.call("status"),
+    await client.call("draft_goal", { content: goalContent }),
+    await client.call("request_planner", {
+      mode: "goal-design",
+      brief: "Plan",
+    }),
+  ]) {
+    assert.deepEqual(result, {
+      isError: true,
+      data: { code: "audit-unavailable" },
+    });
+  }
+  assert.deepEqual(store.listProposals(), []);
+  assert.deepEqual(plannerCalls, []);
+  assert.equal(reads, 0);
+  store.close();
+  assert.deepEqual(
+    await client.call("request_planner", {
+      mode: "goal-design",
+      brief: "Plan",
+    }),
+    {
+      isError: true,
+      data: { code: "audit-unavailable" },
+    },
+  );
+  await client.closed;
+});
+
+test("an outcome audit failure reports an error and leaves the committed draft", async () => {
+  const client = await listen();
+  const recordApiCall = store.recordApiCall.bind(store);
+  store.recordApiCall = (id, event) => {
+    if (event.kind === "call") throw new Error("outcome audit write failed");
+    recordApiCall(id, event);
+  };
+  assert.deepEqual(await client.call("draft_goal", { content: goalContent }), {
+    isError: true,
+    data: { code: "audit-unavailable" },
+  });
+  const [draft] = store.listProposals();
+  assert.ok(draft);
+  assert.equal(draft.status, "pending");
+  assert.equal(
+    store.listEvents({ subjectId: draft.id, limit: 1 })[0]?.kind,
+    "goal.proposed",
+  );
+});

@@ -81,12 +81,12 @@ export class OrchestratorStoreError extends Error {
   }
 }
 
-const proposalStatuses = [
+export const proposalStatuses = Object.freeze([
   "pending",
   "approved",
   "rejected",
   "registered",
-] as const;
+] as const);
 type ProposalStatus = (typeof proposalStatuses)[number];
 const finalExecutionStatuses = [
   "succeeded",
@@ -425,6 +425,45 @@ export class OrchestratorStore {
       correlation.sessionId ?? null,
       correlation.executionId ?? null,
       canonicalJson(data, 4096),
+    );
+  }
+
+  recordApiCall(
+    sessionId: string,
+    event:
+      | { kind: "connected" | "disconnected"; durationMs: number }
+      | { kind: "authorized"; callId: string; tool: string; durationMs: number }
+      | {
+          kind: "call";
+          callId: string;
+          tool: string;
+          outcome: "ok" | "denied" | "error";
+          code: string;
+          durationMs: number;
+          executionId?: string;
+        },
+  ): void {
+    const id = identifier(sessionId);
+    const { kind, ...data } = event;
+    const executionId = event.kind === "call" ? event.executionId : undefined;
+    if ("executionId" in data) delete data.executionId;
+    this.#write((at) => {
+      this.#event(at, `host-api.${kind}`, "session", id, data, {
+        sessionId: id,
+        ...(executionId === undefined ? {} : { executionId }),
+      });
+    });
+  }
+
+  isActiveConciergeSession(sessionId: string): boolean {
+    const id = identifier(sessionId);
+    return this.#read(
+      () =>
+        this.#db
+          .query(
+            "SELECT id FROM actor_sessions WHERE id = ? AND actor = 'Concierge' AND status = 'active'",
+          )
+          .get(id) !== null,
     );
   }
 
@@ -957,6 +996,84 @@ export class OrchestratorStore {
       const row = this.#proposal(id);
       return row === null ? null : proposalRecord(row);
     });
+  }
+
+  #proposalGate(proposal: ReturnType<typeof proposalRecord>) {
+    if (proposal.kind === "goal") return this.#goalPolicy(proposal.content);
+    if (proposal.status === "registered")
+      return { gate: null, policy: null, source: null, loosening: [] };
+    const goal = goalRecord(required(this.#goal(proposal.content.goalId)));
+    return this.#taskPolicy(proposal.content, goal.content);
+  }
+
+  getProposalDetails(proposalId: string) {
+    const id = identifier(proposalId);
+    return this.#read(() => {
+      const row = this.#proposal(id);
+      if (!row) return null;
+      const proposal = proposalRecord(row);
+      const decision = this.#db
+        .query<{
+          gate: Gate;
+          policy: ApprovalPolicy["policy"];
+          source: ApprovalPolicy["source"];
+        }>(
+          "SELECT gate, policy, policy_source AS source FROM approvals WHERE proposal_id = ?",
+        )
+        .get(id);
+      return freeze({
+        ...proposal,
+        ...this.#proposalGate(proposal),
+        ...decision,
+        origin: proposal.source,
+      });
+    });
+  }
+
+  getHostApiStatus() {
+    return this.#read(() =>
+      this.#db
+        .transaction(() => {
+          const counts = (table: "goals" | "tasks" | "proposals") =>
+            Object.fromEntries(
+              this.#db
+                .query<{ status: string; count: number }>(
+                  `SELECT status, count(*) AS count FROM ${table} GROUP BY status`,
+                )
+                .all()
+                .map(({ status, count }) => [status, count]),
+            );
+          const pendingProposals = this.#db
+            .query<ProposalRow>(
+              `SELECT ${proposalColumns} FROM proposals WHERE status = 'pending' ORDER BY rowid DESC LIMIT 20`,
+            )
+            .all()
+            .map((row) => {
+              const proposal = proposalRecord(row);
+              const { gate, policy } = this.#proposalGate(proposal);
+              return {
+                id: proposal.id,
+                kind: proposal.kind,
+                title: proposal.content.title,
+                gate,
+                policy,
+              };
+            });
+          const recentExecutions = this.#db
+            .query<Pick<ExecutionRow, "id" | "actor" | "mode" | "status">>(
+              "SELECT id, actor, mode, status FROM executions ORDER BY rowid DESC LIMIT 20",
+            )
+            .all();
+          return freeze({
+            goals: counts("goals"),
+            tasks: counts("tasks"),
+            proposals: counts("proposals"),
+            pendingProposals,
+            recentExecutions,
+          });
+        })
+        .deferred(),
+    );
   }
 
   listProposals(options: { status?: ProposalStatus } = {}) {
