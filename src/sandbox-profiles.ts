@@ -1,6 +1,12 @@
 import { SandboxRuntimeError } from "./sandbox-runtime.ts";
 
-export const PROFILE_NAMES = ["base", "db", "browser", "concierge"] as const;
+export const PROFILE_NAMES = [
+  "base",
+  "db",
+  "browser",
+  "concierge",
+  "bun",
+] as const;
 export type ProfileName = (typeof PROFILE_NAMES)[number];
 
 export interface SandboxProfile {
@@ -27,8 +33,8 @@ export const ROLE_PROFILES: Readonly<
   Coordinator: Object.freeze(["base"] as const),
   Planner: Object.freeze(["base"] as const),
   Reviewer: Object.freeze(["base"] as const),
-  Worker: Object.freeze(["base", "db", "browser"] as const),
-  Verification: Object.freeze(["base", "db", "browser"] as const),
+  Worker: Object.freeze(["base", "db", "browser", "bun"] as const),
+  Verification: Object.freeze(["base", "db", "browser", "bun"] as const),
   Concierge: Object.freeze(["concierge"] as const),
 });
 

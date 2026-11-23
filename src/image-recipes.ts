@@ -45,8 +45,17 @@ export interface PinnedPackage {
   readonly sha256: string;
 }
 
+export interface PinnedFile {
+  readonly name: string;
+  /** Path relative to the repository root. */
+  readonly source: string;
+  readonly sha256: string;
+}
+
 export interface Feature {
   readonly packages: readonly PinnedPackage[];
+  /** Non-apk inputs staged alongside the packages in /tmp/pkgs. */
+  readonly files?: readonly PinnedFile[];
   /** Shell run in the build VM after the packages are installed. */
   readonly setup?: string;
 }
@@ -103,7 +112,38 @@ const ZSTD_PACKAGE = pkg(
   "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
 );
 
+const CXX_RUNTIME_PACKAGES = [
+  pkg(
+    "libgcc-15.2.0-r2.apk",
+    "eaaafda78fde1c904e1741680ddea91649f051e29a343152c8a4327605704b0f",
+  ),
+  pkg(
+    "libstdc++-15.2.0-r2.apk",
+    "10d72e25f6fcc0f3d9fdd801c9bdaed81d6e836aa2b65b63f25d2d97f860a7d1",
+  ),
+] as const;
+
+const BUN_VERSION = "1.4.4";
+const BUN_ARCHIVE = {
+  name: "bun-linux-aarch64-musl.zip",
+  source: `.local/bun/${BUN_VERSION}/bun-linux-aarch64-musl.zip`,
+  sha256: "57f01b02ac7113c61c935f28f38c2eab849e3c970dab21f8b640a87b1ef65009",
+} as const satisfies PinnedFile;
+const BUN_BINARY_SHA256 =
+  "a6a3d99a48600b59597070d2d2ff8d37b65975b8aab247ee3479b1eb33d000a6";
+const BUN_SETUP = `mkdir -p /usr/local/bin
+busybox unzip -p /tmp/pkgs/${BUN_ARCHIVE.name} bun-linux-aarch64-musl/bun > /usr/local/bin/bun
+printf '%s  %s\\n' '${BUN_BINARY_SHA256}' /usr/local/bin/bun | sha256sum -c -
+chmod 0755 /usr/local/bin/bun
+ln -s bun /usr/local/bin/bunx
+`;
+
 export const FEATURES = {
+  bun: {
+    packages: CXX_RUNTIME_PACKAGES,
+    files: [BUN_ARCHIVE],
+    setup: BUN_SETUP,
+  },
   sqlite: {
     packages: [
       pkg(
@@ -148,14 +188,7 @@ export const FEATURES = {
         "icu-data-en-76.1-r1.apk",
         "1a072bb4a9a036a7fc239a94f9e691df059cecfbd92f2058bf4f261cc6636e00",
       ),
-      pkg(
-        "libgcc-15.2.0-r2.apk",
-        "eaaafda78fde1c904e1741680ddea91649f051e29a343152c8a4327605704b0f",
-      ),
-      pkg(
-        "libstdc++-15.2.0-r2.apk",
-        "10d72e25f6fcc0f3d9fdd801c9bdaed81d6e836aa2b65b63f25d2d97f860a7d1",
-      ),
+      ...CXX_RUNTIME_PACKAGES,
       pkg(
         "libldap-2.6.13-r0.apk",
         "c2808f6bf8129b11c727b356f99a476afc6e1cf8053ea5a1d7cbf368bf5e50b4",
@@ -349,6 +382,12 @@ export const PROFILE_RECIPES: Readonly<
     memoryMiB: 1024,
     cpus: 2,
   },
+  bun: {
+    base: ALPINE_3_23,
+    features: ["bun", "zstd", "git"],
+    memoryMiB: 2048,
+    cpus: 2,
+  },
 };
 
 export function recipeFor(name: string): ProfileRecipe {
@@ -397,6 +436,28 @@ export function profilePackages(name: string): PinnedPackage[] {
     .map(([n, sha256]) => ({ name: n, sha256 }));
 }
 
+/** Non-apk files for an Alpine recipe, sorted by staging name. */
+export function profileFiles(name: string): PinnedFile[] {
+  const packageNames = new Set(profilePackages(name).map((item) => item.name));
+  const byName = new Map<string, PinnedFile>();
+  for (const feature of alpineRecipe(name).features) {
+    const { files } = FEATURES[feature] as Feature;
+    for (const item of files ?? []) {
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(item.name) ||
+        item.name.endsWith(".apk") ||
+        packageNames.has(item.name) ||
+        byName.has(item.name)
+      )
+        throw new Error(`Invalid or duplicate staged file name: ${item.name}`);
+      byName.set(item.name, item);
+    }
+  }
+  return [...byName.values()].sort(({ name: a }, { name: b }) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+}
+
 /** Sorted, de-duplicated apt package names of a Debian recipe. */
 export function aptPackages(name: string): string[] {
   const recipe = recipeFor(name);
@@ -408,14 +469,19 @@ export function aptPackages(name: string): string[] {
   return [...names].sort();
 }
 
-/** SHA-256 (hex) of the recipe inputs: base, packages, setup scripts, limits. */
+/** SHA-256 (hex) of the recipe inputs: base, packages, files, setup scripts, limits. */
 export function recipeDigest(name: string): string {
   const recipe = recipeFor(name);
+  const files =
+    recipe.base.kind === "alpine"
+      ? profileFiles(name).map(({ name, sha256 }) => [name, sha256])
+      : [];
   const canonical =
     recipe.base.kind === "alpine"
       ? JSON.stringify({
           base: recipe.base.reference,
           packages: profilePackages(name).map((p) => [p.name, p.sha256]),
+          ...(files.length > 0 ? { files } : {}),
           setup: setupsOf(recipe),
           memoryMiB: recipe.memoryMiB,
           cpus: recipe.cpus,
@@ -584,6 +650,10 @@ export function smokeTest(name: string): {
   if (features.includes("vsock-relay")) {
     script.push("socat -V >/dev/null && echo socat-ok");
     expected.push("socat-ok");
+  }
+  if (features.includes("bun")) {
+    script.push("bun --version");
+    expected.push(BUN_VERSION);
   }
   if (features.includes("git")) {
     script.push("git --version >/dev/null && echo git-ok");

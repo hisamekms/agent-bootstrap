@@ -41,7 +41,7 @@ function fixture(t: TestContext): string {
   return join(directory, "audit.sqlite");
 }
 
-function legacy(filename: string, version: 1 | 2 | 3 | 4 | 5): void {
+function legacy(filename: string, version: 1 | 2 | 3 | 4 | 5 | 6): void {
   const db = new Database(filename, { create: true });
   try {
     db.exec("PRAGMA journal_mode=WAL");
@@ -148,11 +148,11 @@ function v5Appends(audit: SqliteAudit): (() => void)[] {
   ];
 }
 
-test("fresh v6 stores and reopens every kind of evidence", (t) => {
+test("fresh v7 stores and reopens every kind of evidence", (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 6);
+  assert.equal(audit.schemaVersion, 7);
   assert.equal(audit.isV5Writable, true);
   audit.append(started);
   audit.claimRequest(claim);
@@ -160,7 +160,7 @@ test("fresh v6 stores and reopens every kind of evidence", (t) => {
   audit.close();
 
   withDb(filename, (db) => {
-    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 6);
+    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 7);
     assert.equal(db.query("PRAGMA journal_mode").get()?.journal_mode, "wal");
     assert.equal(db.query("PRAGMA quick_check").get()?.quick_check, "ok");
   });
@@ -288,7 +288,7 @@ test("read-only v4 is preserved and write-open upgrades without changing existin
 
   const writer = new SqliteAudit(filename);
   t.after(() => writer.close());
-  assert.equal(writer.schemaVersion, 6);
+  assert.equal(writer.schemaVersion, 7);
   assert.deepEqual(writer.readExecution(invocationId), expected);
   assert.equal(writer.claimRequest(claim).replayed, true);
   writer.appendExecutionContext(context);
@@ -626,7 +626,7 @@ test("v5 upgrade preserves existing history, the sequence watermark and append-o
 
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 6);
+  assert.equal(audit.schemaVersion, 7);
   assert.deepEqual(audit.readSince({}), oldRows);
   audit.append({
     invocationId,
@@ -660,4 +660,49 @@ test("v5 upgrade preserves existing history, the sequence watermark and append-o
   const reopened = new SqliteAudit(filename, { readonly: true });
   t.after(() => reopened.close());
   assert.deepEqual(reopened.read(invocationId)[1], concierge);
+});
+
+test("v6 upgrade preserves Concierge detail and accepts Bun profile evidence", (t) => {
+  const filename = fixture(t);
+  legacy(filename, 6);
+  const detail = {
+    socketPath: "/fixture/api.sock",
+    vsockPort: 5000,
+    snapshotDir: "/fixture/repo",
+    volumeName: "lo-session",
+  };
+  withDb(filename, (db) => {
+    db.query(
+      `INSERT INTO audit_events
+        (sequence, recorded_at, invocation_id, kind, operation, role, profile, image, detail)
+        VALUES (7, ?, ?, 'operation.requested', 'sandbox.create', 'Concierge', 'concierge', ?, ?)`,
+    ).run(
+      new Date().toISOString(),
+      invocationId,
+      digest,
+      JSON.stringify(detail),
+    );
+    db.exec("UPDATE sqlite_sequence SET seq = 30 WHERE name = 'audit_events'");
+  });
+  const reader = new SqliteAudit(filename, { readonly: true });
+  assert.equal(reader.schemaVersion, 6);
+  const [concierge] = reader.read(invocationId);
+  assert.deepEqual(concierge?.detail, detail);
+  reader.close();
+
+  const audit = new SqliteAudit(filename);
+  t.after(() => audit.close());
+  assert.equal(audit.schemaVersion, 7);
+  audit.append({
+    invocationId,
+    kind: "operation.requested",
+    operation: "sandbox.create",
+    role: "Verification",
+    profile: "bun",
+    image: digest,
+  });
+  const [migrated, bun] = audit.read(invocationId);
+  assert.deepEqual(migrated, concierge);
+  assert.equal(bun?.profile, "bun");
+  assert.equal(bun?.sequence, 31);
 });

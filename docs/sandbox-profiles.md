@@ -1,7 +1,7 @@
 # Sandbox profiles
 
-The `base`, `db`, and `browser` images are configured. The `concierge`
-recipe is available for a local build.
+The `base`, `db`, `browser`, and `concierge` images are configured. The
+`bun` profile is available after a local build writes its lock entry.
 
 Some tasks need a database or a browser in the VM, and most do not. A
 **sandbox profile** names one VM environment: a digest-pinned image plus
@@ -17,6 +17,7 @@ which stays per adapter. Each VM still lives for one invocation.
 | `db`        | `base` plus SQLite and PostgreSQL          | Database tests and migrations               |
 | `browser`   | `db` plus headless Chromium and Playwright | End-to-end tests                            |
 | `concierge` | `base` plus socat and Git                  | Concierge MCP stdio relay and local history |
+| `bun`       | Alpine 3.23 with Bun 1.4.4 and Git         | Bun/TypeScript development and verification |
 
 Images are built ahead of time and pinned by digest, because a VM has no
 package network. The Concierge runs with networking disabled. It uses socat
@@ -30,7 +31,13 @@ check records the selected profile in its evidence.
 ### `src/sandbox-profiles.ts` (new)
 
 ```ts
-export const PROFILE_NAMES = ["base", "db", "browser", "concierge"] as const;
+export const PROFILE_NAMES = [
+  "base",
+  "db",
+  "browser",
+  "concierge",
+  "bun",
+] as const;
 export type ProfileName = (typeof PROFILE_NAMES)[number];
 export interface SandboxProfile {
   readonly image: string; // name@sha256:<64 hex>
@@ -49,7 +56,7 @@ export const ROLE_PROFILES: Readonly<
   Record<ProfileRole, readonly ProfileName[]>
 >;
 //   Coordinator, Planner, Reviewer: ["base"]
-//   Worker, Verification: ["base", "db", "browser"]
+//   Worker, Verification: ["base", "db", "browser", "bun"]
 //   Concierge: ["concierge"]
 export class ProfileCatalog {
   constructor(profiles: Partial<Record<ProfileName, SandboxProfile>>); // must include base; validates; deep-copies and freezes
@@ -99,7 +106,9 @@ the audit cannot name one image while another boots.
   - `image TEXT CHECK (image IS NULL OR (length(image) = 64 AND image NOT GLOB '*[^0-9a-f]*'))`
 - `AuditInput` gains optional `profile` and `image`. Both are allowed only on
   an `operation.requested` event for `sandbox.create`, and only together.
-- A new database is created at v4.
+- New databases use v7. Opening a v4, v5, or v6 database for writing
+  upgrades it to v7 and preserves its rows and sequence watermark.
+  v7 adds `bun` to the profile CHECK and preserves v6 Concierge details.
 - Versions 1–3 still open and read, but writing `profile`, `image` or role
   `Verification` to them fails closed with `invalid-event` or
   `append-failed`. This is the same pattern v3 used for `provider.egress`.
@@ -170,7 +179,8 @@ is built. A request still names one profile.
 | ----------- | -------------- | --------------------------------------- |
 | `db`        | Alpine 3.23    | `sqlite`, `postgres`, `git`             |
 | `browser`   | Debian 13 slim | `sqlite`, `postgres`, `chromium`, `git` |
-| `concierge` | Alpine 3.23    | `vsock-relay`, `git`                    |
+| `concierge` | Alpine 3.23    | `vsock-relay`, `zstd`, `git`            |
+| `bun`       | Alpine 3.23    | `bun`, `zstd`, `git`                    |
 
 A feature recipe lists pinned packages (file name and SHA-256) and an
 optional setup script. The `browser` profile has Debian variants of the
@@ -178,6 +188,13 @@ optional setup script. The `browser` profile has Debian variants of the
 The `vsock-relay` feature pins socat and its OpenSSL and readline
 dependencies. The `concierge` image smoke test runs `socat -V` and
 `git --version` in a VM with networking disabled.
+
+The `bun` profile gives Executors and Verification 2048 MiB and 2 CPUs
+for commands such as `bun test`. Stage the official aarch64 musl ZIP at
+`.local/bun/1.4.4/bun-linux-aarch64-musl.zip` and build
+`bun` with `spike/images/build-profile.ts`. The host checks the ZIP hash.
+The build VM checks the extracted binary hash before making it executable
+and adding the `bunx` symlink. The smoke test checks Bun 1.4.4 and Git.
 
 ### Build steps (Alpine)
 

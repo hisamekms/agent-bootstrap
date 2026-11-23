@@ -568,7 +568,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
   assert.deepEqual(calls, ["create", "destroy"]);
 });
 
-test("a new audit database uses schema 6 and records provider egress", async (t) => {
+test("a new audit database uses schema 7 and records provider egress", async (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   const id = randomUUID();
@@ -594,7 +594,7 @@ test("a new audit database uses schema 6 and records provider egress", async (t)
       encoding: "utf8",
     },
   );
-  if (version.status === 0) assert.equal(version.stdout.trim(), "6");
+  if (version.status === 0) assert.equal(version.stdout.trim(), "7");
 });
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
@@ -607,6 +607,7 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
 const dbProfiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
   db: { image: `fixture.invalid/postgres@sha256:${"b".repeat(64)}` },
+  bun: { image: `fixture.invalid/bun@sha256:${"d".repeat(64)}` },
 });
 
 function recorder() {
@@ -669,21 +670,21 @@ test("sandbox.create records the default base profile and its digest", async (t)
   );
 });
 
-test("Worker may use a configured db profile and not an unconfigured one", async (t) => {
+test("Worker may use a configured bun profile and not an unconfigured one", async (t) => {
   const audit = new SqliteAudit(fixture(t));
   t.after(() => audit.close());
   const { specs, runtime } = recorder();
   const host = new TrustedHost(audit, runtime, dbProfiles);
-  const worker = (profile: "db" | "browser") => ({
+  const worker = (profile: "bun" | "browser") => ({
     sandbox: { maxLifetimeMs: 10_000, profile },
     ...quick,
     collectPaths: [],
   });
-  const run = await host.runWorker(worker("db"));
+  const run = await host.runWorker(worker("bun"));
   assert.equal(run.outcome, "ok");
-  assert.equal(requested(audit, run.id)[0]?.profile, "db");
-  assert.equal(requested(audit, run.id)[0]?.image, "b".repeat(64));
-  assert.equal(specs[0]?.profile, "db");
+  assert.equal(requested(audit, run.id)[0]?.profile, "bun");
+  assert.equal(requested(audit, run.id)[0]?.image, "d".repeat(64));
+  assert.equal(specs[0]?.profile, "bun");
   const id = randomUUID();
   await assert.rejects(
     host.runWorker(worker("browser"), id),
@@ -693,15 +694,15 @@ test("Worker may use a configured db profile and not an unconfigured one", async
   assert.equal(specs.length, 1);
 });
 
-test("Reviewer, Planner and Coordinator refuse db before any audit write", async (t) => {
+test("Reviewer, Planner and Coordinator refuse bun before any audit write", async (t) => {
   const audit = new SqliteAudit(fixture(t));
   t.after(() => audit.close());
   const { specs, runtime } = recorder();
   const host = new TrustedHost(audit, runtime, dbProfiles);
-  const sandbox = { maxLifetimeMs: 10_000, profile: "db" as const };
+  const sandbox = { maxLifetimeMs: 10_000, profile: "bun" as const };
   const control = {
     maxLifetimeMs: 10_000,
-    profile: "db" as const,
+    profile: "bun" as const,
     readOnlyFiles: [{ path: "control.json", bytes: Buffer.from("{}") }],
   };
   for (const [name, run] of [
@@ -745,20 +746,20 @@ test("the session path records profile and image on sandbox.create", async (t) =
   assert.equal(event?.role, "Coordinator");
 });
 
-test("runVerification is read-only, audited as Verification and accepts db", async (t) => {
+test("runVerification is read-only, audited as Verification and accepts bun", async (t) => {
   const audit = new SqliteAudit(fixture(t));
   t.after(() => audit.close());
   const { specs, runtime } = recorder();
   const host = new TrustedHost(audit, runtime, dbProfiles);
   const run = await host.runVerification({
-    sandbox: { maxLifetimeMs: 10_000, profile: "db" },
+    sandbox: { maxLifetimeMs: 10_000, profile: "bun" },
     ...quick,
   });
   assert.equal(run.outcome, "ok");
   const trace = audit.read(run.id);
   assert.ok(trace.every((event) => event.role === "Verification"));
-  assert.equal(requested(audit, run.id)[0]?.profile, "db");
-  assert.equal(specs[0]?.profile, "db");
+  assert.equal(requested(audit, run.id)[0]?.profile, "bun");
+  assert.equal(specs[0]?.profile, "bun");
   assert.equal(
     trace.some((event) => event.operation === "sandbox.collect"),
     false,
@@ -774,7 +775,7 @@ test("runVerification is read-only, audited as Verification and accepts db", asy
   );
   const id = randomUUID();
   await assert.rejects(
-    refused.runVerification({ sandbox: { profile: "db" }, ...quick }, id),
+    refused.runVerification({ sandbox: { profile: "bun" }, ...quick }, id),
     /Sandbox profile not allowed/,
   );
   assert.deepEqual(audit.read(id), []);
@@ -1409,7 +1410,7 @@ test("required host refuses invalid setup, mismatched context and direct host po
         config: requiredConfig,
         gatewayFactory: fake.open,
       }),
-    /Writable v6/,
+    /Writable v7/,
   );
   await assert.rejects(
     host.runWorker({

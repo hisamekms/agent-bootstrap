@@ -284,7 +284,7 @@ export class TrustedHost {
       const mode = options.config.audit.mode;
       if (mode === "required") {
         if (!writableAudit(audit))
-          throw new Error("Writable v6 audit required");
+          throw new Error("Writable v7 audit required");
         const runtime = sandbox as Partial<BoundSandboxRuntime>;
         if (
           typeof runtime.createBound !== "function" ||
