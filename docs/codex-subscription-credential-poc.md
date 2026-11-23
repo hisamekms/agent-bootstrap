@@ -153,6 +153,44 @@ remain unverified. The offline runtime's concurrent workspace separation and
 isolated synthetic guest-local authentication state also passed with two
 live VMs. That run had no credential projection.
 
+### Keeping the refresh token
+
+On macOS, put `--keychain` immediately after `--authorize-and-run` or
+`--authorize-and-run-m5` to keep the refresh token in the generic-password
+Keychain item for `$USER`. Each checkout has one item, with a service name
+formed by appending a dot and the first 16 hex characters of the registration
+host ID's SHA-256 hash to `agent-bootstrap.siwc.refresh`. The app registration
+and subject hash stay in `.local/siwc-smoke/registration.json`.
+
+The run lock serializes refreshes per checkout. Later runs save the rotated
+token before starting the runner. A missing item leads to browser consent.
+If the provider rejects a refresh with HTTP 400 or 401, the launcher attempts
+revocation, deletes the item, and warns on stderr before starting consent.
+That warning is the only signal that the grant may have been refreshed
+elsewhere. If the registration is missing a client ID or a subject hash, the
+launcher attempts revocation when it has a valid client ID, deletes the saved
+item, and warns before starting consent. An invalid client ID stops the launcher
+before any Keychain access or browser consent.
+
+The refresh token has a rolling 30-day lifetime. Any same-user process able
+to run `security` can read the item without a prompt. The launcher accepts
+this trade-off and omits a `-T` restriction to avoid a prompt on every run.
+If the launcher crashes after a successful refresh and before writing to
+Keychain, the new token remains unrevoked. To recover, disconnect Agent
+Bootstrap in ChatGPT settings.
+
+Run `bun spike/m1/subscription-authorize.ts --forget` in a terminal to revoke
+the grant and remove this checkout's item. Keep
+`.local/siwc-smoke/registration.json` while the item exists. Run `--forget`
+before deleting or recreating the file. If the launcher cannot confirm
+revocation, it still deletes the item and directs you to disconnect Agent
+Bootstrap in ChatGPT settings.
+
+If the registration is lost or unreadable, disconnect Agent Bootstrap in
+ChatGPT settings. The leftover `agent-bootstrap.siwc.refresh.<hex>` item can
+only be removed by hand. Use Keychain Access or run
+`security delete-generic-password -s <service>` with the full service name.
+
 ## Host credential lifecycle
 
 [`CredentialProvider`](../src/credentials.ts) exposes an access credential
@@ -172,5 +210,4 @@ would refresh once per registered session, atomically persist the
 replacement and give subsequent worker requests the new generation. A
 future delegated resolver must be callable only from the trusted proxy,
 and must avoid replay of an admitted or partially streamed inference
-request. The operator launcher exchanges an authorization code for a single
-run. Live renewal remains unimplemented.
+request. The operator launcher supports opt-in refresh between runs on macOS.

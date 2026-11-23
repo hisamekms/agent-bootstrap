@@ -217,7 +217,7 @@ export class EgressGateway {
     );
     if (options.resolver) this.#resolver = options.resolver;
     else {
-      const resolver = new Resolver({ timeout: DNS_TIMEOUT_MS, tries: 1 });
+      const resolver = new Resolver({ timeout: 1500, tries: 3 });
       this.#defaultResolver = resolver;
       this.#resolver = (hostname, qtype) =>
         qtype === 1

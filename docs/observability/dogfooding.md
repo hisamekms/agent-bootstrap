@@ -110,8 +110,11 @@ digest-pinned images. Set `MSB` and `CODEX_BINARY` to absolute paths.
 The live runner uses the synthetic `hello.txt` task and creates a temporary
 repository under `.local`. Review the candidate at the approval prompt.
 
-1. For a Codex Worker, opt in via the existing launcher and complete the
-   browser consent flow. The launcher passes the single-run token over stdin.
+1. For a Codex Worker, opt in via the launcher. On macOS, optionally add
+   `--keychain` after `--authorize-and-run-m5` to reuse browser consent on later
+   runs. The launcher passes the access token over stdin. Set `MSB_HOME` to a
+   short absolute path outside the repository. A path under this repository is
+   too long for macOS's 104-byte Unix socket path limit.
    Follow the [subscription credential procedure](../codex-subscription-credential-poc.md).
 
    ```sh
@@ -119,6 +122,12 @@ repository under `.local`. Review the candidate at the approval prompt.
      bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 \
        "$MSB" "$CODEX_BINARY"
    ```
+
+   Set `M5_DEBUG_WORKER=1` to capture up to 4096 bytes of stderr from a
+   failing live Codex Worker. M5 prints only the path to the private local
+   `worker-stderr-<invocation id>.txt` file in the run directory (mode 0600).
+   Treat this file as sensitive. The guest sees a credential placeholder,
+   which Microsandbox replaces with the real token at egress.
 
 2. For a Claude Worker, use Claude Code API-key mode and the macOS Keychain
    item for account `$USER`. Supply the service name via
@@ -150,8 +159,97 @@ repository under `.local`. Review the candidate at the approval prompt.
 
 | Live claim                                           | Codex evidence | Claude evidence |
 | ---------------------------------------------------- | -------------- | --------------- |
-| Command outcome, role execution IDs and audit export | Pending        | Pending         |
-| Lifecycle, provider TCP and DNS rows                 | Pending        | Pending         |
-| Audit and trace joins and Worker resource comparison | Pending        | Pending         |
+| Command outcome, role execution IDs and audit export | Pass (1)       | Pass (2)        |
+| Lifecycle, provider TCP and DNS rows                 | Pass (1)       | Pass (2)        |
+| Audit and trace joins and Worker resource comparison | Pass (1)       | Pass (2)        |
 | External termination and abnormal records            | Pending        | Pending         |
-| Evidence review and cleanup                          | Pending        | Pending         |
+| Evidence review and cleanup                          | Pass (1)       | Pass (2)        |
+
+### Codex live evidence
+
+(1) On 2026-11-23, M5 completed live with `M5_ACTORS=all=codex`, model
+`gpt-6.2-sol` with the derived catalog, gateway egress, and the
+Keychain-stored refresh token (`--keychain`, no browser consent). Task
+`dca9b351-0507-488c-a494-5365e2af542c` finished `done` in 72.8 seconds
+with three Coordinator turns, one Worker, one Reviewer, no revisions, no
+retries and one approval. The repository's `hello.txt` now reads
+`Good day.`. The operator delegated the approval gate to the coordinating
+agent, which approved the one-line candidate after checking it against the
+task. The prompt, diff, reason and answer are in the run's local
+`gate-answers.md`.
+
+| Role         | Execution ID                           | Seconds |
+| ------------ | -------------------------------------- | ------: |
+| Coordinator  | `0690b49a-09a8-4633-bc7b-a9546d140548` |   12.05 |
+| Worker       | `a3c5db79-80ec-459b-b087-a6c3860fec0c` |   16.78 |
+| Coordinator  | `3cdac9f6-a8f6-4a05-8242-75c6080bfd54` |    9.40 |
+| Reviewer     | `bae9f3da-7db8-4521-aa4f-f2f4d482fa42` |    9.28 |
+| Coordinator  | `c265dce6-f57f-4b0f-bde6-dabb72e15d58` |    8.20 |
+| Verification | `66c35f82-42e9-4b03-8bcc-b7ee18902cc4` |    0.50 |
+
+- The report says `auditExported: true`. Every model-driven role shows
+  create, exec and destroy finished `ok` and a `provider.egress` grant.
+  Verification has no egress.
+- Each model-driven role connected only to `api.openai.com:443` on channel
+  `provider-egress`. The Worker made three connections (55–58 KB sent,
+  76–94 KB received). DNS for `chatgpt.com`, `ab.chatgpt.com` and
+  `api.github.com` was denied with `dns-not-allowlisted`. The second
+  Coordinator turn's relay ended with `error` although its turn succeeded.
+- For the Worker, the audit-to-trace join matched 285 rows by execution ID.
+  The durable-context join matched 180 rows for the first Coordinator
+  turn and none for the Worker, which has no durable context of its own.
+  The Worker used 2.06 s CPU and 90 MB peak memory with a 6.1% startup
+  ratio. The Coordinator used 1.96 s CPU and 87 MB with a 9.0% ratio.
+  See the Claude evidence below for the cross-provider comparison.
+- No sandboxes remained in the dedicated `MSB_HOME`. The run lock was
+  released, and the refresh token stayed in the Keychain as intended.
+- External termination was not exercised live.
+
+Earlier live attempts on the same day found two problems.
+
+- A repository-local `MSB_HOME` exceeded the 104-byte Unix socket limit.
+- The Worker's `codex exec` failed with HTTP 400
+  `subscription_sharing_unsupported_capability`, because subscription
+  sharing rejects `tool_search`. `M5_DEBUG_WORKER=1` exposed the error, and
+  the derived catalog now disables `supports_search_tool`.
+
+### Claude live evidence
+
+(2) On 2026-11-23, M5 completed live with `M5_ACTORS=all=claude`, model
+`claude-opus-5-5`, gateway egress, and the operator-credential mode.
+The credential came from a Keychain item through `M5_CLAUDE_KEYCHAIN`.
+Task `e64f7e43-be5f-4340-a8e2-8464b33bd915` finished `done` in 70.0 seconds
+with three Coordinator turns, one Worker, one Reviewer, no revisions, no
+retries and one approval. `hello.txt` now reads
+`Good day, and warm greetings to you.`. The coordinating agent answered the
+approval gate as in (1), and the run's local `gate-answers.md` records the
+answer.
+
+| Role         | Execution ID                           | Seconds |
+| ------------ | -------------------------------------- | ------: |
+| Coordinator  | `3817c820-9022-40ca-af70-3c0869ac39d4` |    9.26 |
+| Worker       | `15b53974-0b36-4040-9238-5425cbf08c50` |   17.26 |
+| Coordinator  | `7df3777c-cd46-48ea-a86f-6dcad819b590` |    8.31 |
+| Reviewer     | `cfe14b22-8bfd-4b68-b8b8-150c3438a764` |   11.58 |
+| Coordinator  | `28e4ea16-9dc6-4c5e-9a92-cb934c446c05` |    8.80 |
+| Verification | `45ca30ae-4fe9-47ab-9cbc-45ad26e5d863` |    0.50 |
+
+- The report says `auditExported: true`. Each model-driven role connected
+  only to `api.anthropic.com:443`. Each made four connections: two short
+  ones (about 0.8 KB sent), one that closed with no bytes, and the model
+  request. DNS for `dl-cdn.alpinelinux.org` was denied 40 times in total.
+  The CLI tries to reach that host from the Alpine guest, and the policy
+  refuses it as intended.
+- For the Worker, the audit-to-trace join matched 260 rows by execution ID.
+  For the first Coordinator turn, the durable-context join matched 225 rows.
+- Coordinator usage was reported for all three turns, at 2 input and about
+  30 output tokens each. Prompt caching likely accounts for the low input
+  figures.
+- No sandboxes remained.
+
+Worker comparison, from the two live runs:
+
+| Worker | Seconds | Startup (ms) | Startup ratio | CPU (s) | Peak memory (MB) |
+| ------ | ------: | -----------: | ------------: | ------: | ---------------: |
+| Codex  |   16.78 |         1031 |         0.061 |    2.06 |               90 |
+| Claude |   17.26 |         1281 |         0.074 |    2.88 |              186 |

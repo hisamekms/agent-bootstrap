@@ -17,7 +17,11 @@ import type {
   SandboxFile,
   SandboxSpec,
 } from "./sandbox-runtime.ts";
-import type { ReviewerRun, TrustedHost } from "./trusted-host.ts";
+import type {
+  ReviewerRun,
+  TrustedHost,
+  TrustedHostRunOptions,
+} from "./trusted-host.ts";
 import {
   diffWorkspace,
   parseLsTree,
@@ -162,6 +166,7 @@ type Plan = {
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
   readonly workerHostServices?: readonly HostService[];
+  readonly onWorkerStderr?: TrustedHostRunOptions["onWorkerStderr"];
   readonly reviewerHostServices?: readonly HostService[];
   /** Maps the Reviewer's raw stdout to the review JSON, for harnesses that
    * wrap their answer (for example a CLI result object). Verification output
@@ -397,6 +402,7 @@ export class ReviewedIntegration {
       reviewer: copy(plan.reviewer),
       verification,
       workerSandbox: roleSandbox(plan.workerSandbox),
+      onWorkerStderr: plan.onWorkerStderr,
       reviewerSandbox: roleSandbox(plan.reviewerSandbox),
       ...(plan.workerHostServices
         ? {
@@ -413,6 +419,15 @@ export class ReviewedIntegration {
           }
         : {}),
       ...(plan.reviewerOutput ? { reviewerOutput: plan.reviewerOutput } : {}),
+    };
+  }
+
+  #workerOptions(): TrustedHostRunOptions | undefined {
+    const { workerHostServices, onWorkerStderr } = this.#plan;
+    if (!workerHostServices && !onWorkerStderr) return undefined;
+    return {
+      ...(workerHostServices ? { hostServices: workerHostServices } : {}),
+      ...(onWorkerStderr ? { onWorkerStderr } : {}),
     };
   }
 
@@ -534,9 +549,7 @@ export class ReviewedIntegration {
       },
       id,
       undefined,
-      this.#plan.workerHostServices
-        ? { hostServices: this.#plan.workerHostServices }
-        : undefined,
+      this.#workerOptions(),
     );
     const changed = worker.artifacts?.files[0];
     if (
@@ -607,9 +620,7 @@ export class ReviewedIntegration {
         },
         id,
         undefined,
-        this.#plan.workerHostServices
-          ? { hostServices: this.#plan.workerHostServices }
-          : undefined,
+        this.#workerOptions(),
       );
       let changes: TreeChange[] = [];
       let flagged = 0;
