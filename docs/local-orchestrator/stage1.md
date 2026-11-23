@@ -75,8 +75,19 @@ an oversized line or after three parse or invalid-request errors.
 
 The socket identifies the Concierge session. The host checks that the
 session is active on each request. The tools read state, draft goal and
-task proposals, and queue Planner executions. The Concierge polls
-`get_execution` with the returned ID. The `status` tool counts all rows
+task proposals, and queue Planner executions. After `request_planner`, the
+Concierge calls `wait_execution` with the returned `id`. The optional
+`timeoutSeconds` is an integer from 1 to 60 and defaults to 30. The tool
+checks the store about every 500 ms and returns the `get_execution` shape
+(`id`, `status`, `result`) as soon as it observes `succeeded`, `failed`,
+`timed-out`, or `cancelled`. If the call reaches its deadline while the
+execution is still queued or running, the response adds `waiting: true`.
+The wait stops early on session end, client disconnect, or server shutdown
+and uses the current execution state for the outcome. Ordinary requests can
+be pipelined during a wait. Each connection permits one pending wait and
+rejects a second with `wait-in-progress`. Responses can arrive out of order.
+
+The `status` tool counts all rows
 by status and returns up to 20 of the newest pending proposals and 20 of
 the newest executions. The operator approves proposals through the host
 CLI. In-scope tasks can auto-register under the ordinary store rules, and
@@ -89,9 +100,9 @@ execution requester. Each call produces one `host-api.call` outcome
 event when the audit store is available, including denials and tool
 errors. A host-generated call ID joins authorization to outcome.
 The records include the session, known tool name, duration and fixed
-outcome code as applicable. Successful execution requests and lookups
-also carry the execution ID. Arguments and tool output stay out of these
-records.
+outcome code as applicable. Outcome events for successful execution
+requests, lookups, and waits also carry the execution ID. Arguments and
+tool output stay out of these records.
 
 A failed authorization audit stops the call. A draft commits with its
 own store event, and the execution requester owns the transaction for

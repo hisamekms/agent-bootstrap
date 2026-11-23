@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   canonicalJson,
   ContractError,
@@ -28,6 +29,7 @@ const protocolVersions = [
 const briefLimit = 20_000;
 const requestMetaLimit = 4 * 1024;
 const mib = 1024 * 1024;
+const waitLimits = { minimum: 1, maximum: 60, default: 30 };
 
 export interface ExecutionRequester {
   /** Queue a Planner execution and return its execution ID. */
@@ -80,6 +82,13 @@ const tools = {
     "Read an execution and its result",
     schema({ id: idSchema }, ["id"]),
   ],
+  wait_execution: [
+    "After request_planner, wait up to timeoutSeconds seconds (default 30) for the returned execution ID to finish",
+    schema(
+      { id: idSchema, timeoutSeconds: { type: "integer", ...waitLimits } },
+      ["id"],
+    ),
+  ],
   draft_goal: [
     "Draft a goal proposal",
     schema({ content: contentSchema }, ["content"]),
@@ -113,10 +122,45 @@ function isTool(value: unknown): value is Tool {
   return typeof value === "string" && Object.hasOwn(tools, value);
 }
 
+function readExecution(store: OrchestratorStore, id: string) {
+  const execution = store.getExecution(id);
+  return (
+    execution && { id, status: execution.status, result: execution.result }
+  );
+}
+
+async function waitForExecution(
+  { store, sessionId }: HostApiOptions,
+  id: string,
+  deadline: number,
+  signal: AbortSignal,
+) {
+  for (;;) {
+    const execution = readExecution(store, id);
+    if (
+      execution === null ||
+      (execution.status !== "queued" && execution.status !== "running") ||
+      signal.aborted ||
+      !store.isActiveConciergeSession(sessionId)
+    )
+      return execution;
+
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return { ...execution, waiting: true };
+    try {
+      await delay(Math.min(500, Math.ceil(remaining)), undefined, { signal });
+    } catch (error) {
+      if (!signal.aborted) throw error;
+    }
+  }
+}
+
 function prepareTool(
   tool: Tool,
   args: unknown,
   options: HostApiOptions,
+  signal: AbortSignal,
+  start: number,
 ): () => unknown {
   const { store, sessionId, requester } = options;
   const input = fields(args, Object.keys(tools[tool][1].properties));
@@ -156,16 +200,15 @@ function prepareTool(
     }
     case "get_execution": {
       const id = identifier(input.id);
-      return () => {
-        const execution = store.getExecution(id);
-        return (
-          execution && {
-            id,
-            status: execution.status,
-            result: execution.result,
-          }
-        );
-      };
+      return () => readExecution(store, id);
+    }
+    case "wait_execution": {
+      const id = identifier(input.id);
+      const seconds = Object.hasOwn(input, "timeoutSeconds")
+        ? integer(input.timeoutSeconds, waitLimits.minimum, waitLimits.maximum)
+        : waitLimits.default;
+      return () =>
+        waitForExecution(options, id, start + seconds * 1000, signal);
     }
     case "draft_goal": {
       const content = validateGoalContent(input.content);
@@ -211,11 +254,17 @@ type ToolCode =
   | "unknown-tool"
   | "invalid-arguments"
   | "invalid-request"
+  | "wait-in-progress"
   | "not-found"
   | "tool-failed"
   | "session-inactive"
   | "audit-unavailable";
 type SessionState = "active" | "inactive" | "unavailable";
+type Connection = {
+  socket: Socket;
+  stop: AbortController;
+  wait?: Promise<void>;
+};
 
 function toolResult(text: string, isError = false) {
   return { content: [{ type: "text", text }], ...(isError ? { isError } : {}) };
@@ -234,6 +283,7 @@ async function callTool(
   options: HostApiOptions,
   session: SessionState,
   notification: boolean,
+  connection: Connection,
 ) {
   const { store, sessionId } = options;
   const start = performance.now();
@@ -247,12 +297,19 @@ async function callTool(
       throw new ContractError();
     if (isTool(input.name)) {
       tool = input.name;
-      if (session === "active" && !notification)
-        run = prepareTool(
-          tool,
-          Object.hasOwn(input, "arguments") ? input.arguments : {},
-          options,
-        );
+      if (session === "active" && !notification) {
+        if (tool === "wait_execution" && connection.wait) {
+          code = "wait-in-progress";
+        } else {
+          run = prepareTool(
+            tool,
+            Object.hasOwn(input, "arguments") ? input.arguments : {},
+            options,
+            connection.stop.signal,
+            start,
+          );
+        }
+      }
     } else {
       tool = "unknown";
       code = "unknown-tool";
@@ -293,7 +350,8 @@ async function callTool(
         if (isObject(value)) {
           if (tool === "request_planner")
             executionId = identifier(value.executionId);
-          if (tool === "get_execution") executionId = identifier(value.id);
+          if (tool === "get_execution" || tool === "wait_execution")
+            executionId = identifier(value.id);
         }
         result = JSON.stringify(value);
         outcome = "ok";
@@ -349,6 +407,7 @@ async function dispatch(
   message: Record<string, unknown>,
   id: RequestId | undefined,
   options: HostApiOptions,
+  connection: Connection,
 ) {
   const { method, params } = message;
   let session: SessionState;
@@ -363,7 +422,13 @@ async function dispatch(
   if (method === "tools/call") {
     return {
       close: session !== "active",
-      result: await callTool(params, options, session, id === undefined),
+      result: await callTool(
+        params,
+        options,
+        session,
+        id === undefined,
+        connection,
+      ),
     };
   }
   if (session !== "active") {
@@ -417,10 +482,28 @@ function send(socket: Socket, response: object): Promise<void> {
 }
 
 async function serve(
-  socket: Socket,
+  connection: Connection,
   options: HostApiOptions,
   maxLineBytes: number,
 ) {
+  const { socket, stop } = connection;
+  async function handle(
+    message: Record<string, unknown>,
+    id: RequestId | undefined,
+  ) {
+    const dispatched = await dispatch(message, id, options, connection);
+    if (id !== undefined && !socket.destroyed)
+      await send(
+        socket,
+        dispatched.error ?? {
+          jsonrpc: "2.0",
+          id,
+          result: dispatched.result,
+        },
+      );
+    return dispatched.close === true;
+  }
+
   const line = Buffer.allocUnsafe(maxLineBytes);
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let length = 0;
@@ -437,7 +520,6 @@ async function serve(
 
       let message: unknown;
       let response: object | undefined;
-      let close = false;
       try {
         message = JSON.parse(decoder.decode(line.subarray(0, length)));
       } catch {
@@ -456,16 +538,27 @@ async function serve(
         ) {
           response = rpcError(null, -32600, "Invalid request");
         } else {
-          const dispatched = await dispatch(message, id, options);
-          close = dispatched.close === true;
-          if (id !== undefined)
-            response = dispatched.error ?? {
-              jsonrpc: "2.0",
-              id,
-              result: dispatched.result,
-            };
-          if (response && !socket.destroyed) await send(socket, response);
-          if (close) return;
+          if (
+            id !== undefined &&
+            message.method === "tools/call" &&
+            isObject(message.params) &&
+            message.params.name === "wait_execution" &&
+            !connection.wait
+          ) {
+            // Keep reading pipelined requests while the wait polls the store.
+            connection.wait = handle(message, id)
+              .then((close) => {
+                if (close) socket.destroy();
+              })
+              .catch(() => {
+                socket.destroy();
+              })
+              .finally(() => {
+                delete connection.wait;
+              });
+          } else if (await handle(message, id)) {
+            return;
+          }
           continue;
         }
       }
@@ -473,6 +566,8 @@ async function serve(
       if (++errors >= 3) return;
     }
   }
+  stop.abort();
+  await connection.wait;
 }
 
 function socketStat(path: string) {
@@ -483,7 +578,7 @@ export class HostApiServer {
   readonly #server: Server;
   readonly #options: HostApiOptions;
   readonly #maxLineBytes: number;
-  #client: Socket | undefined;
+  #client: Connection | undefined;
   #socketIdentity: ReturnType<typeof socketStat>;
   #closing: Promise<void> | undefined;
 
@@ -556,8 +651,12 @@ export class HostApiServer {
       socket.destroy();
       return;
     }
-    this.#client = socket;
+    const stop = new AbortController();
+    const connection: Connection = { socket, stop };
+    this.#client = connection;
+    socket.once("end", () => stop.abort());
     socket.once("close", () => {
+      stop.abort();
       this.#client = undefined;
       try {
         store.recordApiCall(sessionId, {
@@ -568,19 +667,25 @@ export class HostApiServer {
         // The connection is already closed and SQLite may be unavailable.
       }
     });
-    void serve(socket, this.#options, this.#maxLineBytes)
+    void serve(connection, this.#options, this.#maxLineBytes)
       .catch(() => {})
-      .finally(() => socket.destroy());
+      .finally(() => {
+        stop.abort();
+        socket.destroy();
+      });
   }
 
   close(): Promise<void> {
+    const client = this.#client;
     this.#closing ??= new Promise<void>((resolve, reject) => {
       this.#server.close((error) => {
         if (error) reject(error);
         else resolve();
       });
-      this.#client?.destroy();
-    }).then(() => {
+      client?.stop.abort();
+      client?.socket.destroy();
+    }).then(async () => {
+      await client?.wait;
       const path = this.#options.socketPath;
       const current = socketStat(path);
       if (
