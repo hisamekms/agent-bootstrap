@@ -128,3 +128,43 @@ in a host-controlled directory outside those workspaces and snapshots.
   first. The limit defaults to 50 and accepts values from 1 to 1,000.
 
 The CLI exits with 0 on success, 1 on refusal or failure, and 2 on usage errors.
+
+## Runner
+
+One host-owned `ActorRunner` shares a FIFO queue between Planner runs and
+Reviewer approvals, with eight waiting jobs by default. Production uses
+`claudeRoleHarness` with the configured API key boundary. Concurrent calls to
+`drain()` share the same worker. Execution records are durable. The queue,
+Planner briefs and queued proposal references live in memory, so this runner
+cannot resume queued work after a host restart.
+
+The Planner reads `/review/request.json` and host-selected read-only files
+under `/review/repo/`. The runner applies Microsandbox's count, per-file and
+aggregate byte limits to the complete file set. The first Planner attempt and
+each approval use the stored execution ID as the host invocation ID. A
+Planner can retry a non-timeout actor failure or invalid answer once inside
+the same stored execution. The trusted host audit allows one context per
+invocation ID, so the retry uses a fresh ID with `retryOfExecutionId` set to
+the original execution ID. Forward that context when wiring `runPlanner`.
+The runner checks the returned invocation ID before acting on a response.
+Timeouts are terminal. Successful Planner results record the attempt count
+and total reported token usage when available.
+
+The runner validates the entire Planner answer before submitting proposals.
+Task references such as `#0` resolve to the earlier entry's registered task
+ID, or to its proposal ID if it is pending. A dependent proposal with a
+pending dependency also stays pending. Approval creates a separate task ID,
+so the dependent proposal must be resubmitted with that registered ID.
+Each proposal is a separate store transaction. A later write failure leaves
+earlier audited proposals recorded. If the store cannot persist a terminal
+status, `drain()` rejects and stops processing. The stored execution can
+remain running until the host recovers the state.
+
+An approval starts only for a pending proposal with an effective agent
+policy. The runner uses the store's public policy query and accounts for
+pending content that tightens the registration gate to human. The Reviewer
+gets the digest-bound proposal in `proposal.json` and, for a task, the
+registered Goal content in `goal.json`. The store checks the digest, policy
+and approval eligibility while the Reviewer execution is running. A store
+refusal or invalid verdict ends the execution without a decision by the
+runner. Approval runs have one attempt.
