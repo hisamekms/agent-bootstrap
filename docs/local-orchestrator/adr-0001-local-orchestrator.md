@@ -114,6 +114,13 @@ digest-bound content and returns a structured verdict. The host binds
 each approval to the content digest. Any content change requires
 re-approval.
 
+The operator may explicitly authorize a Claude Code session in conversation
+to answer a human gate on their behalf. The host CLI records this as a
+delegated human answer and still requires a terminal and the same typed
+digest confirmation. The approval stores the session identifier and the
+operator-provided authorization reference. The decision event marks the
+delegation and identifies the agent and session.
+
 The host authorizes registration and integration. It checks scope fit,
 budgets and required verification results regardless of the answerer.
 For integration, it checks the pinned candidate and rejects stale bases.

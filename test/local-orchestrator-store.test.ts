@@ -198,6 +198,45 @@ test("rejects stale decisions and agent answers under a human policy without wri
   assert.deepEqual(store.listGoals(), []);
 });
 
+test("validates delegation before writing and records it as a human approval", () => {
+  const pending = store.proposeGoal(goal, operator);
+  const delegate = {
+    agent: "claude-code",
+    session: "s".repeat(200),
+    authorization: "a".repeat(500),
+  } as const;
+  for (const invalid of [
+    undefined,
+    null,
+    { ...delegate, agent: "other" },
+    { ...delegate, session: "bad session" },
+    { ...delegate, authorization: "control\u009b" },
+    { ...delegate, extra: true },
+    { agent: delegate.agent, session: delegate.session },
+  ]) {
+    assert.throws(
+      () => approve(pending, { kind: "human", delegate: invalid } as Answerer),
+      ContractError,
+    );
+  }
+  assert.equal(store.getProposal(pending.id)?.status, "pending");
+  assert.ok(approve(pending, { kind: "human", delegate }).goalId);
+
+  const db = new Database(filename);
+  try {
+    assert.deepEqual(
+      db
+        .query(
+          "SELECT answerer_kind, json_extract(answerer_json, '$.delegate.agent') AS agent, json_extract(answerer_json, '$.delegate.session') AS session, json_extract(answerer_json, '$.delegate.authorization') AS authorization FROM approvals WHERE proposal_id = ?",
+        )
+        .get(pending.id),
+      { answerer_kind: "human", ...delegate },
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("allows an eligible reviewer and refuses the producer and Concierge origins", () => {
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
   assert.deepEqual(store.effectivePolicy("integration"), {

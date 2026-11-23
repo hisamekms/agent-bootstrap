@@ -11,7 +11,11 @@ import {
   type Gate,
   type Policy,
 } from "./model.ts";
-import { OrchestratorStore, OrchestratorStoreError } from "./store.ts";
+import {
+  OrchestratorStore,
+  OrchestratorStoreError,
+  parseHumanDelegate,
+} from "./store.ts";
 
 interface CliIo {
   stdin: NodeJS.ReadableStream;
@@ -34,8 +38,8 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] <comma
   status
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId>
-  approve <proposalId>
-  reject <proposalId>
+  approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
+  reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   policy show
   policy set <gate> <human|agent>
   events [--subject <id>] [--limit <1-1000>]`;
@@ -44,7 +48,11 @@ type Command =
   | { kind: "status" | "policy-show" }
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
-  | { kind: "approve" | "reject"; id: string }
+  | {
+      kind: "approve" | "reject";
+      id: string;
+      delegate?: ReturnType<typeof parseHumanDelegate>;
+    }
   | { kind: "policy-set"; gate: Gate; value: Policy }
   | { kind: "events"; subjectId?: string; limit: number };
 
@@ -59,10 +67,35 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
         return { kind, status: oneOf(args[1], statuses) };
       break;
     case "show":
-    case "approve":
-    case "reject":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
       break;
+    case "approve":
+    case "reject": {
+      const [proposalId, ...flags] = args;
+      const id = identifier(proposalId);
+      if (flags.length === 0) return { kind, id };
+      let onBehalf = false;
+      let session: string | undefined;
+      let authorization: string | undefined;
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--on-behalf" && !onBehalf) onBehalf = true;
+        else if (flags[i] === "--delegate-session" && session === undefined)
+          session = flags[++i];
+        else if (flags[i] === "--authorization" && authorization === undefined)
+          authorization = flags[++i];
+        else throw new ContractError();
+      }
+      if (!onBehalf) throw new ContractError();
+      return {
+        kind,
+        id,
+        delegate: parseHumanDelegate({
+          agent: "claude-code",
+          session,
+          authorization,
+        }),
+      };
+    }
     case "policy":
       if (args.length === 1 && args[0] === "show")
         return { kind: "policy-show" };
@@ -227,7 +260,9 @@ async function execute(
     case "show":
     case "approve":
     case "reject": {
-      const proposal = store.getProposalDetails(command.id);
+      const proposal = store.getProposalDetails(command.id, {
+        includeDelegation: command.kind === "show",
+      });
       if (!proposal) return refuse(io, "Proposal was not found.");
       writeJson(io, displayProposal(proposal));
       if (command.kind === "show") return 0;
@@ -245,9 +280,13 @@ async function execute(
         store.decide(proposal.id, {
           digest,
           decision: command.kind,
-          answerer: { kind: "human" },
+          answerer: {
+            kind: "human",
+            ...(command.delegate && { delegate: command.delegate }),
+          },
         }),
       );
+      if (command.delegate) io.stdout.write("Answer recorded as delegated.\n");
       return 0;
     }
     case "policy-show":
