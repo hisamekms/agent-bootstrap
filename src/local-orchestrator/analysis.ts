@@ -1,3 +1,7 @@
+import {
+  configuredCredentialScanner,
+  type CredentialScanner,
+} from "./credential-scan.ts";
 import { spawnSync } from "node:child_process";
 import { createWriteStream, constants } from "node:fs";
 import {
@@ -15,10 +19,10 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
-import { exportAudit } from "../audit-export.ts";
+import { exportAudit, exportAuditChecked } from "../audit-export.ts";
 import { MISE_DUCKDB as miseArgs, offlineMiseEnv } from "../mise-tools.ts";
 import { checkPrivateDirectory } from "../private-journal.ts";
-import { exportOrchestrator } from "./export.ts";
+import { exportOrchestrator, exportOrchestratorChecked } from "./export.ts";
 import {
   checkDirectory,
   discoverAnalysisTargets,
@@ -85,7 +89,11 @@ async function isDatabase(path: string): Promise<boolean> {
   return true;
 }
 
-async function copyTelemetry(source: string, destination: string) {
+async function copyTelemetry(
+  source: string,
+  destination: string,
+  scan?: CredentialScanner,
+) {
   await privateDirectory(destination);
   for (const signal of ["traces", "metrics", "logs"]) {
     const from = join(source, signal);
@@ -105,8 +113,10 @@ async function copyTelemetry(source: string, destination: string) {
       );
       const temporary = join(to, `.copy-${randomUUID()}.partial`);
       try {
-        if (!(await file.stat()).isFile())
-          throw new Error("Unsafe telemetry rotation");
+        const stat = await file.stat();
+        if (!stat.isFile()) throw new Error("Unsafe telemetry rotation");
+        if (scan && stat.size > 16 * 1024 * 1024)
+          throw new Error("Telemetry rotation exceeds scan limits");
         await pipeline(
           file.createReadStream({ autoClose: false }),
           createWriteStream(temporary, {
@@ -114,6 +124,7 @@ async function copyTelemetry(source: string, destination: string) {
             mode: 0o600,
           }),
         );
+        if (scan) await scan(await readFile(temporary));
         await rename(temporary, join(to, name));
       } finally {
         await file.close();
@@ -191,22 +202,33 @@ export async function analyze(
   if (/[*?[\]\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(out))
     throw new Error("Invalid DuckDB analysis directory");
 
+  const scans: CredentialScanner[] = [];
   for (const { slug, directory } of targets) {
     await checkDirectory(directory).catch((error: unknown) => {
       if (!missing(error)) throw error;
     });
+    const scan = configuredCredentialScanner(directory, (message) =>
+      io.stderr.write(message + "\n"),
+    );
+    if (scan) scans.push(scan);
     const destination = join(out, slug);
     await privateDirectory(destination);
     const audit = snapshot ?? join(directory, "audit.sqlite");
     const state = join(directory, "state.db");
     await privateDirectory(join(destination, "audit"));
     // Open the source read-only. Live databases keep their SQLite WAL sidecars.
-    if (snapshot !== undefined || (await isDatabase(audit)))
-      exportAudit(audit, destination);
-    if (await isDatabase(state)) exportOrchestrator(state, destination);
+    if (snapshot !== undefined || (await isDatabase(audit))) {
+      if (scan) await exportAuditChecked(audit, destination, scan);
+      else exportAudit(audit, destination);
+    }
+    if (await isDatabase(state)) {
+      if (scan) await exportOrchestratorChecked(state, destination, scan);
+      else exportOrchestrator(state, destination);
+    }
     await copyTelemetry(
       join(directory, "observability", "telemetry"),
       join(destination, "telemetry"),
+      scan,
     );
   }
 
@@ -272,17 +294,21 @@ ${orchestrator}
       extra +
       "\n",
   );
-  if (result.stdout)
+  if (result.stdout) {
+    for (const scan of scans) await scan(result.stdout);
     io.stdout.write(
       result.stdout.split("\n").map(escapeTerminalControls).join("\n"),
     );
+  }
   printExport();
   if (result.status !== 0) {
     io.stderr.write("DuckDB analysis query failed.\n");
-    if (result.stderr)
+    if (result.stderr) {
+      for (const scan of scans) await scan(result.stderr);
       io.stderr.write(
         result.stderr.split("\n").map(escapeTerminalControls).join("\n"),
       );
+    }
     return 1;
   }
   return 0;

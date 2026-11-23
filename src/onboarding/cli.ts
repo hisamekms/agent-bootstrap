@@ -1,6 +1,20 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
+import {
+  ClaudeConfigError,
+  loadClaudeConfig,
+  parseClaudeAuthMode,
+  userStateDirectory,
+  validGroup,
+  type ClaudeAuthMode,
+} from "../local-orchestrator/claude-config.ts";
+import { claudeNext } from "../local-orchestrator/claude-errors.ts";
+import {
+  ClaudeRunError,
+  CredentialsVolume,
+} from "../local-orchestrator/credentials-volume.ts";
+import { checkDirectory, resolveTarget } from "../local-orchestrator/target.ts";
 import { parseConciergeArgs } from "../local-orchestrator/concierge.ts";
 import {
   exitCodes,
@@ -12,6 +26,11 @@ import {
   type HelpTopic,
 } from "./help.ts";
 import { doctor, systemHost, type Host } from "./prerequisites.ts";
+import {
+  parseSandboxShell,
+  runSandboxShell,
+  sandboxShellPlan,
+} from "./sandbox-shell.ts";
 import {
   applySetup,
   authorizedAgentWarning,
@@ -56,17 +75,28 @@ function includeJson(argv: readonly string[]) {
   };
 }
 
-function targetOption(args: readonly string[]): string | undefined {
-  const path = args[1];
-  if (
-    args.length !== 2 ||
-    args[0] !== "--target" ||
-    !path ||
-    path.startsWith("--") ||
-    path.includes("\0")
-  )
-    throw new Error("usage");
-  return path;
+function claudeOptions(args: readonly string[]) {
+  let target: string | undefined;
+  let override: ClaudeAuthMode | undefined;
+  const remaining: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--target") {
+      const path = args[++index];
+      if (
+        target !== undefined ||
+        !path ||
+        path.startsWith("--") ||
+        path.includes("\0")
+      )
+        throw new Error("usage");
+      target = path;
+    } else if (arg === "--claude-auth") {
+      if (override !== undefined) throw new Error("usage");
+      override = parseClaudeAuthMode(args[++index]);
+    } else remaining.push(arg);
+  }
+  return { target, override, remaining };
 }
 
 export async function runBootstrap(
@@ -94,7 +124,14 @@ export async function runBootstrap(
       "Run agent-bootstrap help --json for allowed commands and flags.",
     );
 
-  const [command = "help", ...rest] = args;
+  const globalAuth = args[0] === "--claude-auth" ? args.splice(0, 2) : [];
+  const [command = "help", ...commandArgs] = args;
+  const rest = [...commandArgs, ...globalAuth];
+  if (
+    globalAuth.length &&
+    !["doctor", "concierge", "credentials", "login"].includes(command)
+  )
+    return usage();
   try {
     if (command === "help" || command === "--help" || command === "-h") {
       const [topic, ...extra] = rest;
@@ -123,12 +160,15 @@ export async function runBootstrap(
 
     if (command === "doctor") {
       let path: string | undefined;
+      let override: ClaudeAuthMode | undefined;
       try {
-        if (rest.length) path = targetOption(rest);
+        const options = claudeOptions(rest);
+        if (options.remaining.length) return usage();
+        ({ target: path, override } = options);
       } catch {
         return usage();
       }
-      const { checks, first } = await doctor(root, host, path);
+      const { checks, first } = await doctor(root, host, path, false, override);
       const next = first
         ? first.fix.join(" && ") || first.detail
         : path === undefined
@@ -147,6 +187,43 @@ export async function runBootstrap(
       return first ? 3 : 0;
     }
 
+    if (command === "sandbox") {
+      let options: ReturnType<typeof parseSandboxShell>;
+      try {
+        options = parseSandboxShell(rest);
+        if (json && options.run) return usage();
+      } catch {
+        return usage();
+      }
+      if (options.run && !io.conciergeTTY)
+        return fail(
+          1,
+          "Sandbox shell requires an operator terminal.",
+          "Run agent-bootstrap sandbox shell --run from a TTY.",
+        );
+      try {
+        const prepared = await sandboxShellPlan(root, host.env, options);
+        print(prepared.plan);
+        if (options.run) {
+          const { id, outcome } = await runSandboxShell(host, prepared);
+          print({ id, outcome });
+          if (outcome !== "ok")
+            return fail(
+              1,
+              "Sandbox shell did not complete successfully.",
+              "Check the invocation in the audit database shown above.",
+            );
+        }
+        return 0;
+      } catch {
+        return fail(
+          1,
+          "Sandbox shell could not be prepared or run.",
+          "Check the profile, MSB_HOME, mount directories and audit path. See agent-bootstrap help troubleshoot.",
+        );
+      }
+    }
+
     if (command === "setup") {
       if (
         rest.length !== new Set(rest).size ||
@@ -158,15 +235,17 @@ export async function runBootstrap(
       const allowNetwork = rest.includes("--allow-network");
       const yes = rest.includes("--yes");
       if (yes) io.stderr.write(`${authorizedAgentWarning}\n`);
-      const plan = await setupPlan(root, rest.includes("--profiles")).catch(
-        () => {
-          throw new SetupError(
-            "The setup plan could not load the required profile lock.",
-            "Restore the checked-in lock and matching recipes.",
-            3,
-          );
-        },
-      );
+      const plan = await setupPlan(
+        root,
+        rest.includes("--profiles"),
+        host.env,
+      ).catch(() => {
+        throw new SetupError(
+          "The setup plan could not load the required profile lock.",
+          "Restore the checked-in lock and matching recipes.",
+          3,
+        );
+      });
       if (allowNetwork && !yes) {
         if (!io.isTTY)
           return fail(
@@ -200,11 +279,122 @@ export async function runBootstrap(
       return 0;
     }
 
+    if (command === "login" || command === "credentials") {
+      let options: ReturnType<typeof claudeOptions>;
+      try {
+        options = claudeOptions(rest);
+      } catch {
+        return usage();
+      }
+      const { target: path, override, remaining } = options;
+      const [action, ...extra] = remaining;
+      const verifying = command === "credentials" && action === "verify";
+      let group: string | undefined;
+      if (command === "login" || verifying) {
+        const groupArgs = verifying
+          ? extra.filter((arg) => arg !== "--accept")
+          : remaining;
+        if (verifying && extra.filter((arg) => arg === "--accept").length !== 1)
+          return usage();
+        if (groupArgs.length) {
+          if (
+            groupArgs.length !== 2 ||
+            groupArgs[0] !== "--group" ||
+            !validGroup(groupArgs[1])
+          )
+            return usage();
+          group = groupArgs[1];
+        }
+        if (command === "login" && !group) return usage();
+        if (verifying ? !io.isTTY : !io.conciergeTTY)
+          return fail(
+            1,
+            "An operator terminal is required.",
+            `Run agent-bootstrap help ${command}.`,
+          );
+      } else if (
+        (extra.length &&
+          !(
+            action === "detach" &&
+            extra.length === 1 &&
+            extra[0] === "--force"
+          )) ||
+        !["status", "attach", "detach", "init"].includes(action ?? "")
+      ) {
+        return usage();
+      }
+
+      const target = await resolveTarget(path, root);
+      await checkDirectory(target.directory).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        },
+      );
+      const effective = loadClaudeConfig(host.env, target.directory, override);
+      for (const warning of effective.warnings) io.stderr.write(warning + "\n");
+      const config = effective.configDir;
+      if (!config || (group && !Object.hasOwn(config.groups, group)))
+        throw new ClaudeRunError("config-invalid");
+
+      if (command === "login") {
+        const { first } = await doctor(root, host, path, true, override);
+        if (first)
+          return fail(
+            3,
+            "Login prerequisites are missing.",
+            first.fix.join(" && ") || first.detail,
+          );
+        const launchArgs = ["--login-group", group!];
+        if (path) launchArgs.push("--target", path);
+        if (override) launchArgs.push("--claude-auth", override);
+        if (!(await (io.launch ?? launch)(root, launchArgs, json)))
+          return fail(
+            1,
+            "Login launcher failed.",
+            "Review the terminal transcript and run agent-bootstrap help login.",
+          );
+        print({ status: "ok" });
+        return 0;
+      }
+
+      const volume = new CredentialsVolume(
+        config,
+        userStateDirectory(host.env),
+      );
+      if (action === "status") {
+        const status = volume.status();
+        print(status);
+        if (status.stale)
+          hint(
+            "Run agent-bootstrap doctor, then credentials detach --force after confirming no VM is running.",
+          );
+        return 0;
+      }
+      if (action === "init") volume.init();
+      if (action === "attach") volume.attach();
+      if (action === "detach") volume.detach(extra[0] === "--force");
+      if (verifying) {
+        const { release } = volume.acquire();
+        try {
+          for (const name of group ? [group] : Object.keys(config.groups))
+            volume.integrity(name, "accept", (note) =>
+              io.stderr.write(note + "\n"),
+            );
+        } finally {
+          release();
+        }
+      }
+      print({ status: "ok" });
+      return 0;
+    }
+
     if (command === "concierge") {
       let path: string | undefined;
+      let override: ClaudeAuthMode | undefined;
       try {
-        if (rest.includes("--run")) return usage();
-        path = parseConciergeArgs(rest).target;
+        if (rest.includes("--run") || rest.includes("--login-group"))
+          return usage();
+        ({ target: path, claudeAuth: override } = parseConciergeArgs(rest));
       } catch {
         return usage();
       }
@@ -214,7 +404,7 @@ export async function runBootstrap(
           "Concierge requires an operator terminal.",
           "Run agent-bootstrap concierge from a TTY with OSC 52 clipboard access disabled.",
         );
-      const { first } = await doctor(root, host, path, true);
+      const { first } = await doctor(root, host, path, true, override);
       if (first)
         return fail(
           3,
@@ -301,6 +491,14 @@ export async function runBootstrap(
     hint(output.next);
     return 0;
   } catch (error) {
+    if (error instanceof ClaudeConfigError)
+      return fail(
+        1,
+        error.message,
+        "Review the private Claude config.json and run agent-bootstrap doctor.",
+      );
+    if (error instanceof ClaudeRunError)
+      return fail(1, error.code, claudeNext(error.code));
     if (error instanceof SetupError)
       return fail(error.code, error.message, error.next);
     return fail(

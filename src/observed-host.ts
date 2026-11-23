@@ -19,6 +19,7 @@ import type {
 } from "./sandbox-runtime.ts";
 import {
   TrustedHost,
+  type ClaudeHostPolicy,
   type HostGateway,
   type HostObserver,
 } from "./trusted-host.ts";
@@ -37,6 +38,7 @@ export interface ObservedHostOptions {
   readonly msb: Pick<MicrosandboxConfig, "binary" | "home" | "stagingRoot">;
   readonly profiles: MicrosandboxConfig["profiles"];
   readonly credentials?: MicrosandboxConfig["credentials"];
+  readonly gatewayHosts?: readonly string[];
   readonly providers?: MicrosandboxConfig["providers"];
   /** One credential per binding. Exclusive with credentials and providers. */
   readonly providerBindings?: readonly {
@@ -44,6 +46,7 @@ export interface ObservedHostOptions {
     readonly credentials: NonNullable<MicrosandboxConfig["credentials"]>;
   }[];
   readonly observers?: readonly ObservedHostObserver[];
+  readonly claude?: ClaudeHostPolicy;
   /** Host-side override for fixtures. The same factory serves startup and runs. */
   readonly openGateway?: (
     options: EgressGatewayOptions,
@@ -97,12 +100,6 @@ class ObservedRuntime extends MicrosandboxRuntime {
 
   override async createBound(spec: SandboxSpec, sandboxId: string) {
     this.#assertOpen();
-    if (
-      this.#required &&
-      (spec.hostTcpPort !== undefined ||
-        (spec.provider !== undefined && spec.egressGateway === undefined))
-    )
-      throw new Error("Audited gateway required for sandbox egress");
     const handle = await super.createBound(spec, sandboxId);
     this.#onCreated(spec, handle);
     return handle;
@@ -114,8 +111,10 @@ export async function createObservedHost({
   auditPath,
   msb,
   profiles,
+  claude,
   credentials,
   providers,
+  gatewayHosts = [],
   providerBindings,
   observers = [],
   openGateway = EgressGateway.open,
@@ -243,6 +242,7 @@ export async function createObservedHost({
           home: msb.home,
           stagingRoot: msb.stagingRoot,
           profiles,
+          gatewayHosts,
           ...(credentials === undefined ? {} : { credentials }),
           ...(providers === undefined ? {} : { providers }),
           ...(required
@@ -279,8 +279,10 @@ export async function createObservedHost({
     });
     const host = new TrustedHost(audit, runtime, profiles, {
       config,
+      gatewayHosts,
       observers: [...activeObservers, ...samplingObservers],
       ...(required ? { gatewayFactory } : {}),
+      ...(claude ? { claude } : {}),
     });
 
     if (required) {

@@ -35,7 +35,7 @@ import { createTelemetry } from "../../src/telemetry.ts";
 const local = fileURLToPath(new URL("../../.local/", import.meta.url));
 const image =
   "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd";
-const hostname = "anthropic.fixture.invalid";
+const hostname = "gateway.fixture.invalid";
 const fixtureIp = "192.0.2.22";
 const providerPort = 443;
 const model = "claude-opus-5-5";
@@ -349,6 +349,7 @@ async function main() {
       profiles,
       observers: [telemetry],
       providers: [provider],
+      gatewayHosts: [hostname],
       credentials: {
         async withAccessToken(consume) {
           return consume(syntheticKey);
@@ -591,7 +592,9 @@ async function main() {
       variable: process.env.M6_OPERATOR_VARIABLE ?? "ANTHROPIC_AUTH_TOKEN",
       header: "authorization" as const,
     };
-    const operatorProvider = claudeCodeProvider(operatorAuth, binding);
+    const operatorProvider = claudeCodeProvider(operatorAuth, binding, [
+      hostname,
+    ]);
     await observed.close();
     observed = await openHost(
       operatorProvider,

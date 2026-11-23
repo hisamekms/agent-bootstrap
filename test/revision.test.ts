@@ -130,6 +130,7 @@ async function fixture(
         traceSamplingRatio: 1,
       },
     },
+    gatewayHosts: ["api.openai.com"],
     gatewayFactory: (options) => fakeGateway([]).open(options),
   });
   const flow = new ReviewedIntegration(git, host, journal, {

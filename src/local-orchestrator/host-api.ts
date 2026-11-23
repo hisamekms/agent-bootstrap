@@ -1,3 +1,5 @@
+import type { CredentialScanner } from "./credential-scan.ts";
+import { ClaudeRunError } from "./credentials-volume.ts";
 import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -43,6 +45,7 @@ export interface ExecutionRequester {
 
 export interface HostApiOptions {
   readonly store: OrchestratorStore;
+  readonly scan?: CredentialScanner;
   readonly socketPath: string;
   readonly sessionId: string;
   readonly requester: ExecutionRequester;
@@ -282,6 +285,7 @@ function prepareTool(
 }
 
 type ToolCode =
+  | "credential-leak"
   | "ok"
   | "unknown-tool"
   | "invalid-arguments"
@@ -375,6 +379,8 @@ async function callTool(
   }
   if (run) {
     try {
+      if (tool === "draft_goal" || tool === "draft_task")
+        await options.scan?.(JSON.stringify(params));
       const value = await run();
       if (value === null) {
         code = "not-found";
@@ -388,11 +394,16 @@ async function callTool(
           if (tool === "get_execution" || tool === "wait_execution")
             executionId = identifier(value.id);
         }
-        result = JSON.stringify(value);
+        const serialized = JSON.stringify(value);
+        await options.scan?.(serialized);
+        result = serialized;
         outcome = "ok";
       }
-    } catch {
-      code = "tool-failed";
+    } catch (error) {
+      code =
+        error instanceof ClaudeRunError && error.code === "credential-leak"
+          ? "credential-leak"
+          : "tool-failed";
       outcome = "error";
     }
   }

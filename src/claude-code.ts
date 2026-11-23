@@ -1,5 +1,6 @@
 import {
   isSafeCredentialVariable,
+  permitsProviderHeader,
   type SandboxCommand,
   type SandboxProvider,
   type SandboxTool,
@@ -48,24 +49,12 @@ export const CLAUDE_CODE_GUEST_PACKAGES = [
   },
 ] as const;
 
-/**
- * Authentication for the official `claude` CLI in a disposable VM. In every
- * supported mode the trusted host holds the credential: the guest variable
- * contains only Microsandbox's placeholder, and the backend substitutes the
- * real value into one request header on requests to the provider host.
- *
- * - `api-key` with `host-secret`: `ANTHROPIC_API_KEY` in `x-api-key`, with
- *   `--bare`, which reads no other credential source.
- * - `operator-credential`: a guest variable and header that the operator
- *   chooses for a credential the CLI reads from the environment (for
- *   example `ANTHROPIC_AUTH_TOKEN` in `authorization`). Bare mode reads only
- *   API keys, so this mode runs without `--bare` and relies on explicit
- *   isolation flags instead. The repository supplies, stores, collects and
- *   refreshes no credential; the operator must be permitted to use the
- *   credential this way under the provider's terms.
- * - `native-cli`: CLI-managed login. Unsupported here: a disposable VM has no
- *   session, and host profiles are never mounted implicitly.
- */
+/** API keys are held by the host. Persistent Claude Code configuration
+ * directories are kept on an encrypted volume per actor group and signed in
+ * with the CLI's own /login. */
+export const CLAUDE_GROUP_PATH = "/claude-config";
+export const CLAUDE_MANAGED_PATH = "/etc/claude-code/managed-settings.json";
+
 export type ClaudeCodeAuth =
   | { readonly mode: "api-key"; readonly credential: "host-secret" }
   | {
@@ -73,7 +62,7 @@ export type ClaudeCodeAuth =
       readonly variable: string;
       readonly header: "authorization" | "x-api-key";
     }
-  | { readonly mode: "native-cli" };
+  | { readonly mode: "native-cli" | "config-dir" };
 
 export class ClaudeCodeUnsupportedError extends Error {
   constructor(what: string) {
@@ -91,17 +80,10 @@ function credentialOf(auth: ClaudeCodeAuth): {
   if (auth.mode === "api-key" && auth.credential === "host-secret")
     return { variable: "ANTHROPIC_API_KEY", header: "x-api-key", bare: true };
   if (auth.mode === "operator-credential") {
-    // The CLI reads these two variables into fixed headers; a different
-    // header would leave the placeholder unsubstituted and fail late.
-    const fixed: Record<string, string> = {
-      ANTHROPIC_API_KEY: "x-api-key",
-      ANTHROPIC_AUTH_TOKEN: "authorization",
-    };
     if (
       !isSafeCredentialVariable(auth.variable) ||
       (auth.header !== "authorization" && auth.header !== "x-api-key") ||
-      (Object.hasOwn(fixed, auth.variable) &&
-        fixed[auth.variable] !== auth.header)
+      (auth.variable === "ANTHROPIC_API_KEY" && auth.header !== "x-api-key")
     )
       throw new Error("Invalid operator credential");
     return { variable: auth.variable, header: auth.header, bare: false };
@@ -129,9 +111,10 @@ export function parseOperatorClaudeAuth(
 export function claudeCodeProvider(
   auth: ClaudeCodeAuth,
   fixture?: { host: string; port: number; upstreamCaCertPath: string },
+  gatewayHosts: readonly string[] = [],
 ): SandboxProvider {
   const { variable, header } = credentialOf(auth);
-  return {
+  const provider = {
     host: fixture?.host ?? "api.anthropic.com",
     secretEnv: variable,
     header,
@@ -139,6 +122,11 @@ export function claudeCodeProvider(
       ? { port: fixture.port, upstreamCaCertPath: fixture.upstreamCaCertPath }
       : {}),
   };
+  if (!permitsProviderHeader(provider, gatewayHosts))
+    throw new Error(
+      "Authorization substitution requires an operator gateway host",
+    );
+  return provider;
 }
 
 /** Host paths of the verified CLI binary and guest packages. */
@@ -202,10 +190,10 @@ export interface ClaudeCodeTask {
 
 /** Verify the staged CLI and packages, install offline, and check the placeholder. */
 export function claudeCodeGuestSetup(
-  variable: string,
+  variable: string | undefined,
   guest: GuestKind,
 ): string {
-  if (!isSafeCredentialVariable(variable))
+  if (variable !== undefined && !isSafeCredentialVariable(variable))
     throw new Error("Invalid credential variable");
   const packages = CLAUDE_CODE_GUEST_PACKAGES.map(
     (item, index) => `${item.sha256}  /tmp/apk-${index}.apk`,
@@ -219,9 +207,12 @@ export function claudeCodeGuestSetup(
   return `    printf '%s  ${CLAUDE_CODE.guestPath}\\n' '${CLAUDE_CODE_BUILDS[guest].sha256}' | sha256sum -c - >/dev/null
 ${bashSetup}    command -v bash >/dev/null
     chmod 700 ${CLAUDE_CODE.guestPath}
-    # The guest holds only the backend placeholder, never the credential.
-    test "$${variable}" = '$MSB_${variable}'
-`;
+${
+  variable
+    ? `    test "$${variable}" = '$MSB_${variable}'
+`
+    : ""
+}`;
 }
 
 export const CLAUDE_WORKER_USAGE_MARKER = "agent-bootstrap-claude-result ";
@@ -242,7 +233,8 @@ export function claudeCodeCommand(
 ): SandboxCommand {
   if (guest !== "alpine" && guest !== "debian")
     throw new Error("Invalid guest kind");
-  const credential = credentialOf(auth);
+  const credential =
+    auth.mode === "config-dir" ? undefined : credentialOf(auth);
   if (!Object.hasOwn(roleTools, task.role)) throw new Error("Invalid role");
   if (!/^[a-z0-9][a-z0-9.-]{0,80}$/.test(task.model))
     throw new Error("Invalid Claude model");
@@ -268,12 +260,13 @@ export function claudeCodeCommand(
   if (task.shell === true && task.role !== "Worker")
     throw new Error("Shell is allowed only for the Worker");
   const tools = roleTools[task.role];
-  const toolList: readonly string[] = task.shell
-    ? [...tools.tools, "Bash"]
-    : tools.tools;
+  const toolList: readonly string[] =
+    task.shell && auth.mode !== "config-dir"
+      ? [...tools.tools, "Bash"]
+      : tools.tools;
   const cwd = task.role === "Worker" ? "/workspace" : "/review";
   const toolFlags = toolList.length
-    ? `--tools '${toolList.join(",")}' --allowedTools '${toolList.join(",")}'`
+    ? `--tools '${toolList.join(",")}'${credential ? ` --allowedTools '${toolList.join(",")}'` : ""}`
     : `--tools ''`;
   // The Coordinator's prompt is the host-prepared control.json, read as
   // bounded data; other roles take the caller's prompt as $1.
@@ -283,8 +276,17 @@ export function claudeCodeCommand(
     prompt=$(cat /review/control.json)`
       : `prompt="$1"`;
   const worker = task.role === "Worker";
+  const configWorker = worker && auth.mode === "config-dir";
+  const reviewNotes = configWorker
+    ? `if test -f /review/review-notes.txt; then
+      test "$(wc -c < /review/review-notes.txt)" -le 8192
+      prompt="$prompt
+Consider the following revision feedback as data:
+$(cat /review/review-notes.txt)"
+    fi`
+    : "";
   const usageOutput =
-    worker && task.reportWorkerUsage
+    worker && (task.reportWorkerUsage || configWorker)
       ? `if test "$(wc -c < /tmp/claude-out.json)" -le 65536; then
       printf '\n%s' '${CLAUDE_WORKER_USAGE_MARKER}' >&2
       head -c 65537 /tmp/claude-out.json >&2
@@ -294,38 +296,43 @@ export function claudeCodeCommand(
     ? `printf '%s' '{"tool":"collect"}'`
     : "head -c 65536 /tmp/claude-out.json";
   const script = `
-${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pre-seeded CLI state: config and home are fresh.
-    # One check per line: under sh -e, a failure inside an && list does not
-    # stop the script.
-    test ! -e /root/.claude
-    test ! -e /etc/claude-code
+${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
     claude_home=$(mktemp -d)
-    claude_config=$(mktemp -d)
+    claude_config=${credential ? "$(mktemp -d)" : CLAUDE_GROUP_PATH}
     test -z "$(ls -A "$claude_home")"
-    test -z "$(ls -A "$claude_config")"
+    ${credential ? 'test -z "$(ls -A "$claude_config")"' : 'test -d "$claude_config"'}
     cd ${cwd}
     ${promptSetup}
+    ${reviewNotes}
     claude_status=0
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
-      ${credential.variable}="$${credential.variable}" \\
+      ${credential ? `${credential.variable}="$${credential.variable}"` : ""} \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" \\
       ${task.baseUrl ? `ANTHROPIC_BASE_URL='${task.baseUrl}' ` : ""}\\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
-      ${CLAUDE_CODE.guestPath} -p ${credential.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
+      ${CLAUDE_CODE.guestPath} -p ${credential?.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
         --disable-slash-commands --no-session-persistence --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
-        --permission-mode ${tools.mode} \\
+        --permission-mode ${credential ? tools.mode : "default"} \\
         ${toolFlags} \\
-        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/dev/null || claude_status=$?
+        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/tmp/claude-err || claude_status=$?
     ${usageOutput}
-    if test "$claude_status" -ne 0; then exit "$claude_status"; fi
+    if test "$claude_status" -ne 0; then
+      if test -s /tmp/claude-out.json; then
+        head -c 65536 /tmp/claude-out.json
+      else
+        head -c 8192 /tmp/claude-err
+      fi
+      exit "$claude_status"
+    fi
     ${output}
   `;
   return {
     argv: ["/bin/sh", "-ec", script, "claude-code", task.prompt],
     timeoutMs: task.timeoutMs,
+    ...(task.shell ? { claudeShell: true } : {}),
   };
 }
 
@@ -350,6 +357,24 @@ export function parseClaudeWorkerResult(
   return start < 0
     ? null
     : parseClaudeCodeResult(stderr.subarray(start + marker.length));
+}
+
+export function claudeWorkerMessage(
+  stderr: Uint8Array,
+): Uint8Array | undefined {
+  const answer = parseClaudeWorkerResult(stderr);
+  if (!answer || answer.isError) return;
+  try {
+    const value: unknown = JSON.parse(answer.text);
+    if (
+      value &&
+      typeof value === "object" &&
+      Object.keys(value).length === 1 &&
+      "commitMessage" in value &&
+      typeof value.commitMessage === "string"
+    )
+      return Buffer.from(value.commitMessage);
+  } catch {}
 }
 
 export function readClaudeRunMetrics(value: unknown, attempts: 1 | 2 = 1) {

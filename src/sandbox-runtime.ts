@@ -30,7 +30,7 @@ export function isSafeCredentialVariable(name: unknown): name is string {
     )
   )
     return false;
-  return !/_PROXY$/.test(name);
+  return !name.endsWith("_PROXY");
 }
 
 export interface SandboxProvider {
@@ -76,10 +76,28 @@ export interface InteractiveSpec {
   readonly snapshotDir: string;
 }
 
+export type InteractiveSandbox = InteractiveSpec | { readonly login: true };
+
+export function permitsProviderHeader(
+  provider: SandboxProvider,
+  gatewayHosts: readonly string[] = [],
+): boolean {
+  if (provider.header === "x-api-key") return true;
+  return (
+    (provider.header === undefined || provider.header === "authorization") &&
+    typeof provider.host === "string" &&
+    /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+      provider.host,
+    ) &&
+    !/(?:^|\.)(?:anthropic\.com|claude\.(?:ai|com))$/.test(provider.host) &&
+    gatewayHosts.includes(provider.host)
+  );
+}
+
 export interface TerminalCommand {
   readonly argv: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
-  readonly workdir?: "/repo" | "/state";
+  readonly workdir?: "/repo" | "/state" | "/";
 }
 
 export const INTERACTIVE_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
@@ -110,6 +128,26 @@ export function terminalEnvEntries(
   return entries;
 }
 
+export const DEBUG_SHELL_LIFETIME_MS = 300_000;
+
+export interface DebugMount {
+  readonly host: string;
+  readonly guest: string;
+  readonly readOnly: boolean;
+}
+
+export function isDebugMount(mount: DebugMount): boolean {
+  return (
+    /^\/[^:\0\r\n]+$/.test(mount.host) &&
+    !/[\0\r\n]/.test(mount.guest) &&
+    /^\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(
+      mount.guest,
+    ) &&
+    !/^\/(?:dev|proc|sys|run|workspace)(?:\/|$)/.test(mount.guest) &&
+    typeof mount.readOnly === "boolean"
+  );
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -127,7 +165,7 @@ export interface SandboxSpec {
     readonly tree: string;
   };
   readonly tools?: readonly SandboxTool[];
-  /** Direct TCP to this host port. Mutually exclusive with the gateway. */
+  /** Legacy fixture field. Real runtimes reject direct host egress. */
   readonly hostTcpPort?: number;
   readonly egressGateway?: SandboxEgressGateway;
   /** Network and interactive host-channel argv digest recorded before create. */
@@ -138,7 +176,12 @@ export interface SandboxSpec {
   readonly provider?: SandboxProvider;
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
-  readonly interactive?: InteractiveSpec;
+  readonly interactive?: InteractiveSandbox;
+  /** Operator-only terminal mounts, including an empty list for a bare shell. */
+  readonly debugMounts?: readonly DebugMount[];
+  /** The host assigns and validates paths for Claude runs. */
+  readonly claude?: true;
+  readonly claudeMounts?: { readonly managed: string; readonly group?: string };
   readonly maxLifetimeMs?: number;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
   readonly invocationId?: string;
@@ -172,6 +215,7 @@ export interface SandboxCommand {
   readonly argv: readonly string[];
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  readonly claudeShell?: true;
 }
 
 export interface ExecResult {

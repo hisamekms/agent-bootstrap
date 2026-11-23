@@ -140,13 +140,17 @@ to record who answered each gate.
 - Run Claude Code interactively with `msb exec -t`. Use a session-enabled
   invocation with the existing credential boundary.
 - Mount a read-only repository snapshot taken from the checkout.
-  Keep session state on a named volume for continuation.
+  Keep API-key mode session state on a named volume for continuation.
+  Config-dir mode uses persistent Claude Code configuration directories per
+  actor group, kept on an encrypted volume and signed in with the CLI’s
+  own `/login`. The named volume keeps the Concierge guest home.
 - Expose a dedicated per-VM host Unix socket with `msb create --vsock`.
   Use `socat` in the `concierge` profile as the guest relay to the Host
   API over vsock (CID 2). The host uses the socket identity as the client
   identity. The Host API needs no network egress.
-- Allow egress only to `api.anthropic.com`. The existing host gateway
-  enforces this outside the VM.
+- Enforce egress through the audited host gateway. Config-dir mode uses
+  plain HTTPS to the API host and the configured hosts. See the
+  [authentication reference](../claude-code-auth.md).
 - Allow the Concierge to read, draft proposals, request actor executions
   and fetch results through the Host API. It can never approve.
 
@@ -224,13 +228,14 @@ applicable. Keep the audit outside VMs, beyond actor write access. This
 lets the operator trace a host decision from the conversation through
 execution and registration.
 
-### D11. Keep API keys at the credential boundary
+### D11. Support API-key and configuration directory modes
 
-All actors use Claude Code in the existing `operator-credential` mode
-with an API key. The guest sees only a placeholder. The existing
-credential boundary substitutes the real key only for the configured
-provider host, `api.anthropic.com`. The same restriction applies to the
-Researcher with public HTTPS access.
+In `api-key` mode, guests receive a placeholder. The host substitutes
+the Keychain API key into `x-api-key` for `api.anthropic.com`.
+In `config-dir` mode, the host mounts the actor group's configuration
+directory from the encrypted volume and the CLI manages its sign-in.
+The host serializes leases for the same group and checks directory
+integrity around each run. See [Claude Code authentication](../claude-code-auth.md).
 
 Use the same token accounting across actors. Future enforcement would
 need usage data early enough to stop work at the cap, including during

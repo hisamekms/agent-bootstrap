@@ -16,11 +16,13 @@ import {
   foldTreePath,
   isSafeSymlinkTarget,
   matchesTreePaths,
+  unsafeInputSymlinkNext,
 } from "./workspace-tree.ts";
 
 export type GitIntegrationCode =
   | "invalid-input"
   | "unsafe-repository"
+  | "unsafe-input-symlink"
   | "invalid-object"
   | "invalid-candidate"
   | "stale-base"
@@ -39,7 +41,7 @@ export class GitIntegrationError extends Error {
 
   constructor(code: GitIntegrationCode, cleanupFailed = false) {
     super(
-      `Local Git integration: ${code}${cleanupFailed ? "; cleanup failed" : ""}`,
+      `Local Git integration: ${code}${cleanupFailed ? "; cleanup failed" : ""}${code === "unsafe-input-symlink" ? `. ${unsafeInputSymlinkNext}` : ""}`,
     );
     this.name = "GitIntegrationError";
     this.code = code;
@@ -546,10 +548,16 @@ export class LocalGitIntegration {
   async #file(
     commit: string,
     path: string,
+    input = false,
   ): Promise<{ blob: string; mode: string }> {
     const entry = (
       await this.#git(["ls-tree", "-z", "--full-tree", commit, "--", path])
     ).toString("utf8");
+    if (input && entry.startsWith("120000 blob ")) {
+      const link = /^120000 blob ([a-f0-9]{40})\t([^\0]+)\0$/.exec(entry);
+      if (link?.[2] === path)
+        await this.#checkInputSymlinks([{ path, oid: link[1]! }]);
+    }
     const match = /^(100644|100755) blob ([a-f0-9]{40})\t([^\0]+)\0$/.exec(
       entry,
     );
@@ -593,7 +601,7 @@ export class LocalGitIntegration {
     filePath(path);
     await this.#repository();
     await this.#commit(commit);
-    const file = await this.#file(commit, path);
+    const file = await this.#file(commit, path, true);
     return this.#git(["cat-file", "blob", file.blob]);
   }
 
@@ -848,6 +856,20 @@ export class LocalGitIntegration {
       newMode,
       target: targets.get(path),
     }));
+  }
+
+  async #checkInputSymlinks(entries: readonly { path: string; oid: string }[]) {
+    if (!entries.length) return;
+    try {
+      await this.#checkCandidateSymlinks(entries);
+    } catch (error) {
+      if (
+        error instanceof GitIntegrationError &&
+        (error.code === "invalid-candidate" || error.code === "output-limit")
+      )
+        throw new GitIntegrationError("unsafe-input-symlink");
+      throw error;
+    }
   }
 
   async #checkCandidateSymlinks(
@@ -1381,6 +1403,15 @@ export class LocalGitIntegration {
       await rm(join(gitDir, "hooks"), { recursive: true, force: true });
       const entries = await this.#entries(gitDir, directory, "HEAD");
       const selected = entries.filter((entry) => included(entry.path));
+      await this.#checkInputSymlinks(
+        entries.filter(({ mode }) => mode === "120000"),
+      );
+      if (previous !== undefined && previous !== base)
+        await this.#checkInputSymlinks(
+          (await this.#entries(gitDir, directory, base)).filter(
+            ({ mode }) => mode === "120000",
+          ),
+        );
       for (const entry of entries) treePath(entry.path);
       if (selected.length > workspaceFileLimit)
         throw new GitIntegrationError("output-limit");

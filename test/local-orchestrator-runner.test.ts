@@ -1,5 +1,6 @@
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -851,4 +852,32 @@ test("Reviewer rejects an invalid verdict without retrying or deciding the propo
     result: { code: "contract-violation", rawAnswer: prefix },
   });
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
+});
+
+test("Planner and approval answers with credentials fail without copying their text", async () => {
+  enableGoalAgentApproval();
+  const proposal = store.proposeGoal(goal, plannerOrigin);
+  const secret = "sk-ant-9ZTR5LF4_rZDsVhGdlNOCzIrUQ5";
+  const notes: string[] = [];
+  const work = runner({
+    scan: createCredentialScanner({}, realpathSync(folder), (note) =>
+      notes.push(note),
+    ),
+    runPlanner: async (_, id) =>
+      response(id, { goals: [{ ...goal, description: secret }] }),
+    runReviewer: async (_, id) =>
+      response(id, { decision: "approve", reasons: [secret] }),
+  });
+  const planner = await work.requestPlanner(goalRequest);
+  const reviewer = await work.requestApproval(proposal.id);
+  await work.drain();
+  for (const id of [planner, reviewer]) {
+    const execution = store.getExecution(id);
+    assert.equal(execution?.status, "failed");
+    assert.match(JSON.stringify(execution), /credential-leak/);
+    assert.doesNotMatch(JSON.stringify(execution), new RegExp(secret));
+  }
+  assert.equal(store.listProposals().length, 1);
+  assert.equal(store.getProposal(proposal.id)?.status, "pending");
+  assert.equal(notes.length, 2);
 });

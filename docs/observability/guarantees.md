@@ -7,7 +7,7 @@ See [ADR 0001](adr-0001-observability.md) for the design.
 
 ## Durable audit
 
-SQLite schema v5 is the sole source of audit truth. In required mode the host
+The SQLite audit database is the sole source of audit truth. In required mode the host
 records the execution context, sandbox binding and network rule-set digest
 before sandbox creation. The gateway commits requested and decided records
 together before an upstream TCP connect or DNS policy reply. Lifecycle,
@@ -24,15 +24,27 @@ audit, or model token and cost accounting.
 
 ## Network coverage
 
+- Every VM created by agent-bootstrap runs offline or sends egress through
+  the audited gateway. The role launcher uses required audit. Each image
+  build and image smoke test binds a gateway before VM creation and records
+  lifecycle, TCP and DNS evidence in `builds/audit.sqlite` under the user
+  state directory. Build egress is limited to the recipe's host and port
+  declarations. Smoke tests use an empty allowlist.
+- Use `agent-bootstrap sandbox shell --json` to print the plan. Run
+  `agent-bootstrap sandbox shell --run` from an operator TTY. It opens a five-minute shell with no provider credentials
+  or actor configuration and uses the requested host and port allowlist.
+  Its audit is under `sandbox-shell/audit.sqlite` in the user state
+  directory. The operator can still run Microsandbox by hand outside
+  agent-bootstrap and its audit.
 - Audit covers connections and DNS decisions at the gateway. It does not
   inspect TLS bodies, HTTP methods, paths or headers, or DoH inside allowed
   connections. Exfiltration to an allowlisted destination is possible.
   Direct-IP flows carry no hostname.
 - G1 remains open. Microsandbox blocks the host group, foreign resolvers,
   DoT, UDP outside gateway DNS, ICMP and raw IP before the gateway. Those
-  attempts have no individual audit record. Gateway refusals that leave no
-  per-attempt record are counted only. The gateway sends aggregate counts to
-  runtime observers, including telemetry. The counts are absent from SQLite.
+  attempts have no individual audit record. Where counters are available,
+  refusal evidence is aggregate only. Gateway refusal counts reach runtime
+  observers, including telemetry, and are absent from SQLite.
 - N-10, N-11, N-15, N-16 and N-18 have no packet-level evidence. The
   rootless socket witness and recorded rule digest are the evidence for
   those rows. See the [matrix](network-audit-matrix.md) and
@@ -95,10 +107,11 @@ observability-disabled run, so there is no measured whole-run overhead.
   schema check and are refused.
 - The legacy three-argument `TrustedHost` constructor is for offline
   callers. Use the configured host for gateway-backed runs.
-- With `audit.mode: "disabled"`, a run that supplies `provider`, `tools`,
-  a repository or `hostTcpPort` requires explicit per-run
-  `allowUnauditedRun: true`. Disabling telemetry leaves audit enabled in
-  required mode.
+- The direct host-port and provider network modes have been removed from the
+  adapter. There is no per-run opt-out from the audit requirement. Disabled
+  audit remains available to offline fixtures without tools, provider
+  egress, repository staging or host ports. Disabling telemetry leaves
+  required audit enabled.
 
 ## Verified after the final security review (SEC-2)
 

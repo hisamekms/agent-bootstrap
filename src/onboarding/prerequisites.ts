@@ -1,7 +1,15 @@
 import { execFile, spawn } from "node:child_process";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { parseOperatorClaudeAuth } from "../claude-code.ts";
+import { userInfo } from "node:os";
+import {
+  ClaudeConfigError,
+  loadClaudeConfig,
+  userStateDirectory,
+  validService,
+  type ClaudeAuthMode,
+} from "../local-orchestrator/claude-config.ts";
+import { CredentialsVolume } from "../local-orchestrator/credentials-volume.ts";
 import { ALPINE_3_23, BUN_VERSION } from "../image-recipes.ts";
 import {
   checkDirectory,
@@ -101,10 +109,12 @@ export const systemHost: Host = {
 
 export const install = "bun install --frozen-lockfile --ignore-scripts";
 export const provisionKeychain =
-  'security add-generic-password -s "$LO_CLAUDE_KEYCHAIN" -a "$USER" -w';
-const configureService = "export LO_CLAUDE_KEYCHAIN=agent-bootstrap-claude";
-const configureAuth =
-  "export LO_CLAUDE_AUTH=operator:ANTHROPIC_API_KEY:x-api-key";
+  'security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w';
+export const configureClaude = [
+  'config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"',
+  'mkdir -p "$config_dir"',
+  `(umask 077; set -C; printf '%s\\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")`,
+];
 const setup = "agent-bootstrap setup --allow-network";
 const msbHomeFix = ['mkdir -p "$HOME/.msb"', 'export MSB_HOME="$HOME/.msb"'];
 
@@ -302,6 +312,7 @@ export async function doctor(
   host: Host,
   path?: string,
   concierge = false,
+  override?: ClaudeAuthMode,
 ) {
   const { checks, home } = await hostChecks(root, host);
   const required = new Set(checks.map(({ id }) => id));
@@ -329,6 +340,7 @@ export async function doctor(
   );
 
   let verifyProfile: string | undefined;
+  let targetDirectory: string | undefined;
   if (path !== undefined || concierge) {
     const target = await resolveTarget(path ?? root, root).catch(
       (error: unknown) => error,
@@ -352,6 +364,7 @@ export async function doctor(
             if (error.code !== "ENOENT") throw error;
           },
         );
+        targetDirectory = target.directory;
         const verification = readVerificationConfig(target.directory);
         verifyProfile = verification?.profile;
         const valid =
@@ -493,61 +506,120 @@ export async function doctor(
     );
   }
 
-  const { USER, LO_CLAUDE_KEYCHAIN } = host.env;
-  const validName = (value: string | undefined): value is string =>
-    !!value && /^[A-Za-z0-9._-]+$/.test(value);
-  const configured = validName(USER) && validName(LO_CLAUDE_KEYCHAIN);
-  const keychain =
-    configured && host.platform === "darwin"
-      ? await host.command(
-          "/usr/bin/security",
-          ["find-generic-password", "-s", LO_CLAUDE_KEYCHAIN, "-a", USER],
-          { PATH: "/usr/bin:/bin" },
-        )
-      : undefined;
-  const keychainStatus = !configured
-    ? LO_CLAUDE_KEYCHAIN
-      ? "wrong"
-      : "missing"
-    : !keychain || keychain.code === null
-      ? "skipped"
-      : keychain.code === 0
-        ? "ok"
-        : keychain.code === 44
-          ? "missing"
-          : "wrong";
-  add(
-    check(
-      "keychain",
-      keychainStatus,
-      !configured
-        ? "Set LO_CLAUDE_KEYCHAIN and USER to valid service and account names."
-        : keychainStatus === "ok"
-          ? "The configured Keychain item exists."
-          : keychainStatus === "skipped"
-            ? "Keychain presence could not be checked on this host."
-            : "Keychain did not confirm the configured item.",
-      [...(!configured ? [configureService] : []), provisionKeychain],
-      false,
-      true,
-    ),
-  );
-  let authStatus: Status = "ok";
   try {
-    parseOperatorClaudeAuth(host.env.LO_CLAUDE_AUTH);
-  } catch {
-    authStatus = host.env.LO_CLAUDE_AUTH ? "wrong" : "missing";
+    if (path === undefined && !concierge) {
+      const target = await resolveTarget(undefined, root);
+      await checkDirectory(target.directory).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        },
+      );
+      targetDirectory = target.directory;
+    }
+    const effective = loadClaudeConfig(host.env, targetDirectory, override);
+    add(
+      check(
+        "claude-auth",
+        "ok",
+        `Claude auth is ${effective.auth} (source: ${effective.source}).`,
+      ),
+    );
+    for (const [index, warning] of effective.warnings.entries())
+      add(
+        check(`claude-config-warning-${index + 1}`, "skipped", warning),
+        false,
+      );
+
+    const directory = effective.configDir;
+    const service =
+      directory?.volume.keychainService ?? effective.keychainService;
+    const account = host === systemHost ? userInfo().username : host.env.USER;
+    const configured = validService(account) && validService(service);
+    const keychain =
+      configured && host.platform === "darwin"
+        ? await host.command(
+            "/usr/bin/security",
+            ["find-generic-password", "-s", service, "-a", account],
+            { PATH: "/usr/bin:/bin" },
+          )
+        : undefined;
+    const status = !configured
+      ? "missing"
+      : !keychain || keychain.code === null
+        ? "skipped"
+        : keychain.code === 0
+          ? "ok"
+          : keychain.code === 44
+            ? "missing"
+            : "wrong";
+    add(
+      check(
+        "keychain",
+        status,
+        status === "ok"
+          ? "The configured Keychain item exists."
+          : status === "skipped"
+            ? "Keychain presence could not be checked on this host."
+            : "Keychain did not confirm the configured service and account.",
+        directory
+          ? ["See agent-bootstrap help credentials."]
+          : service
+            ? ["Provision the configured API key service in Keychain."]
+            : [...configureClaude, provisionKeychain],
+        false,
+        true,
+      ),
+    );
+
+    if (directory && host.platform === "darwin") {
+      try {
+        const image = await stat(directory.volume.image).catch(() => undefined);
+        const volume = new CredentialsVolume(
+          directory,
+          userStateDirectory(host.env),
+        );
+        const volumeStatus = volume.status();
+        add(
+          check(
+            "credentials-volume",
+            volumeStatus.stale ? "wrong" : image?.isFile() ? "ok" : "missing",
+            volumeStatus.stale
+              ? "The Claude configuration volume has a stale attachment or lease. Confirm no VM is running before clearing it."
+              : volumeStatus.mounted
+                ? "The Claude configuration volume is attached."
+                : image?.isFile()
+                  ? "The Claude configuration volume attaches when a run begins."
+                  : "The Claude configuration volume image is missing.",
+            volumeStatus.stale
+              ? ["agent-bootstrap credentials detach --force"]
+              : image?.isFile()
+                ? []
+                : ["agent-bootstrap credentials init"],
+          ),
+        );
+      } catch {
+        add(
+          check(
+            "credentials-volume",
+            "wrong",
+            "The Claude configuration volume status could not be checked.",
+            ["agent-bootstrap credentials status"],
+          ),
+        );
+      }
+    }
+  } catch (error) {
+    add(
+      check(
+        "claude-auth",
+        "wrong",
+        error instanceof ClaudeConfigError
+          ? error.message
+          : "Invalid Claude configuration.",
+        ["agent-bootstrap help setup"],
+      ),
+    );
   }
-  add(
-    check(
-      "claude-auth",
-      authStatus,
-      "Claude authorization uses operator:<VARIABLE>:<header>.",
-      [configureAuth],
-      false,
-      true,
-    ),
-  );
   if (!concierge) {
     const duck = miseAvailable(checks)
       ? await host.command(

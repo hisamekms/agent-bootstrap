@@ -107,6 +107,7 @@ async function fixture(
               traceSamplingRatio: 1,
             },
           },
+          gatewayHosts: ["review.invalid"],
           async gatewayFactory(options) {
             policies.push(options.policy);
             return fakeGateway([]).open(options);

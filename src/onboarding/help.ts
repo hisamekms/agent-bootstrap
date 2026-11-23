@@ -1,3 +1,5 @@
+import { configureClaude, provisionKeychain } from "./prerequisites.ts";
+
 export const exitCodes = {
   0: "Success",
   1: "Command failed or was refused",
@@ -50,13 +52,12 @@ export const helpTopics = {
       "agent-bootstrap setup --json",
       "agent-bootstrap setup --allow-network",
       "agent-bootstrap setup --allow-network --profiles",
-      "export LO_CLAUDE_KEYCHAIN=agent-bootstrap-claude",
-      'security add-generic-password -s "$LO_CLAUDE_KEYCHAIN" -a "$USER" -w',
-      "export LO_CLAUDE_AUTH=operator:ANTHROPIC_API_KEY:x-api-key",
+      ...configureClaude,
+      provisionKeychain,
     ],
     output:
-      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. The optional browser build pulls a pinned Debian base and uses the existing Debian snapshot recipe over HTTP with signed and hash-pinned release metadata. A digest mismatch stops setup before the image is published under its locked reference.",
-    next: "Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.",
+      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. Build VMs use an audited gateway limited to recipe destinations. The browser build uses a pinned Debian base and signed, hash-pinned snapshot metadata. Setup lists the build audit database and allowlist for each profile. A digest mismatch stops setup before the image is published under its locked reference.",
+    next: "API-key mode is the default. Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.",
     human:
       "Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.",
   },
@@ -166,9 +167,11 @@ export const helpTopics = {
       `${target} show-execution "$execution_id" --json`,
       `${target} retry-task "$task_id"`,
       `${launch} --continue --mode default`,
+      "agent-bootstrap sandbox shell --json",
+      "agent-bootstrap sandbox shell --profile base --run",
     ],
     output:
-      "Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt and a fresh token budget window.",
+      "Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. For unsafe-input-symlink, replace absolute or escaping links with relative links inside the repository and retry with the corrected commit. Doctor reports the effective authentication mode and its source.",
     next: "Check status for the new attempt. If integration remains uncertain, inspect the private ref and integration journal before retrying.",
     human: "The operator confirms reconciliation and retries from a host TTY.",
   },
@@ -181,11 +184,35 @@ export const helpTopics = {
       `${target} policy show --json`,
       `${target} proposals --status pending --json`,
       "agent-bootstrap setup --json",
+      "agent-bootstrap sandbox shell --allow example.com:443 --json",
     ],
     output:
-      "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement.",
+      "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.",
     next: "Review the proposed paths, verification result, digest, and policy before answering each gate.",
-    human: `${humanRepo} ${humanGate} Keep secrets out of command arguments, repository files, and agent context.`,
+    human: `${humanRepo} ${humanGate} Keep API keys in Keychain. In config-dir mode, processes inside a Claude VM can read the mounted group directory. Researcher and verification receive neither the directory nor its egress policy.`,
+  },
+  credentials: {
+    purpose:
+      "Manage the encrypted volume for persistent Claude Code configuration directories per actor group, signed in with the CLI's own /login.",
+    prerequisites:
+      "A private config.json with the volume path, Keychain service name and actor groups. API-key mode remains the default.",
+    commands: [],
+    output:
+      "Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. After doctor reports a stale lease, confirm no VM is running and use detach --force.",
+    next: "If integrity fails, inspect the evidence path and use credentials verify --accept from an operator terminal. Use the same target and authentication options as the failing run.",
+    human:
+      "The operator inspects and accepts any intended changes to the group's configuration.",
+  },
+  login: {
+    purpose:
+      "Open Claude Code in an audited terminal for a configured actor group.",
+    prerequisites:
+      "Config-dir mode and a configured encrypted volume. Use a terminal with OSC 52 clipboard access disabled.",
+    commands: [],
+    output:
+      "The CLI can reach the group's configured hosts and its additional login hosts.",
+    next: "Use the Claude Code CLI's own /login, then exit the CLI.",
+    human: "The operator signs in from the Claude Code CLI.",
   },
 } satisfies Record<string, Topic>;
 
@@ -276,7 +303,8 @@ export const onboardingOutputs = {
     json: "{ topics, commands, exitCodes }",
   },
   doctor: {
-    usage: "doctor [--target <path>] [--json]",
+    usage:
+      "doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]",
     json: "Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.",
   },
   setup: {
@@ -284,8 +312,24 @@ export const onboardingOutputs = {
     json: "{ mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.",
   },
   concierge: {
-    usage: "concierge [--target <path>] [--continue] [--mode <m>] [--json]",
+    usage:
+      "concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]",
     json: "{ status, next } after an interactive TTY session. Transcript goes to stderr.",
+  },
+  sandbox: {
+    usage:
+      "sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]",
+    json: "A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.",
+  },
+  credentials: {
+    usage:
+      "credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]",
+    json: "{ mounted, active, stale } for status or { status } after a completed action.",
+  },
+  login: {
+    usage:
+      "login --group <name> [--target <path>] [--claude-auth <mode>] [--json]",
+    json: "{ status } after a successful interactive session. Transcript goes to stderr in JSON mode.",
   },
 } as const;
 
@@ -294,25 +338,23 @@ export type HelpTopic = keyof typeof helpTopics;
 export function renderHelpTopic(topic: HelpTopic): string {
   const { purpose, prerequisites, commands, output, next, human } =
     helpTopics[topic];
+  const hardBreak = commands.length ? "  " : "\n";
   return [
     `## ${topic}`,
     "",
     purpose,
     "",
-    `**Prerequisites**  `,
+    `**Prerequisites**${hardBreak}`,
     prerequisites,
     "",
-    "```sh",
-    ...commands,
-    "```",
-    "",
-    "**Expected output**  ",
+    ...(commands.length ? ["```sh", ...commands, "```", ""] : []),
+    `**Expected output**${hardBreak}`,
     output,
     "",
-    "**Next action**  ",
+    `**Next action**${hardBreak}`,
     next,
     "",
-    "**Human involvement**  ",
+    `**Human involvement**${hardBreak}`,
     human,
     "",
   ].join("\n");
@@ -324,7 +366,7 @@ export function renderAgentGuide(): string {
     "",
     "Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.",
     "",
-    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor or concierge. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
+    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, credentials, or login. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",

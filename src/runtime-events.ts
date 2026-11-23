@@ -1,3 +1,4 @@
+import type { ClaudeFailureCode } from "./local-orchestrator/claude-config.ts";
 import { randomUUID } from "node:crypto";
 import type { ExecutionContext } from "./execution-context.ts";
 import type { ProfileName, ProfileRole } from "./sandbox-profiles.ts";
@@ -79,6 +80,7 @@ export interface RuntimeEventPayloads {
   };
   readonly "execution.finished": Duration & {
     readonly outcome: ExecutionOutcome;
+    readonly code?: ClaudeFailureCode;
   };
   readonly "sandbox.created": EffectOutcome &
     Duration & {
