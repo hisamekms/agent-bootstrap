@@ -37,10 +37,17 @@ provides partial observation.
 The Concierge runs in an interactive VM with a read-only repository snapshot
 and a named session volume. It reaches the Host API through a dedicated
 Unix socket exposed over vsock. The Host API binds actions to the session
-and reserves approval for the operator. Network egress reaches only
-`api.anthropic.com:443` through the audited gateway with a guest credential
-placeholder. Claude Code settings, hooks, MCP and tool allowlists are
-auxiliary controls. The VM and trusted host enforce the boundary.
+and reserves approval for the operator. The audited gateway allows
+`api.anthropic.com:443` with a guest credential placeholder. Concierge
+alone can also reach `platform.claude.com:443` without credential substitution.
+The gateway relays TCP without terminating TLS and audits DNS and connection
+decisions. When both DNS names have an active pin for the same IP address,
+the gateway attributes TCP connections to the provider binding. The Claude
+Code startup check probes both hosts.
+On 2026-11-23, interactive v2.1.330 exited with `ENOTFOUND` for the
+platform host, which the gateway recorded as `dns-not-allowlisted` while
+allowing API provider egress. Claude Code settings, hooks, MCP and tool
+allowlists are auxiliary controls. The VM and trusted host enforce the boundary.
 
 The adapter checks each component of the socket and snapshot paths from the
 root using `lstat`, and repeats the checks immediately before launching VM

@@ -56,6 +56,9 @@ type AuditedProfile = NonNullable<AuditInput["profile"]>;
 
 const AUDIT_HEALTH_POLL_MS = 25;
 const DEFAULT_CONCIERGE_LIFETIME_MS = 120_000;
+const CONCIERGE_EXTRA_EGRESS = [
+  { hostname: "platform.claude.com", port: 443 },
+] as const;
 // Bump when the gateway policy evaluation or digest schema changes.
 const GATEWAY_POLICY_VERSION = 1;
 
@@ -526,7 +529,7 @@ export class TrustedHost {
       )
     )
       throw new Error(
-        "Concierge requires an audited interactive sandbox with provider-only egress",
+        "Concierge requires an audited interactive sandbox with the Anthropic API provider",
       );
     const sandbox: SandboxSpec = {
       profile,
@@ -778,7 +781,10 @@ export class TrustedHost {
     const policy =
       audit && (providerBinding || hostServices?.length)
         ? new EgressPolicy({
-            allow: providerBinding ? [providerBinding] : [],
+            allow: [
+              ...(providerBinding ? [providerBinding] : []),
+              ...(role === "Concierge" ? CONCIERGE_EXTRA_EGRESS : []),
+            ],
             ...(providerBinding ? { providerBinding } : {}),
             ...(hostServices ? { hostServices } : {}),
           })

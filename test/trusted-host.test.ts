@@ -1771,10 +1771,51 @@ test("Concierge creates through the audited provider gateway and records each te
     { id, outcome: "failed" },
   );
   await assert.rejects(escaped!({ argv: ["claude"] }), /unknown-handle/);
-  assert.deepEqual(fake.opened?.policy.allow, [
+  const { policy, sandboxLabel } = fake.opened!;
+  assert.deepEqual(policy.allow, [
     { hostname: "api.anthropic.com", port: 443 },
+    { hostname: "platform.claude.com", port: 443 },
   ]);
-  assert.deepEqual(fake.opened?.policy.hostServices, []);
+  assert.deepEqual(policy.providerBinding, {
+    hostname: "api.anthropic.com",
+    port: 443,
+  });
+  assert.deepEqual(policy.hostServices, []);
+  for (const qtype of [1, 28]) {
+    assert.equal(
+      policy.decideDns({ qname: "platform.claude.com", qtype }).decision,
+      "allow",
+    );
+  }
+  for (const [hostname, ip, channel] of [
+    ["api.anthropic.com", "8.8.8.8", "provider-egress"],
+    ["platform.claude.com", "8.8.4.4", "egress"],
+  ] as const) {
+    policy.dnsPins.pin(sandboxLabel, hostname, ip, 60);
+    assert.deepEqual(
+      policy.decideConnect({ sandbox: sandboxLabel, ip, port: 443 }),
+      {
+        decision: "allow",
+        reasonCode: "allowlisted-host",
+        hostname,
+        channel,
+        upstream: { ip, port: 443 },
+      },
+    );
+  }
+  assert.equal(
+    policy.decideDns({ qname: "other.example", qtype: 1 }).reasonCode,
+    "dns-not-allowlisted",
+  );
+  for (const [ip, port] of [
+    ["1.1.1.1", 443],
+    ["8.8.4.4", 444],
+  ] as const) {
+    assert.equal(
+      policy.decideConnect({ sandbox: sandboxLabel, ip, port }).decision,
+      "deny",
+    );
+  }
   assert.deepEqual(
     db.readExecution(id).processResults.map(({ exitCode }) => exitCode),
     [7, 0],
@@ -1808,6 +1849,37 @@ test("Concierge creates through the audited provider gateway and records each te
     ),
     ["create", "attach", "attach", "gateway.close", "destroy"],
   );
+});
+
+test("other roles keep Anthropic API-only gateway policies", async (t) => {
+  const { host, fake } = observedFixture(t);
+  const sandbox = { provider: conciergePlan.sandbox.provider };
+  const command = plan.command;
+  for (const run of [
+    () => host.runWorker({ ...plan, sandbox }),
+    () => host.runPlanner({ sandbox, command }),
+    () => host.runReviewer({ sandbox, command }),
+    () =>
+      host.runCoordinator({
+        sandbox: {
+          ...sandbox,
+          readOnlyFiles: [{ path: "control.json", bytes: Buffer.from("{}") }],
+        },
+        command,
+      }),
+  ]) {
+    const { id, outcome } = await run();
+    assert.equal(outcome, "ok");
+    assert.equal(fake.opened?.executionId, id);
+    assert.deepEqual(fake.opened?.policy.allow, [
+      { hostname: "api.anthropic.com", port: 443 },
+    ]);
+    assert.equal(
+      fake.opened?.policy.decideDns({ qname: "platform.claude.com", qtype: 1 })
+        .reasonCode,
+      "dns-not-allowlisted",
+    );
+  }
 });
 
 test("Concierge refuses unsupported hosts, other profiles, other providers and host services before create", async (t) => {

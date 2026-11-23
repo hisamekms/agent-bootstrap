@@ -26,7 +26,10 @@ for details.
 ## Start or resume
 
 From the repository root, preview the launch with the first command. The
-second command starts an audited session with egress to the Anthropic API.
+second command starts an audited session with egress to
+`api.anthropic.com:443` and `platform.claude.com:443`. The platform host
+supports Claude Code's startup connectivity check. The gateway relays its
+traffic without credential substitution.
 Repository context and conversation content can reach the provider.
 
 ```sh

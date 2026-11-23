@@ -172,8 +172,19 @@ runner. Approval runs have one attempt.
 ## Interactive sandboxes
 
 `TrustedHost.runConcierge` requires audit schema v6 and required audit mode.
-It binds the `concierge` profile to the audited gateway with egress limited
-to `api.anthropic.com:443`. The host prepares a dedicated Unix socket with
+It binds the `concierge` profile to the audited gateway. The provider binding
+for `api.anthropic.com:443` uses credential substitution. Concierge alone can
+also resolve and connect to `platform.claude.com:443` without credential
+substitution. The gateway relays TCP without terminating TLS and audits
+DNS and TCP decisions for both destinations.
+
+The Claude Code network docs describe a startup connectivity check against
+both hosts. On 2026-11-23, interactive Claude Code v2.1.330 exited with
+`Failed to connect to platform.claude.com: ENOTFOUND`. The audit showed
+provider egress allowed for the API and `dns-not-allowlisted` for the
+platform host. Headless (`-p`) runs did not contact the platform host.
+
+The host prepares a dedicated Unix socket with
 mode `0600` in a protected directory. The guest connects through vsock CID 2.
 The adapter mounts the trusted snapshot read-only at `/repo` and the named
 `lo-*` volume at `/state`. `TrustedHost.prepareConciergeVolume` and
