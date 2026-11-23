@@ -159,8 +159,56 @@ repository under `.local`. Review the candidate at the approval prompt.
 
 | Live claim                                           | Codex evidence | Claude evidence |
 | ---------------------------------------------------- | -------------- | --------------- |
-| Command outcome, role execution IDs and audit export | Pending        | Pending         |
-| Lifecycle, provider TCP and DNS rows                 | Pending        | Pending         |
-| Audit and trace joins and Worker resource comparison | Pending        | Pending         |
+| Command outcome, role execution IDs and audit export | Pass (1)       | Pending         |
+| Lifecycle, provider TCP and DNS rows                 | Pass (1)       | Pending         |
+| Audit and trace joins and Worker resource comparison | Partial (1)    | Pending         |
 | External termination and abnormal records            | Pending        | Pending         |
-| Evidence review and cleanup                          | Pending        | Pending         |
+| Evidence review and cleanup                          | Pass (1)       | Pending         |
+
+### Codex live evidence
+
+(1) On 2026-11-23, M5 completed live with `M5_ACTORS=all=codex`, model
+`gpt-6.2-sol` with the derived catalog, gateway egress, and the
+Keychain-stored refresh token (`--keychain`, no browser consent). Task
+`dca9b351-0507-488c-a494-5365e2af542c` finished `done` in 72.8 seconds
+with three Coordinator turns, one Worker, one Reviewer, no revisions, no
+retries and one approval. The repository's `hello.txt` now reads
+`Good day.`. The operator delegated the approval gate to the coordinating
+agent, which approved the one-line candidate after checking it against the
+task. The prompt, diff, reason and answer are in the run's local
+`gate-answers.md`.
+
+| Role         | Execution ID                           | Seconds |
+| ------------ | -------------------------------------- | ------: |
+| Coordinator  | `0690b49a-09a8-4633-bc7b-a9546d140548` |   12.05 |
+| Worker       | `a3c5db79-80ec-459b-b087-a6c3860fec0c` |   16.78 |
+| Coordinator  | `3cdac9f6-a8f6-4a05-8242-75c6080bfd54` |    9.40 |
+| Reviewer     | `bae9f3da-7db8-4521-aa4f-f2f4d482fa42` |    9.28 |
+| Coordinator  | `c265dce6-f57f-4b0f-bde6-dabb72e15d58` |    8.20 |
+| Verification | `66c35f82-42e9-4b03-8bcc-b7ee18902cc4` |    0.50 |
+
+- The report says `auditExported: true`. Every model-driven role shows
+  create, exec and destroy finished `ok` and a `provider.egress` grant.
+  Verification has no egress.
+- Each model-driven role connected only to `api.openai.com:443` on channel
+  `provider-egress`. The Worker made three connections (55–58 KB sent,
+  76–94 KB received). DNS for `chatgpt.com`, `ab.chatgpt.com` and
+  `api.github.com` was denied with `dns-not-allowlisted`. The second
+  Coordinator turn's relay ended with `error` although its turn succeeded.
+- For the Worker, the audit-to-trace join matched 285 rows by execution ID.
+  The durable-context join matched 180 rows for the first Coordinator
+  turn and none for the Worker, which has no durable context of its own.
+  The Worker used 2.06 s CPU and 90 MB peak memory with a 6.1% startup
+  ratio. The Coordinator used 1.96 s CPU and 87 MB with a 9.0% ratio.
+  A Claude run is still needed for the cross-provider comparison.
+- No sandboxes remained in the dedicated `MSB_HOME`. The run lock was
+  released, and the refresh token stayed in the Keychain as intended.
+- External termination was not exercised live.
+
+Earlier live attempts on the same day found two problems.
+
+- A repository-local `MSB_HOME` exceeded the 104-byte Unix socket limit.
+- The Worker's `codex exec` failed with HTTP 400
+  `subscription_sharing_unsupported_capability`, because subscription
+  sharing rejects `tool_search`. `M5_DEBUG_WORKER=1` exposed the error, and
+  the derived catalog now disables `supports_search_tool`.
