@@ -312,6 +312,12 @@
       "recipeDigest": "0b8941e99cad4b66b727a04df31ce89a4a0043aaf4e2abbbac96a2e144cd984e",
       "memoryMiB": 1024,
       "cpus": 2
+    },
+    "bun": {
+      "image": "localhost/agent-bootstrap/bun@sha256:f7ee4da9f20ebf016f9c59e41fa2e9da3cad69dce893c44fedee7abcf7aac2d3",
+      "recipeDigest": "310032b3c7a47c66536247c44c6b81dbcc3282c7aaaf9324db73f7af6f8749a3",
+      "memoryMiB": 2048,
+      "cpus": 2
     }
   }
 }
