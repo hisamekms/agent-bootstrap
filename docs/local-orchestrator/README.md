@@ -2,7 +2,8 @@
 
 Status: proposed (2026-11-23). See [ADR 0001](adr-0001-local-orchestrator.md).
 
-Stage 1 evidence is recorded in the [Concierge PoC](front-poc.md).
+Stage 1 evidence is recorded in the [Concierge PoC](front-poc.md) and the
+[Concierge live runs](stage1-live.md).
 
 | Stage | Content                                                                                                         |
 | ----- | --------------------------------------------------------------------------------------------------------------- |
