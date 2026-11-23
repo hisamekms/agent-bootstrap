@@ -11,6 +11,7 @@ import {
   type SandboxRuntime,
   type SandboxSession,
   type SandboxSpec,
+  type TerminalCommand,
 } from "./sandbox-runtime.ts";
 
 export interface RuntimeRoute {
@@ -66,6 +67,8 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
       sameProvider(candidate.provider, spec.provider),
     );
     if (!route) throw new SandboxRuntimeError("invalid-input");
+    if (spec.interactive !== undefined && !route.runtime.attachTerminal)
+      throw new SandboxRuntimeError("unsupported");
     return route.runtime;
   }
 
@@ -114,6 +117,47 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     const owner = this.#owner(handle);
     if (!owner.openSession) throw new SandboxRuntimeError("unsupported");
     return owner.openSession(handle, command);
+  }
+
+  async attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+  ): Promise<{ exitCode: number | null }> {
+    const owner = this.#owner(handle);
+    if (!owner.attachTerminal) throw new SandboxRuntimeError("unsupported");
+    return owner.attachTerminal(handle, command);
+  }
+
+  #volumeRuntime(): SandboxRuntime {
+    // Volume operations have no handle. Prefer the Concierge provider's
+    // backend, or require a unique volume backend in other deployments.
+    const concierge = this.#routes.filter(
+      ({ provider }) =>
+        provider?.host === "api.anthropic.com" &&
+        (provider.port ?? 443) === 443,
+    );
+    const routes = concierge.length
+      ? concierge
+      : this.#routes.filter(
+          ({ runtime }) => runtime.createVolume && runtime.removeVolume,
+        );
+    const candidates = new Set(routes.map(({ runtime }) => runtime));
+    const [runtime] = candidates;
+    if (
+      !runtime?.createVolume ||
+      !runtime.removeVolume ||
+      candidates.size !== 1
+    )
+      throw new SandboxRuntimeError("unsupported");
+    return runtime;
+  }
+
+  async createVolume(name: string): Promise<void> {
+    await this.#volumeRuntime().createVolume!(name);
+  }
+
+  async removeVolume(name: string): Promise<void> {
+    await this.#volumeRuntime().removeVolume!(name);
   }
 
   collect(

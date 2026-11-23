@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, lstatSync } from "node:fs";
 import {
   copyFile,
   cp,
@@ -13,7 +13,7 @@ import {
   rmdir,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CredentialProvider } from "./credentials.ts";
 import { boundedLines } from "./lines.ts";
 import {
@@ -30,6 +30,7 @@ import {
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
+  type InteractiveSpec,
   type ResourceSample,
   type SandboxCommand,
   type SandboxEgressGateway,
@@ -39,6 +40,7 @@ import {
   type SandboxSession,
   type SandboxSpec,
   type SandboxTool,
+  type TerminalCommand,
 } from "./sandbox-runtime.ts";
 
 export interface MicrosandboxConfig {
@@ -76,6 +78,7 @@ export const MICROSANDBOX_LIMITS = {
   commandTimeoutMs: 240_000,
   defaultLifetimeMs: 120_000,
   maxLifetimeMs: 300_000,
+  interactiveMaxLifetimeMs: 12 * 60 * 60 * 1000,
   backendTimeoutMs: 15_000,
   tools: 8,
   toolBytes: 512 * 1024 * 1024,
@@ -142,6 +145,8 @@ type State = {
   cleanupLabel?: string;
   directory: string;
   deadline: number;
+  interactive: boolean;
+  terminal?: { stop(): void; finished: Promise<{ exitCode: number | null }> };
   busy: boolean;
   closed: boolean;
   removed: boolean;
@@ -240,6 +245,111 @@ function providerArgs(
     "--secret-violation-action",
     "block",
   ];
+}
+
+function checkVolumeName(name: string): void {
+  if (typeof name !== "string" || !/^lo-[a-z0-9][a-z0-9-]{0,62}$/.test(name))
+    invalid();
+}
+
+function interactiveArgs(spec: SandboxSpec): string[] {
+  const { interactive } = spec;
+  if (interactive === undefined) {
+    if (spec.profile === "concierge") invalid();
+    return [];
+  }
+  if (
+    !interactive?.vsock ||
+    spec.profile !== "concierge" ||
+    !spec.egressGateway ||
+    !spec.provider ||
+    spec.repository !== undefined ||
+    spec.readOnlyFiles !== undefined ||
+    spec.files !== undefined ||
+    spec.hostTcpPort !== undefined
+  )
+    invalid();
+  const {
+    vsock: { hostPath, port },
+    stateVolume,
+    snapshotDir,
+  } = interactive;
+  for (const path of [hostPath, snapshotDir])
+    if (
+      typeof path !== "string" ||
+      !isAbsolute(path) ||
+      resolve(path) !== path ||
+      /[\0:=,\r\n]/.test(path)
+    )
+      invalid();
+  if (Buffer.byteLength(hostPath) >= 100 || port < 1024) invalid();
+  boundedInteger(port, 65_535);
+  checkVolumeName(stateVolume);
+  return [
+    "--vsock",
+    `${hostPath}:${port}`,
+    "--mount-named",
+    `${stateVolume}:/state`,
+    "--mount-dir",
+    `${snapshotDir}:/repo:ro`,
+  ];
+}
+
+function checkInteractivePaths(spec: InteractiveSpec): void {
+  const {
+    vsock: { hostPath },
+    snapshotDir,
+  } = spec;
+  const uid = process.getuid?.();
+  const socket = lstatSync(hostPath, { throwIfNoEntry: false });
+  const parent = lstatSync(dirname(hostPath), { throwIfNoEntry: false });
+  const snapshot = lstatSync(snapshotDir, { throwIfNoEntry: false });
+  if (
+    uid === undefined ||
+    !socket?.isSocket() ||
+    socket.uid !== uid ||
+    (socket.mode & 0o7777) !== 0o600 ||
+    !parent?.isDirectory() ||
+    (parent.mode & 0o022) !== 0 ||
+    !snapshot?.isDirectory() ||
+    snapshot.uid !== uid
+  )
+    invalid();
+}
+
+function terminalArgs(command: TerminalCommand): string[] {
+  if (
+    !Array.isArray(command.argv) ||
+    command.argv.length < 1 ||
+    command.argv.length > 64 ||
+    [...command.argv].some(
+      (arg) => typeof arg !== "string" || arg.includes("\0"),
+    ) ||
+    (command.env !== undefined &&
+      (!command.env ||
+        typeof command.env !== "object" ||
+        Array.isArray(command.env))) ||
+    (command.workdir !== undefined &&
+      command.workdir !== "/repo" &&
+      command.workdir !== "/state")
+  )
+    invalid();
+  const assignments = Object.entries(command.env ?? {}).map(([name, value]) => {
+    if (
+      !/^[A-Z][A-Z0-9_]{0,63}$/.test(name) ||
+      /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTHORIZATION)(?:_|$)/.test(
+        name,
+      ) ||
+      typeof value !== "string" ||
+      value.includes("\0")
+    )
+      invalid();
+    return `${name}=${value}`;
+  });
+  if (!assignments.length) return [...command.argv];
+  // env interprets leading NAME=value arguments as assignments, even after --.
+  if (!command.argv[0] || command.argv[0].includes("=")) invalid();
+  return ["/usr/bin/env", "--", ...assignments, ...command.argv];
 }
 
 function digestNetworkArgs(args: readonly string[]): string {
@@ -489,7 +599,11 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   }
 
   netRuleDigest(spec: SandboxSpec): string {
-    return digestNetworkArgs(this.#network(spec).args);
+    // Preserve the exact digest input for non-interactive sandboxes.
+    return digestNetworkArgs([
+      ...this.#network(spec).args,
+      ...interactiveArgs(spec),
+    ]);
   }
 
   async #createBackend(
@@ -497,35 +611,38 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     args: readonly string[],
     gateway?: SandboxEgressGateway,
     provider?: SandboxProvider,
+    interactive?: InteractiveSpec,
   ): Promise<void> {
-    const env: Record<string, string> = {};
-    if (gateway) {
-      let password: string | undefined;
-      try {
-        password = await this.#config.gatewayPassword?.(gateway);
-      } catch {
-        throw new SandboxRuntimeError("backend-failure");
+    const create = async (env: Record<string, string>) => {
+      if (gateway) {
+        let password: string | undefined;
+        try {
+          // Resolve the provider token before the final gateway health check.
+          const resolved = this.#config.gatewayPassword?.(gateway);
+          password = typeof resolved === "string" ? resolved : await resolved;
+        } catch {
+          throw new SandboxRuntimeError("backend-failure");
+        }
+        if (
+          typeof password !== "string" ||
+          password.length < 1 ||
+          password.length > 255 ||
+          /[^\x21-\x7e]/.test(password)
+        )
+          invalid();
+        env[gateway.passwordEnv] = password;
       }
-      if (
-        typeof password !== "string" ||
-        password.length < 1 ||
-        password.length > 255 ||
-        /[^\x21-\x7e]/.test(password)
-      )
-        invalid();
-      env[gateway.passwordEnv] = password;
-    }
-    const create = (extraEnv: Record<string, string>) => {
+      if (interactive) checkInteractivePaths(interactive);
       // A failed CLI create can leave a partially created sandbox.
       state.removed = false;
-      return this.#checked(args, extraEnv);
+      return this.#checked(args, env);
     };
     const credentials = this.#config.credentials;
     if (provider && credentials)
       await credentials.withAccessToken((token) =>
-        create({ ...env, [provider.secretEnv]: token }),
+        create({ [provider.secretEnv]: token }),
       );
-    else await create(env);
+    else await create({});
   }
 
   async create(
@@ -595,10 +712,24 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       invalid();
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
-    boundedInteger(lifetime, MICROSANDBOX_LIMITS.maxLifetimeMs);
+    const requestedInteractive = spec.interactive;
+    if (requestedInteractive !== undefined && !requestedInteractive?.vsock)
+      invalid();
+    const interactive = requestedInteractive
+      ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
+      : undefined;
+    const channels = interactiveArgs(
+      interactive ? { ...spec, interactive } : spec,
+    );
+    boundedInteger(
+      lifetime,
+      interactive
+        ? MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs
+        : MICROSANDBOX_LIMITS.maxLifetimeMs,
+    );
     const tools = checkTools(spec.tools ?? []);
     const { args: networkArgs, gateway, provider } = this.#network(spec);
-    const netRuleDigest = digestNetworkArgs(networkArgs);
+    const netRuleDigest = digestNetworkArgs([...networkArgs, ...channels]);
     if (
       (bound || spec.expectedNetRuleDigest !== undefined) &&
       spec.expectedNetRuleDigest !== netRuleDigest
@@ -634,6 +765,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     let directory: string | undefined;
     let reservation: string | undefined;
     try {
+      if (interactive) checkInteractivePaths(interactive);
       if (bound) {
         // Reserve the name across adapters and processes sharing this home.
         const path = join(
@@ -709,6 +841,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           : {}),
         directory,
         deadline: performance.now() + lifetime,
+        interactive: interactive !== undefined,
         busy: false,
         closed: false,
         removed: true,
@@ -724,6 +857,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         "--pull",
         "never",
         ...networkArgs,
+        ...channels,
         "--max-duration",
         `${Math.ceil(lifetime / 1000)}s`,
         ...(profile.memoryMiB !== undefined
@@ -740,7 +874,13 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(stagedTree ? ["--copy-file", `${stagedTree}:${TREE_GUEST}`] : []),
         profile.image,
       ];
-      await this.#createBackend(state, createArgs, gateway, provider);
+      await this.#createBackend(
+        state,
+        createArgs,
+        gateway,
+        provider,
+        interactive,
+      );
       if (stagedTree) {
         const extracted = await this.#execute(
           state,
@@ -851,6 +991,68 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     } finally {
       state.busy = false;
     }
+  }
+
+  async attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+  ): Promise<{ exitCode: number | null }> {
+    const state = this.#state(handle);
+    if (!state.interactive) throw new SandboxRuntimeError("unsupported");
+    const argv = terminalArgs(command);
+    const remaining = state.deadline - performance.now();
+    if (remaining <= 0) throw new SandboxRuntimeError("lifetime-expired");
+    const child = spawn(
+      this.#config.binary,
+      [
+        "exec",
+        "-t",
+        "--workdir",
+        command.workdir ?? "/repo",
+        state.id,
+        "--",
+        ...argv,
+      ],
+      { cwd: this.#config.home, env: this.#env(), stdio: "inherit" },
+    );
+    const stop = () => {
+      child.kill("SIGKILL");
+    };
+    const timer = setTimeout(stop, Math.ceil(remaining));
+    const finished = new Promise<{ exitCode: number | null }>(
+      (resolve, reject) => {
+        child.once("error", () =>
+          reject(new SandboxRuntimeError("backend-failure")),
+        );
+        child.once("close", (exitCode) => resolve({ exitCode }));
+      },
+    ).finally(() => {
+      clearTimeout(timer);
+      delete state.terminal;
+      state.busy = false;
+    });
+    state.busy = true;
+    state.terminal = { stop, finished };
+    return finished;
+  }
+
+  async createVolume(name: string): Promise<void> {
+    checkVolumeName(name);
+    const result = await this.#run(
+      ["volume", "create", name],
+      MICROSANDBOX_LIMITS.backendTimeoutMs,
+    );
+    if (
+      result.failure ||
+      (result.code !== 0 &&
+        !/already exists/i.test(result.stderr.toString("utf8")))
+    )
+      throw new SandboxRuntimeError(result.failure ?? "backend-failure");
+  }
+
+  async removeVolume(name: string): Promise<void> {
+    checkVolumeName(name);
+    await this.#checked(["volume", "remove", name]);
   }
 
   /** One streamed guest command. The handle stays busy until it stops; then
@@ -1150,6 +1352,11 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     state.closed = true;
     state.destruction = (async () => {
       let failed = false;
+      const terminal = state.terminal;
+      if (terminal) {
+        terminal.stop();
+        await terminal.finished.catch(() => {});
+      }
       if (!state.removed) {
         const sampling = state.sampling;
         if (sampling) {
@@ -1192,7 +1399,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     if (!state)
       return Promise.reject(new SandboxRuntimeError("unknown-handle"));
     if (state.destruction) return state.destruction;
-    if (state.busy) return Promise.reject(new SandboxRuntimeError("busy"));
+    if (state.busy && !state.terminal)
+      return Promise.reject(new SandboxRuntimeError("busy"));
     return this.#destroy(state);
   }
 }

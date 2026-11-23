@@ -27,9 +27,14 @@ export type AuditInput = {
   readonly outcome?:
     "ok" | "denied" | "failed" | "timed-out" | "cancelled" | "interrupted";
   readonly role?:
-    "Worker" | "Planner" | "Reviewer" | "Coordinator" | "Verification";
+    | "Worker"
+    | "Planner"
+    | "Reviewer"
+    | "Coordinator"
+    | "Verification"
+    | "Concierge";
   /** Schema v4. Only on `sandbox.create` requests, together with `image`. */
-  readonly profile?: "base" | "db" | "browser";
+  readonly profile?: "base" | "db" | "browser" | "concierge";
   /** Schema v4. Lowercase hex SHA-256 digest of the sandbox image. */
   readonly image?: string;
 };
@@ -122,8 +127,15 @@ const outcomes = [
   "cancelled",
   "interrupted",
 ];
-const roles = ["Worker", "Planner", "Reviewer", "Coordinator", "Verification"];
-const profiles = ["base", "db", "browser"];
+const roles = [
+  "Worker",
+  "Planner",
+  "Reviewer",
+  "Coordinator",
+  "Verification",
+  "Concierge",
+];
+const profiles = ["base", "db", "browser", "concierge"];
 const imageDigest = /^[0-9a-f]{64}$/;
 const inputKeys = [
   "invocationId",
@@ -474,12 +486,21 @@ const v5Additions = [
   ),
 ];
 const schemaV5 = [...schemaV4, ...v5Additions];
+const auditTableV6 = auditTableV4
+  .replace("'Verification'))", "'Verification','Concierge'))")
+  .replace("'base','db','browser'", "'base','db','browser','concierge'");
+const schemaV6 = [
+  { name: "audit_events", sql: auditTableV6 },
+  ...schemaV5.slice(1),
+];
+const currentVersion = 6;
 const versionSchemas = {
   1: auditSchema,
   2: schema,
   3: schemaV3,
   4: schemaV4,
   5: schemaV5,
+  6: schemaV6,
 };
 
 type AuditVersion = keyof typeof versionSchemas;
@@ -1168,11 +1189,11 @@ export class SqliteAudit implements AuditSink {
         database.exec("PRAGMA journal_mode=WAL");
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of schemaV5) database.exec(entry.sql);
+          for (const entry of schemaV6) database.exec(entry.sql);
           database.exec(
-            `PRAGMA application_id=${applicationId}; PRAGMA user_version=5; COMMIT`,
+            `PRAGMA application_id=${applicationId}; PRAGMA user_version=${currentVersion}; COMMIT`,
           );
-          version = 5;
+          version = currentVersion;
         } catch {
           try {
             database.exec("ROLLBACK");
@@ -1188,7 +1209,8 @@ export class SqliteAudit implements AuditSink {
             foundVersion !== 2 &&
             foundVersion !== 3 &&
             foundVersion !== 4 &&
-            foundVersion !== 5)
+            foundVersion !== 5 &&
+            foundVersion !== currentVersion)
         )
           throw new AuditStoreError("invalid-database");
         version = foundVersion;
@@ -1198,7 +1220,7 @@ export class SqliteAudit implements AuditSink {
           "SELECT name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
         )
         .all();
-      const matchesSchema = (expectedSchema: typeof schemaV5) =>
+      const matchesSchema = (expectedSchema: typeof schemaV6) =>
         installed.length === expectedSchema.length &&
         expectedSchema.every((expected) =>
           installed.some((value) => {
@@ -1208,7 +1230,7 @@ export class SqliteAudit implements AuditSink {
         );
       // v5 was never released without the capacity reason, so an earlier
       // draft layout is refused by the exact check rather than rewritten:
-      // append-only tables are never rebuilt in place.
+      // only supported schemas can be migrated.
       if (!matchesSchema(versionSchemas[version]))
         throw new AuditStoreError("invalid-database");
       if (
@@ -1231,7 +1253,7 @@ export class SqliteAudit implements AuditSink {
           .all())
           parseClaimRow(raw);
       }
-      if (version === 5) {
+      if (version >= 5) {
         for (const table of exportTables) {
           if (table === "audit_events") continue;
           const rows = database
@@ -1242,12 +1264,42 @@ export class SqliteAudit implements AuditSink {
           else for (const row of rows) tableReaders[table](row);
         }
       }
-      if (!this.#readOnly && (version === 1 || version === 4)) {
-        const additions = version === 1 ? claimSchema : v5Additions;
-        const upgradedVersion = version === 1 ? 2 : 5;
+      if (
+        !this.#readOnly &&
+        (version === 1 || version === 4 || version === 5)
+      ) {
+        const upgradedVersion = version === 1 ? 2 : currentVersion;
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of additions) database.exec(entry.sql);
+          if (
+            record(database.query("PRAGMA user_version").get()).user_version !==
+            version
+          )
+            throw new AuditStoreError("invalid-database");
+          if (version === 1) {
+            for (const entry of claimSchema) database.exec(entry.sql);
+          } else {
+            if (version === 4)
+              for (const entry of v5Additions) database.exec(entry.sql);
+            // Rebuild only the table whose CHECK constraints changed. Copy
+            // original IDs and the sequence watermark before dropping it.
+            database.exec(
+              "ALTER TABLE audit_events RENAME TO audit_events_previous",
+            );
+            database.exec(auditTableV6);
+            database.exec(`
+              INSERT INTO audit_events SELECT * FROM audit_events_previous;
+              INSERT INTO sqlite_sequence (name, seq)
+                SELECT 'audit_events', seq FROM sqlite_sequence
+                WHERE name = 'audit_events_previous'
+                  AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'audit_events');
+              UPDATE sqlite_sequence SET seq = max(seq, coalesce(
+                (SELECT seq FROM sqlite_sequence WHERE name = 'audit_events_previous'), 0
+              )) WHERE name = 'audit_events';
+              DROP TABLE audit_events_previous;
+            `);
+            for (const entry of auditSchema.slice(1)) database.exec(entry.sql);
+          }
           database.exec(`PRAGMA user_version=${upgradedVersion}; COMMIT`);
           version = upgradedVersion;
         } catch {
@@ -1284,16 +1336,17 @@ export class SqliteAudit implements AuditSink {
     return this.#version;
   }
 
+  /** Legacy capability name used by the gateway. Requires the current schema. */
   get isV5Writable(): boolean {
     return (
-      this.#version === 5 &&
+      this.#version === currentVersion &&
       !this.#closed &&
       !this.#readOnly &&
       !this.#writeFailed
     );
   }
 
-  /** Notify subscribers when this store can no longer accept v5 writes. */
+  /** Notify subscribers when this store can no longer accept audited runtime writes. */
   onV5Unwritable(listener: () => void): () => void {
     if (!this.isV5Writable) listener();
     else this.#writabilityListeners.add(listener);
@@ -1318,9 +1371,10 @@ export class SqliteAudit implements AuditSink {
     if (this.#writeFailed) throw new AuditStoreError("append-failed");
   }
 
-  #requireV5Writer(): void {
+  #requireCurrentWriter(): void {
     this.#requireWriter();
-    if (this.#version !== 5) throw new AuditStoreError("invalid-event");
+    if (this.#version !== currentVersion)
+      throw new AuditStoreError("invalid-event");
   }
 
   #appendTransaction(write: (recordedAt: string) => void): void {
@@ -1363,6 +1417,11 @@ export class SqliteAudit implements AuditSink {
   append(event: AuditInput): void {
     this.#requireWriter();
     const input = parseInput(event);
+    if (
+      this.#version < 6 &&
+      (input.role === "Concierge" || input.profile === "concierge")
+    )
+      throw new AuditStoreError("invalid-event");
     // Older traces must never silently lose profile or verification evidence.
     if (
       this.#version < 4 &&
@@ -1386,7 +1445,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendExecutionContext(context: ExecutionContext): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const input = parseAuditContext(context);
     this.#appendTransaction((recordedAt) =>
       this.#insert("execution_contexts", recordedAt, {
@@ -1404,7 +1463,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendSandboxBinding(binding: SandboxBindingInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const input = parseBinding(binding);
     this.#appendTransaction((recordedAt) =>
       this.#insert("sandbox_bindings", recordedAt, input),
@@ -1412,7 +1471,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendProcessResult(result: ProcessResultInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const input = parseProcess(result);
     this.#appendTransaction((recordedAt) =>
       this.#insert("process_results", recordedAt, {
@@ -1424,7 +1483,7 @@ export class SqliteAudit implements AuditSink {
 
   /** Return only once both the request and decision are durably committed. */
   appendNetwork(network: NetworkInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const {
       connectionId: flowId,
       decision,
@@ -1449,7 +1508,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendNetworkFinished(network: NetworkFinishedInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const { connectionId: flowId, ...input } = parseFinished(network);
     this.#appendTransaction((recordedAt) => {
       const grant = this.#database
@@ -1469,7 +1528,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendDnsQuery(query: DnsQueryInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const {
       queryId: flowId,
       qname,
@@ -1488,7 +1547,7 @@ export class SqliteAudit implements AuditSink {
   }
 
   appendResourceEvent(event: ResourceEventInput): void {
-    this.#requireV5Writer();
+    this.#requireCurrentWriter();
     const input = parseResource(event);
     this.#appendTransaction((recordedAt) =>
       this.#insert("resource_events", recordedAt, input),

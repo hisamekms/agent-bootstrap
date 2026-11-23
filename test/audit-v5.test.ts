@@ -41,7 +41,7 @@ function fixture(t: TestContext): string {
   return join(directory, "audit.sqlite");
 }
 
-function legacy(filename: string, version: 1 | 2 | 3 | 4): void {
+function legacy(filename: string, version: 1 | 2 | 3 | 4 | 5): void {
   const db = new Database(filename, { create: true });
   try {
     db.exec("PRAGMA journal_mode=WAL");
@@ -148,11 +148,11 @@ function v5Appends(audit: SqliteAudit): (() => void)[] {
   ];
 }
 
-test("fresh v5 stores and reopens every kind of evidence", (t) => {
+test("fresh v6 stores and reopens every kind of evidence", (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 5);
+  assert.equal(audit.schemaVersion, 6);
   assert.equal(audit.isV5Writable, true);
   audit.append(started);
   audit.claimRequest(claim);
@@ -160,7 +160,7 @@ test("fresh v5 stores and reopens every kind of evidence", (t) => {
   audit.close();
 
   withDb(filename, (db) => {
-    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 5);
+    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 6);
     assert.equal(db.query("PRAGMA journal_mode").get()?.journal_mode, "wal");
     assert.equal(db.query("PRAGMA quick_check").get()?.quick_check, "ok");
   });
@@ -255,7 +255,7 @@ test("export watermarks resume independently for each execution table", (t) => {
     );
 });
 
-test("read-only v4 is preserved and write-open upgrades without changing existing tables or rows", (t) => {
+test("read-only v4 is preserved and write-open upgrades without changing existing rows", (t) => {
   const filename = fixture(t);
   legacy(filename, 4);
   withDb(filename, (db) => {
@@ -288,7 +288,7 @@ test("read-only v4 is preserved and write-open upgrades without changing existin
 
   const writer = new SqliteAudit(filename);
   t.after(() => writer.close());
-  assert.equal(writer.schemaVersion, 5);
+  assert.equal(writer.schemaVersion, 6);
   assert.deepEqual(writer.readExecution(invocationId), expected);
   assert.equal(writer.claimRequest(claim).replayed, true);
   writer.appendExecutionContext(context);
@@ -341,7 +341,7 @@ test("every audit table blocks updates and deletes", (t) => {
   });
 });
 
-test("exact-schema validation refuses a replaced v5 trigger", (t) => {
+test("exact-schema validation refuses a replaced runtime audit trigger", (t) => {
   const filename = fixture(t);
   new SqliteAudit(filename).close();
   withDb(filename, (db) => {
@@ -603,4 +603,55 @@ test("a killed writer leaves a durable decision and a derived unknown outcome", 
       .map(({ connectionId, outcome }) => [connectionId, outcome]),
     [[network.connectionId, "unknown"]],
   );
+});
+
+test("v5 upgrade preserves existing history, the sequence watermark and append-only triggers", (t) => {
+  const filename = fixture(t);
+  legacy(filename, 5);
+  withDb(filename, (db) => {
+    db.query(
+      "INSERT INTO audit_events (sequence, recorded_at, invocation_id, kind, role) VALUES (7, ?, ?, 'invocation.started', 'Worker')",
+    ).run(new Date().toISOString(), invocationId);
+    db.query(
+      "INSERT INTO resource_events (recorded_at, invocation_id, kind) VALUES (?, ?, 'timed-out')",
+    ).run(new Date().toISOString(), invocationId);
+    db.exec("UPDATE sqlite_sequence SET seq = 30 WHERE name = 'audit_events'");
+  });
+  const reader = new SqliteAudit(filename, { readonly: true });
+  assert.equal(reader.schemaVersion, 5);
+  assert.equal(reader.isV5Writable, false);
+  const oldRows = reader.readSince({});
+  assert.equal(oldRows.length, 2);
+  reader.close();
+
+  const audit = new SqliteAudit(filename);
+  t.after(() => audit.close());
+  assert.equal(audit.schemaVersion, 6);
+  assert.deepEqual(audit.readSince({}), oldRows);
+  audit.append({
+    invocationId,
+    kind: "operation.requested",
+    operation: "sandbox.create",
+    role: "Concierge",
+    profile: "concierge",
+    image: digest,
+  });
+  audit.append({ ...started, role: "Reviewer" });
+  const [, concierge, reviewer] = audit.read(invocationId);
+  assert.equal(concierge?.sequence, 31);
+  assert.equal(concierge?.role, "Concierge");
+  assert.equal(concierge?.profile, "concierge");
+  assert.equal(reviewer?.role, "Reviewer");
+  withDb(filename, (db) => {
+    assert.throws(
+      () => db.exec("UPDATE audit_events SET role = 'Worker'"),
+      /append-only/,
+    );
+    assert.throws(() => db.exec("DELETE FROM audit_events"), /append-only/);
+    assert.throws(() => db.exec("DELETE FROM resource_events"), /append-only/);
+  });
+  audit.close();
+  const reopened = new SqliteAudit(filename, { readonly: true });
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.read(invocationId)[1], concierge);
 });

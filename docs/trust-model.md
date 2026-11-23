@@ -34,10 +34,18 @@ artifact references. Persist large artifacts separately under controlled
 access and redact secrets before persistence. Process output by itself
 provides partial observation.
 
+The Concierge runs in an interactive VM with a read-only repository snapshot
+and a named session volume. It reaches the Host API through a dedicated
+Unix socket exposed over vsock. The Host API binds actions to the session
+and reserves approval for the operator. Network egress reaches only
+`api.anthropic.com:443` through the audited gateway with a guest credential
+placeholder. Claude Code settings, hooks, MCP and tool allowlists are
+auxiliary controls. The VM and trusted host enforce the boundary.
+
 ## Runtime observability
 
-SQLite v5 is the authoritative audit store. In required mode the trusted
-host records the sandbox binding and rule-set digest before creation, and the
+SQLite v6 is the authoritative audit store. In required mode the trusted
+host records the sandbox binding and create-channel digest before creation, and the
 host gateway records TCP and DNS decisions before the corresponding outbound
 connect or policy reply. Audit failure stops normal execution and triggers
 emergency teardown. JSONL and OTLP files are analysis copies with no tamper

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -8,6 +9,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { symlink } from "node:fs/promises";
 import test, { type TestContext } from "node:test";
@@ -19,7 +21,11 @@ import {
 } from "../src/microsandbox.ts";
 import { RoutingSandboxRuntime } from "../src/routing-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
-import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
+import {
+  SandboxRuntimeError,
+  type SandboxSpec,
+  type TerminalCommand,
+} from "../src/sandbox-runtime.ts";
 
 const image = `fixture.invalid/alpine@sha256:${"a".repeat(64)}`;
 const profiles = new ProfileCatalog({ base: { image } });
@@ -62,6 +68,7 @@ async function fixture(t: TestContext) {
     binary,
     `#!${process.execPath}
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from "node:net";
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { truncateSync } from 'node:fs';
@@ -130,7 +137,11 @@ if (args[0] === '--version') {
   const command = args.slice(separator + 1);
   const workspace = join(guests, name);
   if (!existsSync(workspace)) fail();
-  if (command[0] === 'fixture-write') writeFileSync(join(workspace, command[1]), command[2]);
+  if (args[1] === '-t') {
+    if (mode === 'terminal-sleep') await new Promise(resolve => setTimeout(resolve, 30000));
+    else process.exitCode = mode === 'terminal-fail' ? 7 : 0;
+  }
+  else if (command[0] === 'fixture-write') writeFileSync(join(workspace, command[1]), command[2]);
   else if (command[0] === 'fixture-cat') process.stdout.write(readFileSync(join(workspace, command[1])));
   else if (command[0] === 'fixture-fail') { process.stderr.write('synthetic guest failure'); process.exitCode = 7; }
   else if (command[0] === 'fixture-sleep') await new Promise(resolve => setTimeout(resolve, 30000));
@@ -160,6 +171,13 @@ if (args[0] === '--version') {
     console.log(String(mode === 'oversized-collection' ? 999999999 : bytes.length));
     console.log(bytes.toString('base64'));
   } else fail();
+} else if (args[0] === 'volume') {
+  log();
+  if (mode === 'volume-fail') fail();
+  if (mode === 'volume-exists') {
+    process.stderr.write('volume already exists');
+    process.exitCode = 1;
+  }
 } else if (args[0] === 'copy') {
   log();
   const [name, guestPath] = args[1].split(':');
@@ -1329,4 +1347,316 @@ test("tree collection failures and oversized tars clean up", async (t) => {
     await assert.rejects(f.runtime.collect(handle, { tree: true }), pattern);
     await assertCleanup(f);
   }
+});
+
+async function interactiveFixture(t: TestContext) {
+  const f = await fixture(t);
+  // A Unix-domain socket needs a much shorter pathname than the worktree.
+  const root = await mkdtemp("/tmp/lo-msb-");
+  const hostPath = join(root, "api.sock");
+  const snapshotDir = join(root, "snapshot");
+  const server = createServer();
+  t.after(async () => {
+    if (server.listening)
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  await mkdir(snapshotDir);
+  const socketAvailable = await new Promise<boolean>((resolve, reject) => {
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EPERM") resolve(false);
+      else reject(error);
+    });
+    server.listen(hostPath, () => resolve(true));
+  });
+  if (socketAvailable) await chmod(hostPath, 0o600);
+  const provider = {
+    host: "api.anthropic.com",
+    secretEnv: "ANTHROPIC_API_KEY",
+  };
+  const runtime = new MicrosandboxRuntime({
+    ...f.config,
+    profiles: new ProfileCatalog({ base: { image }, concierge: { image } }),
+    providers: [provider],
+    credentials: { withAccessToken: (consume) => consume("fixture-token") },
+    gatewayPassword: () => gatewayPassword,
+  });
+  const interactive = {
+    vsock: { hostPath, port: 5000 },
+    stateVolume: "lo-session-1",
+    snapshotDir,
+  };
+  const spec = {
+    profile: "concierge",
+    interactive,
+    provider,
+    egressGateway: gateway,
+  } as const;
+  return { ...f, runtime, root, spec, interactive, socketAvailable };
+}
+
+test("non-interactive digest still hashes the original network argv", async (t) => {
+  const { runtime } = await fixture(t);
+  assert.equal(
+    runtime.netRuleDigest({}),
+    createHash("sha256").update('["--no-net"]').digest("hex"),
+  );
+});
+
+test("interactive create hashes exact host channels without changing non-interactive digests", async (t) => {
+  const { runtime, spec, interactive, events, setMode, socketAvailable } =
+    await interactiveFixture(t);
+  if (!socketAvailable)
+    return t.skip("Unix socket bind is blocked by the execution sandbox");
+  const plain = { provider: spec.provider, egressGateway: gateway };
+  const channels = [
+    "--vsock",
+    `${interactive.vsock.hostPath}:5000`,
+    "--mount-named",
+    "lo-session-1:/state",
+    "--mount-dir",
+    `${interactive.snapshotDir}:/repo:ro`,
+  ];
+  const handle = await runtime.create({
+    ...spec,
+    maxLifetimeMs: MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs,
+  });
+  try {
+    const create = (await events()).find(
+      (event) => event.args[0] === "create",
+    )!;
+    const network = create.args.slice(
+      create.args.indexOf("--no-net"),
+      create.args.indexOf("--vsock"),
+    );
+    const digest = (args: string[]) =>
+      createHash("sha256").update(JSON.stringify(args)).digest("hex");
+    assert.equal(runtime.netRuleDigest(plain), digest(network));
+    assert.equal(handle.netRuleDigest, digest([...network, ...channels]));
+    assert.deepEqual(
+      create.args.slice(
+        create.args.indexOf("--vsock"),
+        create.args.indexOf("--copy-dir"),
+      ),
+      [...channels, "--max-duration", "43200s"],
+    );
+    assert.notEqual(
+      runtime.netRuleDigest({
+        ...spec,
+        interactive: { ...interactive, stateVolume: "lo-other" },
+      }),
+      handle.netRuleDigest,
+    );
+
+    await setMode("terminal-fail");
+    assert.deepEqual(
+      await runtime.attachTerminal(handle, {
+        argv: ["claude", "--continue"],
+        env: { HOME: "/state", TERM: "xterm-256color" },
+        workdir: "/state",
+      }),
+      { exitCode: 7 },
+    );
+    const attach = (await events()).at(-1)!;
+    assert.deepEqual(attach.args, [
+      "exec",
+      "-t",
+      "--workdir",
+      "/state",
+      handle.id,
+      "--",
+      "/usr/bin/env",
+      "--",
+      "HOME=/state",
+      "TERM=xterm-256color",
+      "claude",
+      "--continue",
+    ]);
+    assert.deepEqual(attach.envKeys, ["MSB_BACKEND", "MSB_HOME", "PATH"]);
+  } finally {
+    await runtime.destroy(handle);
+  }
+});
+
+test("interactive specs reject conflicting channels, invalid names and unsafe host paths before launch", async (t) => {
+  const { runtime, root, spec, interactive, events, socketAvailable } =
+    await interactiveFixture(t);
+  const { vsock, snapshotDir } = interactive;
+  const linkedSnapshot = join(root, "snapshot-link");
+  const linkedSocket = join(root, "socket-link");
+  await symlink(snapshotDir, linkedSnapshot);
+  await symlink(vsock.hostPath, linkedSocket);
+  const invalidSpecs: SandboxSpec[] = [
+    { profile: "concierge" },
+    { ...spec, profile: "base" },
+    { ...spec, interactive, provider: undefined } as unknown as SandboxSpec,
+    {
+      ...spec,
+      interactive,
+      egressGateway: undefined,
+    } as unknown as SandboxSpec,
+    { ...spec, files: [] },
+    { ...spec, readOnlyFiles: [] },
+    { ...spec, repository: { gitDir: "/fixture", tree: "/fixture" } },
+    { ...spec, hostTcpPort: 8000 },
+    {
+      ...spec,
+      maxLifetimeMs: MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs + 1,
+    },
+    { maxLifetimeMs: MICROSANDBOX_LIMITS.maxLifetimeMs + 1 },
+    ...[0, 1023, 1024.5, 65536].map((port) => ({
+      ...spec,
+      interactive: { ...interactive, vsock: { ...vsock, port } },
+    })),
+    ...[
+      "relative",
+      linkedSocket,
+      snapshotDir,
+      ...[":", ",", "=", "\0", "\n"].map((c) => vsock.hostPath + c),
+      "/" + "é".repeat(50),
+    ].map((hostPath) => ({
+      ...spec,
+      interactive: { ...interactive, vsock: { ...vsock, hostPath } },
+    })),
+    ...[
+      "no-prefix",
+      "lo-",
+      "lo--a",
+      "lo-A",
+      "lo-a/b",
+      "lo-" + "a".repeat(64),
+    ].map((stateVolume) => ({
+      ...spec,
+      interactive: { ...interactive, stateVolume },
+    })),
+    ...[
+      "relative",
+      vsock.hostPath,
+      linkedSnapshot,
+      linkedSnapshot + "/",
+      ...[":", ",", "="].map((c) => snapshotDir + c),
+    ].map((snapshotDir) => ({
+      ...spec,
+      interactive: { ...interactive, snapshotDir },
+    })),
+  ];
+  for (const invalidSpec of invalidSpecs)
+    await assert.rejects(runtime.create(invalidSpec), /invalid-input/);
+  if (socketAvailable) {
+    await chmod(vsock.hostPath, 0o660);
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+    await chmod(vsock.hostPath, 0o600);
+    await chmod(root, 0o720);
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  } else {
+    await assert.rejects(runtime.create(spec), /invalid-input/);
+  }
+  assert.deepEqual(await events(), []);
+});
+
+test("terminal validation, exclusive attach and deadline use the existing handle", async (t) => {
+  const { runtime, spec, setMode, events, socketAvailable } =
+    await interactiveFixture(t);
+  if (!socketAvailable)
+    return t.skip("Unix socket bind is blocked by the execution sandbox");
+  const plain = await runtime.create({});
+  await assert.rejects(
+    runtime.attachTerminal(plain, { argv: ["claude"] }),
+    /unsupported/,
+  );
+  await runtime.destroy(plain);
+  const handle = await runtime.create({ ...spec, maxLifetimeMs: 1500 });
+  const invalid: TerminalCommand[] = [
+    { argv: [] },
+    { argv: Array<string>(65).fill("x") },
+    { argv: ["claude", "x\0y"] },
+    { argv: ["claude"], workdir: "/workspace" } as unknown as TerminalCommand,
+    { argv: ["claude"], env: { lowercase: "x" } },
+    { argv: ["claude"], env: { ANTHROPIC_API_KEY: "fixture" } },
+    { argv: ["claude"], env: { DATABASE_PASSWORD: "fixture" } },
+    { argv: ["claude"], env: { TERM: "x\0y" } },
+    { argv: ["ANTHROPIC_API_KEY=fixture", "claude"], env: { TERM: "x" } },
+  ];
+  for (const command of invalid)
+    await assert.rejects(
+      runtime.attachTerminal(handle, command),
+      /invalid-input/,
+    );
+  await setMode("terminal-sleep");
+  const hanging = runtime.attachTerminal(handle, { argv: ["claude"] });
+  await assert.rejects(
+    runtime.attachTerminal(handle, { argv: ["claude"] }),
+    /busy/,
+  );
+  assert.deepEqual(await hanging, { exitCode: null });
+  assert.deepEqual((await events()).at(-1)?.args, [
+    "exec",
+    "-t",
+    "--workdir",
+    "/repo",
+    handle.id,
+    "--",
+    "claude",
+  ]);
+  await assert.rejects(
+    runtime.attachTerminal(handle, { argv: ["claude"] }),
+    /lifetime-expired/,
+  );
+  await runtime.destroy(handle);
+});
+
+test("volume create tolerates existing volumes and rejects other failures and invalid names", async (t) => {
+  const { runtime, events, setMode } = await fixture(t);
+  await assert.rejects(runtime.createVolume("-o"), /invalid-input/);
+  await assert.rejects(runtime.removeVolume("lo-../../"), /invalid-input/);
+  await runtime.createVolume("lo-session");
+  await setMode("volume-exists");
+  await runtime.createVolume("lo-session");
+  await setMode("volume-fail");
+  await assert.rejects(runtime.createVolume("lo-session"), /backend-failure/);
+  await assert.rejects(runtime.removeVolume("lo-session"), /backend-failure/);
+  await setMode("normal");
+  await runtime.removeVolume("lo-session");
+  assert.deepEqual(
+    (await events()).map(({ args }) => args),
+    [
+      ["volume", "create", "lo-session"],
+      ["volume", "create", "lo-session"],
+      ["volume", "create", "lo-session"],
+      ["volume", "remove", "lo-session"],
+      ["volume", "remove", "lo-session"],
+    ],
+  );
+});
+
+test("create checks gateway availability after asynchronous provider credential acquisition", async (t) => {
+  const { config, events } = await fixture(t);
+  const provider = {
+    host: "api.anthropic.com",
+    secretEnv: "ANTHROPIC_API_KEY",
+  };
+  let grant = true;
+  const runtime = new MicrosandboxRuntime({
+    ...config,
+    providers: [provider],
+    gatewayPassword() {
+      if (!grant) throw new Error("gateway unavailable");
+      return gatewayPassword;
+    },
+    credentials: {
+      async withAccessToken(consume) {
+        await Promise.resolve();
+        grant = false;
+        return consume("fixture-token");
+      },
+    },
+  });
+  await assert.rejects(
+    runtime.create({ provider, egressGateway: gateway }),
+    /backend-failure/,
+  );
+  assert.equal(
+    (await events()).some(({ args }) => args[0] === "create"),
+    false,
+  );
 });

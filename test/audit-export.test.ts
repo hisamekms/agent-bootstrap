@@ -376,3 +376,20 @@ test("reports checkpoint ENOSPC while holding the lock and resumes without dupli
     audit_events: 2,
   });
 });
+
+test("exports Concierge role and profile with the existing JSONL schema", (t) => {
+  const { db, obs, dir, audit } = fixture(t);
+  audit.append({
+    invocationId,
+    kind: "operation.requested",
+    operation: "sandbox.create",
+    role: "Concierge",
+    profile: "concierge",
+    image: policyId,
+  });
+  exportAudit(db, obs, { now });
+  const [row] = lines(dir);
+  assert.equal(row?.schemaVersion, "agent-bootstrap.audit/v1");
+  assert.equal(row?.actor, "Concierge");
+  assert.deepEqual(row?.attributes, { profile: "concierge", image: policyId });
+});

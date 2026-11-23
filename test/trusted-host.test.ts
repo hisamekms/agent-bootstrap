@@ -29,6 +29,7 @@ import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+  concierge: { image: `fixture.invalid/concierge@sha256:${"c".repeat(64)}` },
 });
 
 function fixture(t: { after(fn: () => void): void }) {
@@ -564,7 +565,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
   assert.deepEqual(calls, ["create", "destroy"]);
 });
 
-test("a new audit database uses schema 5 and records provider egress", async (t) => {
+test("a new audit database uses schema 6 and records provider egress", async (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   const id = randomUUID();
@@ -590,7 +591,7 @@ test("a new audit database uses schema 5 and records provider egress", async (t)
       encoding: "utf8",
     },
   );
-  if (version.status === 0) assert.equal(version.stdout.trim(), "5");
+  if (version.status === 0) assert.equal(version.stdout.trim(), "6");
 });
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
@@ -1405,7 +1406,7 @@ test("required host refuses invalid setup, mismatched context and direct host po
         config: requiredConfig,
         gatewayFactory: fake.open,
       }),
-    /Writable v5/,
+    /Writable v6/,
   );
   await assert.rejects(
     host.runWorker({
@@ -1726,4 +1727,227 @@ test("Coordinator session send refuses further guest work after gateway quaranti
     "gateway.close",
     "destroy",
   ]);
+});
+
+const conciergePlan = {
+  sandbox: {
+    profile: "concierge",
+    provider: { host: "api.anthropic.com", secretEnv: "ANTHROPIC_API_KEY" },
+    interactive: {
+      vsock: { hostPath: "/fixture/api.sock", port: 5000 },
+      stateVolume: "lo-session",
+      snapshotDir: "/fixture/repo",
+    },
+  },
+} as const;
+
+test("Concierge creates through the audited provider gateway and records each terminal attach", async (t) => {
+  const id = randomUUID();
+  const results = [7, 0];
+  const { host, calls, db, fake } = observedFixture(t, {
+    async attachTerminal(handle, command) {
+      calls.push("attach");
+      assert.equal(
+        handle.id,
+        db.readExecution(id).sandboxBindings[0]?.sandboxId,
+      );
+      assert.equal(db.read(id).at(-1)?.kind, "operation.allowed");
+      assert.equal(db.read(id).at(-1)?.operation, "sandbox.exec");
+      assert.deepEqual(command.argv, ["claude"]);
+      return { exitCode: results.shift()! };
+    },
+  });
+  let escaped: ((command: { argv: string[] }) => Promise<unknown>) | undefined;
+  assert.deepEqual(
+    await host.runConcierge(conciergePlan, id, async ({ attach }) => {
+      escaped = attach;
+      assert.deepEqual(await attach({ argv: ["claude"] }), { exitCode: 7 });
+      assert.deepEqual(await attach({ argv: ["claude"] }), { exitCode: 0 });
+      return "used";
+    }),
+    { id, outcome: "ok", value: "used" },
+  );
+  await assert.rejects(escaped!({ argv: ["claude"] }), /unknown-handle/);
+  assert.deepEqual(fake.opened?.policy.allow, [
+    { hostname: "api.anthropic.com", port: 443 },
+  ]);
+  assert.deepEqual(fake.opened?.policy.hostServices, []);
+  assert.deepEqual(
+    db.readExecution(id).processResults.map(({ exitCode }) => exitCode),
+    [7, 0],
+  );
+  const trace = db.read(id);
+  assert.ok(trace.every(({ role }) => role === "Concierge"));
+  assert.equal(
+    trace.find(({ operation }) => operation === "sandbox.create")?.profile,
+    "concierge",
+  );
+  assert.deepEqual(
+    trace
+      .filter(({ operation }) => operation === "sandbox.exec")
+      .map(({ kind, outcome }) => [kind, outcome]),
+    [
+      ["operation.requested", undefined],
+      ["operation.allowed", undefined],
+      ["operation.finished", "failed"],
+      ["operation.requested", undefined],
+      ["operation.allowed", undefined],
+      ["operation.finished", "ok"],
+    ],
+  );
+  assert.deepEqual(
+    calls.filter((call) =>
+      ["create", "attach", "gateway.close", "destroy"].includes(call),
+    ),
+    ["create", "attach", "attach", "gateway.close", "destroy"],
+  );
+});
+
+test("Concierge refuses unsupported hosts, other profiles, other providers and host services before create", async (t) => {
+  const use = async () => assert.fail("unexpected callback");
+  const unsupported = observedFixture(t);
+  await assert.rejects(
+    unsupported.host.runConcierge(conciergePlan, randomUUID(), use),
+    /audited interactive/,
+  );
+  const { host, calls, runtime, db } = observedFixture(t, {
+    async attachTerminal() {
+      assert.fail("unexpected attach");
+    },
+  });
+  const unaudited = new TrustedHost(db, runtime, profiles);
+  await assert.rejects(
+    unaudited.runConcierge(conciergePlan, randomUUID(), use),
+    /audited interactive/,
+  );
+  for (const sandbox of [
+    { ...conciergePlan.sandbox, profile: "base" as const },
+    { ...conciergePlan.sandbox, provider },
+    {
+      ...conciergePlan.sandbox,
+      provider: { ...conciergePlan.sandbox.provider, port: 444 },
+    },
+    { ...conciergePlan.sandbox, hostTcpPort: 8080 },
+  ])
+    await assert.rejects(
+      host.runConcierge({ sandbox }, randomUUID(), use),
+      /audited interactive/,
+    );
+  await assert.rejects(
+    host.runConcierge(conciergePlan, randomUUID(), use, undefined, {
+      hostServices: [
+        {
+          hostname: HOST_SERVICE_NAME,
+          port: 8080,
+          ip: "192.0.2.1",
+          loopbackPort: 8080,
+        },
+      ],
+    }),
+    /audited interactive/,
+  );
+  await assert.rejects(
+    host.runWorker({ ...plan, sandbox: { profile: "concierge" } }),
+    /profile not allowed/,
+  );
+  await assert.rejects(
+    host.runWorker({
+      ...plan,
+      sandbox: { interactive: conciergePlan.sandbox.interactive },
+    }),
+    /Only Concierge/,
+  );
+  assert.deepEqual(calls, []);
+  assert.deepEqual(unsupported.calls, []);
+});
+
+test("Concierge cannot resume guest work after a mandatory terminal audit failure", async (t) => {
+  for (const label of [
+    "operation.requested sandbox.exec",
+    "operation.allowed sandbox.exec",
+    "process_results",
+    "operation.finished sandbox.exec",
+  ]) {
+    const id = randomUUID();
+    const { host, calls, db } = observedFixture(
+      t,
+      {
+        async attachTerminal() {
+          calls.push("attach");
+          return { exitCode: 0 };
+        },
+      },
+      label,
+    );
+    await assert.rejects(
+      host.runConcierge(conciergePlan, id, async ({ attach }) => {
+        await assert.rejects(attach({ argv: ["claude"] }), HostAuditError);
+        await assert.rejects(
+          async () => attach({ argv: ["claude"] }),
+          HostAuditError,
+        );
+      }),
+      HostAuditError,
+    );
+    assert.equal(
+      calls.filter((call) => call === "attach").length,
+      label.startsWith("operation.") && !label.includes("finished") ? 0 : 1,
+    );
+    assert.equal(
+      db.read(id).some(({ operation }) => operation === "sandbox.destroy"),
+      false,
+    );
+    assert.deepEqual(calls.slice(-2), ["gateway.close", "destroy"]);
+  }
+});
+
+test("Concierge closes the gateway and destroys a sandbox when audit fails during an attach", async (t) => {
+  const id = randomUUID();
+  let stop: (result: { exitCode: null }) => void = () =>
+    assert.fail("no attach");
+  const { host, calls, db, fake } = observedFixture(t, {
+    async attachTerminal() {
+      calls.push("attach");
+      return new Promise((resolve) => {
+        stop = resolve;
+        fake.quarantine();
+      });
+    },
+    async destroy() {
+      calls.push("destroy");
+      stop({ exitCode: null });
+    },
+  });
+  await assert.rejects(
+    host.runConcierge(conciergePlan, id, ({ attach }) =>
+      attach({ argv: ["claude"] }),
+    ),
+    HostAuditError,
+  );
+  assert.deepEqual(calls.slice(-3), ["attach", "gateway.close", "destroy"]);
+  assert.deepEqual(db.readExecution(id).processResults, []);
+});
+
+test("an idle Concierge callback cannot retain the VM and gateway past its lifetime", async (t) => {
+  const id = randomUUID();
+  const { host, calls, db } = observedFixture(t, {
+    async attachTerminal() {
+      assert.fail("unexpected attach");
+    },
+  });
+  let attachAfterExpiry: (() => Promise<unknown>) | undefined;
+  const result = await host.runConcierge(
+    {
+      sandbox: { ...conciergePlan.sandbox, maxLifetimeMs: 30 },
+    },
+    id,
+    ({ attach }) => {
+      attachAfterExpiry = () => attach({ argv: ["claude"] });
+      return new Promise(() => {});
+    },
+  );
+  assert.deepEqual(result, { id, outcome: "timed-out" });
+  await assert.rejects(attachAfterExpiry!(), /unknown-handle/);
+  assert.equal(db.read(id).at(-1)?.outcome, "timed-out");
+  assert.ok(calls.indexOf("gateway.close") < calls.indexOf("destroy"));
 });

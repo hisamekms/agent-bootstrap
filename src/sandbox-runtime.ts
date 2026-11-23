@@ -70,6 +70,18 @@ export interface SandboxEgressGateway {
   readonly passwordEnv: string;
 }
 
+export interface InteractiveSpec {
+  readonly vsock: { readonly hostPath: string; readonly port: number };
+  readonly stateVolume: string;
+  readonly snapshotDir: string;
+}
+
+export interface TerminalCommand {
+  readonly argv: readonly string[];
+  readonly env?: Readonly<Record<string, string>>;
+  readonly workdir?: "/repo" | "/state";
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -90,7 +102,7 @@ export interface SandboxSpec {
   /** Direct TCP to this host port. Mutually exclusive with the gateway. */
   readonly hostTcpPort?: number;
   readonly egressGateway?: SandboxEgressGateway;
-  /** Network argv digest already recorded by the host before create. */
+  /** Network and interactive host-channel argv digest recorded before create. */
   readonly expectedNetRuleDigest?: string;
   /** HTTPS egress to one model provider host, with the trusted host's
    * credential substituted for a guest placeholder in the Authorization
@@ -98,6 +110,7 @@ export interface SandboxSpec {
   readonly provider?: SandboxProvider;
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
+  readonly interactive?: InteractiveSpec;
   readonly maxLifetimeMs?: number;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
   readonly invocationId?: string;
@@ -167,7 +180,7 @@ export interface SandboxSession {
 }
 
 export interface SandboxRuntime {
-  /** Computes the network argv digest before the host authorizes create. */
+  /** Computes the network and interactive host-channel argv digest before the host authorizes create. */
   netRuleDigest?(spec: SandboxSpec): string;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
   /** Creates under the host's audited ID and enforces expectedNetRuleDigest. */
@@ -178,6 +191,12 @@ export interface SandboxRuntime {
     handle: SandboxHandle,
     command: SandboxCommand,
   ): Promise<SandboxSession>;
+  attachTerminal?(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+  ): Promise<{ exitCode: number | null }>;
+  createVolume?(name: string): Promise<void>;
+  removeVolume?(name: string): Promise<void>;
   collect(
     handle: SandboxHandle,
     spec: CollectSpec,

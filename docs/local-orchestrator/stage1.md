@@ -128,3 +128,35 @@ in a host-controlled directory outside those workspaces and snapshots.
   first. The limit defaults to 50 and accepts values from 1 to 1,000.
 
 The CLI exits with 0 on success, 1 on refusal or failure, and 2 on usage errors.
+
+## Interactive sandboxes
+
+`TrustedHost.runConcierge` requires audit schema v6 and required audit mode.
+It binds the `concierge` profile to the audited gateway with egress limited
+to `api.anthropic.com:443`. The host prepares a dedicated Unix socket with
+mode `0600` in a protected directory. The guest connects through vsock CID 2.
+The adapter mounts the trusted snapshot read-only at `/repo` and the named
+`lo-*` volume at `/state`. The host manages the named volume separately so
+session state can survive VM replacement.
+
+The create binding retains the `netRuleDigest` field and hashes the JSON
+array of network arguments followed by the vsock, named volume and snapshot
+mount arguments in CLI order. The digest input for non-interactive VMs
+still consists of the network arguments alone. The v5-to-v6 migration
+preserves existing audit events, their sequence numbers and the append-only
+triggers.
+
+The adapter inherits terminal I/O for one `msb exec -t` at a time and kills
+the client at the VM deadline. Interactive VMs accept a lifetime of up to
+12 hours. Guest environment overrides are passed as literal arguments to
+`/usr/bin/env` because this implementation uses the guest command interface
+for environment setup. Credential-like variable names are rejected. The host
+records each attach authorization and exit status. If a mandatory audit
+write fails, it stops normal execution, closes egress and attempts emergency
+VM teardown.
+
+Fake CLI tests cover argument construction, channel validation, digest
+compatibility and attach deadlines. The prior PoC exercised vsock, mounts
+and initial TTY behavior individually. The combined gateway and interactive
+session path, guest environment wrapper, and live TTY resize still need
+real-VM verification.
