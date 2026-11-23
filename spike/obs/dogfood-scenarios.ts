@@ -507,7 +507,8 @@ function scenarioChecks(
 ): Checks {
   const run = "execution_id = getvariable('execution_id')";
   const checks: Checks = {
-    "clean finalized inputs": "(SELECT count(*) = 0 FROM input_issues)",
+    "clean finalized inputs":
+      "(SELECT count(*) = 0 FROM input_issues WHERE issue <> 'missing-stream')",
     "result by execution ID": `
       (SELECT count(*) = 1 AND min(outcome) = ${quote(expectedOutcome(scenario))}
         AND min(audit_record_count) > 0 AND bool_and(started_at IS NOT NULL)

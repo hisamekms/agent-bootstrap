@@ -4,6 +4,21 @@ CREATE OR REPLACE TEMP VIEW orchestrator_checkpoints AS
 SELECT obs_source_target(filename, 3) AS target, try_cast(decode(content) AS JSON) AS state
 FROM read_blob(obs_paths('orchestrator', '/export-state.json'));
 
+CREATE OR REPLACE TEMP VIEW input_issues AS
+SELECT * FROM obs_input_issues
+UNION ALL
+SELECT 'orchestrator', path, 'missing-stream'
+FROM unnest(obs_paths('orchestrator', '/export-state.json')) AS paths(path)
+ANTI JOIN glob(obs_paths('orchestrator', '/export-state.json')) ON path = file
+UNION ALL
+SELECT * FROM obs_missing_rotations('orchestrator/events')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/proposals')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/approvals')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/tasks')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/goals')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/executions')
+UNION ALL SELECT * FROM obs_missing_rotations('orchestrator/sessions');
+
 CREATE OR REPLACE TEMP MACRO orchestrator_records(stream) AS TABLE
 SELECT c.target, r.record
 FROM obs_records('orchestrator/' || stream) r
@@ -125,6 +140,22 @@ LEFT JOIN derived_goals g USING (target, id)
 LEFT JOIN approval_context a USING (target, id)
 LEFT JOIN proposal_context p ON (e.target, e.approval_proposal_id) = (p.target, p.proposal_id)
 LEFT JOIN timing v USING (target, id);
+
+CREATE OR REPLACE TEMP VIEW denials AS
+WITH run_ids AS (
+    SELECT target, execution_id, actor, 1 AS priority FROM actor_runs
+    UNION ALL SELECT target, invocation_id, actor, 2 FROM actor_runs
+    UNION ALL
+    SELECT r.target, a.execution_id, r.actor, 3
+    FROM actor_runs r JOIN obs_audit a ON r.target = a.source_target
+        AND (a.attributes ->> 'retryOfExecutionId') IN (r.execution_id, r.invocation_id)
+    WHERE a.audit_table = 'execution_contexts'
+), actors AS (
+    SELECT target, execution_id, first(actor ORDER BY priority, actor) AS actor
+    FROM run_ids GROUP BY target, execution_id
+)
+SELECT d.* REPLACE (coalesce(a.actor, d.actor) AS actor)
+FROM obs_denials d LEFT JOIN actors a USING (target, execution_id);
 
 CREATE OR REPLACE TEMP VIEW concierge_sessions AS
 WITH sessions AS (

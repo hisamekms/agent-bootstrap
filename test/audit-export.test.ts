@@ -2,13 +2,19 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { SqliteAudit, type NetworkInput } from "../src/audit.ts";
+import {
+  AuditStoreError,
+  SqliteAudit,
+  type NetworkInput,
+} from "../src/audit.ts";
 import { exportAudit } from "../src/audit-export.ts";
 import { JsonlFileError, scan } from "../src/jsonl-files.ts";
+import { runCli } from "../src/local-orchestrator/cli.ts";
 
 const now = () => new Date("2026-11-23T01:02:03Z");
 const invocationId = "719fcff0-ee4f-4adc-a9af-124be8115e72";
@@ -69,6 +75,56 @@ function lines(dir: string): Record<string, unknown>[] {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
 }
+
+test("exports a non-WAL backup without accepting it as a writable audit", async (t) => {
+  const { root, db, obs, dir, audit } = fixture(t);
+  audit.append(start);
+  const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
+    Database: new (filename: string) => {
+      run(sql: string, path: string): void;
+      close(): void;
+    };
+  };
+  const snapshot = join(root, "audit-backup.sqlite");
+  const source = new Database(db);
+  try {
+    source.run("VACUUM INTO ?", snapshot);
+  } finally {
+    source.close();
+  }
+  const before = fs.readFileSync(snapshot);
+  exportAudit(snapshot, obs, { now });
+  assert.equal(lines(dir)[0]?.executionId, invocationId);
+  const out = join(root, "analysis");
+  let stderr = "";
+  const io = {
+    stdin: process.stdin,
+    isTTY: false,
+    stdout: { write: () => {} },
+    stderr: { write: (chunk: string) => (stderr += chunk) },
+    prompt: () => {
+      throw new Error("unexpected analysis prompt");
+    },
+  };
+  assert.equal(
+    await runCli(["analyze", "--audit", snapshot, "--out", out], io, root),
+    0,
+    stderr,
+  );
+  const target = fs.readdirSync(out).find((name) => name !== "load.sql")!;
+  assert.equal(lines(join(out, target, "audit"))[0]?.executionId, invocationId);
+  assert.equal(
+    await runCli(["--all-targets", "analyze", "--audit", snapshot], io, root),
+    2,
+  );
+  assert.throws(
+    () => new SqliteAudit(snapshot),
+    (error) => error instanceof AuditStoreError && error.code === "open-failed",
+  );
+  assert.deepEqual(fs.readFileSync(snapshot), before);
+  assert.equal(fs.existsSync(`${snapshot}-wal`), false);
+  assert.equal(fs.existsSync(`${snapshot}-shm`), false);
+});
 
 test("projects every execution table into the exact schema with deterministic output", (t) => {
   const { root, db, obs, dir, audit, state } = fixture(t);

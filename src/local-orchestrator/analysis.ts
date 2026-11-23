@@ -25,10 +25,9 @@ import {
   type resolveTarget,
 } from "./target.ts";
 
-export interface AnalysisOptions {
-  out?: string;
-  sql?: string;
-}
+export type AnalysisCommand =
+  | { kind: "analyze"; out?: string; sql?: string; audit?: string }
+  | { kind: "denials"; since?: string; limit?: number };
 
 const miseArgs = [
   "--no-config",
@@ -156,32 +155,53 @@ SELECT target, proposal_id, gate, policy, answerer_kind, decision, duration_ms
 FROM gate_latency ORDER BY decided_at DESC, target, proposal_id LIMIT 40;
 `;
 
+function denialReport(since: string | undefined, limit: number | undefined) {
+  const cutoff =
+    since === undefined ? undefined : `TIMESTAMPTZ ${sqlLiteral(since)}`;
+  const summary = cutoff ? `count_denials(${cutoff})` : "denial_summary";
+  const latest =
+    limit === undefined
+      ? ""
+      : `SELECT * FROM denials
+${cutoff ? `WHERE recorded_at >= ${cutoff}` : ""}
+ORDER BY recorded_at DESC NULLS LAST, target, execution_id, kind, hostname, destination, reason_code
+LIMIT ${limit};\n`;
+  return `SELECT * FROM ${summary} ORDER BY target, kind, hostname, reason_code;\n${latest}`;
+}
+
 export async function analyze(
   target: Awaited<ReturnType<typeof resolveTarget>>,
   allTargets: boolean,
-  options: AnalysisOptions,
+  options: AnalysisCommand,
   io: {
     stdout: { write(text: string): unknown };
     stderr: { write(text: string): unknown };
   },
 ): Promise<0 | 1> {
+  const snapshot =
+    options.kind === "analyze" && options.audit !== undefined
+      ? resolve(options.audit)
+      : undefined;
+  if (snapshot !== undefined && !(await isDatabase(snapshot)))
+    throw new Error("Analysis audit snapshot is missing");
   const targets = allTargets ? await discoverAnalysisTargets(target) : [target];
-  const out = options.out
-    ? await outputDirectory(resolve(options.out))
-    : await mkdtemp(
-        join(
-          await prepareTargetDirectory(
-            target.bootstrapRoot,
-            join(
+  const out =
+    options.kind === "analyze" && options.out
+      ? await outputDirectory(resolve(options.out))
+      : await mkdtemp(
+          join(
+            await prepareTargetDirectory(
               target.bootstrapRoot,
-              ".local",
-              "local-orchestrator",
-              "analysis",
+              join(
+                target.bootstrapRoot,
+                ".local",
+                "local-orchestrator",
+                "analysis",
+              ),
             ),
+            `${new Date().toISOString().replace(/[:.]/g, "-")}-`,
           ),
-          `${new Date().toISOString().replace(/[:.]/g, "-")}-`,
-        ),
-      );
+        );
   await checkPrivateDirectory(out);
   if (/[*?[\]\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(out))
     throw new Error("Invalid DuckDB analysis directory");
@@ -192,11 +212,12 @@ export async function analyze(
     });
     const destination = join(out, slug);
     await privateDirectory(destination);
-    const audit = join(directory, "audit.sqlite");
+    const audit = snapshot ?? join(directory, "audit.sqlite");
     const state = join(directory, "state.db");
     await privateDirectory(join(destination, "audit"));
-    // Open the audit database where it lives, with all SQLite WAL sidecars.
-    if (await isDatabase(audit)) exportAudit(audit, destination);
+    // Open the source read-only. Live databases keep their SQLite WAL sidecars.
+    if (snapshot !== undefined || (await isDatabase(audit)))
+      exportAudit(audit, destination);
     if (await isDatabase(state)) exportOrchestrator(state, destination);
     await copyTelemetry(
       join(directory, "observability", "telemetry"),
@@ -222,24 +243,36 @@ ${orchestrator}
   } finally {
     await rm(temporary, { force: true });
   }
-  io.stdout.write(
-    `Analysis export ${escapeTerminalControls(JSON.stringify(out))}\n`,
-  );
-  const manual = `env MISE_OFFLINE=1 MISE_NOT_FOUND_AUTO_INSTALL=false mise ${miseArgs.join(" ")} :memory: -f ${shellLiteral(loaderPath)} -c 'SELECT * FROM actor_summary LIMIT 40;'`;
-  io.stdout.write(`Ad-hoc queries\n${manual}\n`);
+  const report =
+    options.kind === "denials"
+      ? denialReport(options.since, options.limit)
+      : summaries;
+  const printExport = () => {
+    const query =
+      options.kind === "denials"
+        ? report.trim().replaceAll("\n", " ")
+        : "SELECT * FROM actor_summary LIMIT 40;";
+    const manual = `env MISE_OFFLINE=1 MISE_NOT_FOUND_AUTO_INSTALL=false mise ${miseArgs.join(" ")} :memory: -f ${shellLiteral(loaderPath)} -c ${shellLiteral(query)}`;
+    io.stdout.write(
+      `Analysis export ${escapeTerminalControls(JSON.stringify(out))}\nAd-hoc queries\n${manual}\n`,
+    );
+  };
   if (runDuckDb(["-version"]).status !== 0) {
+    printExport();
     io.stderr.write(
       "Pinned DuckDB 1.5.6 is unavailable. The export is ready for the manual command.\n",
     );
-    if (options.sql) io.stderr.write("The extra SQL was not run.\n");
-    return 0;
+    if (options.kind === "analyze" && options.sql)
+      io.stderr.write("The extra SQL was not run.\n");
+    return options.kind === "denials" ? 1 : 0;
   }
 
   let extra = "";
-  if (options.sql) {
+  if (options.kind === "analyze" && options.sql) {
     try {
       extra = await readFile(resolve(options.sql), "utf8");
     } catch {
+      printExport();
       io.stderr.write(
         "Could not read the operator SQL file. The export is ready.\n",
       );
@@ -248,12 +281,17 @@ ${orchestrator}
   }
   const result = runDuckDb(
     ["-bail", "-box", ":memory:"],
-    loader + summaries + extra + "\n",
+    loader +
+      "SELECT * FROM input_issues ORDER BY stream, filename, issue;\n" +
+      report +
+      extra +
+      "\n",
   );
   if (result.stdout)
     io.stdout.write(
       result.stdout.split("\n").map(escapeTerminalControls).join("\n"),
     );
+  printExport();
   if (result.status !== 0) {
     io.stderr.write("DuckDB analysis query failed.\n");
     if (result.stderr)

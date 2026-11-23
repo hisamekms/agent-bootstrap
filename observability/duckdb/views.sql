@@ -10,8 +10,9 @@ CREATE OR REPLACE TEMP MACRO obs_root() AS (
             THEN error('Set obs_dir to a local exporter directory')
         WHEN regexp_matches(getvariable('obs_dir'), '[*?\[\]]')
             THEN error('obs_dir cannot contain glob characters')
-        WHEN starts_with(getvariable('obs_dir'), '/') THEN getvariable('obs_dir')
-        ELSE './' || getvariable('obs_dir')
+        WHEN starts_with(getvariable('obs_dir'), '/')
+            THEN rtrim(regexp_replace(getvariable('obs_dir'), '/+', '/', 'g'), '/')
+        ELSE './' || rtrim(regexp_replace(getvariable('obs_dir'), '/+', '/', 'g'), '/')
     END)
 );
 
@@ -74,11 +75,23 @@ UNION ALL
 SELECT DISTINCT stream, filename, 'invalid-json'
 FROM obs_records(stream) WHERE json_type(record) IS DISTINCT FROM 'OBJECT';
 
-CREATE OR REPLACE TEMP VIEW input_issues AS
+CREATE OR REPLACE TEMP MACRO obs_missing_rotations(stream) AS TABLE
+SELECT stream AS stream, expected.directory AS filename, 'missing-stream' AS issue
+FROM unnest(obs_paths(stream, '')) AS expected(directory)
+ANTI JOIN glob(obs_file_patterns(stream, '')) AS rotations
+    ON expected.directory = parse_dirpath(rotations.file);
+
+CREATE OR REPLACE TEMP VIEW obs_input_issues AS
 SELECT * FROM obs_stream_issues('audit')
 UNION ALL SELECT * FROM obs_stream_issues('telemetry/traces')
 UNION ALL SELECT * FROM obs_stream_issues('telemetry/metrics')
-UNION ALL SELECT * FROM obs_stream_issues('telemetry/logs');
+UNION ALL SELECT * FROM obs_stream_issues('telemetry/logs')
+UNION ALL SELECT * FROM obs_missing_rotations('audit')
+UNION ALL SELECT * FROM obs_missing_rotations('telemetry/traces')
+UNION ALL SELECT * FROM obs_missing_rotations('telemetry/metrics')
+UNION ALL SELECT * FROM obs_missing_rotations('telemetry/logs');
+
+CREATE OR REPLACE TEMP VIEW input_issues AS SELECT * FROM obs_input_issues;
 
 CREATE OR REPLACE TEMP VIEW obs_audit AS
 SELECT record ->> 'auditId' AS audit_id,
@@ -186,6 +199,33 @@ SELECT audit_id, execution_id, sandbox_id, operation_id, recorded_at, actor,
        try_cast(attributes -> 'answerIps' AS VARCHAR[]) AS dns_answer_ips
 FROM obs_audit
 WHERE phase = 'decision' AND NOT derived;
+
+CREATE OR REPLACE TEMP VIEW obs_denials AS
+WITH roles AS (
+    SELECT source_target, execution_id, arg_max(actor, audit_sequence) AS role
+    FROM obs_audit
+    WHERE audit_table = 'audit_events' AND actor <> 'host' AND NOT derived
+    GROUP BY source_target, execution_id
+)
+SELECT a.source_target AS target, a.execution_id, r.role,
+       coalesce(r.role, a.actor) AS actor,
+       CASE a.action WHEN 'network.dns' THEN 'dns' ELSE 'connect' END AS kind,
+       CASE WHEN kind = 'dns' THEN a.target ELSE a.attributes ->> 'hostname' END AS hostname,
+       CASE WHEN kind = 'connect' THEN a.target END AS destination,
+       a.reason_code, a.recorded_at
+FROM obs_audit a LEFT JOIN roles r USING (source_target, execution_id)
+WHERE a.audit_table = 'network_events' AND a.action IN ('network.connect', 'network.dns')
+  AND a.phase = 'decision' AND a.result = 'deny' AND NOT a.derived;
+
+CREATE OR REPLACE TEMP VIEW denials AS SELECT * FROM obs_denials;
+
+CREATE OR REPLACE TEMP MACRO count_denials(since) AS TABLE
+SELECT target, kind, hostname, reason_code, count(*) AS count
+FROM obs_denials
+WHERE since IS NULL OR recorded_at >= since
+GROUP BY target, kind, hostname, reason_code;
+
+CREATE OR REPLACE TEMP VIEW denial_summary AS SELECT * FROM count_denials(NULL);
 
 -- Match OTLP KeyValue keys literally, including dots. A missing attribute
 -- returns SQL NULL. Only known fields are projected.

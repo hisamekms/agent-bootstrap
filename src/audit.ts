@@ -1323,6 +1323,14 @@ export class SqliteAudit implements AuditSink {
             foundVersion !== currentVersion)
         )
           throw new AuditStoreError("invalid-database");
+        // Only an empty store may initialize WAL. Refuse a snapshot before
+        // any schema migration can modify it.
+        if (
+          !this.#readOnly &&
+          record(database.query("PRAGMA journal_mode").get()).journal_mode !==
+            "wal"
+        )
+          throw new AuditStoreError("invalid-database");
         version = foundVersion;
       }
       const installed = database
@@ -1425,13 +1433,11 @@ export class SqliteAudit implements AuditSink {
           throw new AuditStoreError("invalid-database");
         }
       }
-      // Change persistent journaling only after recognizing and validating the
-      // database. Unrelated SQLite databases are rejected without this mutation.
-      if (!this.#readOnly) database.exec("PRAGMA journal_mode=WAL");
       if (
-        record(database.query("PRAGMA journal_mode").get()).journal_mode !==
+        !this.#readOnly &&
+        (record(database.query("PRAGMA journal_mode").get()).journal_mode !==
           "wal" ||
-        record(database.query("PRAGMA synchronous").get()).synchronous !== 2
+          record(database.query("PRAGMA synchronous").get()).synchronous !== 2)
       )
         throw new AuditStoreError("invalid-database");
       this.#database = database;

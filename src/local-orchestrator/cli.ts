@@ -4,7 +4,7 @@ import { GitIntegrationError } from "../git-integration.ts";
 import {
   analyze,
   escapeTerminalControls,
-  type AnalysisOptions,
+  type AnalysisCommand,
 } from "./analysis.ts";
 import {
   ContractError,
@@ -56,7 +56,8 @@ type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
 const maxFieldLength = 4000;
 const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--target <path>] <command>
-  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] analyze [--out <dir>] [--sql <file>]
+  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] analyze [--audit <file>] [--out <dir>] [--sql <file>]
+  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] denials [--since <iso>] [--limit <1-1000>]
   reconcile
   status
   retry-task <taskId>
@@ -76,7 +77,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
 
 type Command =
   | { kind: "status" | "policy-show" | "reconcile" }
-  | ({ kind: "analyze" } & AnalysisOptions)
+  | AnalysisCommand
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
   | { kind: "show-execution" | "retry-task" | "update-goal-base"; id: string }
@@ -94,18 +95,57 @@ type Command =
 function parseCommand([kind, ...args]: readonly string[]): Command {
   switch (kind) {
     case "analyze": {
-      const options: AnalysisOptions = {};
+      const command: Extract<AnalysisCommand, { kind: "analyze" }> = { kind };
       for (let i = 0; i < args.length; i += 2) {
         const flag = args[i];
         const value = args[i + 1];
         if (!value || value.startsWith("--") || value.includes("\0"))
           throw new ContractError();
-        if (flag === "--out" && options.out === undefined) options.out = value;
-        else if (flag === "--sql" && options.sql === undefined)
-          options.sql = value;
+        if (flag === "--out" && command.out === undefined) command.out = value;
+        else if (flag === "--sql" && command.sql === undefined)
+          command.sql = value;
+        else if (flag === "--audit" && command.audit === undefined)
+          command.audit = value;
         else throw new ContractError();
       }
-      return { kind, ...options };
+      return command;
+    }
+    case "denials": {
+      const command: Extract<AnalysisCommand, { kind: "denials" }> = { kind };
+      for (let i = 0; i < args.length; i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (
+          flag === "--since" &&
+          command.since === undefined &&
+          value !== undefined &&
+          /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(
+            value,
+          )
+        ) {
+          const date = new Date(value);
+          const day = value.slice(0, 10);
+          const midnight = new Date(day);
+          if (
+            !Number.isFinite(date.getTime()) ||
+            !Number.isFinite(midnight.getTime()) ||
+            !midnight.toISOString().startsWith(day)
+          )
+            throw new ContractError();
+          command.since =
+            value.length === 10
+              ? `${value}T00:00:00Z`
+              : value.replace(/(T\d{2}:\d{2})(?=Z|[+-])/, "$1:00");
+        } else if (
+          flag === "--limit" &&
+          command.limit === undefined &&
+          value !== undefined &&
+          /^[0-9]+$/.test(value)
+        ) {
+          command.limit = integer(Number(value), 1, 1000);
+        } else throw new ContractError();
+      }
+      return command;
     }
     case "status":
     case "reconcile":
@@ -289,7 +329,7 @@ function refuse(io: CliIo, message: string): 1 {
 async function execute(
   io: CliIo,
   store: OrchestratorStore,
-  command: Exclude<Command, { kind: "analyze" }>,
+  command: Exclude<Command, AnalysisCommand>,
   directory: string | undefined,
   repoRoot: string,
 ): Promise<0 | 1> {
@@ -585,10 +625,11 @@ export async function runCli(
       else throw new ContractError();
     }
     command = parseCommand(argv.slice(i));
+    const analysis = command.kind === "analyze" || command.kind === "denials";
     if (
-      (allTargets &&
-        (targetPath !== undefined || command.kind !== "analyze")) ||
-      (db !== undefined && command.kind === "analyze")
+      (allTargets && (targetPath !== undefined || !analysis)) ||
+      (db !== undefined && analysis) ||
+      (allTargets && command.kind === "analyze" && command.audit !== undefined)
     )
       throw new ContractError();
   } catch {
@@ -627,7 +668,7 @@ export async function runCli(
 
   try {
     const target = await resolveTarget(targetPath, bootstrapRoot);
-    if (command.kind === "analyze")
+    if (command.kind === "analyze" || command.kind === "denials")
       return await analyze(target, allTargets, command, io);
     const { repoRoot, directory } = target;
     if (command.kind === "policy-set") {
@@ -655,7 +696,7 @@ export async function runCli(
     }
   } catch (error) {
     if (error instanceof TargetError) return refuse(io, error.message);
-    if (command.kind === "analyze")
+    if (command.kind === "analyze" || command.kind === "denials")
       return refuse(io, "Local orchestrator analysis export failed.");
     if (
       command.kind === "export-goal-branch" &&

@@ -334,6 +334,32 @@ test("the non-interactive analyzer joins target-local audit and telemetry in Duc
         operation: "sandbox.create",
         ...(kind === "operation.finished" ? { outcome: "ok" } : {}),
       });
+    const network = {
+      invocationId: worker,
+      sandboxId: `bootstrap-${randomUUID()}`,
+      decision: "deny",
+      policyId: "a".repeat(64),
+    } as const;
+    audit.appendNetwork({
+      ...network,
+      connectionId: randomUUID(),
+      destinationIp: "192.0.2.1",
+      destinationPort: 443,
+      channel: "egress",
+      hostname: "blocked.example",
+      reasonCode: "not-allowlisted",
+    });
+    for (const invocationId of [worker, plannerRetry])
+      audit.appendDnsQuery({
+        ...network,
+        invocationId,
+        queryId: randomUUID(),
+        protocol: "udp",
+        qname: "blocked.example",
+        qtype: 1,
+        reasonCode: "dns-not-allowlisted",
+        answerIps: [],
+      });
     const traces = new JsonlWriter(
       join(target.directory, "observability/telemetry/traces"),
     );
@@ -386,24 +412,35 @@ SELECT CASE WHEN (SELECT count(*) FROM actor_runs) = 12
       FROM concierge_sessions)
  AND (SELECT count(*) = 2 AND bool_and(failures_by_code ->> 'path-violation' = '1' AND success_rate = 0.5)
       FROM actor_summary WHERE actor = 'Executor')
+ AND (SELECT count(*) = 3 AND bool_and(target = '${target.slug}' AND hostname = 'blocked.example')
+      FROM denials)
+ AND (SELECT role = 'Worker' AND actor = 'Executor' AND destination = '192.0.2.1:443'
+      FROM denials WHERE kind = 'connect')
+ AND (SELECT role IS NULL AND actor = 'Planner' AND destination IS NULL
+      FROM denials WHERE execution_id = '${plannerRetry}')
+ AND (SELECT count = 2 FROM denial_summary WHERE kind = 'dns' AND reason_code = 'dns-not-allowlisted')
+ AND (SELECT count(*) = 2 FROM input_issues WHERE stream = 'telemetry/logs' AND issue = 'missing-stream')
+ AND (SELECT count(*) = 1 FROM input_issues WHERE stream = 'audit' AND issue = 'missing-stream'
+      AND filename LIKE '%/${other}/audit')
  THEN 'fixture-ok' ELSE error('unexpected local orchestrator analysis') END;`,
     );
     let stdout = "";
     let stderr = "";
     const out = join(root, "analysis with spaces");
+    const io = {
+      stdin: process.stdin,
+      isTTY: false,
+      stdout: { write: (text: string) => (stdout += text) },
+      stderr: { write: (text: string) => (stderr += text) },
+      prompt: () => {
+        throw new Error("unexpected analysis prompt");
+      },
+    };
     let code: number;
     try {
       code = await runCli(
         ["--all-targets", "analyze", "--out", out, "--sql", extra],
-        {
-          stdin: process.stdin,
-          isTTY: false,
-          stdout: { write: (text) => (stdout += text) },
-          stderr: { write: (text) => (stderr += text) },
-          prompt: () => {
-            throw new Error("unexpected analysis prompt");
-          },
-        },
+        io,
         root,
       );
     } finally {
@@ -412,11 +449,48 @@ SELECT CASE WHEN (SELECT count(*) FROM actor_runs) = 12
     assert.equal(code, 0, stderr);
     assert.match(stdout, /fixture-ok/);
     assert.match(stdout, /-init \/dev\/null/);
+    assert.ok(
+      stdout.indexOf("missing-stream") < stdout.indexOf("failures_by_code"),
+    );
     assert.equal(statSync(out).mode & 0o777, 0o700);
     assert.deepEqual(
       readdirSync(out).sort(),
       [target.slug, other, "load.sql"].sort(),
     );
+    writeFileSync(
+      join(out, other, "audit", "unrecognized.jsonl"),
+      "not JSON\n",
+    );
+    const issues = runDuckDb(
+      ["-bail", "-csv", "-noheader", ":memory:"],
+      readFileSync(join(out, "load.sql"), "utf8") +
+        `SELECT issue FROM input_issues WHERE stream = 'audit' AND filename LIKE '%/${other}/audit%';\n`,
+    );
+    assert.equal(issues.status, 0, issues.stderr);
+    assert.equal(issues.stdout.trim(), "missing-stream");
+    stdout = "";
+    stderr = "";
+    assert.equal(
+      await runCli(
+        ["--all-targets", "denials", "--since", "2000-01-01", "--limit", "1"],
+        io,
+        root,
+      ),
+      0,
+      stderr,
+    );
+    assert.match(stdout, /dns-not-allowlisted\s+│\s+2\s+│/);
+    assert.equal(
+      stdout.match(new RegExp(`(?:${worker}|${plannerRetry})`, "g"))?.length,
+      1,
+    );
+    stdout = "";
+    assert.equal(
+      await runCli(["denials", "--since", "2099-01-01T00:00+09:00"], io, root),
+      0,
+      stderr,
+    );
+    assert.doesNotMatch(stdout, /blocked\.example/);
     const resumed = OrchestratorStore.open(state);
     try {
       const execution = resumed.createExecution({
