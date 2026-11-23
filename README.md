@@ -45,7 +45,8 @@ Goal and Task, audit, and performance workflows.
 
 - [Concierge and operator commands](docs/local-orchestrator/running.md)
 - [DuckDB analysis](docs/local-orchestrator/analysis.md)
-- [Authentication](docs/claude-code-auth.md#setup) and [sandbox profiles](docs/sandbox-profiles.md)
+- [Claude Code authentication and encrypted mounts](docs/claude-code-auth.md)
+- [Sandbox profiles](docs/sandbox-profiles.md)
 - [Trust model](docs/trust-model.md) and [milestone checks](docs/milestones.md)
 
 Contributors can use `bun run lo` and `bun run concierge` from the checkout.

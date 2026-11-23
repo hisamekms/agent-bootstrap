@@ -3,7 +3,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { EgressPolicy, type HostPort } from "../egress-policy.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { userStateDirectory } from "../local-orchestrator/claude-config.ts";
-import { privateDirectory } from "../local-orchestrator/credentials-volume.ts";
+import { privateDirectory } from "../volumes/volume.ts";
 import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../mise-tools.ts";
 import { createObservedHost } from "../observed-host.ts";
 import { profileCatalog } from "../profile-lock.ts";
@@ -12,6 +12,7 @@ import {
   DEBUG_SHELL_LIFETIME_MS,
   isDebugMount,
   type DebugMount,
+  type TerminalCommand,
 } from "../sandbox-runtime.ts";
 import { readLock, type Host } from "./prerequisites.ts";
 
@@ -109,6 +110,7 @@ export async function sandboxShellPlan(
 export async function runSandboxShell(
   host: Host,
   { plan, directory, profiles }: Awaited<ReturnType<typeof sandboxShellPlan>>,
+  command?: TerminalCommand,
 ) {
   const requestedHome = host.env.MSB_HOME;
   if (!requestedHome || !isAbsolute(requestedHome))
@@ -154,6 +156,8 @@ export async function runSandboxShell(
       plan.profile,
       plan.allow,
       mounts,
+      undefined,
+      command,
     );
   } finally {
     await observed.close();

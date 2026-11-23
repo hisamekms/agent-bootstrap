@@ -49,7 +49,15 @@ type AuditLine = {
   reasonCode: string | null;
   traceId: string | null;
   attributes: Readonly<
-    Record<string, string | number | boolean | null | readonly string[]>
+    Record<
+      string,
+      | string
+      | number
+      | boolean
+      | null
+      | readonly string[]
+      | readonly { name: string; mode: string; path: string }[]
+    >
   >;
   derived?: true;
 };

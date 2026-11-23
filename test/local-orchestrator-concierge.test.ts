@@ -417,7 +417,8 @@ test("Concierge guest command admits only validated options and uses a fixed rel
   assert.doesNotMatch(script!, /managed-settings/);
   assert.match(script!, /--strict-mcp-config --setting-sources ''/);
   assert.match(script!, /exec env -i .*HOME=\/state\/home/);
-  assert.ok(script!.includes("CLAUDE_CONFIG_DIR=/state/claude"));
+  assert.ok(script!.includes("claude_config=/state/claude"));
+  assert.ok(script!.includes('CLAUDE_CONFIG_DIR="$claude_config"'));
   assert.ok(
     script!.includes("--model 'claude-model.1' --permission-mode auto"),
   );

@@ -107,11 +107,10 @@ appear in a declaration.
 `agent-bootstrap project approve <name>` does the following:
 
 1. Reads and validates the declaration at local `main` (C3).
-2. Shows the full difference from the current approved copy. Every
-   string is rendered with non-printable, control, format and
-   bidirectional characters escaped. A string cannot hide an entry or
-   move the cursor. Egress added for an actor that has a mount is
-   highlighted.
+2. Shows the changed configuration keys and egress destination counts.
+   Configuration values stay out of the preview. Egress added for an
+   actor that has a mount is highlighted. The operator can inspect the
+   declaration at the displayed local commit before confirming.
 3. Reads the confirmation from `/dev/tty`. The operator types the
    project name. The command fails when stdin or stdout is not a
    terminal. There is no `--yes`.
@@ -161,8 +160,8 @@ config. `local.json` can refer to them. `agent-bootstrap config edit
 - **Negation.** No layer can remove a grant from a lower layer in
   version 1.
 
-`doctor --target <path>` prints the effective configuration, with the
-layer each entry came from.
+`doctor --target <path>` prints effective configuration keys and their
+layer sources.
 
 ### C7. Validation and messages
 

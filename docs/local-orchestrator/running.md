@@ -45,11 +45,10 @@ agent-bootstrap concierge
 ```
 
 Run one Concierge per target. Launchers for the same target in the same
-agent-bootstrap checkout share the named volume. In API-key mode it holds
-the Concierge's configuration and guest home. In config-dir mode the
-named volume holds the guest home, and conversation state lives in the
-group's persistent Claude Code configuration directory on the encrypted
-volume. The launcher prints its session ID and audit database
+agent-bootstrap checkout share the named session volume. The Concierge
+uses it for its guest home and its default configuration directory.
+A declared mount can replace that directory through the adapter's
+environment allowlist. The launcher prints its session ID and audit database
 path. Exit Claude Code to end the session and remove temporary files. If
 the launcher process is terminated abruptly, its session record and
 temporary files can remain until host-side cleanup, and the backend

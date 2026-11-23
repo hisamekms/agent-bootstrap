@@ -17,6 +17,8 @@ import {
 import { exportAudit, exportAuditChecked } from "../src/audit-export.ts";
 import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { JsonlFileError, scan } from "../src/jsonl-files.ts";
+import { readInvocationTrace } from "../src/task-trace.ts";
+import { CLAUDE_MANAGED_PATH } from "../src/claude-code.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 
 const now = () => new Date("2026-11-23T01:02:03Z");
@@ -519,4 +521,46 @@ test("checked audit export screens projected records before publication", async 
     createCredentialScanner({}, root, () => {}),
   );
   assert.equal(lines(dir)[0]?.actor, "Worker");
+});
+
+test("legacy Claude details remain readable for audit export and trace", (t) => {
+  const { db, obs, dir, audit } = fixture(t);
+  const detail = {
+    authMode: "config-dir",
+    settingsDigest: "a".repeat(64),
+    managedPath: CLAUDE_MANAGED_PATH,
+    group: "fixture-group",
+    groupPath: "/claude-config",
+  };
+  assert.throws(
+    () => audit.append({ ...start, role: "Reviewer", detail } as never),
+    (error: AuditStoreError) => error.code === "invalid-event",
+  );
+  const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
+    Database: new (filename: string) => {
+      run(sql: string, values: string[]): void;
+      close(): void;
+    };
+  };
+  const legacy = new Database(db);
+  try {
+    legacy.run(
+      "INSERT INTO audit_events (recorded_at, invocation_id, kind, role, detail) VALUES (?, ?, ?, ?, ?)",
+      [
+        now().toISOString(),
+        invocationId,
+        start.kind,
+        "Reviewer",
+        JSON.stringify(detail),
+      ],
+    );
+  } finally {
+    legacy.close();
+  }
+  assert.deepEqual(
+    readInvocationTrace(audit, invocationId)?.events[0]?.detail,
+    detail,
+  );
+  exportAudit(db, obs, { now });
+  assert.deepEqual(lines(dir)[0]?.attributes, detail);
 });

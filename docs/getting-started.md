@@ -56,10 +56,8 @@ agent-bootstrap doctor --target "$target"
 Enter your API key at the Keychain prompt. Keep existing configuration files
 at mode `0600` and add `"version": 1` if upgrading from an unversioned
 user config. The linked command ignores the
-current directory's `.env`. For persistent Claude Code configuration
-directories per actor group, kept on an encrypted volume and signed in
-with the CLI's own `/login`, see [Claude Code authentication](claude-code-auth.md).
-Doctor checks presence
+current directory's `.env`. See [Claude Code authentication](claude-code-auth.md)
+for external mode, encrypted volumes and declared mounts. Doctor checks Keychain presence
 without reading the password. When required checks pass, doctor exits 0.
 Exit 3 means a required check needs attention. DuckDB is optional and uses
 `mise --no-config --no-env --no-hooks install duckdb@1.5.6`.
@@ -68,7 +66,7 @@ Worktrees share their project's name and state. When moving a registered
 repository, run `agent-bootstrap project move <name> <path>`. If the
 previous installation has legacy state, run `agent-bootstrap migrate` with
 the original paths of any external targets before launching. Stop any
-active runs and release active leases first.
+active runs and release active leases and attachments first.
 
 A project can request verification, profiles, and egress in
 `.agent-bootstrap/project.json` committed to local `main`. Run

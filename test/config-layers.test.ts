@@ -75,7 +75,7 @@ function commitDeclaration(repo: string, contents?: string, mode = 0o644) {
 
 const verification = (arg: string) => ({ profile: "bun", argv: ["bun", arg] });
 
-test("C1/C3/C4: only pinned approval grants a declaration; a hostile terminal string is escaped", async (t) => {
+test("C1/C3/C4: only pinned approval grants a declaration; values stay out of its preview", async (t) => {
   const { repo, env } = fixture(t);
   const project = addProject(repo, undefined, env);
   const directory = projectConfigDirectory(project.name, env);
@@ -106,6 +106,16 @@ test("C1/C3/C4: only pinned approval grants a declaration; a hostile terminal st
     version: 1,
     mounts: { tool: mount },
   });
+  writePrivateConfig(userConfigPath(env), configRoot(env), {
+    version: 1,
+    volumes: {
+      m: {
+        image: "/volume.sparseimage",
+        keychainService: "volume-service",
+        attach: "while-running",
+      },
+    },
+  });
   const local = readFileSync(join(directory, "local.json"));
   const io = {
     isTTY: true,
@@ -113,7 +123,8 @@ test("C1/C3/C4: only pinned approval grants a declaration; a hostile terminal st
       preview += chunk;
     },
     async confirm() {
-      assert.match(preview, /\\u202e\\u009b\\u001b\[2J\\u2028/);
+      assert.match(preview, /\+ verification/);
+      assert.ok(!preview.includes("first.example"));
       assert.match(
         preview,
         /egress.Reviewer adds destinations for an actor with a mount/,
@@ -323,7 +334,7 @@ test("C5/C6/C8: merge sources, union grants and enforce actor and layer constrai
     mounts: { tool: mount },
     volumes: {
       private: {
-        image: "/volume",
+        image: "/volume.sparseimage",
         keychainService: "keychain",
         attach: "while-running",
       },
@@ -457,7 +468,7 @@ test("exclusive config recovers from crashes at each write and publication step"
       },
     }));
     const { writePrivateConfig } = await import(module);
-    writePrivateConfig(path, directory, { version: 1, egress: { Reviewer: ["fixture:443"] } }, true);
+    writePrivateConfig(path, directory, { version: 1, egress: { Reviewer: ["fixture.example:443"] } }, true);
   `;
   const unpublished = ["open", "partial-write", "write", "file-sync", "close"];
   for (const point of [...unpublished, "link", "unlink", "directory-sync"]) {
@@ -481,7 +492,7 @@ test("exclusive config recovers from crashes at each write and publication step"
     assert.deepEqual(
       loadConfig(env).user,
       published
-        ? { version: 1, egress: { Reviewer: ["fixture:443"] } }
+        ? { version: 1, egress: { Reviewer: ["fixture.example:443"] } }
         : { version: 1 },
       point,
     );
@@ -706,7 +717,7 @@ test("C5/C7: the CLI creates local settings privately and rejects project approv
   const effective = checks.find(
     ({ id }: { id: string }) => id === "effective-configuration",
   ).effective;
-  assert.deepEqual(effective.config.verification, verification("approved"));
+  assert.equal(effective.config, undefined);
   assert.equal(effective.sources.verification, "approved");
   writeFileSync(
     local,
@@ -778,10 +789,7 @@ test("C9: migrates default and external state, refuses active sessions, and perm
     () => migrate(repo, [other], env),
     (error: ConfigError) => {
       assert.match(error.message, /A lease or run is active/);
-      assert.match(
-        error.next,
-        /agent-bootstrap doctor.*stale or quarantined.*credentials detach --force/,
-      );
+      assert.match(error.next, /volume recovery command/);
       return true;
     },
   );

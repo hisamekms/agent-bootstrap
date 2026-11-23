@@ -49,10 +49,23 @@ export const CLAUDE_CODE_GUEST_PACKAGES = [
   },
 ] as const;
 
-/** API keys are held by the host. Persistent Claude Code configuration
- * directories are kept on an encrypted volume per actor group and signed in
- * with the CLI's own /login. */
-export const CLAUDE_GROUP_PATH = "/claude-config";
+export const CLAUDE_MOUNT_ENV = ["CLAUDE_CONFIG_DIR"] as const;
+
+export function claudeMountArgv(
+  argv: readonly string[],
+  path?: string,
+  restricted = false,
+): readonly string[] {
+  return path || restricted
+    ? [
+        "/usr/bin/env",
+        ...(path ? [`LO_MOUNT_CONFIG_DIR=${path}`] : []),
+        ...(restricted ? ["LO_MOUNT_RESTRICTED=1"] : []),
+        ...argv,
+      ]
+    : argv;
+}
+
 export const CLAUDE_MANAGED_PATH = "/etc/claude-code/managed-settings.json";
 
 export type ClaudeCodeAuth =
@@ -62,7 +75,7 @@ export type ClaudeCodeAuth =
       readonly variable: string;
       readonly header: "authorization" | "x-api-key";
     }
-  | { readonly mode: "native-cli" | "config-dir" };
+  | { readonly mode: "native-cli" | "external" };
 
 export class ClaudeCodeUnsupportedError extends Error {
   constructor(what: string) {
@@ -233,8 +246,7 @@ export function claudeCodeCommand(
 ): SandboxCommand {
   if (guest !== "alpine" && guest !== "debian")
     throw new Error("Invalid guest kind");
-  const credential =
-    auth.mode === "config-dir" ? undefined : credentialOf(auth);
+  const credential = auth.mode === "external" ? undefined : credentialOf(auth);
   if (!Object.hasOwn(roleTools, task.role)) throw new Error("Invalid role");
   if (!/^[a-z0-9][a-z0-9.-]{0,80}$/.test(task.model))
     throw new Error("Invalid Claude model");
@@ -260,10 +272,9 @@ export function claudeCodeCommand(
   if (task.shell === true && task.role !== "Worker")
     throw new Error("Shell is allowed only for the Worker");
   const tools = roleTools[task.role];
-  const toolList: readonly string[] =
-    task.shell && auth.mode !== "config-dir"
-      ? [...tools.tools, "Bash"]
-      : tools.tools;
+  const toolList: readonly string[] = task.shell
+    ? [...tools.tools, "Bash"]
+    : tools.tools;
   const cwd = task.role === "Worker" ? "/workspace" : "/review";
   const toolFlags = toolList.length
     ? `--tools '${toolList.join(",")}'${credential ? ` --allowedTools '${toolList.join(",")}'` : ""}`
@@ -276,7 +287,7 @@ export function claudeCodeCommand(
     prompt=$(cat /review/control.json)`
       : `prompt="$1"`;
   const worker = task.role === "Worker";
-  const configWorker = worker && auth.mode === "config-dir";
+  const configWorker = worker && auth.mode === "external";
   const reviewNotes = configWorker
     ? `if test -f /review/review-notes.txt; then
       test "$(wc -c < /review/review-notes.txt)" -le 8192
@@ -298,12 +309,18 @@ $(cat /review/review-notes.txt)"
   const script = `
 ${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
     claude_home=$(mktemp -d)
-    claude_config=${credential ? "$(mktemp -d)" : CLAUDE_GROUP_PATH}
+    claude_config="\${LO_MOUNT_CONFIG_DIR:-$(mktemp -d)}"
     test -z "$(ls -A "$claude_home")"
-    ${credential ? 'test -z "$(ls -A "$claude_config")"' : 'test -d "$claude_config"'}
+    test -d "$claude_config"
     cd ${cwd}
     ${promptSetup}
     ${reviewNotes}
+    permission_mode=${credential ? tools.mode : "default"}
+    set -- ${toolFlags}
+    if test -n "\${LO_MOUNT_RESTRICTED:-}"; then
+      permission_mode=default
+      set -- --tools '${tools.tools.join(",")}'
+    fi
     claude_status=0
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
@@ -315,8 +332,8 @@ ${claudeCodeGuestSetup(credential?.variable, guest)}    test ! -e /root/.claude
       ${CLAUDE_CODE.guestPath} -p ${credential?.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
         --disable-slash-commands --no-session-persistence --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
-        --permission-mode ${credential ? tools.mode : "default"} \\
-        ${toolFlags} \\
+        --permission-mode "$permission_mode" \\
+        "$@" \\
         -- "$prompt" </dev/null >/tmp/claude-out.json 2>/tmp/claude-err || claude_status=$?
     ${usageOutput}
     if test "$claude_status" -ne 0; then

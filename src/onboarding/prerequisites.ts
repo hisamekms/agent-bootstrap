@@ -1,3 +1,4 @@
+import type { LocalActorHarnesses } from "../actors.ts";
 import { execFile, spawn } from "node:child_process";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -9,7 +10,7 @@ import {
   validService,
   type ClaudeAuthMode,
 } from "../local-orchestrator/claude-config.ts";
-import { CredentialsVolume } from "../local-orchestrator/credentials-volume.ts";
+import { Volume } from "../volumes/volume.ts";
 import { loadConfig, missing, privatePath } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
 import {
@@ -46,7 +47,7 @@ import {
 export type Status = "ok" | "missing" | "wrong" | "skipped";
 
 export interface Check {
-  effective?: Pick<ReturnType<typeof loadConfig>, "config" | "sources">;
+  effective?: Pick<ReturnType<typeof loadConfig>, "sources">;
   id: string;
   status: Status;
   detail: string;
@@ -66,6 +67,7 @@ export interface Host {
   arch: string;
   bun: string;
   env: NodeJS.ProcessEnv;
+  actorHarnesses?: LocalActorHarnesses;
   command(
     file: string,
     args: readonly string[],
@@ -396,7 +398,7 @@ export async function doctor(
       path !== undefined || concierge || defaultRegistered
         ? await resolveTarget(path, root, host.env)
         : undefined;
-    layers = loadConfig(host.env, target?.configDirectory);
+    layers = loadConfig(host.env, target?.configDirectory, host.actorHarnesses);
     if (target) {
       add(
         check(
@@ -408,7 +410,7 @@ export async function doctor(
       const drift = driftWarning(target.project, layers.approved);
       if (drift) add(check("configuration-drift", "skipped", drift), false);
       if (!concierge && path !== undefined) {
-        const { config, sources } = layers;
+        const { sources } = layers;
         add(
           {
             ...check(
@@ -416,7 +418,7 @@ export async function doctor(
               "ok",
               "Effective configuration with its layer sources.",
             ),
-            effective: { config, sources },
+            effective: { sources },
           },
           false,
         );
@@ -553,7 +555,7 @@ export async function doctor(
       check(
         "claude-auth",
         "ok",
-        `Claude auth is ${effective.auth} (source: ${effective.source}).`,
+        `Claude authentication configuration is valid (source: ${effective.source}).`,
       ),
     );
     for (const [index, warning] of effective.warnings.entries())
@@ -562,9 +564,7 @@ export async function doctor(
         false,
       );
 
-    const directory = effective.configDir;
-    const service =
-      directory?.volume.keychainService ?? effective.keychainService;
+    const service = effective.keychainService;
     const account = host === systemHost ? userInfo().username : host.env.USER;
     const configured = validService(account) && validService(service);
     const keychain =
@@ -584,60 +584,90 @@ export async function doctor(
           : keychain.code === 44
             ? "missing"
             : "wrong";
-    add(
-      check(
-        "keychain",
-        status,
-        status === "ok"
-          ? "The configured Keychain item exists."
-          : status === "skipped"
-            ? "Keychain presence could not be checked on this host."
-            : "Keychain did not confirm the configured service and account.",
-        directory
-          ? ["See agent-bootstrap help credentials."]
-          : service
+    if (effective.auth === "api-key")
+      add(
+        check(
+          "keychain",
+          status,
+          status === "ok"
+            ? "The configured Keychain item exists."
+            : status === "skipped"
+              ? "Keychain presence could not be checked on this host."
+              : "Keychain did not confirm the configured service and account.",
+          service
             ? ["Provision the configured API key service in Keychain."]
             : [...configureClaude, provisionKeychain],
-        false,
-        true,
+          false,
+          true,
+        ),
+      );
+
+    const mountedActors = new Set(
+      Object.values(effective.config.mounts ?? {}).flatMap(
+        ({ actors }) => actors,
       ),
     );
-
-    if (directory && host.platform === "darwin") {
-      try {
-        const image = await stat(directory.volume.image).catch(() => undefined);
-        const volume = new CredentialsVolume(
-          directory,
-          userStateDirectory(host.env),
-        );
-        const volumeStatus = volume.status();
+    for (const actor of mountedActors) {
+      add(
+        check(
+          `mount-tools-${actor}`,
+          "skipped",
+          `${actor} loses shell tools when a mount is present.`,
+        ),
+        false,
+      );
+      if (
+        effective.config.egress?.[
+          actor as keyof NonNullable<typeof effective.config.egress>
+        ]?.length
+      )
         add(
           check(
-            "credentials-volume",
-            volumeStatus.stale ? "wrong" : image?.isFile() ? "ok" : "missing",
-            volumeStatus.stale
-              ? "The Claude configuration volume has a stale attachment or lease. Confirm no VM is running before clearing it."
-              : volumeStatus.mounted
-                ? "The Claude configuration volume is attached."
+            `mount-egress-${actor}`,
+            "skipped",
+            `Warning: ${actor} has a mount and added egress.`,
+          ),
+          false,
+        );
+    }
+    if (host === systemHost && host.platform === "darwin") {
+      for (const [name, definition] of Object.entries(
+        effective.config.volumes ?? {},
+      )) {
+        try {
+          const image = await stat(definition.image).catch(() => undefined);
+          const volume = new Volume(definition, userStateDirectory(host.env));
+          const status = volume.status();
+          add(
+            check(
+              `volumes.${name}`,
+              status.stale ? "wrong" : image?.isFile() ? "ok" : "missing",
+              status.stale
+                ? "The volume has a stale attachment or lease."
+                : status.mounted
+                  ? "The volume is attached."
+                  : image?.isFile()
+                    ? "The volume attaches while a lease exists."
+                    : "The image is missing.",
+              status.stale
+                ? [
+                    "Confirm no VM is running, then use agent-bootstrap volume detach --force.",
+                  ]
                 : image?.isFile()
-                  ? "The Claude configuration volume attaches when a run begins."
-                  : "The Claude configuration volume image is missing.",
-            volumeStatus.stale
-              ? ["agent-bootstrap credentials detach --force"]
-              : image?.isFile()
-                ? []
-                : ["agent-bootstrap credentials init"],
-          ),
-        );
-      } catch {
-        add(
-          check(
-            "credentials-volume",
-            "wrong",
-            "The Claude configuration volume status could not be checked.",
-            ["agent-bootstrap credentials status"],
-          ),
-        );
+                  ? []
+                  : ["Run agent-bootstrap volume init for this volume."],
+            ),
+          );
+        } catch {
+          add(
+            check(
+              `volumes.${name}`,
+              "wrong",
+              "Volume status could not be checked.",
+              ["Run agent-bootstrap volume status for this volume."],
+            ),
+          );
+        }
       }
     }
   } catch (error) {

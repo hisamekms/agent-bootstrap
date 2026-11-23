@@ -6,6 +6,14 @@ import type {
   ClaudePatternCode,
 } from "./claude-config.ts";
 
+export class ClaudeRunError extends Error {
+  readonly code: ClaudeFailureCode;
+  constructor(code: ClaudeFailureCode) {
+    super(code);
+    this.code = code;
+  }
+}
+
 export async function classifyClaudeFailure(
   bytes: Uint8Array,
   patterns: readonly ClaudeErrorPattern[],
@@ -47,23 +55,21 @@ export async function classifyClaudeFailure(
   });
 }
 
-export function claudeNext(code: ClaudeFailureCode, group?: string): string {
+export function claudeNext(code: ClaudeFailureCode): string {
   switch (code) {
     case "auth-required":
-      return group
-        ? `agent-bootstrap login --group ${group}`
-        : "Check the API key in Keychain with agent-bootstrap doctor.";
+      return "Check the selected Claude authentication mode with agent-bootstrap doctor.";
     case "rate-limited":
       return "Wait before retrying the Claude run.";
     case "config-invalid":
       return "Review the Claude configuration and run agent-bootstrap doctor.";
-    case "credentials-detached":
-      return "agent-bootstrap credentials attach";
+    case "volume-detached":
+      return "Run agent-bootstrap doctor and check the volume status.";
     case "shell-disabled":
-      return "Disable Worker shell and run tests through host verification, or select api-key mode.";
+      return "Run shell commands through host verification.";
     case "credential-leak":
       return "Inspect the host evidence before retrying.";
-    case "config-tampered":
-      return "Inspect the evidence, then run agent-bootstrap credentials verify --accept.";
+    case "mount-busy":
+      return "Wait for the current mount holder to finish, then retry.";
   }
 }

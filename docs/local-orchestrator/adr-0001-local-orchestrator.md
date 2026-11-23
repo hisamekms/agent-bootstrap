@@ -228,14 +228,13 @@ applicable. Keep the audit outside VMs, beyond actor write access. This
 lets the operator trace a host decision from the conversation through
 execution and registration.
 
-### D11. Support API-key and configuration directory modes
+### D11. Support API-key and external modes
 
 In `api-key` mode, guests receive a placeholder. The host substitutes
 the Keychain API key into `x-api-key` for `api.anthropic.com`.
-In `config-dir` mode, the host mounts the actor group's configuration
-directory from the encrypted volume and the CLI manages its sign-in.
-The host serializes leases for the same group and checks directory
-integrity around each run. See [Claude Code authentication](../claude-code-auth.md).
+In `external` mode, the host supplies no credential or substitution.
+Both modes support declared mounts on encrypted volumes.
+See [Claude Code authentication](../claude-code-auth.md).
 
 Use the same token accounting across actors. Future enforcement would
 need usage data early enough to stop work at the cap, including during

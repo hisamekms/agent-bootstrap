@@ -2,7 +2,7 @@
 
 Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.
 
-Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, credentials, or login. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
+Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, or volume shell. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
 
 Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.
 
@@ -223,13 +223,13 @@ agent-bootstrap migrate
 ```
 
 **Expected output**  
-Doctor shows effective settings and their sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.
+Doctor shows effective configuration keys and their layer sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.
 
 **Next action**  
 Use config edit for user settings. For legacy external targets, pass the original worktree paths to migrate.
 
 **Human involvement**  
-Read the approval diff and type the project name to accept the full declaration at local main.
+Review the declaration at local main and the approval summary, then type the project name to accept the declaration.
 
 ## troubleshoot
 
@@ -278,60 +278,41 @@ Policy reports goal-registration, task-registration, and integration defaults. P
 Review the proposed paths, verification result, digest, and policy before answering each gate.
 
 **Human involvement**  
-The operator updates local main, pushes branches, and opens pull requests. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep API keys in Keychain. In config-dir mode, processes inside a Claude VM can read the mounted group directory. Researcher and verification receive neither the directory nor its egress policy.
+The operator updates local main, pushes branches, and opens pull requests. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep API keys in Keychain. Review mount and egress grants separately.
 
-## credentials
+## volume
 
-Manage the encrypted volume for persistent Claude Code configuration directories per actor group, signed in with the CLI's own /login.
+Manage encrypted volumes and open an audited operator shell for a declared mount.
 
-**Prerequisites**
+**Prerequisites**  
+Define volumes in the user config. The shell requires an operator terminal.
 
-A private config.json with the volume path, Keychain service name and actor groups. API-key mode remains the default.
+```sh
+agent-bootstrap volume init <name>
+agent-bootstrap volume status <name>
+agent-bootstrap volume shell <mount> [--target <path>]
+```
 
-**Expected output**
+**Expected output**  
+Status reports attachment, active leases and stale state. The shell takes an exclusive lease and mounts the directory read-write.
 
-Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. After doctor reports a stale lease, confirm no VM is running and use detach --force.
+**Next action**  
+For stale state, run doctor. Confirm no VM is running before using volume detach <name> --force.
 
-**Next action**
-
-If integrity fails, inspect the evidence path and use credentials verify --accept from an operator terminal. Use the same target and authentication options as the failing run.
-
-**Human involvement**
-
-The operator inspects and accepts any intended changes to the group's configuration.
-
-## login
-
-Open Claude Code in an audited terminal for a configured actor group.
-
-**Prerequisites**
-
-Config-dir mode and a configured encrypted volume. Use a terminal with OSC 52 clipboard access disabled.
-
-**Expected output**
-
-The CLI can reach the group's configured hosts and its additional login hosts.
-
-**Next action**
-
-Use the Claude Code CLI's own /login, then exit the CLI.
-
-**Human involvement**
-
-The operator signs in from the Claude Code CLI.
+**Human involvement**  
+Declare read-write mounts in a project's local.json for one actor and a dedicated directory.
 
 ## Command reference
 
 - `agent-bootstrap help [topic] [--json] | help --agent` → { topics, commands, exitCodes }
-- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman } with effective settings and sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.
+- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|external>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap setup [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
-- `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
+- `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
 - `agent-bootstrap sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]` → A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.
 - `agent-bootstrap project add <path> [--name <name>] | project list | project show <name> | project move <name> <path> | project remove <name> | project approve <name>` → Project record, list of records, or a confirmation object.
 - `agent-bootstrap config edit [--project <name>]` → { edited: true } after the editor exits and file validation succeeds.
-- `agent-bootstrap migrate [<original-target-path>...]` → { projects, orphanedVolumes } with migrated project names and legacy Concierge volume names left for operator review.
-- `agent-bootstrap credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]` → { mounted, active, stale } for status or { status } after a completed action.
-- `agent-bootstrap login --group <name> [--target <path>] [--claude-auth <mode>] [--json]` → { status } after a successful interactive session. Transcript goes to stderr in JSON mode.
+- `agent-bootstrap migrate [<original-target-path>...]` → { projects, orphanedVolumes, volumeMigration? } with project names, legacy Concierge volume names and any mount migration guidance.
+- `agent-bootstrap volume <init|attach|detach|status> <name> [--force for detach] | volume shell <mount> [--target <path>]` → { mounted, active, stale } for status or { status } after a completed action.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }
 - `agent-bootstrap proposals [--status <pending|approved|rejected|registered>]` → Array of proposals with effective policy.
 - `agent-bootstrap show <proposalId|goalId|taskId>` → One proposal, Goal, or Task object.

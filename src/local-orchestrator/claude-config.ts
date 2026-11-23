@@ -1,6 +1,12 @@
+import { validKeychainService as validService } from "../credentials.ts";
+export { validService };
 import { constants, closeSync, fstatSync, openSync, readSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
-import { layerFile, loadConfig, type Layer } from "../config/layers.ts";
+import {
+  layerFile,
+  loadConfig,
+  type Layer,
+  type Config,
+} from "../config/layers.ts";
 import { ConfigError, type ConfigFix } from "../config/messages.ts";
 
 export { userConfigPath, userStateDirectory } from "../config/layers.ts";
@@ -12,7 +18,7 @@ export const CLAUDE_ACTORS = [
   "Reviewer",
 ] as const;
 export type ClaudeActor = (typeof CLAUDE_ACTORS)[number];
-export type ClaudeAuthMode = "api-key" | "config-dir";
+export type ClaudeAuthMode = "api-key" | "external";
 const CLAUDE_PATTERN_CODES = [
   "auth-required",
   "rate-limited",
@@ -20,8 +26,8 @@ const CLAUDE_PATTERN_CODES = [
 ] as const;
 export const CLAUDE_FAILURE_CODES = [
   ...CLAUDE_PATTERN_CODES,
-  "credentials-detached",
-  "config-tampered",
+  "volume-detached",
+  "mount-busy",
   "shell-disabled",
   "credential-leak",
 ] as const;
@@ -31,21 +37,6 @@ export interface ClaudeErrorPattern {
   readonly match: string;
   readonly code: ClaudePatternCode;
 }
-export interface ClaudeDirectoryConfig {
-  readonly volume: {
-    image: string;
-    keychainService: string;
-    attach: "while-running";
-  };
-  readonly groups: Readonly<
-    Record<string, { readonly actors: readonly ClaudeActor[] }>
-  >;
-  readonly egress: readonly string[];
-  readonly loginEgress: readonly string[];
-  readonly leakPatterns?: readonly string[];
-  readonly errors: readonly ClaudeErrorPattern[];
-}
-
 const invalid = "Invalid Claude configuration.";
 const unsafe =
   "Claude configuration must be a user-owned regular file with mode 0600.";
@@ -67,28 +58,12 @@ function object(
 }
 
 export function parseClaudeAuthMode(value: unknown): ClaudeAuthMode {
-  if (value === "api-key" || value === "config-dir") return value;
+  if (value === "api-key" || value === "external") return value;
   return reject();
 }
 
 const looksLikeSecret = (value: string) =>
   /sk-[a-zA-Z0-9_-]{12,}|bearer\s+\S+/i.test(value);
-
-export function validService(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value) &&
-    !looksLikeSecret(value)
-  );
-}
-
-export function validGroup(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    /^[a-z][a-z0-9-]{0,47}$/.test(value) &&
-    !looksLikeSecret(value)
-  );
-}
 
 export function validClaudeHostname(value: unknown): value is string {
   return (
@@ -112,8 +87,8 @@ function hosts(value: unknown) {
   return [...new Set(parsed)];
 }
 
-function patterns(value: unknown): ClaudeErrorPattern[] {
-  if (!Array.isArray(value) || value.length > 16) reject();
+function patterns(value: unknown, limit = 16): ClaudeErrorPattern[] {
+  if (!Array.isArray(value) || value.length > limit) reject();
   return value.map((item) => {
     const { match, code } = object(item, ["match", "code"]);
     if (
@@ -135,8 +110,10 @@ function patterns(value: unknown): ClaudeErrorPattern[] {
   });
 }
 
-function leakPatterns(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length > 16) reject();
+function leakPatterns(value: unknown, layer: Layer): string[] {
+  // Migration can combine two legacy lists into one project-local list.
+  if (!Array.isArray(value) || value.length > (layer === "local" ? 32 : 16))
+    reject();
   return value.map((pattern) => {
     if (
       typeof pattern !== "string" ||
@@ -154,59 +131,7 @@ function leakPatterns(value: unknown): string[] {
   });
 }
 
-function groups(value: unknown, warnings: Set<string>) {
-  const parsed = Object.create(null) as Record<
-    string,
-    { actors: ClaudeActor[] }
-  >;
-  for (const [name, group] of Object.entries(object(value))) {
-    if (!validGroup(name)) reject();
-    const { actors } = object(group, ["actors"]);
-    if (!Array.isArray(actors) || actors.length > 8) reject();
-    parsed[name] = {
-      actors: actors.flatMap((actor) => {
-        if (
-          actor === "Researcher" ||
-          actor === "verification" ||
-          actor === "Verification"
-        ) {
-          warnings.add(
-            "Researcher and verification are ignored in Claude actor groups.",
-          );
-          return [];
-        }
-        if (!CLAUDE_ACTORS.includes(actor)) reject();
-        return [actor as ClaudeActor];
-      }),
-    };
-  }
-  return parsed;
-}
-
-function volume(value: unknown): Partial<ClaudeDirectoryConfig["volume"]> {
-  const entry = object(value, ["image", "keychainService", "attach"]);
-  const { image, keychainService, attach } = entry;
-  if (
-    "image" in entry &&
-    (typeof image !== "string" ||
-      !isAbsolute(image) ||
-      resolve(image) !== image ||
-      !image.endsWith(".sparseimage") ||
-      /[\0\r\n]/.test(image) ||
-      looksLikeSecret(image))
-  )
-    reject();
-  if ("keychainService" in entry && !validService(keychainService)) reject();
-  if ("attach" in entry && attach !== "while-running") reject();
-  return entry as Partial<ClaudeDirectoryConfig["volume"]>;
-}
-
-function parseConfig(
-  value: unknown,
-  warnings: Set<string>,
-  layer: Layer,
-  fix: ConfigFix,
-) {
+function parseConfig(value: unknown, layer: Layer, fix: ConfigFix) {
   const validate = <T>(key: string, reason: string, parse: () => T): T => {
     try {
       return parse();
@@ -215,6 +140,17 @@ function parseConfig(
       throw new ConfigError(key, reason, fix);
     }
   };
+  if (
+    value &&
+    typeof value === "object" &&
+    (Object.hasOwn(value, "configDir") ||
+      Reflect.get(value, "auth") === "config-dir")
+  )
+    throw new ConfigError(
+      "claude",
+      "Legacy volume configuration requires migration.",
+      "Run agent-bootstrap migrate.",
+    );
   const claude =
     value === undefined
       ? {}
@@ -222,7 +158,14 @@ function parseConfig(
           "claude",
           "Expected an object with supported Claude settings.",
           () =>
-            object(value, ["auth", "model", "apiKey", "configDir", "gateway"]),
+            object(value, [
+              "auth",
+              "model",
+              "apiKey",
+              "gateway",
+              "errors",
+              "leakPatterns",
+            ]),
         );
   if (
     "model" in claude &&
@@ -261,28 +204,6 @@ function parseConfig(
       "Only the supported API key variable is allowed.",
       fix,
     );
-  const dir =
-    "configDir" in claude
-      ? validate(
-          "claude.configDir",
-          "Expected an object with supported configuration directory settings.",
-          () =>
-            object(claude.configDir, [
-              "volume",
-              "groups",
-              "egress",
-              "loginEgress",
-              "errors",
-              "leakPatterns",
-            ]),
-        )
-      : {};
-  if (layer === "local" && "volume" in dir)
-    throw new ConfigError(
-      "claude.configDir.volume",
-      "Only the user layer can define the Claude configuration volume.",
-      fix,
-    );
   return {
     model: claude.model as string | undefined,
     gatewayHosts:
@@ -302,52 +223,20 @@ function parseConfig(
           )
         : undefined,
     service: api.keychainService as string | undefined,
-    volume:
-      "volume" in dir
-        ? validate(
-            "claude.configDir.volume",
-            "The volume definition has an invalid field.",
-            () => volume(dir.volume),
-          )
-        : {},
-    groups:
-      "groups" in dir
-        ? validate(
-            "claude.configDir.groups",
-            "The actor group definitions have an invalid field.",
-            () => groups(dir.groups, warnings),
-          )
-        : {},
-    egress:
-      "egress" in dir
-        ? validate(
-            "claude.configDir.egress",
-            "Expected a list of HTTPS destinations.",
-            () => hosts(dir.egress),
-          )
-        : undefined,
-    loginEgress:
-      "loginEgress" in dir
-        ? validate(
-            "claude.configDir.loginEgress",
-            "Expected a list of HTTPS destinations.",
-            () => hosts(dir.loginEgress),
-          )
-        : undefined,
     errors:
-      "errors" in dir
+      "errors" in claude
         ? validate(
-            "claude.configDir.errors",
+            "claude.errors",
             "Expected supported failure codes and bounded match patterns.",
-            () => patterns(dir.errors),
+            () => patterns(claude.errors),
           )
         : undefined,
     leakPatterns:
-      "leakPatterns" in dir
+      "leakPatterns" in claude
         ? validate(
-            "claude.configDir.leakPatterns",
+            "claude.leakPatterns",
             "Expected a list of bounded match patterns.",
-            () => leakPatterns(dir.leakPatterns),
+            () => leakPatterns(claude.leakPatterns, layer),
           )
         : undefined,
   };
@@ -358,7 +247,7 @@ export function validateClaudeLayer(
   layer: Layer,
   fix: ConfigFix,
 ) {
-  parseConfig(value, new Set(), layer, fix);
+  parseConfig(value, layer, fix);
 }
 
 export function readLegacyPrivateFile(
@@ -405,7 +294,8 @@ export interface EffectiveClaudeConfig {
   readonly model?: string;
   readonly keychainService?: string;
   readonly gatewayHosts?: readonly string[];
-  readonly configDir?: ClaudeDirectoryConfig;
+  readonly config: Config;
+  readonly errors: readonly ClaudeErrorPattern[];
   readonly warnings: readonly string[];
   readonly leakPatterns?: readonly string[];
 }
@@ -419,8 +309,8 @@ export function loadClaudeConfig(
   const warnings = new Set<string>();
   const userFix = layerFile("user", env);
   const localFix = layerFile("local", env, layers.directory);
-  const user = parseConfig(layers.user.claude, warnings, "user", userFix);
-  const target = parseConfig(layers.local.claude, warnings, "local", localFix);
+  const user = parseConfig(layers.user.claude, "user", userFix);
+  const target = parseConfig(layers.local.claude, "local", localFix);
   const model = env.LO_CLAUDE_MODEL ?? target.model ?? user.model;
   const auth = override ?? target.auth ?? user.auth ?? "api-key";
   const source = override
@@ -435,65 +325,34 @@ export function loadClaudeConfig(
     ...(user.leakPatterns ?? []),
     ...(target.leakPatterns ?? []),
   ];
-  if (auth === "api-key") {
-    let keychainService = target.service ?? user.service;
-    if (
-      !keychainService &&
-      (env.LO_CLAUDE_KEYCHAIN !== undefined || env.LO_CLAUDE_AUTH !== undefined)
-    ) {
-      warnings.add(
-        "LO_CLAUDE_AUTH and LO_CLAUDE_KEYCHAIN are deprecated. Set claude.apiKey in config.json.",
-      );
-      if (
-        (env.LO_CLAUDE_AUTH !== undefined &&
-          env.LO_CLAUDE_AUTH !== "operator:ANTHROPIC_API_KEY:x-api-key") ||
-        (env.LO_CLAUDE_KEYCHAIN !== undefined &&
-          !validService(env.LO_CLAUDE_KEYCHAIN))
-      )
-        reject();
-      keychainService = env.LO_CLAUDE_KEYCHAIN;
-    }
-    return {
-      auth,
-      source,
-      ...(model === undefined ? {} : { model }),
-      ...(gatewayHosts ? { gatewayHosts } : {}),
-      ...(outgoingPatterns.length ? { leakPatterns: outgoingPatterns } : {}),
-      ...(keychainService ? { keychainService } : {}),
-      warnings: [...warnings],
-    };
-  }
-
-  const { image, keychainService, attach } = user.volume;
-  if (!image || !keychainService || attach !== "while-running")
-    throw new ConfigError(
-      "claude.configDir.volume",
-      "The volume definition is incomplete.",
-      userFix,
-    );
-  const actorGroups = { ...user.groups, ...target.groups };
-  const actors = Object.values(actorGroups).flatMap((group) => group.actors);
+  let keychainService =
+    auth === "api-key" ? (target.service ?? user.service) : undefined;
   if (
-    actors.length !== CLAUDE_ACTORS.length ||
-    new Set(actors).size !== actors.length
-  )
-    throw new ConfigError(
-      "claude.configDir.groups",
-      "Each supported actor must appear in exactly one group.",
-      Object.keys(target.groups).length ? localFix : userFix,
+    auth === "api-key" &&
+    !keychainService &&
+    (env.LO_CLAUDE_KEYCHAIN !== undefined || env.LO_CLAUDE_AUTH !== undefined)
+  ) {
+    warnings.add(
+      "LO_CLAUDE_AUTH and LO_CLAUDE_KEYCHAIN are deprecated. Set claude.apiKey in config.json.",
     );
+    if (
+      (env.LO_CLAUDE_AUTH !== undefined &&
+        env.LO_CLAUDE_AUTH !== "operator:ANTHROPIC_API_KEY:x-api-key") ||
+      (env.LO_CLAUDE_KEYCHAIN !== undefined &&
+        !validService(env.LO_CLAUDE_KEYCHAIN))
+    )
+      reject();
+    keychainService = env.LO_CLAUDE_KEYCHAIN;
+  }
   return {
     auth,
     source,
     ...(model === undefined ? {} : { model }),
+    ...(gatewayHosts ? { gatewayHosts } : {}),
+    ...(keychainService ? { keychainService } : {}),
+    config: layers.config,
+    errors: patterns(layers.config.claude?.errors ?? [], 32),
+    leakPatterns: [...new Set(outgoingPatterns)],
     warnings: [...warnings],
-    configDir: {
-      volume: { image, keychainService, attach },
-      groups: actorGroups,
-      egress: target.egress ?? user.egress ?? [],
-      loginEgress: target.loginEgress ?? user.loginEgress ?? [],
-      errors: target.errors ?? user.errors ?? [],
-      leakPatterns: outgoingPatterns,
-    },
   };
 }

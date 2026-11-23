@@ -17,12 +17,22 @@ import {
   ClaudeConfigError,
   readLegacyPrivateFile,
 } from "../local-orchestrator/claude-config.ts";
+import { assertDetachedImages } from "../volumes/volume.ts";
+import {
+  convertProjectVolumeConfig,
+  convertUserVolumeConfig,
+} from "./volume-migration.ts";
 import { legacyStateDirectory } from "../local-orchestrator/target.ts";
 import {
   configRoot,
+  conflictingClaims,
   layerFix,
   missing,
-  parseConfig,
+  mergeConfig,
+  maxConfigBytes,
+  layerFile,
+  type Config,
+  type EgressActor,
   privatePath,
   projectConfigDirectory,
   projectStateDirectory,
@@ -56,10 +66,11 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
 const retry =
   "Stop the launcher, release any leases, then run agent-bootstrap migrate.";
 const leaseRecovery =
-  "Stop the launcher and run agent-bootstrap doctor --claude-auth config-dir. After confirming no VM is running, clear stale or quarantined leases with agent-bootstrap credentials detach --force --claude-auth config-dir, then rerun agent-bootstrap migrate.";
+  "Stop active runs and use the volume recovery command for the installed version before retrying migration.";
 const locate =
   "Run agent-bootstrap migrate with the original target worktree paths.";
 const markerName = ".layout-migration.json";
+const maxJournalBytes = 2 * 1024 * 1024;
 
 function exists(path: string) {
   try {
@@ -117,7 +128,11 @@ function oldSlug(repoRoot: string) {
   return `${name}-${hash.slice(0, 12)}`;
 }
 
-function legacyConfig(directory: string, name: string) {
+function legacyConfig(
+  directory: string,
+  name: string,
+  convert: (value: unknown, fix: ReturnType<typeof layerFix>) => Config,
+) {
   const path = join(directory, "config.json");
   if (!exists(path)) return undefined;
   const fix = {
@@ -126,13 +141,13 @@ function legacyConfig(directory: string, name: string) {
   };
   let value: unknown;
   try {
-    value = readLegacyPrivateFile(path, 256 * 1024, true);
+    value = readLegacyPrivateFile(path, maxConfigBytes, true);
   } catch (error) {
     if (!(error instanceof ClaudeConfigError)) throw error;
     invalid("$", "The target configuration is invalid or unsafe to read.", fix);
   }
   const raw = record(value, "$", fix, ["profile", "argv", "claude"]);
-  return parseConfig(
+  const config = convert(
     {
       version: 1,
       ...(raw.profile !== undefined || raw.argv !== undefined
@@ -140,9 +155,10 @@ function legacyConfig(directory: string, name: string) {
         : {}),
       ...(raw.claude === undefined ? {} : { claude: raw.claude }),
     },
-    "local",
     fix,
   );
+  checkConfigSize(config, maxConfigBytes, fix);
+  return config;
 }
 
 function syncState(path: string) {
@@ -166,16 +182,349 @@ function syncState(path: string) {
     );
 }
 
+function checkConfigSize(
+  value: unknown,
+  limit: number,
+  fix: ReturnType<typeof layerFix>,
+) {
+  if (Buffer.byteLength(JSON.stringify(value, null, 2)) + 1 > limit)
+    invalid(
+      "migration",
+      "The converted configuration exceeds the file size limit.",
+      fix,
+    );
+}
+
+function checkRuns(directory: string) {
+  checkDatabase(join(directory, "state.db"), [
+    ["actor_sessions", "status = 'active'"],
+    ["tasks", "status = 'running'"],
+    ["executions", "status IN ('queued', 'running')"],
+  ]);
+}
+
+function checkLeases(stateRoot: string) {
+  for (const subdirectory of ["credentials", "volumes"]) {
+    const root = join(stateRoot, subdirectory);
+    if (!exists(root)) continue;
+    privatePath(root, stateRoot);
+    for (const entry of readdirSync(root)) {
+      const directory = join(root, entry);
+      privatePath(directory, stateRoot);
+      checkDatabase(
+        join(directory, "lock.sqlite"),
+        [["lease", "1"]],
+        leaseRecovery,
+      );
+    }
+  }
+}
+
 export function migrate(
   checkout: string,
   paths: readonly string[] = [],
   env = process.env,
+  checkAttachments = assertDetachedImages,
 ) {
   const bootstrapRoot = realpathSync(checkout);
   const root = legacyStateDirectory(bootstrapRoot);
   const oldDefaultVolume = `lo-concierge-${createHash("sha256").update(bootstrapRoot).digest("hex").slice(0, 16)}`;
   const cleanup = root + ".migrated";
+  const registered = listProjects(env);
+  const stateRoot = userStateDirectory(env);
+  const userFix = layerFile("user", env);
+  const currentUser = readPrivateConfig(
+    userFix.path,
+    configRoot(env),
+    "$",
+    userFix,
+  );
+  const journalPath = join(configRoot(env), ".volume-migration.json");
+  const rawJournal = readPrivateConfig(
+    journalPath,
+    configRoot(env),
+    "migration",
+    retry,
+    maxJournalBytes,
+  );
+  const journal =
+    rawJournal === undefined
+      ? undefined
+      : record(rawJournal, "migration", userFix, [
+          "version",
+          "before",
+          "after",
+          "legacyRoot",
+          "projects",
+        ]);
+  const sameConfig = (left: unknown, right: unknown) =>
+    JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+  if (
+    journal &&
+    (journal.version !== 1 ||
+      (!sameConfig(currentUser, journal.before) &&
+        !sameConfig(currentUser, journal.after)))
+  )
+    invalid(
+      "migration",
+      "The user configuration changed during an incomplete migration.",
+      retry,
+    );
+  if (journal && journal.legacyRoot !== null && journal.legacyRoot !== root)
+    invalid(
+      "migration",
+      "The pending legacy state belongs to a different checkout.",
+      "Rerun agent-bootstrap migrate from the original bootstrap checkout.",
+    );
+  const rawUser = journal ? (journal.before ?? undefined) : currentUser;
+  const userConfig =
+    rawUser === undefined ? { version: 1 } : record(rawUser, "$", userFix);
+  const user = convertUserVolumeConfig({ version: 1, ...userConfig }, userFix);
+  const journalProjects = journal
+    ? record(journal.projects, "migration.projects", userFix)
+    : undefined;
+  const projectDigest = (identity: string, config: Config) =>
+    createHash("sha256")
+      .update(JSON.stringify([identity, config]))
+      .digest("hex");
+  const convertLocal = (
+    name: string,
+    identity: string,
+    id: string | undefined,
+    value: unknown,
+    fix: ReturnType<typeof layerFix>,
+  ) => {
+    const pending =
+      journalProjects && Object.hasOwn(journalProjects, name)
+        ? record(journalProjects[name], "migration.projects", userFix, [
+            "id",
+            "digest",
+          ])
+        : undefined;
+    const plan = convertProjectVolumeConfig(
+      value,
+      fix,
+      journalProjects && !pending
+        ? { ...user, active: false, legacy: {} }
+        : user,
+    );
+    if (
+      journalProjects &&
+      (pending
+        ? (pending.id !== null && pending.id !== id) ||
+          pending.digest !== projectDigest(identity, plan.config)
+        : plan.converted)
+    )
+      invalid(
+        "migration",
+        "The project configuration changed during an incomplete migration.",
+        fix,
+      );
+    return { ...plan, identity, id };
+  };
+  const legacyLocalPlans = new Map<string, ReturnType<typeof convertLocal>>();
+  const localPlans = () =>
+    registered.flatMap(({ name, identity, id }) => {
+      const directory = projectConfigDirectory(name, env);
+      const fix = layerFile("local", env, directory);
+      const value = readPrivateConfig(fix.path, configRoot(env), "$", fix);
+      if (value === undefined && legacyLocalPlans.has(name)) return [];
+      return [
+        {
+          name,
+          fix,
+          create: value === undefined,
+          ...convertLocal(name, identity, id, value ?? { version: 1 }, fix),
+        },
+      ];
+    });
+  const userPlan = () => {
+    const { config } = user;
+    mergeConfig(config, undefined, { version: 1 }, env);
+    checkConfigSize(config, maxConfigBytes, userFix);
+    const locals = localPlans();
+    const projects = new Map(legacyLocalPlans);
+    for (const plan of locals) {
+      const legacy = legacyLocalPlans.get(plan.name);
+      if (
+        (user.converted || journal) &&
+        legacy &&
+        !sameConfig(plan.config, legacy.config)
+      )
+        invalid(
+          "$",
+          "A different local configuration already exists.",
+          plan.fix,
+        );
+      projects.set(plan.name, plan);
+      checkConfigSize(plan.config, maxConfigBytes, plan.fix);
+    }
+    const claims = new Map<
+      string,
+      { project: string; mount: NonNullable<Config["mounts"]>[string] }[]
+    >();
+    for (const [project, { config: local }] of projects) {
+      const directory = projectConfigDirectory(project, env);
+      mergeConfig(config, undefined, local, env, directory);
+      for (const [name, mount] of Object.entries(local.mounts ?? {})) {
+        const key = `${mount.volume}/${mount.dir}`;
+        const entries = claims.get(key) ?? [];
+        if (
+          entries.some(
+            (other) =>
+              other.project !== project &&
+              conflictingClaims(other.mount, mount),
+          )
+        )
+          invalid(
+            `mounts.${name}.dir`,
+            "A directory with a write grant is also claimed by another project.",
+            layerFile("local", env, directory),
+          );
+        entries.push({ project, mount });
+        claims.set(key, entries);
+      }
+    }
+    return {
+      config,
+      changed:
+        user.converted ||
+        (rawUser !== undefined && !Object.hasOwn(userConfig, "version")),
+      locals,
+      projects,
+    };
+  };
+
+  const applyVolumes = ({
+    config,
+    changed,
+    locals,
+    projects,
+  }: ReturnType<typeof userPlan>) => {
+    checkLeases(stateRoot);
+    for (const project of registered) {
+      const directory = projectStateDirectory(project.name, env);
+      if (exists(directory)) {
+        privatePath(directory, stateRoot);
+        checkRuns(directory);
+      }
+    }
+    try {
+      checkAttachments(
+        Object.values(config.volumes ?? {}).map(({ image }) => image),
+      );
+    } catch {
+      invalid(
+        "volumes",
+        "Volumes must be detached before migration.",
+        leaseRecovery,
+      );
+    }
+    if (journal && !sameConfig(config, journal.after))
+      invalid(
+        "migration",
+        "The planned user configuration changed during migration.",
+        retry,
+      );
+    if (!journal && changed) {
+      // Resume with the original defaults only for the projects in this plan.
+      const entry = {
+        version: 1,
+        before: rawUser ?? null,
+        after: config,
+        legacyRoot: exists(root) ? root : null,
+        projects: Object.fromEntries(
+          [...projects].map(([name, plan]) => [
+            name,
+            {
+              id: plan.id ?? null,
+              digest: projectDigest(plan.identity, plan.config),
+            },
+          ]),
+        ),
+      };
+      checkConfigSize(entry, maxJournalBytes, userFix);
+      writePrivateConfig(journalPath, configRoot(env), entry, true);
+    }
+    if (changed && !sameConfig(currentUser, config))
+      writePrivateConfig(userFix.path, configRoot(env), config);
+    for (const { fix, config: local, converted, create } of locals) {
+      if (converted)
+        writePrivateConfig(fix.path, configRoot(env), local, create);
+    }
+    if (!changed && ![...projects.values()].some(({ converted }) => converted))
+      return undefined;
+    const actors = [
+      ...new Set(
+        [...projects.values()].flatMap(({ mounts }) =>
+          Object.values(mounts).flatMap(({ actors }) => actors),
+        ),
+      ),
+    ];
+    return {
+      actorsLosingWriteAccess: actors,
+      actorsLosingShellTools: actors,
+      projects: [...projects].map(([project, plan]) => {
+        const previousMounts = { ...config.mounts, ...plan.previous.mounts };
+        const addedMounts = Object.entries(plan.mounts)
+          .filter(([name]) => !Object.hasOwn(previousMounts, name))
+          .map(([, mount]) => mount);
+        const mountedActors = new Set(
+          Object.values(previousMounts).flatMap(({ actors }) => actors),
+        );
+        const addedEgress: Partial<Record<EgressActor, number>> = {};
+        for (const actor of Object.keys(
+          plan.config.egress ?? {},
+        ) as EgressActor[]) {
+          if (actor === "shell") continue;
+          const previous = new Set([
+            ...(config.egress?.[actor] ?? []),
+            ...(plan.previous.egress?.[actor] ?? []),
+          ]);
+          const count = new Set(
+            (plan.config.egress?.[actor] ?? []).filter(
+              (entry) => !previous.has(entry),
+            ),
+          ).size;
+          if (count) addedEgress[actor] = count;
+        }
+        return {
+          project,
+          addedEgress,
+          addedMounts: addedMounts.length,
+          actorsLosingShellTools: [
+            ...new Set(addedMounts.flatMap(({ actors }) => actors)),
+          ].filter((actor) => !mountedActors.has(actor)),
+        };
+      }),
+      localJsonMountExample: {
+        mounts: {
+          "new-mount": {
+            volume: "<volume>",
+            dir: "new-directory",
+            actors: ["<actor>"],
+            path: "/mnt/new-directory",
+            mode: "rw",
+          },
+        },
+      },
+      next: [
+        'Add a uniquely named mount in the project local.json with a dedicated dir and path, mode "rw" and exactly one actor.',
+        "If replacing an existing mount environment variable, remove the duplicate assignment from the read-only mount first.",
+        "Run agent-bootstrap volume shell <mount> --target <path> to create its directory. Exit the shell before launching the actor.",
+      ],
+    };
+  };
+
+  const finishVolumeMigration = () => {
+    if (exists(journalPath)) {
+      rmSync(journalPath);
+      syncDirectory(configRoot(env));
+    }
+  };
+
   if (!exists(root)) {
+    const volumeMigration = applyVolumes(userPlan());
     const orphanedVolumes: string[] = [];
     if (exists(cleanup)) {
       privatePath(cleanup, cleanup);
@@ -189,7 +538,12 @@ export function migrate(
       }
       rmSync(cleanup, { recursive: true });
     }
-    return { projects: [], orphanedVolumes };
+    finishVolumeMigration();
+    return {
+      projects: [],
+      orphanedVolumes,
+      ...(volumeMigration ? { volumeMigration } : {}),
+    };
   }
   if (exists(cleanup))
     invalid(
@@ -200,21 +554,6 @@ export function migrate(
   privatePath(root, root);
   const targets = join(root, "targets");
   if (exists(targets)) privatePath(targets, root);
-  const stateRoot = userStateDirectory(env);
-  const credentials = join(stateRoot, "credentials");
-  if (exists(credentials)) {
-    privatePath(credentials, stateRoot);
-    for (const entry of readdirSync(credentials)) {
-      const directory = join(credentials, entry);
-      privatePath(directory, stateRoot);
-      checkDatabase(
-        join(directory, "lock.sqlite"),
-        [["lease", "1"]],
-        leaseRecovery,
-      );
-    }
-  }
-  const registered = listProjects(env);
   const bootstrap = repository(checkout);
   const supplied = [bootstrap, ...paths.map(repository)];
   const identities = new Set([
@@ -256,24 +595,53 @@ export function migrate(
       "Archive the conflicting legacy state before retrying.",
     );
 
+  const projectNames = new Map(
+    registered.map(({ name, identity }) => [name, identity]),
+  );
   const plans = jobs.map(({ directory, repo }) => {
     assertExternalPaths(repo, env);
-    checkDatabase(join(directory, "state.db"), [
-      ["actor_sessions", "status = 'active'"],
-      ["tasks", "status = 'running'"],
-      ["executions", "status IN ('queued', 'running')"],
-    ]);
+    checkRuns(directory);
+    const project = registered.find(
+      ({ identity }) => identity === repo.identity,
+    );
     const name =
-      registered.find(({ identity }) => identity === repo.identity)?.name ??
+      project?.name ??
       defaultProjectName(
         basename(repo.identity) === ".git"
           ? dirname(repo.identity)
           : repo.repoRoot,
       );
-    const config = legacyConfig(directory, name);
+    if (projectNames.has(name) && projectNames.get(name) !== repo.identity)
+      invalid(
+        "migration.targets",
+        "Legacy targets conflict on a project name.",
+        locate,
+      );
+    projectNames.set(name, repo.identity);
+    const convert = (value: unknown, fix: ReturnType<typeof layerFix>) => {
+      const plan = convertLocal(name, repo.identity, project?.id, value, fix);
+      legacyLocalPlans.set(name, plan);
+      return plan.config;
+    };
+    let config = legacyConfig(directory, name, convert);
+    if (!config && !project) {
+      const fix = layerFile("local", env, projectConfigDirectory(name, env));
+      const plan = convertLocal(
+        name,
+        repo.identity,
+        undefined,
+        { version: 1 },
+        fix,
+      );
+      if (plan.converted) {
+        legacyLocalPlans.set(name, plan);
+        config = plan.config;
+      }
+    }
     return { directory, repo, config };
   });
 
+  const volumeMigration = applyVolumes(userPlan());
   const names: string[] = [];
   for (const { directory, repo, config } of plans) {
     const project =
@@ -337,5 +705,10 @@ export function migrate(
   syncDirectory(dirname(root));
   rmSync(cleanup, { recursive: true });
   syncDirectory(dirname(root));
-  return { projects: names, orphanedVolumes };
+  finishVolumeMigration();
+  return {
+    projects: names,
+    orphanedVolumes,
+    ...(volumeMigration ? { volumeMigration } : {}),
+  };
 }

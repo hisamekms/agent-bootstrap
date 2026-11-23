@@ -220,20 +220,20 @@ The change removes the following at once, with no compatibility period:
 
 `agent-bootstrap migrate` also converts `claude.configDir`. It refuses to
 run while any lease exists, a run is active or a volume is attached. It
-can be rerun safely. It writes new files atomically and removes the old
-keys last. It converts as follows:
+can be rerun safely and writes each configuration file atomically.
 
-- **Volume.** The configured volume becomes a `volumes` entry.
-- **Groups.** Every group becomes a `ro` mount in the user config. The
-  mount keeps `dir` as the group name and lists the group's actors.
+- The user config receives the `volumes` entry and `egress.shell` from
+  `loginEgress`. Only `volume shell` uses these destinations.
+- Each project whose effective legacy auth was `config-dir` receives
+  `claude.auth: "external"`, `ro` mounts for the groups from its user
+  and local layers, and per-actor egress in its `local.json`. A mount
+  keeps the group name as its `dir` and lists the group's actors.
+  Local egress takes precedence over legacy user egress for those actors.
 - **Write access.** The command prints which actors lose it. It also
   prints the `local.json` entry and the `volume shell` steps for
   creating a project-scoped `rw` directory when one is wanted. Under
   V3.1, a writable directory cannot be granted to several projects
   automatically.
-- **Egress.** `egress` becomes per-actor `egress` for exactly the actors
-  that the old group granted it to. `loginEgress` becomes
-  `egress.shell`.
 - **Concierge volumes.** Named Concierge volumes are renamed from the
   project name. Existing `lo-concierge-*` volumes are listed for the
   operator to review and remove, and their contents are never converted.

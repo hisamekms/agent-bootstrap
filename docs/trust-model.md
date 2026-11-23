@@ -45,18 +45,18 @@ Concierge can also reach `platform.claude.com:443` with plain HTTPS.
 Authorization-header substitution is confined to operator-configured
 gateway hosts outside Anthropic domains.
 
-In config-dir mode, persistent Claude Code configuration directories per
-actor group are kept on an encrypted volume and signed in with the CLI's
-own `/login`. Claude Code and other processes in its VM can read and write
-the mounted group directory. Actors configured in the same group share
-that directory, including while runs overlap. Group members can change
-shared files between integrity checks. Use separate groups for roles that
-should not share writable state. The host reads contents only from the paths covered by
-the integrity check and never parses or copies CLI state or sign-in files.
-Researcher and verification receive neither the directory nor its egress
-hosts. Config-dir runs use plain HTTPS through the audited gateway to the
-API host and configured egress hosts. Login can also reach the configured
-login hosts.
+In external mode, the audited gateway relays plain HTTPS and the host
+supplies no API key. Added egress is granted per actor through effective
+configuration. Verification stays offline.
+
+Encrypted volumes attach while leased. The host checks directory
+identity and permissions at launch and audits mount names, modes and
+guest paths. Readers can share a directory. A project-scoped writer or
+the operator shell takes an exclusive lease. An unconfirmed VM removal
+quarantines its leases. The only adapter that can currently receive
+declared mounts is Claude. A mounted actor loses shell tools, and its
+file tools are limited to working paths with every mount denied.
+Verification receives no mounts.
 
 The gateway relays TCP without terminating TLS and audits DNS and
 connection decisions. Host-generated managed settings are mounted

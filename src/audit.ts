@@ -1,8 +1,8 @@
-import { CLAUDE_GROUP_PATH, CLAUDE_MANAGED_PATH } from "./claude-code.ts";
+import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import {
   CLAUDE_FAILURE_CODES,
   validClaudeHostname,
-  validGroup,
+  validService,
   type ClaudeFailureCode,
 } from "./local-orchestrator/claude-config.ts";
 import { createRequire } from "node:module";
@@ -17,23 +17,44 @@ import {
 import { isConciergeVolumeName } from "./sandbox-runtime.ts";
 import { PROFILE_NAMES, type ProfileName } from "./sandbox-profiles.ts";
 
+interface AuditMount {
+  readonly name: string;
+  readonly mode: "ro" | "rw";
+  readonly path: string;
+}
+
+function auditMounts(value: unknown): AuditMount[] {
+  if (!Array.isArray(value) || !value.length) return invalidEvent();
+  return value.map((item) => {
+    const { name, mode, path } = dataFields(item, ["name", "mode", "path"]);
+    if (
+      typeof name !== "string" ||
+      !/^[a-z][a-z0-9-]{0,47}$/.test(name) ||
+      (mode !== "ro" && mode !== "rw") ||
+      typeof path !== "string" ||
+      !/^\/mnt\/[a-z0-9][a-z0-9._-]{0,63}$/.test(path)
+    )
+      return invalidEvent();
+    return { name, mode, path };
+  });
+}
+
 type AuditDetail =
   | {
       readonly socketPath: string;
       readonly vsockPort: number;
       readonly snapshotDir: string;
       readonly volumeName: string;
-      readonly group?: string;
+      readonly mounts?: readonly AuditMount[];
     }
   | { readonly volumeName: string; readonly reused?: boolean }
   | { readonly plainHosts: readonly string[] }
-  | { readonly mode: "login" | "config-dir"; readonly group: string }
+  | { readonly mounts: readonly AuditMount[] }
   | {
-      readonly authMode: "api-key" | "config-dir";
+      readonly authMode: "api-key" | "external";
       readonly settingsDigest: string;
       readonly managedPath: typeof CLAUDE_MANAGED_PATH;
-      readonly group?: string;
-      readonly groupPath?: typeof CLAUDE_GROUP_PATH;
+      readonly mounts?: readonly AuditMount[];
     }
   | { readonly code: ClaudeFailureCode };
 
@@ -87,7 +108,25 @@ export type RequestClaimInput = {
 
 export type RequestClaim = { readonly id: string; readonly replayed: boolean };
 
-export type AuditEvent = AuditInput & {
+type LegacyAuditDetail =
+  | {
+      readonly authMode: "config-dir";
+      readonly settingsDigest: string;
+      readonly managedPath: typeof CLAUDE_MANAGED_PATH;
+      readonly group: string;
+      readonly groupPath?: "/claude-config";
+    }
+  | { readonly mode: "login" | "config-dir"; readonly group: string }
+  | {
+      readonly socketPath: string;
+      readonly vsockPort: number;
+      readonly snapshotDir: string;
+      readonly volumeName: string;
+      readonly group: string;
+    };
+
+export type AuditEvent = Omit<AuditInput, "detail"> & {
+  readonly detail?: AuditDetail | LegacyAuditDetail;
   readonly sequence: number;
   readonly recordedAt: string;
 };
@@ -575,7 +614,15 @@ function invocationId(value: unknown): string {
   return value;
 }
 
-function parseInput(value: unknown): AuditInput {
+function parseInput(value: unknown): AuditInput;
+function parseInput(
+  value: unknown,
+  stored: true,
+): Omit<AuditEvent, "sequence" | "recordedAt">;
+function parseInput(
+  value: unknown,
+  stored = false,
+): Omit<AuditEvent, "sequence" | "recordedAt"> {
   const input = record(value);
   const descriptors = Object.getOwnPropertyDescriptors(input);
   for (const key of Reflect.ownKeys(descriptors)) {
@@ -645,8 +692,12 @@ function parseInput(value: unknown): AuditInput {
     Object.hasOwn(descriptors, "detail"),
     descriptors.detail?.value,
     result,
+    stored,
   );
-  return { ...result, ...(detail ? { detail } : {}) } as AuditInput;
+  return { ...result, ...(detail ? { detail } : {}) } as Omit<
+    AuditEvent,
+    "sequence" | "recordedAt"
+  >;
 }
 
 function parseAuditDetail(
@@ -659,7 +710,8 @@ function parseAuditDetail(
     profile?: string;
     outcome?: string;
   },
-): AuditDetail | undefined {
+  stored: boolean,
+): AuditDetail | LegacyAuditDetail | undefined {
   const { kind, operation, role, profile, outcome } = event;
   const claudeRole =
     role === "Concierge" ||
@@ -667,29 +719,53 @@ function parseAuditDetail(
     role === "Planner" ||
     role === "Reviewer";
   if (present && claudeRole && kind === "invocation.started") {
-    const { authMode, settingsDigest, managedPath, group, groupPath } =
-      dataFields(value, [
-        "authMode",
-        "settingsDigest",
-        "managedPath",
-        "group",
-        "groupPath",
-      ]);
     if (
-      (authMode !== "api-key" && authMode !== "config-dir") ||
+      stored &&
+      value &&
+      typeof value === "object" &&
+      Object.hasOwn(value, "group")
+    ) {
+      const { authMode, settingsDigest, managedPath, group, groupPath } =
+        dataFields(value, [
+          "authMode",
+          "settingsDigest",
+          "managedPath",
+          "group",
+          "groupPath",
+        ]);
+      if (
+        authMode !== "config-dir" ||
+        typeof settingsDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(settingsDigest) ||
+        managedPath !== CLAUDE_MANAGED_PATH ||
+        !validAuditGroup(group) ||
+        (groupPath !== undefined && groupPath !== "/claude-config")
+      )
+        return invalidEvent();
+      return {
+        authMode,
+        settingsDigest,
+        managedPath,
+        group,
+        ...(groupPath ? { groupPath } : {}),
+      };
+    }
+    const { authMode, settingsDigest, managedPath, mounts } = dataFields(
+      value,
+      ["authMode", "settingsDigest", "managedPath", "mounts"],
+    );
+    if (
+      (authMode !== "api-key" && authMode !== "external") ||
       typeof settingsDigest !== "string" ||
       !/^[a-f0-9]{64}$/.test(settingsDigest) ||
-      managedPath !== CLAUDE_MANAGED_PATH ||
-      (authMode === "config-dir"
-        ? !validGroup(group) || groupPath !== CLAUDE_GROUP_PATH
-        : group !== undefined || groupPath !== undefined)
+      managedPath !== CLAUDE_MANAGED_PATH
     )
       return invalidEvent();
     return {
       authMode,
       settingsDigest,
       managedPath,
-      ...(validGroup(group) ? { group, groupPath: CLAUDE_GROUP_PATH } : {}),
+      ...(mounts === undefined ? {} : { mounts: auditMounts(mounts) }),
     };
   }
   if (
@@ -705,7 +781,7 @@ function parseAuditDetail(
   }
   if (
     present &&
-    claudeRole &&
+    role !== "Verification" &&
     kind === "operation.requested" &&
     operation === "provider.egress"
   ) {
@@ -713,9 +789,8 @@ function parseAuditDetail(
     if (
       !Array.isArray(plainHosts) ||
       plainHosts.length < 1 ||
-      plainHosts.length > 65 ||
-      !plainHosts.every(validClaudeHostname) ||
-      plainHosts[0] !== "api.anthropic.com"
+      plainHosts.length > 193 ||
+      !plainHosts.every(validClaudeHostname)
     )
       return invalidEvent();
     return { plainHosts: [...plainHosts] };
@@ -736,6 +811,7 @@ function parseAuditDetail(
     return { volumeName: detail.volumeName, reused: detail.reused };
   }
   if (
+    stored &&
     present &&
     claudeRole &&
     kind === "operation.requested" &&
@@ -746,11 +822,24 @@ function parseAuditDetail(
   ) {
     const { mode, group } = dataFields(value, ["mode", "group"]);
     if (
-      !validGroup(group) ||
-      (role === "Concierge" ? mode !== "login" : mode !== "config-dir")
+      !validAuditGroup(group) ||
+      mode !== (role === "Concierge" ? "login" : "config-dir")
     )
       return invalidEvent();
     return { mode: role === "Concierge" ? "login" : "config-dir", group };
+  }
+  if (
+    present &&
+    claudeRole &&
+    kind === "operation.requested" &&
+    operation === "sandbox.create" &&
+    value &&
+    typeof value === "object" &&
+    Object.hasOwn(value, "mounts") &&
+    !Object.hasOwn(value, "socketPath")
+  ) {
+    const { mounts } = dataFields(value, ["mounts"]);
+    return { mounts: auditMounts(mounts) };
   }
   if (
     role === "Concierge" &&
@@ -763,15 +852,16 @@ function parseAuditDetail(
       "vsockPort",
       "snapshotDir",
       "volumeName",
-      "group",
+      "mounts",
+      ...(stored ? ["group"] : []),
     ]);
-    const { socketPath, snapshotDir, volumeName, group } = detail;
+    const { socketPath, snapshotDir, volumeName, mounts, group } = detail;
     if (
       !isInteractiveAuditPath(socketPath) ||
       Buffer.byteLength(socketPath) >= 100 ||
       !isInteractiveAuditPath(snapshotDir) ||
       !isConciergeVolumeName(volumeName) ||
-      (group !== undefined && !validGroup(group))
+      (group !== undefined && (!validAuditGroup(group) || mounts !== undefined))
     )
       return invalidEvent();
     return {
@@ -779,7 +869,8 @@ function parseAuditDetail(
       vsockPort: integer(detail.vsockPort, 1024, 65535),
       snapshotDir,
       volumeName,
-      ...(group ? { group } : {}),
+      ...(mounts === undefined ? {} : { mounts: auditMounts(mounts) }),
+      ...(validAuditGroup(group) ? { group } : {}),
     };
   }
   if (present) return invalidEvent();
@@ -856,20 +947,27 @@ function parseClaimRow(value: unknown): RequestClaimInput & { id: string } {
 
 function parseRow(value: unknown): AuditEvent {
   const row = record(value);
-  const input = parseInput({
-    invocationId: row.invocation_id,
-    kind: row.kind,
-    ...(row.operation === null ? {} : { operation: row.operation }),
-    ...(row.outcome === null ? {} : { outcome: row.outcome }),
-    ...(row.role === null ? {} : { role: row.role }),
-    // Absent on version 1-3 rows.
-    ...(row.profile == null ? {} : { profile: row.profile }),
-    ...(row.image == null ? {} : { image: row.image }),
-    ...(row.detail == null
-      ? {}
-      : { detail: JSON.parse(String(row.detail)) as unknown }),
-  });
+  const input = parseInput(
+    {
+      invocationId: row.invocation_id,
+      kind: row.kind,
+      ...(row.operation === null ? {} : { operation: row.operation }),
+      ...(row.outcome === null ? {} : { outcome: row.outcome }),
+      ...(row.role === null ? {} : { role: row.role }),
+      // Absent on version 1-3 rows.
+      ...(row.profile == null ? {} : { profile: row.profile }),
+      ...(row.image == null ? {} : { image: row.image }),
+      ...(row.detail == null
+        ? {}
+        : { detail: JSON.parse(String(row.detail)) as unknown }),
+    },
+    true,
+  );
   return { ...input, ...rowMetadata(row) };
+}
+
+function validAuditGroup(value: unknown): value is string {
+  return validService(value) && /^[a-z][a-z0-9-]{0,47}$/.test(value);
 }
 
 function invalidEvent(): never {

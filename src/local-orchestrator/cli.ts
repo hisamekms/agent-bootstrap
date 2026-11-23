@@ -5,7 +5,7 @@ import {
   recordedCredentialScanner,
   type CredentialScanner,
 } from "./credential-scan.ts";
-import { ClaudeRunError } from "./credentials-volume.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { GitIntegrationError } from "../git-integration.ts";

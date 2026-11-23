@@ -457,20 +457,11 @@ export async function approveProject(
   const next: Config = shown.config ?? { version: 1 };
   const old = current.approved?.config;
   io.write(`Declaration at main (${shown.commit.slice(0, 7)})\n`);
-  if (escapedJson(old ?? null) !== escapedJson(next)) {
-    io.write(
-      escapedJson(old ?? null)
-        .split("\n")
-        .map((row) => `- ${row}\n`)
-        .join(""),
-    );
-    io.write(
-      escapedJson(next)
-        .split("\n")
-        .map((row) => `+ ${row}\n`)
-        .join(""),
-    );
-  } else io.write("No changes to the approved settings.\n");
+  const { added, removed } = changes(old, next);
+  for (const entry of removed) io.write(`- ${entry}\n`);
+  for (const entry of added) io.write(`+ ${entry}\n`);
+  if (!added.length && !removed.length)
+    io.write("No changes to the approved settings.\n");
   for (const [actor, after] of Object.entries(destinations(next))) {
     if (
       delta(

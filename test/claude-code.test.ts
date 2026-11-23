@@ -33,7 +33,7 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
   assert.ok(!script.includes("pwned") && !script.includes("Edit hello.txt"));
   assert.match(script, /-p --bare --strict-mcp-config --setting-sources ''/);
   assert.match(script, /--disable-slash-commands --no-session-persistence/);
-  assert.match(script, /--permission-mode acceptEdits/);
+  assert.match(script, /permission_mode=acceptEdits/);
   assert.match(
     script,
     /--tools 'Read,Glob,Grep,Edit,Write' --allowedTools 'Read,Glob,Grep,Edit,Write'/,
@@ -273,16 +273,16 @@ test("credential variables must be credential-shaped and fit their fixed header"
   for (const line of [
     "test ! -e /root/.claude",
     "claude_home=$(mktemp -d)",
-    "claude_config=$(mktemp -d)",
+    'claude_config="${LO_MOUNT_CONFIG_DIR:-$(mktemp -d)}"',
     'test -z "$(ls -A "$claude_home")"',
-    'test -z "$(ls -A "$claude_config")"',
+    'test -d "$claude_config"',
   ])
     assert.ok(
       script.split("\n").some((entry) => entry.trim() === line),
       line,
     );
   assert.doesNotMatch(script, /&& test|mktemp -d\) &&/);
-  assert.match(script, /claude_config=\$\(mktemp -d\)/);
+  assert.match(script, /CLAUDE_CONFIG_DIR="\$claude_config"/);
   assert.match(script, /ENABLE_TOOL_SEARCH=false/);
 });
 
@@ -308,7 +308,7 @@ test("shell adds Bash for the Worker only, and only as a boolean", () => {
     withShell,
     /--tools 'Read,Glob,Grep,Edit,Write,Bash' --allowedTools 'Read,Glob,Grep,Edit,Write,Bash'/,
   );
-  assert.match(withShell, /--permission-mode acceptEdits/);
+  assert.match(withShell, /permission_mode=acceptEdits/);
   assert.doesNotMatch(withShell, /bypassPermissions|dangerously/);
   const off = claudeCodeCommand({ ...task, shell: false }).argv[2]!;
   assert.equal(off, claudeCodeCommand(task).argv[2]!);
@@ -335,7 +335,7 @@ test("the Debian guest uses the glibc build, no apk step, and the same isolation
   for (const flag of [
     /-p --bare --strict-mcp-config --setting-sources ''/,
     /--disable-slash-commands --no-session-persistence/,
-    /--permission-mode acceptEdits/,
+    /permission_mode=acceptEdits/,
     /env -i PATH=/,
     /claude_home=\$\(mktemp -d\)/,
     /NODE_EXTRA_CA_CERTS=/,
@@ -384,8 +384,8 @@ test("authorization substitution requires an exact operator gateway host", () =>
   );
 });
 
-test("directory Workers return optional commit messages in their result envelope", () => {
-  const script = claudeCodeCommand(task, { mode: "config-dir" }).argv[2]!;
+test("external-mode Workers return optional commit messages in their result envelope", () => {
+  const script = claudeCodeCommand(task, { mode: "external" }).argv[2]!;
   assert.match(script, /cat \/review\/review-notes\.txt/);
   assert.doesNotMatch(script, /--allowedTools/);
   const encode = (value: object) =>

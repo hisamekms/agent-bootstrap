@@ -22,7 +22,6 @@ import { claudeRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
-  CLAUDE_GROUP_PATH,
   claudeCodeGuestSetup,
   claudeCodeProvider,
   claudeCodeTools,
@@ -38,11 +37,7 @@ import {
   type TerminalCommand,
 } from "../sandbox-runtime.ts";
 import type { TrustedHost } from "../trusted-host.ts";
-import {
-  parseClaudeAuthMode,
-  validGroup,
-  type ClaudeAuthMode,
-} from "./claude-config.ts";
+import { parseClaudeAuthMode, type ClaudeAuthMode } from "./claude-config.ts";
 import { orchestratorMcp } from "./claude-policy.ts";
 import { HostApiServer } from "./host-api.ts";
 import { gitCommit } from "./model.ts";
@@ -136,46 +131,32 @@ export function conciergeCommand(
     options.mode === undefined ? "auto" : options.mode,
   );
   const secretEnv =
-    auth.mode === "config-dir" ? undefined : claudeCodeProvider(auth).secretEnv;
+    auth.mode === "external" ? undefined : claudeCodeProvider(auth).secretEnv;
   const mcp = JSON.stringify({ mcpServers: { orchestrator: orchestratorMcp } });
   const script = `
 ${claudeCodeGuestSetup(secretEnv, "alpine")}    umask 077
     mkdir -p /state/home
     chmod 700 /state/home
-    ${secretEnv ? "mkdir -p /state/claude && chmod 700 /state/claude" : `test -d ${CLAUDE_GROUP_PATH}`}
+    if test -n "\${LO_MOUNT_CONFIG_DIR:-}"; then
+      claude_config="$LO_MOUNT_CONFIG_DIR"
+    else
+      ${secretEnv ? 'claude_config=/state/claude; mkdir -p "$claude_config"; chmod 700 "$claude_config"' : "claude_config=$(mktemp -d)"}
+    fi
     cat > /tmp/lo-mcp.json <<'EOF'
 ${mcp}
 EOF
+    set --
+    if test -n "\${LO_MOUNT_RESTRICTED:-}"; then set -- --tools ""; fi
     cd /repo
     exec env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/state/home \\
-      CLAUDE_CONFIG_DIR=${secretEnv ? `/state/claude ${secretEnv}="$${secretEnv}"` : CLAUDE_GROUP_PATH} \\
+      CLAUDE_CONFIG_DIR="$claude_config" ${secretEnv ? `${secretEnv}="$${secretEnv}"` : ""} \\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" TERM=xterm-256color \\
       ${CLAUDE_CODE.guestPath} --mcp-config /tmp/lo-mcp.json --strict-mcp-config --setting-sources '' \\
-      --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""}
+      "$@" --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""}
   `;
   return { argv: ["/bin/sh", "-ec", script], workdir: "/repo" };
-}
-
-export function claudeLoginCommand(): TerminalCommand {
-  return {
-    workdir: "/",
-    argv: [
-      "/bin/sh",
-      "-ec",
-      `
-${claudeCodeGuestSetup(undefined, "alpine")}    umask 077
-    test -d ${CLAUDE_GROUP_PATH}
-    home=$(mktemp -d)
-    cd "$home"
-    exec env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$home" \\
-      CLAUDE_CONFIG_DIR=${CLAUDE_GROUP_PATH} TERM=xterm-256color \\
-      DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
-      ${CLAUDE_CODE.guestPath} --strict-mcp-config --setting-sources '' --tools '' --permission-mode default
-  `,
-    ],
-  };
 }
 
 function exited(child: ReturnType<typeof spawn>): Promise<void> {
@@ -435,7 +416,7 @@ export async function startConcierge(
   )
     throw new Error("Invalid Concierge lifetime");
   const provider =
-    auth.mode === "config-dir" ? undefined : claudeCodeProvider(auth);
+    auth.mode === "external" ? undefined : claudeCodeProvider(auth);
   const tools = claudeCodeTools(install, "alpine");
   const harness = claudeRoleHarness({
     auth,
@@ -446,8 +427,9 @@ export async function startConcierge(
   const { repoRoot } = options;
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
-  if (auth.mode === "config-dir") {
-    if (!deps.scan) throw new Error("Credential screening is required");
+  if (auth.mode === "external" && !deps.scan)
+    throw new Error("Credential screening is required");
+  if (deps.scan) {
     requireCredentialScan(
       await prepareTargetDirectory(bootstrapRoot, target.directory, env),
     );
@@ -686,16 +668,17 @@ export function parseConciergeArgs(args: readonly string[]) {
   let resume = false;
   let target: string | undefined;
   let claudeAuth: ClaudeAuthMode | undefined;
-  let loginGroup: string | undefined;
+  let volumeShell: string | undefined;
   let mode: ReturnType<typeof parseConciergeMode> | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--run" && !run) run = true;
     else if (args[i] === "--continue" && !resume) resume = true;
     else if (args[i] === "--claude-auth" && claudeAuth === undefined)
       claudeAuth = parseClaudeAuthMode(args[++i]);
-    else if (args[i] === "--login-group" && loginGroup === undefined) {
-      loginGroup = args[++i];
-      if (!validGroup(loginGroup)) throw new Error("Invalid Claude group");
+    else if (args[i] === "--volume-shell" && volumeShell === undefined) {
+      volumeShell = args[++i];
+      if (!volumeShell || !/^[a-z][a-z0-9-]{0,47}$/.test(volumeShell))
+        throw new Error("Invalid mount name");
     } else if (args[i] === "--mode" && mode === undefined)
       mode = parseConciergeMode(args[++i]);
     else if (args[i] === "--target" && target === undefined) {
@@ -710,6 +693,6 @@ export function parseConciergeArgs(args: readonly string[]) {
     continue: resume,
     target,
     ...(claudeAuth ? { claudeAuth } : {}),
-    ...(loginGroup ? { loginGroup } : {}),
+    ...(volumeShell ? { volumeShell } : {}),
   };
 }
