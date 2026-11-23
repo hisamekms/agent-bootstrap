@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -12,6 +12,7 @@ import {
   type Policy,
 } from "./model.ts";
 import { OrchestratorStore, OrchestratorStoreError } from "./store.ts";
+import { candidateDiffStat } from "./tasks.ts";
 
 interface CliIo {
   stdin: NodeJS.ReadableStream;
@@ -185,6 +186,7 @@ async function execute(
   io: CliIo,
   store: OrchestratorStore,
   command: Command,
+  directory: string,
 ): Promise<0 | 1> {
   switch (command.kind) {
     case "status": {
@@ -195,7 +197,12 @@ async function execute(
         .map((proposal) => ({
           id: proposal.id,
           kind: proposal.kind,
-          title: proposal.content.title,
+          ...(proposal.kind === "integration"
+            ? {
+                goalId: proposal.content.goalId,
+                taskId: proposal.content.taskId,
+              }
+            : { title: proposal.content.title }),
           ...proposalPolicy(requireProposalDetails(store, proposal.id)),
         }));
       writeJson(io, {
@@ -229,7 +236,14 @@ async function execute(
     case "reject": {
       const proposal = store.getProposalDetails(command.id);
       if (!proposal) return refuse(io, "Proposal was not found.");
-      writeJson(io, displayProposal(proposal));
+      const diffStat =
+        proposal.kind === "integration"
+          ? await candidateDiffStat(directory, proposal.content)
+          : undefined;
+      writeJson(io, {
+        ...displayProposal(proposal),
+        ...(diffStat === undefined ? {} : { diffStat }),
+      });
       if (command.kind === "show") return 0;
       if (proposal.status !== "pending")
         return refuse(io, "Proposal is no longer pending.");
@@ -301,7 +315,7 @@ export async function runCli(
       mkdirSync(dirname(defaultDb), { recursive: true, mode: 0o700 });
     const store = OrchestratorStore.open(filename);
     try {
-      return await execute(io, store, command);
+      return await execute(io, store, command, dirname(resolve(filename)));
     } finally {
       store.close();
     }

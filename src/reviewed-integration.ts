@@ -54,7 +54,7 @@ type RoleSandbox = Pick<
   "tools" | "provider" | "hostTcpPort" | "profile"
 >;
 
-type Verification = {
+export type Verification = {
   readonly command: SandboxCommand;
   readonly profile?: ProfileName;
   /** Host-pinned test files, delivered read-only under `suite/`. */
@@ -162,7 +162,7 @@ type Plan = {
   readonly tree?: TreePlan;
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
-  readonly verification: Verification;
+  readonly verification?: Verification | undefined;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
   readonly workerHostServices?: readonly HostService[];
@@ -375,13 +375,16 @@ function latestPin(events: IntegrationEvent[], target: string) {
  * The caller of decide must be the authenticated local operator entry point. */
 export class ReviewedIntegration {
   readonly #git: IntegrationGit;
-  readonly #host: TrustedHost;
+  readonly #host: Pick<
+    TrustedHost,
+    "runWorker" | "runReviewer" | "runVerification"
+  >;
   readonly #journal: IntegrationJournal;
   readonly #plan: Plan;
 
   constructor(
     git: IntegrationGit,
-    host: TrustedHost,
+    host: Pick<TrustedHost, "runWorker" | "runReviewer" | "runVerification">,
     journal: IntegrationJournal,
     plan: Plan,
   ) {
@@ -392,7 +395,8 @@ export class ReviewedIntegration {
       ...command,
       argv: [...command.argv],
     });
-    const verification = copyVerification(plan.verification);
+    const verification =
+      plan.verification && copyVerification(plan.verification);
     if ((plan.path === undefined) === (plan.tree === undefined))
       throw new Error("A plan needs exactly one of path and tree");
     this.#plan = {
@@ -442,10 +446,10 @@ export class ReviewedIntegration {
         tree ? "tree" : "file",
         sorted(tree?.scope),
         sorted(tree?.protectedPaths),
-        verification.command.argv,
-        verification.command.timeoutMs,
-        verification.profile ?? "base",
-        (verification.suite ?? []).map((file) => [
+        verification?.command.argv ?? null,
+        verification?.command.timeoutMs ?? null,
+        verification?.profile ?? "base",
+        (verification?.suite ?? []).map((file) => [
           file.path,
           sha256(file.bytes),
         ]),
@@ -499,7 +503,7 @@ export class ReviewedIntegration {
   }
 
   #suiteFiles(): SandboxFile[] {
-    return (this.#plan.verification.suite ?? []).map((file) => ({
+    return (this.#plan.verification?.suite ?? []).map((file) => ({
       path: SUITE_PREFIX + file.path,
       bytes: new Uint8Array(file.bytes),
     }));
@@ -533,7 +537,7 @@ export class ReviewedIntegration {
   ): Promise<PinnedCandidate> {
     const path = this.#plan.path!;
     const profile =
-      this.#plan.workerSandbox?.profile ?? this.#plan.verification.profile;
+      this.#plan.workerSandbox?.profile ?? this.#plan.verification?.profile;
     const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
     const worker = await this.#host.runWorker(
       {
@@ -597,7 +601,7 @@ export class ReviewedIntegration {
   ): Promise<PinnedCandidate> {
     const { scope, protectedPaths } = this.#plan.tree!;
     const profile =
-      this.#plan.workerSandbox?.profile ?? this.#plan.verification.profile;
+      this.#plan.workerSandbox?.profile ?? this.#plan.verification?.profile;
     const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
     const prepared = await this.#git.prepareWorkspace({
       base,
@@ -704,19 +708,29 @@ export class ReviewedIntegration {
    * review and human decision. */
   async revise(id?: string): Promise<PinnedCandidate> {
     const events = await this.#journal.read();
-    const { pin, review, run } = latestPin(events, await this.#target());
+    const target = await this.#target();
+    const last = events.at(-1);
+    const rejected = last?.kind === "candidate.rejected";
+    const pin = candidatePin(events, target);
+    const review = rejected ? undefined : latestPin(events, target);
+    if (rejected && last.digest !== pin.digest)
+      throw new Error("Candidate evidence does not match its durable pin");
     const rounds = events.filter(
       (event) => event.kind === "revision.requested",
     ).length;
-    if (events.at(-1)?.kind !== "review.submitted" || review === "pass")
+    if (
+      !rejected &&
+      (last?.kind !== "review.submitted" || review?.review === "pass")
+    )
       throw new Error(
         "Only a candidate reviewed as needing changes can be revised",
       );
     if (rounds >= MAX_REVISIONS) throw new Error("Revision limit reached");
     // Notes count only when recorded immediately before this review.
     const noted = events.at(-2);
-    const notes =
-      noted?.kind === "review.noted" && noted.run === run
+    const notes = rejected
+      ? last.notes
+      : noted?.kind === "review.noted" && noted.run === review?.run
         ? noted.notes
         : NO_NOTES;
     const append = this.#writer(events.length);
@@ -742,6 +756,38 @@ export class ReviewedIntegration {
     return this.#produce(append, pin.base, source, readOnly, id);
   }
 
+  /** Record a host path rejection before allowing another Worker attempt. */
+  async rejectCandidate(candidate: PinnedCandidate): Promise<void> {
+    const events = await this.#journal.read();
+    const pin = candidatePin(events, await this.#target());
+    if (events.at(-1)?.kind !== "candidate.created" || !samePin(candidate, pin))
+      throw new Error("Candidate cannot be rejected");
+    const notes = await this.#journal.saveNote(
+      "The host rejected the previous candidate for changing paths outside the Task. Restore all out-of-scope paths to the base and keep changes within the Task's allowed paths.",
+    );
+    await this.#writer(events.length)({
+      kind: "candidate.rejected",
+      digest: pin.digest,
+      notes,
+    });
+  }
+
+  /** Verify the pinned candidate before review when a host suite is configured. */
+  async verifyCandidate(): Promise<boolean> {
+    const events = await this.#journal.read();
+    const pin = candidatePin(events, await this.#target());
+    if (events.at(-1)?.kind !== "candidate.created")
+      throw new Error("Candidate cannot be verified");
+    const diff = await this.#git.diff(
+      pin.base,
+      pin.candidate,
+      this.#fileExpectation(),
+    );
+    if (sha256(diff) !== pin.digest)
+      throw new Error("Candidate evidence does not match its durable pin");
+    return this.#verify(pin, diff, this.#writer(events.length));
+  }
+
   /** The current candidate when its latest review passed, else null. */
   async reviewedPin(): Promise<PinnedCandidate | null> {
     const events = await this.#journal.read();
@@ -758,7 +804,15 @@ export class ReviewedIntegration {
   ): Promise<PinnedCandidate & { review: Review }> {
     const events = await this.#journal.read();
     const pin = candidatePin(events, await this.#target());
-    if (events.at(-1)?.kind !== "candidate.created")
+    const last = events.at(-1);
+    if (
+      last?.kind !== "candidate.created" &&
+      !(
+        last?.kind === "verification.finished" &&
+        last.review === "pass" &&
+        last.digest === pin.digest
+      )
+    )
       throw new Error("Candidate review has already been attempted");
     const diff = await this.#git.diff(
       pin.base,
@@ -913,8 +967,35 @@ export class ReviewedIntegration {
       await append({ kind: "denied", reason: "evidence" });
       return "denied";
     }
+    if (!(await this.#verify(pin, diff, append, id))) {
+      await append({ kind: "denied", reason: "verification" });
+      return "denied";
+    }
+    await append({ kind: "integration.authorized", ...pin });
+    try {
+      await this.#git.advance(pin.base, pin.candidate, this.#fileExpectation());
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === "stale-base") {
+        await append({ kind: "denied", reason: "stale-base" });
+        return "denied";
+      }
+      await append({ kind: "integration.uncertain", candidate: pin.candidate });
+      return "uncertain";
+    }
+    await append({ kind: "integration.completed", candidate: pin.candidate });
+    return "completed";
+  }
+
+  async #verify(
+    pin: PinnedCandidate,
+    diff: Uint8Array,
+    append: (event: Event) => Promise<void>,
+    id?: string,
+  ): Promise<boolean> {
+    const plan = this.#plan.verification;
+    if (!plan) throw new Error("Verification is not configured");
     await append({ kind: "verification.authorized", ...pin });
-    const { profile } = this.#plan.verification;
+    const { profile } = plan;
     const files = [
       ...(await this.#candidateFiles(pin, diff)),
       ...this.#suiteFiles(),
@@ -935,7 +1016,7 @@ export class ReviewedIntegration {
               ? { repository: { gitDir: prepared.gitDir, tree: prepared.tree } }
               : {}),
           },
-          command: this.#plan.verification.command,
+          command: plan.command,
         },
         id,
       );
@@ -950,22 +1031,6 @@ export class ReviewedIntegration {
       review: verified,
       ...(tests ? { tests } : {}),
     });
-    if (verified !== "pass") {
-      await append({ kind: "denied", reason: "verification" });
-      return "denied";
-    }
-    await append({ kind: "integration.authorized", ...pin });
-    try {
-      await this.#git.advance(pin.base, pin.candidate, this.#fileExpectation());
-    } catch (error) {
-      if ((error as { code?: string } | null)?.code === "stale-base") {
-        await append({ kind: "denied", reason: "stale-base" });
-        return "denied";
-      }
-      await append({ kind: "integration.uncertain", candidate: pin.candidate });
-      return "uncertain";
-    }
-    await append({ kind: "integration.completed", candidate: pin.candidate });
-    return "completed";
+    return verified === "pass";
   }
 }

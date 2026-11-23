@@ -299,7 +299,9 @@ export class LocalGitIntegration {
     }
     if (
       typeof config.branch !== "string" ||
-      !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(config.branch)
+      !/^(?:[A-Za-z][A-Za-z0-9_-]{0,63}|lo\/goal-[a-f0-9]{8})$/.test(
+        config.branch,
+      )
     )
       throw new GitIntegrationError("invalid-input");
     this.#config = { ...config };
@@ -861,6 +863,41 @@ export class LocalGitIntegration {
     }
     if (offset !== batch.length)
       throw new GitIntegrationError("invalid-candidate");
+  }
+
+  async changedPaths(base: string, candidate: string): Promise<string[]> {
+    await this.#repository();
+    return (await this.#candidate(base, candidate))
+      .map(({ path }) => path)
+      .sort();
+  }
+
+  async diffStat(base: string, candidate: string): Promise<string> {
+    await this.#repository();
+    await this.#candidate(base, candidate);
+    return (
+      await this.#git([
+        "diff",
+        "--stat",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        base,
+        candidate,
+        "--",
+      ])
+    ).toString("utf8");
+  }
+
+  /** Initialize an absent direct Goal ref without moving an existing branch. */
+  async initializeGoalBranch(base: string): Promise<void> {
+    if (!/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch))
+      throw new GitIntegrationError("invalid-input");
+    await this.#repository();
+    await this.#commit(base);
+    if ((await this.#reference(this.#ref)) === null)
+      await this.#compareAndSwap(this.#ref, base, null);
   }
 
   async protectedPaths(

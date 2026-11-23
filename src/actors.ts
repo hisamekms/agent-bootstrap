@@ -104,6 +104,7 @@ export function claudeRoleHarness(options: {
   readonly maxTurns?: number;
   /** Opt-in Bash for the Worker command only. */
   readonly shell?: boolean;
+  readonly reportWorkerUsage?: boolean;
   /** Guest userland the tools and command are built for. Default: from
    * `profile`, else Alpine. */
   readonly guest?: GuestKind;
@@ -132,6 +133,9 @@ export function claudeRoleHarness(options: {
           timeoutMs: task.timeoutMs,
           ...(baseUrl ? { baseUrl } : {}),
           ...(options.shell && task.role === "Worker" ? { shell: true } : {}),
+          ...(options.reportWorkerUsage && task.role === "Worker"
+            ? { reportWorkerUsage: true }
+            : {}),
         },
         options.auth,
         guest,

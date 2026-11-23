@@ -82,6 +82,7 @@ Both paths use the same authorization, status and audit records.
   go through the `task-registration` gate. In-scope auto-registration
   has no gate.
 - **Integration.** The `integration` gate applies to changes entering
+  the Goal's work branch. Only the human PR can bring those changes into
   `main`. Reuse the reviewed integration design. See
   [repository environments](../repository-environments.md).
 
@@ -231,7 +232,7 @@ common cost budget across actors.
 | Stage | Content                                                                                                         |
 | ----- | --------------------------------------------------------------------------------------------------------------- |
 | 1     | Concierge (VM, vsock, read-only mount, session continuation), Planner, approval CLI, Goal and Task registration |
-| 2     | Executor and Reviewer on the existing Worker and Reviewer paths, plus the distributed tests in D8               |
+| 2     | Executor and Reviewer on the existing Worker and Reviewer paths, through the integration approval gate          |
 | 3     | Integration and the full end-to-end cycle. Start dagq-lite development on it.                                   |
 | 4     | Researcher with public-internet policy, and replanning                                                          |
 
@@ -252,6 +253,21 @@ reuse the named volume to continue the session.
 The stages put the conversation and approval path first. The full
 development cycle can start dogfooding before research and replanning
 are added.
+
+### D13. Goal work branches
+
+When the first Task under a Goal starts, the host creates a local work
+branch named `lo/goal-<first 8 hex of goalId>` from the current local
+`main` commit. The host stores the branch in its private bare integration
+repository and uses it as the base for Tasks under that Goal. Each Task
+pins its candidate independently.
+
+Stage 2 runs Executor, optional host-configured verification, and Reviewer.
+The host submits a digest-bound integration proposal after a passing
+review. Stage 3 will consume an approved proposal, check the pin and
+current base, and integrate into the Goal's work branch. Dependencies wait
+until Stage 3 records a successful integration. The human handles branch
+pushes and PRs to `main`. See [Stage 2](stage2.md).
 
 ## Consequences
 

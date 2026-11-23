@@ -52,6 +52,64 @@ export interface TaskContent {
   readonly policies?: PolicySet;
 }
 
+export interface IntegrationContent {
+  readonly taskId: string;
+  readonly goalId: string;
+  readonly branch: string;
+  readonly base: string;
+  readonly candidate: string;
+  readonly digest: string;
+  readonly changedPaths: readonly string[];
+  readonly review: { readonly result: "pass"; readonly notes?: string };
+}
+
+export function goalBranch(goalId: string): string {
+  const prefix = goalId.split("-")[0];
+  if (!prefix || !/^[a-f0-9]{8}$/.test(prefix)) throw new ContractError();
+  return `lo/goal-${prefix}`;
+}
+
+export function validateIntegrationContent(value: unknown): IntegrationContent {
+  const input = fields(value, [
+    "taskId",
+    "goalId",
+    "branch",
+    "base",
+    "candidate",
+    "digest",
+    "changedPaths",
+    "review",
+  ]);
+  const goalId = identifier(input.goalId);
+  const branch = goalBranch(goalId);
+  const oid = (value: unknown, length: number) => {
+    const hash = string(value, length, length);
+    if (!/^[a-f0-9]+$/.test(hash)) throw new ContractError();
+    return hash;
+  };
+  if (input.branch !== branch) throw new ContractError();
+  const review = fields(input.review, ["result", "notes"]);
+  return freeze({
+    taskId: identifier(input.taskId),
+    goalId,
+    branch,
+    base: oid(input.base, 40),
+    candidate: oid(input.candidate, 40),
+    digest: oid(input.digest, 64),
+    changedPaths: unique(input.changedPaths, 1, 10_000, (value) => {
+      const name = path(value);
+      if (name.endsWith("/")) throw new ContractError();
+      return name;
+    }),
+    review: {
+      result: oneOf(review.result, ["pass"]),
+      ...(Object.hasOwn(review, "notes")
+        ? { notes: string(review.notes, 1, 2048) }
+        : {}),
+    },
+  });
+}
+
 export class ContractError extends Error {
   constructor() {
     super("Invalid local orchestrator input");
@@ -326,21 +384,20 @@ export function taskLimitReasons(
   return reasons;
 }
 
+export function allowsPath(paths: readonly string[], path: string): boolean {
+  return paths.some(
+    (scope) =>
+      path === scope || (scope.endsWith("/") && path.startsWith(scope)),
+  );
+}
+
 export function fitsScope(
   goal: GoalContent,
   task: TaskContent,
   registeredTaskCount: number,
 ): { ok: true } | { ok: false; reasons: string[] } {
   const reasons: string[] = [];
-  if (
-    task.paths.some(
-      (path) =>
-        !goal.scope.paths.some(
-          (scope) =>
-            path === scope || (scope.endsWith("/") && path.startsWith(scope)),
-        ),
-    )
-  )
+  if (task.paths.some((path) => !allowsPath(goal.scope.paths, path)))
     reasons.push("paths");
   if (!goal.scope.profiles.includes(task.profile)) reasons.push("profile");
   if (!goal.scope.actors.includes(task.actor)) reasons.push("actor");

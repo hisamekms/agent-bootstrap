@@ -180,6 +180,8 @@ export interface ClaudeCodeTask {
   readonly baseUrl?: string;
   /** Opt-in Bash for the Worker only. Pre-approved through `--allowedTools`. */
   readonly shell?: boolean;
+  /** Emit a bounded result envelope to the host's existing Worker stderr hook. */
+  readonly reportWorkerUsage?: boolean;
 }
 
 /** Verify the staged CLI and packages, install offline, and check the placeholder. */
@@ -264,7 +266,7 @@ export function claudeCodeCommand(
       : `prompt="$1"`;
   const output =
     task.role === "Worker"
-      ? `printf '%s' '{"tool":"collect"}'`
+      ? `${task.reportWorkerUsage ? "head -c 4096 /tmp/claude-out.json >&2\n    " : ""}printf '%s' '{"tool":"collect"}'`
       : "head -c 65536 /tmp/claude-out.json";
   const script = `
 ${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pre-seeded CLI state: config and home are fresh.

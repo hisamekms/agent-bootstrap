@@ -13,9 +13,10 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { claudeRoleHarness } from "../actors.ts";
+import { claudeRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
+  CLAUDE_CODE_BUILDS,
   claudeCodeGuestSetup,
   claudeCodeProvider,
   claudeCodeTools,
@@ -32,6 +33,8 @@ import type { TrustedHost } from "../trusted-host.ts";
 import { HostApiServer } from "./host-api.ts";
 import { ActorRunner } from "./runner.ts";
 import type { OrchestratorStore } from "./store.ts";
+import { createTaskExecutor } from "./tasks.ts";
+import type { Verification } from "../reviewed-integration.ts";
 
 const PORT = 5000;
 const modes = ["default", "acceptEdits", "plan", "auto"] as const;
@@ -55,7 +58,8 @@ export interface ConciergeSnapshot {
 type ConciergeHost = Pick<
   TrustedHost,
   "runConcierge" | "runPlanner" | "runReviewer" | "prepareConciergeVolume"
->;
+> &
+  Partial<Pick<TrustedHost, "runWorker" | "runVerification">>;
 
 export interface ConciergeDeps {
   readonly host: ConciergeHost;
@@ -66,6 +70,7 @@ export interface ConciergeDeps {
   ) => Promise<ConciergeSnapshot>;
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
+  readonly verification?: Verification;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
   ) => Promise<Pick<HostApiServer, "close">>;
@@ -402,12 +407,13 @@ export async function startConcierge(
   const stateVolume = conciergeVolumeName(options.repoRoot);
 
   const invocationId = randomUUID();
-  const { id: sessionId } = store.startSession("Concierge", invocationId);
+  const { id: sessionId } = store.startSession("Concierge", invocationId, true);
   let snapshotDir: string | undefined;
   let socketDir: string | undefined;
   let server: Pick<HostApiServer, "close"> | undefined;
   let drain: Promise<void> | undefined;
   let drainFailed = false;
+  let scheduler: ReturnType<typeof setInterval> | undefined;
   let stopping = false;
   let failed = false;
   let outcome: Awaited<ReturnType<ConciergeHost["runConcierge"]>>["outcome"];
@@ -426,8 +432,48 @@ export async function startConcierge(
     const context = await conciergeContext(snapshot);
     socketDir = await mkdtemp("/private/tmp/lo-");
     const socket = join(socketDir, "h.sock");
+    const tasks =
+      host.runWorker && host.runVerification
+        ? createTaskExecutor({
+            directory: await prepareConciergeDirectory(options.repoRoot),
+            repoRoot: options.repoRoot,
+            host: {
+              runWorker: host.runWorker.bind(host),
+              runReviewer: host.runReviewer.bind(host),
+              runVerification: host.runVerification.bind(host),
+            },
+            worker(profile) {
+              const guest = guestOf(profile);
+              const workerInstall =
+                guest === "alpine"
+                  ? install
+                  : {
+                      ...install,
+                      binary: join(
+                        options.repoRoot,
+                        ".local",
+                        "claude-code",
+                        CLAUDE_CODE.version,
+                        CLAUDE_CODE_BUILDS.debian.platform,
+                        "claude",
+                      ),
+                    };
+              return claudeRoleHarness({
+                auth,
+                model: options.model,
+                profile,
+                reportWorkerUsage: true,
+                tools: claudeCodeTools(workerInstall, guest),
+              });
+            },
+            reviewer: harness,
+            ...(deps.verification ? { verification: deps.verification } : {}),
+          })
+        : undefined;
+
     const runner = new ActorRunner({
       store,
+      ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
       runPlanner: (...args) => {
         if (stopping) throw new Error("Concierge session ended");
         return host.runPlanner(...args);
@@ -439,6 +485,7 @@ export async function startConcierge(
     });
     let drainRequested = false;
     const scheduleDrain = () => {
+      if (stopping || drainFailed) return;
       drainRequested = true;
       if (drain) return;
       drainRequested = false;
@@ -458,6 +505,7 @@ export async function startConcierge(
       store,
       socketPath: socket,
       sessionId,
+      ...(tasks ? { onTaskRegistered: scheduleDrain } : {}),
       requester: {
         async requestPlanner(input) {
           if (stopping) throw new Error("Concierge session ended");
@@ -473,6 +521,12 @@ export async function startConcierge(
       },
     });
     await host.prepareConciergeVolume(stateVolume);
+    if (tasks) {
+      scheduleDrain();
+      // Operator decisions can arrive from another process via state.db.
+      scheduler = setInterval(scheduleDrain, 1000);
+      scheduler.unref();
+    }
     ({ outcome } = await host.runConcierge(
       {
         sandbox: {
@@ -504,6 +558,7 @@ export async function startConcierge(
     throw error;
   } finally {
     stopping = true;
+    clearInterval(scheduler);
     const cleanup = async (code: string, effect: () => unknown) => {
       try {
         await effect();

@@ -35,6 +35,7 @@ const eventFields = {
   "candidate.authorized": ["run", "digest"],
   "candidate.created": ["candidate", "digest"],
   "candidate.failed": ["cleanup"],
+  "candidate.rejected": ["digest", "notes"],
   "review.authorized": ["base", "candidate", "digest"],
   "review.noted": ["run", "notes"],
   "review.submitted": ["run", "digest", "review"],
@@ -156,7 +157,7 @@ function decode(value: unknown): IntegrationEvent {
 
 // The first candidate and integration take up to 13 events; each revision
 // adds up to 6.
-const eventLimit = 13 + 6 * MAX_REVISIONS;
+const eventLimit = 15 + 8 * MAX_REVISIONS;
 
 export class IntegrationJournal {
   readonly #journal: PrivateJournal<IntegrationEvent>;
