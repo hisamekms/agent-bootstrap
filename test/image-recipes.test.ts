@@ -111,10 +111,10 @@ describe("image recipes", () => {
     assert.deepEqual(smoke.expected, ["1", "1", "git-ok"]);
   });
 
-  test("concierge pins the offline vsock relay and Git packages", () => {
+  test("concierge pins the offline vsock relay, zstd, and Git packages", () => {
     assert.deepEqual(PROFILE_RECIPES.concierge, {
       base: ALPINE_3_23,
-      features: ["vsock-relay", "git"],
+      features: ["vsock-relay", "zstd", "git"],
       memoryMiB: 1024,
       cpus: 2,
     });
@@ -146,6 +146,10 @@ describe("image recipes", () => {
         [
           "libcrypto3-3.5.9-r0.apk",
           "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+        ],
+        [
+          "zstd-libs-1.5.7-r2.apk",
+          "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
         ],
         ...readlinePins.map(({ name, sha256 }) => [name, sha256] as const),
         ...FEATURES.git.packages.map(

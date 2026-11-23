@@ -98,6 +98,11 @@ const READLINE_PACKAGES = [
   ),
 ] as const;
 
+const ZSTD_PACKAGE = pkg(
+  "zstd-libs-1.5.7-r2.apk",
+  "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
+);
+
 export const FEATURES = {
   sqlite: {
     packages: [
@@ -130,10 +135,7 @@ export const FEATURES = {
         "libpq-18.7-r0.apk",
         "135ed81b492273e4b50ab88dd64a9cde88cff24d3437c9e8d51aeab0332147b0",
       ),
-      pkg(
-        "zstd-libs-1.5.7-r2.apk",
-        "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
-      ),
+      ZSTD_PACKAGE,
       pkg(
         "tzdata-2026f-r0.apk",
         "84cd4b6c03ba2d8a06570f0c14188022cb8ebc3274b8ed1cf02ce8881ee8bfdd",
@@ -238,6 +240,9 @@ export const FEATURES = {
       ...READLINE_PACKAGES,
     ],
   },
+  zstd: {
+    packages: [ZSTD_PACKAGE],
+  },
 } as const satisfies Record<string, Feature>;
 
 export type FeatureName = keyof typeof FEATURES;
@@ -340,7 +345,7 @@ export const PROFILE_RECIPES: Readonly<
   },
   concierge: {
     base: ALPINE_3_23,
-    features: ["vsock-relay", "git"],
+    features: ["vsock-relay", "zstd", "git"],
     memoryMiB: 1024,
     cpus: 2,
   },
