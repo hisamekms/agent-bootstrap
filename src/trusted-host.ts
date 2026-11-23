@@ -11,7 +11,13 @@ import type {
   SandboxBindingInput,
 } from "./audit.ts";
 import type { EgressGatewayOptions } from "./egress-gateway.ts";
-import { WORKER_MESSAGE_LIMIT } from "./sandbox-runtime.ts";
+import {
+  INTERACTIVE_MAX_LIFETIME_MS,
+  isConciergeVolumeName,
+  SandboxRuntimeError,
+  terminalEnvEntries,
+  WORKER_MESSAGE_LIMIT,
+} from "./sandbox-runtime.ts";
 import { EgressPolicy, type HostService } from "./egress-policy.ts";
 import {
   parseExecutionContext,
@@ -31,6 +37,7 @@ import {
 } from "./runtime-events.ts";
 import type {
   CollectedArtifacts,
+  ConciergeVolumeBackend,
   ExecResult,
   ResourceSample,
   SandboxCommand,
@@ -39,6 +46,7 @@ import type {
   SandboxRuntime,
   SandboxSession,
   SandboxSpec,
+  TerminalCommand,
 } from "./sandbox-runtime.ts";
 import { ProfileCatalog, ROLE_PROFILES } from "./sandbox-profiles.ts";
 
@@ -47,6 +55,7 @@ type Outcome = NonNullable<AuditInput["outcome"]>;
 type AuditedProfile = NonNullable<AuditInput["profile"]>;
 
 const AUDIT_HEALTH_POLL_MS = 25;
+const DEFAULT_CONCIERGE_LIFETIME_MS = 120_000;
 // Bump when the gateway policy evaluation or digest schema changes.
 const GATEWAY_POLICY_VERSION = 1;
 
@@ -92,6 +101,17 @@ export interface CoordinatorSessionPlan {
   readonly command: SandboxCommand;
 }
 
+export interface ConciergePlan {
+  readonly sandbox: Pick<
+    SandboxSpec,
+    "tools" | "provider" | "profile" | "maxLifetimeMs" | "interactive"
+  >;
+}
+
+type ConciergeTerminal = {
+  attach(command: TerminalCommand): Promise<{ exitCode: number | null }>;
+};
+
 export interface VerificationPlan {
   readonly sandbox: Pick<
     SandboxSpec,
@@ -113,7 +133,8 @@ export interface HostObservabilityAudit extends AuditSink {
 
 /** The adapter must use this ID for the actual backend sandbox and enforce
  * spec.expectedNetRuleDigest before creating it. */
-export interface BoundSandboxRuntime extends SandboxRuntime {
+export interface BoundSandboxRuntime
+  extends SandboxRuntime, Partial<ConciergeVolumeBackend> {
   createBound(spec: SandboxSpec, sandboxId: string): Promise<SandboxHandle>;
   netRuleDigest(spec: SandboxSpec): string;
 }
@@ -156,14 +177,21 @@ type Invoke = {
   readonly id: string;
   readonly role: Role;
   readonly sandbox: SandboxSpec;
-  readonly command: SandboxCommand;
   readonly context: ExecutionContext | undefined;
   readonly options: TrustedHostRunOptions | undefined;
 } & (
-  | { readonly plan: Pick<WorkerPlan, "collectPaths" | "collectTree"> }
   | {
+      readonly command: SandboxCommand;
+      readonly plan: Pick<WorkerPlan, "collectPaths" | "collectTree">;
+    }
+  | {
+      readonly command: SandboxCommand;
       readonly open: NonNullable<SandboxRuntime["openSession"]>;
       readonly use: (session: SandboxSession) => Promise<unknown>;
+    }
+  | {
+      readonly attach: NonNullable<SandboxRuntime["attachTerminal"]>;
+      readonly use: (terminal: ConciergeTerminal) => Promise<unknown>;
     }
 );
 
@@ -218,7 +246,7 @@ export class HostAuditError extends Error {
 /** Executes isolated roles. Only Worker may request bounded collection. */
 export class TrustedHost {
   readonly #audit: AuditSink;
-  readonly #sandbox: SandboxRuntime;
+  readonly #sandbox: SandboxRuntime & Partial<ConciergeVolumeBackend>;
   readonly #profiles: ProfileCatalog;
 
   readonly #required:
@@ -243,7 +271,7 @@ export class TrustedHost {
   /** Omitting options retains the existing mandatory audit for offline callers. */
   constructor(
     audit: AuditSink,
-    sandbox: SandboxRuntime,
+    sandbox: SandboxRuntime & Partial<ConciergeVolumeBackend>,
     profiles: ProfileCatalog,
     options?: TrustedHostOptions,
   ) {
@@ -253,7 +281,7 @@ export class TrustedHost {
       const mode = options.config.audit.mode;
       if (mode === "required") {
         if (!writableAudit(audit))
-          throw new Error("Writable v5 audit required");
+          throw new Error("Writable v6 audit required");
         const runtime = sandbox as Partial<BoundSandboxRuntime>;
         if (
           typeof runtime.createBound !== "function" ||
@@ -316,11 +344,7 @@ export class TrustedHost {
   /** Resolves the requested profile before any audit write. */
   #profileFor(role: Role, requested: unknown): AuditedProfile {
     const profile = requested ?? "base";
-    if (
-      !this.#profiles.has(profile) ||
-      profile === "concierge" ||
-      !ROLE_PROFILES[role].includes(profile)
-    )
+    if (!this.#profiles.has(profile) || !ROLE_PROFILES[role].includes(profile))
       throw new Error("Sandbox profile not allowed");
     return profile;
   }
@@ -462,6 +486,146 @@ export class TrustedHost {
       : { id, outcome };
   }
 
+  async runConcierge<T>(
+    plan: ConciergePlan,
+    id: string,
+    use: (terminal: ConciergeTerminal) => Promise<T>,
+    context?: ExecutionContext,
+    options?: TrustedHostRunOptions,
+  ): Promise<{ id: string; outcome: Outcome; value?: T }> {
+    const attach = this.#sandbox.attachTerminal?.bind(this.#sandbox);
+    const {
+      profile,
+      interactive,
+      tools,
+      maxLifetimeMs,
+      provider: requestedProvider,
+    } = plan.sandbox;
+    const provider = requestedProvider && { ...requestedProvider };
+    if (
+      !this.#required ||
+      !attach ||
+      profile !== "concierge" ||
+      !interactive?.vsock ||
+      (maxLifetimeMs !== undefined &&
+        (!Number.isSafeInteger(maxLifetimeMs) ||
+          maxLifetimeMs < 1 ||
+          maxLifetimeMs > INTERACTIVE_MAX_LIFETIME_MS)) ||
+      provider?.host !== "api.anthropic.com" ||
+      (provider.port ?? 443) !== 443 ||
+      options?.hostServices?.length ||
+      Object.keys(plan.sandbox).some(
+        (key) =>
+          ![
+            "tools",
+            "provider",
+            "profile",
+            "maxLifetimeMs",
+            "interactive",
+          ].includes(key),
+      )
+    )
+      throw new Error(
+        "Concierge requires an audited interactive sandbox with provider-only egress",
+      );
+    const sandbox: SandboxSpec = {
+      profile,
+      provider,
+      interactive: Object.freeze({
+        vsock: Object.freeze({ ...interactive.vsock }),
+        stateVolume: interactive.stateVolume,
+        snapshotDir: interactive.snapshotDir,
+      }),
+      ...(tools ? { tools: tools.map((tool) => ({ ...tool })) } : {}),
+      maxLifetimeMs: maxLifetimeMs ?? DEFAULT_CONCIERGE_LIFETIME_MS,
+    };
+    const { outcome, value } = await this.#invoke({
+      id,
+      role: "Concierge",
+      sandbox,
+      attach,
+      use,
+      context:
+        context === undefined ? undefined : parseExecutionContext(context),
+      options,
+    });
+    return outcome === "ok"
+      ? { id, outcome, value: value as T }
+      : { id, outcome };
+  }
+
+  async prepareConciergeVolume(name: string): Promise<{ reused: boolean }> {
+    return this.#conciergeVolume(name, "volume.create", async () => {
+      const reused = (await this.#sandbox.createVolume!(name))?.reused;
+      if (typeof reused !== "boolean")
+        throw new SandboxRuntimeError("backend-failure");
+      return { reused };
+    });
+  }
+
+  async removeConciergeVolume(name: string): Promise<void> {
+    await this.#conciergeVolume(name, "volume.remove", () =>
+      this.#sandbox.removeVolume!(name),
+    );
+  }
+
+  async #conciergeVolume<T extends { reused: boolean } | void>(
+    volumeName: string,
+    operation: "volume.create" | "volume.remove",
+    effect: () => Promise<T>,
+  ): Promise<T> {
+    if (!isConciergeVolumeName(volumeName))
+      throw new SandboxRuntimeError("invalid-input");
+    const audit = this.#required?.audit;
+    if (
+      !audit ||
+      (operation === "volume.create"
+        ? !this.#sandbox.createVolume
+        : !this.#sandbox.removeVolume)
+    )
+      throw new SandboxRuntimeError("unsupported");
+    const invocationId = randomUUID();
+    const ensureAudit = () => {
+      if (!audit.isV5Writable) throw new HostAuditError(invocationId);
+    };
+    const append = async (
+      event: Pick<AuditInput, "kind" | "outcome" | "detail">,
+    ) => {
+      ensureAudit();
+      try {
+        await audit.append({
+          ...event,
+          invocationId,
+          role: "Concierge",
+          operation,
+        });
+      } catch {
+        throw new HostAuditError(invocationId);
+      }
+      ensureAudit();
+    };
+    await append({ kind: "operation.requested", detail: { volumeName } });
+    await append({ kind: "operation.allowed", detail: { volumeName } });
+    ensureAudit();
+    let result: T;
+    try {
+      result = await effect();
+    } catch (error) {
+      await append({
+        kind: "operation.finished",
+        outcome: "failed",
+        detail: { volumeName },
+      });
+      throw error;
+    }
+    await append({
+      kind: "operation.finished",
+      outcome: "ok",
+      detail: { volumeName, ...(result ? { reused: result.reused } : {}) },
+    });
+    return result;
+  }
+
   #readOnly(
     role: "Reviewer" | "Planner" | "Coordinator" | "Verification",
     plan: ReviewerPlan | VerificationPlan,
@@ -575,6 +739,8 @@ export class TrustedHost {
     const sandbox = { ...input.sandbox };
     if (this.#disabled)
       requireAudited(sandbox, { audit: { mode: "disabled" } }, options);
+    if (role !== "Concierge" && sandbox.interactive !== undefined)
+      throw new Error("Only Concierge may use an interactive sandbox");
     if ("egressGateway" in sandbox || "expectedNetRuleDigest" in sandbox)
       throw new Error("Gateway bindings are assigned by the trusted host");
     if (!this.#disabled && "hostTcpPort" in sandbox)
@@ -593,11 +759,15 @@ export class TrustedHost {
 
     if (sandbox.provider)
       sandbox.provider = Object.freeze({ ...sandbox.provider });
-    const command = { ...input.command, argv: [...input.command.argv] };
+    const command =
+      "command" in input
+        ? { ...input.command, argv: [...input.command.argv] }
+        : undefined;
     const profile = this.#profileFor(role, sandbox.profile);
     const image = this.#profiles.imageDigest(profile);
     const provider = sandbox.provider;
-    const hostServices = options?.hostServices;
+    const hostServices =
+      role === "Concierge" ? undefined : options?.hostServices;
     if (hostServices?.length && (!audit || role === "Verification"))
       throw new Error(
         "Host services require an audited gateway and an egress-capable role",
@@ -670,6 +840,7 @@ export class TrustedHost {
     };
 
     const auditUnavailable = () =>
+      auditFailed ||
       (gateway !== undefined && gateway.quarantined !== false) ||
       (audit !== undefined && audit.isV5Writable !== true);
     const ensureAudit = () => {
@@ -680,6 +851,7 @@ export class TrustedHost {
       try {
         await action();
       } catch {
+        auditFailed = true;
         throw new HostAuditError(id);
       }
       ensureAudit();
@@ -689,10 +861,26 @@ export class TrustedHost {
         ? Promise.resolve()
         : write(() => this.#audit.append({ ...event, invocationId: id, role }));
     const authorize = async (operation: Operation, allowed = true) => {
+      const interactive = sandbox.interactive;
       await append({
         kind: "operation.requested",
         operation,
-        ...(operation === "sandbox.create" ? { profile, image } : {}),
+        ...(operation === "sandbox.create"
+          ? {
+              profile,
+              image,
+              ...(interactive
+                ? {
+                    detail: {
+                      socketPath: interactive.vsock.hostPath,
+                      vsockPort: interactive.vsock.port,
+                      snapshotDir: interactive.snapshotDir,
+                      volumeName: interactive.stateVolume,
+                    },
+                  }
+                : {}),
+            }
+          : {}),
       });
       await append(
         allowed
@@ -856,7 +1044,154 @@ export class TrustedHost {
         );
       }
 
-      if (handle) {
+      if (handle && "attach" in input) {
+        const current = handle;
+        const conciergeAudit = audit!; // runConcierge requires an audited host.
+        let accepting = true;
+        let pending: Promise<{ exitCode: number | null }> | undefined;
+        outcome = "ok";
+        let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
+        const lifetime = sandbox.maxLifetimeMs!;
+        const deadline = performance.now() + lifetime;
+        const expired = Symbol("interactive lifetime expired");
+        const expiry = new Promise<typeof expired>((resolve) => {
+          lifetimeTimer = setTimeout(() => resolve(expired), lifetime);
+        });
+        const execute = async (command: TerminalCommand) => {
+          await authorize("sandbox.exec");
+          ensureAudit();
+          const operationId = randomUUID();
+          const started = performance.now();
+          emit("process.started", { outcome: "started" }, operationId);
+          let exitCode: number | null = null;
+          let attachFailure: { error: unknown } | undefined;
+          let attachOutcome: "ok" | "failed" | "timed-out";
+          try {
+            // Observers run synchronously and may have changed audit health.
+            ensureAudit();
+            if (performance.now() >= deadline)
+              throw new SandboxRuntimeError("lifetime-expired");
+            const result = await Promise.race([
+              input.attach(current, command),
+              expiry,
+            ]);
+            if (result === expired)
+              throw new SandboxRuntimeError("lifetime-expired");
+            ({ exitCode } = result);
+            attachOutcome = exitCode === 0 ? "ok" : "failed";
+          } catch (error) {
+            if (error instanceof HostAuditError) throw error;
+            attachFailure = { error };
+            attachOutcome =
+              error instanceof SandboxRuntimeError &&
+              (error.code === "lifetime-expired" || error.code === "timed-out")
+                ? "timed-out"
+                : "failed";
+          }
+          // Invocation severity is timed-out > failed > ok.
+          if (attachOutcome === "timed-out" || outcome === "ok")
+            outcome = attachOutcome;
+          const exit =
+            exitCode === null
+              ? { exitCode, signal: null, guestReported: false as const }
+              : { exitCode, signal: null, guestReported: true as const };
+          await write(() =>
+            conciergeAudit.appendProcessResult({
+              invocationId: id,
+              operation: "sandbox.exec",
+              ...exit,
+            }),
+          );
+          await finish("sandbox.exec", attachOutcome);
+          emit(
+            "process.exited",
+            {
+              ...exit,
+              outcome: executionOutcome(attachOutcome),
+              durationMs: performance.now() - started,
+            },
+            operationId,
+          );
+          if (attachFailure) throw attachFailure.error;
+          return { exitCode };
+        };
+        let monitor: ReturnType<typeof setInterval> | undefined;
+        const unavailable = new Promise<never>((_, reject) => {
+          monitor = setInterval(() => {
+            if (auditUnavailable()) {
+              auditFailed = true;
+              reject(new HostAuditError(id));
+            }
+          }, AUDIT_HEALTH_POLL_MS);
+        });
+        const callback = async () => {
+          try {
+            ensureAudit();
+            return await input.use({
+              attach(command) {
+                if (!accepting || pending)
+                  return Promise.reject(
+                    new SandboxRuntimeError(
+                      accepting ? "busy" : "unknown-handle",
+                    ),
+                  );
+                ensureAudit();
+                let request: TerminalCommand;
+                try {
+                  const { argv, env, workdir } = command;
+                  request = {
+                    argv: Array.isArray(argv) ? [...argv] : argv,
+                    ...(workdir === undefined ? {} : { workdir }),
+                    ...(env === undefined
+                      ? {}
+                      : { env: Object.fromEntries(terminalEnvEntries(env)) }),
+                  };
+                } catch (error) {
+                  return Promise.reject(error);
+                }
+                pending = execute(request).finally(() => {
+                  pending = undefined;
+                });
+                // The callback can start an attach and return without awaiting it.
+                void pending.catch(() => {});
+                return pending;
+              },
+            });
+          } finally {
+            accepting = false;
+            await pending;
+          }
+        };
+        try {
+          const result = await Promise.race([
+            callback().then((result) => ({ result })),
+            unavailable,
+            expiry,
+          ]);
+          if (result === expired) {
+            accepting = false;
+            // The attach races the same deadline and can finish auditing even
+            // if the adapter has yet to stop its terminal client.
+            await Promise.race([
+              pending?.catch((error: unknown) => {
+                if (error instanceof HostAuditError) throw error;
+              }),
+              unavailable,
+            ]);
+            outcome = "timed-out";
+          } else {
+            value = result.result;
+          }
+        } catch (error) {
+          if (error instanceof HostAuditError) throw error;
+          if (outcome === "ok") outcome = "failed";
+        } finally {
+          accepting = false;
+          clearInterval(monitor);
+          clearTimeout(lifetimeTimer);
+        }
+        ensureAudit();
+      } else if (handle && command && !("attach" in input)) {
         const current = handle;
         await authorize("sandbox.exec");
         const operationId = randomUUID();
@@ -1065,7 +1400,7 @@ export class TrustedHost {
     }
   }
   async #runProcess(
-    input: Invoke,
+    input: Exclude<Invoke, { readonly attach: unknown }>,
     handle: SandboxHandle,
     command: SandboxCommand,
     ensureAudit: () => void,

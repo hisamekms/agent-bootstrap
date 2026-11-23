@@ -376,3 +376,49 @@ test("reports checkpoint ENOSPC while holding the lock and resumes without dupli
     audit_events: 2,
   });
 });
+
+test("exports Concierge create channels and volume reuse with the existing JSONL schema", (t) => {
+  const { db, obs, dir, audit } = fixture(t);
+  const detail = {
+    socketPath: "/fixture/api.sock",
+    vsockPort: 5000,
+    snapshotDir: "/fixture/repo",
+    volumeName: "lo-session",
+  };
+  audit.append({
+    invocationId,
+    kind: "operation.requested",
+    operation: "sandbox.create",
+    role: "Concierge",
+    profile: "concierge",
+    image: policyId,
+    detail,
+  });
+  const volume = {
+    invocationId: randomUUID(),
+    role: "Concierge",
+    operation: "volume.create",
+    detail: { volumeName: detail.volumeName },
+  } as const;
+  audit.append({ ...volume, kind: "operation.requested" });
+  audit.append({ ...volume, kind: "operation.allowed" });
+  audit.append({
+    ...volume,
+    kind: "operation.finished",
+    outcome: "ok",
+    detail: { ...volume.detail, reused: true },
+  });
+  exportAudit(db, obs, { now });
+  const [row, requested, allowed, finished] = lines(dir);
+  assert.equal(row?.schemaVersion, "agent-bootstrap.audit/v1");
+  assert.equal(row?.actor, "Concierge");
+  assert.deepEqual(row?.attributes, {
+    profile: "concierge",
+    image: policyId,
+    ...detail,
+  });
+  assert.equal(finished?.action, "volume.create");
+  assert.equal(finished?.operationId, requested?.operationId);
+  assert.equal(allowed?.operationId, requested?.operationId);
+  assert.deepEqual(finished?.attributes, { ...volume.detail, reused: true });
+});

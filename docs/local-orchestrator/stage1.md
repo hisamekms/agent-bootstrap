@@ -168,3 +168,54 @@ registered Goal content in `goal.json`. The store checks the digest, policy
 and approval eligibility while the Reviewer execution is running. A store
 refusal or invalid verdict ends the execution without a decision by the
 runner. Approval runs have one attempt.
+
+## Interactive sandboxes
+
+`TrustedHost.runConcierge` requires audit schema v6 and required audit mode.
+It binds the `concierge` profile to the audited gateway with egress limited
+to `api.anthropic.com:443`. The host prepares a dedicated Unix socket with
+mode `0600` in a protected directory. The guest connects through vsock CID 2.
+The adapter mounts the trusted snapshot read-only at `/repo` and the named
+`lo-*` volume at `/state`. `TrustedHost.prepareConciergeVolume` and
+`TrustedHost.removeConciergeVolume` manage volumes separately so session
+state can survive VM replacement. Audit v6 records requested, allowed and
+finished events for `volume.create` and `volume.remove` with the volume name.
+A successful create records whether it reused an existing volume.
+
+The create binding retains the `netRuleDigest` field and hashes the JSON
+array of network arguments followed by the vsock, named volume and snapshot
+mount arguments in CLI order. The interactive `sandbox.create` request's v6
+event detail also records the socket path, vsock port, snapshot directory and
+volume name. JSONL exports these as event attributes. The digest input for
+non-interactive VMs still consists of the network arguments alone. The v5-to-v6 migration
+preserves existing audit events, their sequence numbers and the append-only
+triggers.
+
+The adapter inherits terminal I/O for one `msb exec -t` at a time and kills
+the client at the VM deadline. The host caps the requested lifetime at
+12 hours and starts teardown at its deadline even if the adapter's attach
+does not settle. Guest environment overrides are passed as literal arguments to
+`/usr/bin/env` because this implementation uses the guest command interface
+for environment setup. The allowlist is `TERM`, `COLORTERM`, `LANG`, `LC_ALL`,
+`COLUMNS`, `LINES` and names matching `^LO_[A-Z0-9_]{1,40}$`. Values may contain
+up to 1024 bytes and must be free of NUL, LF and CR. The host records each
+attach authorization and exit status and retains the worst attach outcome
+for the invocation, in descending order `timed-out`, `failed`, `ok`. If a
+mandatory audit write fails, the host stops normal execution, closes egress
+and attempts emergency VM teardown.
+
+Fake CLI tests cover argument construction, channel validation, digest
+compatibility and attach deadlines. The prior PoC exercised vsock, mounts
+and initial TTY behavior individually. The combined gateway and interactive
+session path, guest environment wrapper, and live TTY resize still need
+real-VM verification.
+
+Follow-up work
+
+- Add a host PTY relay that filters OSC 52, OSC 8, title escapes, DCS and
+  terminal report queries before sending output to the operator's terminal.
+- Close the pre-existing provider egress gap in the gateway or backend.
+  The backend substitutes the operator credential for the placeholder and
+  passes guest-supplied non-placeholder credential headers through unchanged.
+  A guest could supply its own Anthropic credential and exfiltrate data to
+  another account.

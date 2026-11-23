@@ -67,7 +67,7 @@ function code(fn: () => void): unknown {
   return undefined;
 }
 
-test("a new database is v5 and round-trips profile, image and Verification", (t) => {
+test("a new database is v6 and round-trips profile, image and Verification", (t) => {
   const filename = fixture(t);
   const id = randomUUID();
   const audit = new SqliteAudit(filename);
@@ -79,7 +79,7 @@ test("a new database is v5 and round-trips profile, image and Verification", (t)
   );
   audit.append(create(id));
   audit.close();
-  assert.equal(userVersion(filename), 5);
+  assert.equal(userVersion(filename), 6);
   const reopened = new SqliteAudit(filename, { readonly: true });
   t.after(() => reopened.close());
   const events = reopened.read(id);
