@@ -182,6 +182,30 @@ export interface ClaudeCodeTask {
   readonly shell?: boolean;
 }
 
+/** Verify the staged CLI and packages, install offline, and check the placeholder. */
+export function claudeCodeGuestSetup(
+  variable: string,
+  guest: GuestKind,
+): string {
+  if (!isSafeCredentialVariable(variable))
+    throw new Error("Invalid credential variable");
+  const packages = CLAUDE_CODE_GUEST_PACKAGES.map(
+    (item, index) => `${item.sha256}  /tmp/apk-${index}.apk`,
+  ).join("\\n");
+  const bashSetup =
+    guest === "alpine"
+      ? `    printf '${packages}\\n' | sha256sum -c - >/dev/null
+    apk add --no-network --no-cache /tmp/apk-*.apk >/dev/null 2>&1 </dev/null
+`
+      : "";
+  return `    printf '%s  ${CLAUDE_CODE.guestPath}\\n' '${CLAUDE_CODE_BUILDS[guest].sha256}' | sha256sum -c - >/dev/null
+${bashSetup}    command -v bash >/dev/null
+    chmod 700 ${CLAUDE_CODE.guestPath}
+    # The guest holds only the backend placeholder, never the credential.
+    test "$${variable}" = '$MSB_${variable}'
+`;
+}
+
 /**
  * A guest command running the pinned CLI headlessly. Every flag is a constant
  * or a validated value; only the prompt is caller text, as `$1`.
@@ -238,26 +262,12 @@ export function claudeCodeCommand(
       ? `test "$(wc -c < /review/control.json)" -le 65536
     prompt=$(cat /review/control.json)`
       : `prompt="$1"`;
-  const packages = CLAUDE_CODE_GUEST_PACKAGES.map(
-    (item, index) => `${item.sha256}  /tmp/apk-${index}.apk`,
-  ).join("\\n");
-  const bashSetup =
-    guest === "alpine"
-      ? `    printf '${packages}\\n' | sha256sum -c - >/dev/null
-    apk add --no-network --no-cache /tmp/apk-*.apk >/dev/null 2>&1 </dev/null
-`
-      : "";
   const output =
     task.role === "Worker"
       ? `printf '%s' '{"tool":"collect"}'`
       : "head -c 65536 /tmp/claude-out.json";
   const script = `
-    printf '%s  ${CLAUDE_CODE.guestPath}\\n' '${CLAUDE_CODE_BUILDS[guest].sha256}' | sha256sum -c - >/dev/null
-${bashSetup}    command -v bash >/dev/null
-    chmod 700 ${CLAUDE_CODE.guestPath}
-    # The guest holds only the backend placeholder, never the credential.
-    test "$${credential.variable}" = '$MSB_${credential.variable}'
-    # No managed policy or pre-seeded CLI state: config and home are fresh.
+${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pre-seeded CLI state: config and home are fresh.
     # One check per line: under sh -e, a failure inside an && list does not
     # stop the script.
     test ! -e /root/.claude

@@ -219,3 +219,37 @@ Follow-up work
   passes guest-supplied non-placeholder credential headers through unchanged.
   A guest could supply its own Anthropic credential and exfiltrate data to
   another account.
+
+## Concierge launcher
+
+The [operator launcher](running.md) starts an audited Concierge session and
+uses the host invocation UUID as the session's runtime ID. The host exports
+one committed HEAD tree to a private, disposable directory under
+`.local/local-orchestrator/snapshots/`. The VM mounts it read-only at
+`/repo`. The export excludes `.local/` and contains only committed paths
+selected by Git's archive rules. A repository-path hash names the persistent
+volume mounted at `/state`. The host audits new volumes and reuse. Pass
+`--continue` to resume the latest Claude Code conversation in that volume.
+
+The launcher opens a private Unix socket under `/private/tmp` for the
+session's Host API. Inside the VM, Claude Code reaches it via `socat` over
+vsock CID 2, port 5000. The launcher verifies the staged CLI and package
+checksums, installs the packages offline and checks the backend credential
+placeholder before starting Claude Code. It defaults to `auto` permission
+mode. Managed settings deny Bash and WebFetch and allow the orchestrator
+MCP tools. These settings are auxiliary. The VM and trusted host enforce
+isolation, egress policy, and approval authority.
+
+Each accepted Planner request triggers the serial actor runner. Its
+provisional repository context is selected from the same snapshot. It
+includes regular files at `AGENTS.md`, `README.md` and
+`docs/local-orchestrator/*.md` where they fit, plus a truncated
+`files.txt` index of tracked paths. It reserves space for the runner's
+`request.json` within the adapter's 64-file, 256 KiB per-file and 1 MiB
+aggregate limits.
+
+The launcher ends the session, closes the Host API, cancels queued Planner
+jobs and gives an in-flight Planner invocation up to six minutes to
+finish cleanup. It then removes the snapshot and socket directory. The
+volume and host records persist. The library defaults to eight hours and
+accepts a lifetime of up to twelve hours.
