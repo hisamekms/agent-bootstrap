@@ -88,6 +88,7 @@ type ErrorCode =
   | "approval-forbidden"
   | "goal-inactive"
   | "goal-base-ineligible"
+  | "goal-base-stale"
   | "goal-base-record-failed"
   | "task-constraints"
   | "context-mismatch"
@@ -1553,11 +1554,10 @@ export class OrchestratorStore {
     );
   }
 
-  #eligibleGoalBase(id: string): string {
+  #eligibleGoalBase(id: string): string | null {
     const goal = this.#goal(id);
     if (
       goal?.status !== "active" ||
-      goal.baseCommit === null ||
       !this.#ownsGoalBranch(id) ||
       this.#db
         .query(
@@ -1566,15 +1566,33 @@ export class OrchestratorStore {
         .get(id) ||
       this.#db
         .query(
-          "SELECT 1 FROM proposals WHERE kind = 'integration' AND status = 'pending' AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
+          "SELECT 1 FROM proposals WHERE kind = 'integration' AND (status = 'pending' OR ? IS NULL) AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
+        )
+        .get(goal.baseCommit, id)
+    )
+      throw new OrchestratorStoreError("goal-base-ineligible");
+    if (goal.baseCommit !== null) return gitCommit(goal.baseCommit);
+    if (
+      this.#db
+        .query(
+          `SELECT 1 FROM tasks JOIN events ON events.subject_id = tasks.id
+          WHERE tasks.goal_id = ? AND events.subject_kind = 'task'
+            AND events.kind = 'task.status'
+            AND json_extract(events.data, '$.status') IN ('awaiting-integration', 'succeeded')
+          LIMIT 1`,
+        )
+        .get(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM events WHERE subject_id = ? AND subject_kind = 'goal' AND kind = 'goal.base-updated' LIMIT 1",
         )
         .get(id)
     )
       throw new OrchestratorStoreError("goal-base-ineligible");
-    return gitCommit(goal.baseCommit);
+    return null;
   }
 
-  goalBaseForUpdate(goalId: string): string {
+  goalBaseForUpdate(goalId: string): string | null {
     return this.#read(() => this.#eligibleGoalBase(identifier(goalId)));
   }
 
@@ -1583,6 +1601,7 @@ export class OrchestratorStore {
     from: string,
     to: string,
     moveRef: () => Promise<void>,
+    legacyBase = false,
   ) {
     const id = identifier(goalId);
     gitCommit(from);
@@ -1601,14 +1620,15 @@ export class OrchestratorStore {
     this.#updatingGoalBase = true;
     let moved = false;
     try {
-      if (this.#eligibleGoalBase(id) !== from)
-        throw new OrchestratorStoreError("goal-base-ineligible");
+      if (this.#eligibleGoalBase(id) !== (legacyBase ? null : from))
+        throw new OrchestratorStoreError("goal-base-stale");
       await moveRef();
       moved = true;
       this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", to, id);
       this.#event(new Date().toISOString(), "goal.base-updated", "goal", id, {
         from,
         to,
+        ...(legacyBase && { legacyBase: true }),
       });
       this.#db.exec("COMMIT");
     } catch (error) {

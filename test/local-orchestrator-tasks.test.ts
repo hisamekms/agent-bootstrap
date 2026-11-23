@@ -532,7 +532,7 @@ function command(
   return result.stdout;
 }
 
-function goalBaseFixture() {
+function goalBaseFixture(recordBase = true) {
   const repoRoot = join(root, "source");
   const directory = join(repoRoot, ".local", "local-orchestrator");
   const bare = join(directory, "repository.git");
@@ -547,7 +547,7 @@ function goalBaseFixture() {
   const ref = `refs/heads/${goalBranch(goalId)}`;
   bareGit(["init", "--bare", "--template="]);
   git(["push", bare, `${base}:${ref}`]);
-  store.recordGoalCommit(goalId, base, "base");
+  if (recordBase) store.recordGoalCommit(goalId, base, "base");
   writeFileSync(join(repoRoot, "on-new-main"), "new main\n");
   git(["add", "on-new-main"]);
   git(["commit", "-m", "new main"]);
@@ -632,6 +632,88 @@ test("update-goal-base confirms current local main, imports it and records the n
   assert.equal(store.getTask(taskId)?.retries, 1);
 });
 
+test("update-goal-base records the Goal branch head as the previous base for a legacy Goal", async () => {
+  const f = goalBaseFixture(false);
+  assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+  assert.equal(store.getGoal(f.goalId)?.planningCommit, null);
+
+  const result = await f.cli(f.args);
+  assert.equal(result.code, 0, result.stderr.join(""));
+  assert.deepEqual(JSON.parse(result.stdout[0]!), {
+    goalId: f.goalId,
+    from: f.base,
+    to: f.next,
+  });
+  assert.equal(f.head(), f.next);
+  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
+  assert.deepEqual(
+    f.events().map(({ data }) => data),
+    [{ from: f.base, to: f.next, legacyBase: true }],
+  );
+});
+
+test("update-goal-base refuses a legacy Goal with a rejected integration proposal", async () => {
+  const f = goalBaseFixture(false);
+  const taskId = task(f.goalId);
+  const content = {
+    ...pin,
+    goalId: f.goalId,
+    taskId,
+    branch: goalBranch(f.goalId),
+    changedPaths: ["docs/a.md"],
+    symlinks: [],
+    review: { result: "pass", notes: "Good" },
+  };
+  const db = new Database(filename);
+  try {
+    // Seed the proposal alone to exercise the proposal check independently
+    // of the Task status history normally recorded alongside it.
+    db.query(
+      `INSERT INTO proposals VALUES (?, 'integration', ?, ?, '{"kind":"host"}', 'rejected', ?, ?)`,
+    ).run(
+      randomUUID(),
+      JSON.stringify(content),
+      contentDigest(content),
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+    const refused = await f.cli(f.args);
+    assert.equal(refused.code, 1);
+    assert.deepEqual(refused.stderr, [
+      "Goal base update refused (ineligible).\n",
+    ]);
+    assert.deepEqual(refused.questions, []);
+    assert.deepEqual(f.events(), []);
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+  } finally {
+    db.close();
+  }
+});
+
+test("update-goal-base rechecks legacy history after confirmation", async () => {
+  const f = goalBaseFixture(false);
+  const taskId = task(f.goalId);
+  const db = new Database(filename);
+  try {
+    const refused = await f.cli(f.args, true, () => {
+      db.query(
+        `INSERT INTO events VALUES (?, ?, 'task.status', 'task', ?, NULL, NULL, '{"status":"awaiting-integration","code":null}')`,
+      ).run(randomUUID(), new Date().toISOString(), taskId);
+      return f.phrase;
+    });
+    assert.equal(refused.code, 1);
+    assert.deepEqual(refused.stderr, [
+      "Goal base update refused (ineligible).\n",
+    ]);
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+    assert.deepEqual(f.events(), []);
+  } finally {
+    db.close();
+  }
+});
+
 test("update-goal-base refuses ineligible Goal and Task states with a fixed message", async () => {
   const f = goalBaseFixture();
   const taskId = task(f.goalId);
@@ -639,7 +721,9 @@ test("update-goal-base refuses ineligible Goal and Task states with a fixed mess
   async function refused(args = f.args) {
     const result = await f.cli(args);
     assert.equal(result.code, 1);
-    assert.deepEqual(result.stderr, ["Goal base update refused.\n"]);
+    assert.deepEqual(result.stderr, [
+      "Goal base update refused (ineligible).\n",
+    ]);
     assert.deepEqual(result.questions, []);
   }
   try {
@@ -672,14 +756,18 @@ test("update-goal-base refuses a Task claim or ref change during confirmation", 
     assert.ok(store.claimTask(taskId));
     return f.phrase;
   });
-  assert.deepEqual(claimed.stderr, ["Goal base update refused.\n"]);
+  assert.deepEqual(claimed.stderr, [
+    "Goal base update refused (ineligible).\n",
+  ]);
   assert.equal(f.head(), f.base);
   store.failTask(taskId, "review-concern");
   const changedMain = await f.cli(f.args, true, () => {
     f.git(["update-ref", "refs/heads/main", f.base, f.next]);
     return f.phrase;
   });
-  assert.deepEqual(changedMain.stderr, ["Goal base update refused.\n"]);
+  assert.deepEqual(changedMain.stderr, [
+    "Goal base update refused (stale-base).\n",
+  ]);
   assert.equal(f.head(), f.base);
   f.git(["update-ref", "refs/heads/main", f.next, f.base]);
   f.git(["push", f.bare, `${f.next}:refs/heads/next`]);
@@ -687,10 +775,12 @@ test("update-goal-base refuses a Task claim or ref change during confirmation", 
     f.bareGit(["update-ref", f.ref, f.next, f.base]);
     return f.phrase;
   });
-  assert.deepEqual(changed.stderr, ["Goal base update refused.\n"]);
+  assert.deepEqual(changed.stderr, [
+    "Goal base update refused (stale-base).\n",
+  ]);
   assert.equal(f.head(), f.next);
   const stale = await f.cli(f.args);
-  assert.deepEqual(stale.stderr, ["Goal base update refused.\n"]);
+  assert.deepEqual(stale.stderr, ["Goal base update refused (stale-base).\n"]);
   assert.deepEqual(stale.questions, []);
   assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
   assert.deepEqual(f.events(), []);

@@ -192,16 +192,14 @@ async function importGoalBase(
     throw new Error("Git pack import failed");
 }
 
-async function requireGoalBranchBase(
+async function goalBranchHead(
   git: LocalGitIntegration,
-  from: string,
-): Promise<void> {
-  const head = await git.head().catch((error: unknown) => {
+): Promise<string | null> {
+  return git.head().catch((error: unknown) => {
     if (error instanceof GitIntegrationError && error.code === "invalid-object")
       return null;
     throw error;
   });
-  if (head !== from) throw new OrchestratorStoreError("goal-base-ineligible");
 }
 
 export async function previewGoalBaseUpdate(
@@ -210,21 +208,30 @@ export async function previewGoalBaseUpdate(
   directory: string,
   goalId: string,
 ) {
-  const from = store.goalBaseForUpdate(goalId);
+  const recordedBase = store.goalBaseForUpdate(goalId);
   const repository = join(directory, "repository.git");
   const git = localGit(directory, goalBranch(goalId));
-  await requireGoalBranchBase(git, from);
+  const head = await goalBranchHead(git);
+  const from = recordedBase ?? head;
+  if (from === null) throw new OrchestratorStoreError("goal-base-ineligible");
+  if (head !== from) throw new GitIntegrationError("stale-base");
   const to = await localMainCommit(repoRoot);
   return {
     from,
     to,
     async apply() {
-      if ((await localMainCommit(repoRoot)) !== to)
-        throw new OrchestratorStoreError("goal-base-ineligible");
-      await requireGoalBranchBase(git, from);
+      if (
+        (await localMainCommit(repoRoot)) !== to ||
+        (await goalBranchHead(git)) !== from
+      )
+        throw new GitIntegrationError("stale-base");
       await importGoalBase(repoRoot, repository, to);
-      await store.updateGoalBase(goalId, from, to, () =>
-        git.updateGoalBranch(from, to),
+      await store.updateGoalBase(
+        goalId,
+        from,
+        to,
+        () => git.updateGoalBranch(from, to),
+        recordedBase === null,
       );
     },
   };

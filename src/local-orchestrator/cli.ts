@@ -488,12 +488,21 @@ export async function runCli(
   } catch (error) {
     if (command.kind === "update-goal-base") {
       if (
-        (error instanceof OrchestratorStoreError &&
-          error.code === "goal-base-ineligible") ||
-        (error instanceof GitIntegrationError &&
-          ["stale-base", "unsafe-repository"].includes(error.code))
+        error instanceof OrchestratorStoreError &&
+        error.code === "goal-base-ineligible"
       )
-        return refuse(io, "Goal base update refused.");
+        return refuse(io, "Goal base update refused (ineligible).");
+      if (
+        (error instanceof OrchestratorStoreError &&
+          error.code === "goal-base-stale") ||
+        (error instanceof GitIntegrationError && error.code === "stale-base")
+      )
+        return refuse(io, "Goal base update refused (stale-base).");
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "unsafe-repository"
+      )
+        return refuse(io, "Goal base update refused (unsafe-repository).");
       if (
         error instanceof OrchestratorStoreError &&
         error.code === "goal-base-record-failed"
