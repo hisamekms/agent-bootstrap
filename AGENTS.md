@@ -23,8 +23,8 @@
   `src/model-coordinator.ts` owns the provider-neutral Coordinator model port,
   and `src/codex-app-server.ts` owns its first adapter.
   `src/task-trace.ts` joins one task's journal with the host audit.
-  `src/claude-code.ts` owns the official Claude Code CLI adapter (API-key mode
-  only; see `docs/claude-code-auth.md`).
+  `src/claude-code.ts` owns the official Claude Code CLI adapter (see
+  `docs/claude-code-auth.md`).
   `src/codex-exec.ts` owns Codex role commands, `src/claude-coordinator.ts`
   the Claude Code Coordinator model, `src/actors.ts` the harness choice per
   actor, and `src/routing-runtime.ts` routing to one runtime adapter per

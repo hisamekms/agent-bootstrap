@@ -64,7 +64,7 @@ export interface RoleHarness {
   readonly harness: Harness;
   readonly sandbox: Pick<
     SandboxSpec,
-    "tools" | "provider" | "hostTcpPort" | "profile"
+    "tools" | "provider" | "hostTcpPort" | "profile" | "claude"
   >;
   command(task: {
     readonly role: "Planner" | "Worker" | "Reviewer";
@@ -112,7 +112,10 @@ export function claudeRoleHarness(options: {
 }): RoleHarness {
   const guest =
     options.guest ?? (options.profile ? guestOf(options.profile) : "alpine");
-  const provider = claudeCodeProvider(options.auth, options.fixture);
+  const provider =
+    options.auth.mode === "config-dir"
+      ? undefined
+      : claudeCodeProvider(options.auth, options.fixture);
   const baseUrl = options.fixture
     ? `https://${options.fixture.host}:${options.fixture.port}`
     : undefined;
@@ -120,7 +123,8 @@ export function claudeRoleHarness(options: {
     harness: "claude",
     sandbox: {
       tools: options.tools,
-      provider,
+      claude: true,
+      ...(provider ? { provider } : {}),
       ...(options.profile ? { profile: options.profile } : {}),
     },
     command: (task) =>

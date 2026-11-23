@@ -2,7 +2,7 @@
 
 Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.
 
-Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor or concierge. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
+Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, credentials, or login. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
 
 Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.
 
@@ -49,16 +49,17 @@ mise --no-config --no-env --no-hooks install microsandbox@0.7.16
 agent-bootstrap setup --json
 agent-bootstrap setup --allow-network
 agent-bootstrap setup --allow-network --profiles
-export LO_CLAUDE_KEYCHAIN=agent-bootstrap-claude
-security add-generic-password -s "$LO_CLAUDE_KEYCHAIN" -a "$USER" -w
-export LO_CLAUDE_AUTH=operator:ANTHROPIC_API_KEY:x-api-key
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"
+mkdir -p "$config_dir"
+(umask 077; set -C; printf '%s\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")
+security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 ```
 
 **Expected output**  
 Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. The optional browser build pulls a pinned Debian base and uses the existing Debian snapshot recipe over HTTP with signed and hash-pinned release metadata. A digest mismatch stops setup before the image is published under its locked reference.
 
 **Next action**  
-Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.
+API-key mode is the default. Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.
 
 **Human involvement**  
 Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.
@@ -219,7 +220,7 @@ agent-bootstrap concierge --target /path/to/project --continue --mode default
 ```
 
 **Expected output**  
-Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt and a fresh token budget window.
+Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. Doctor reports the effective authentication mode and its source.
 
 **Next action**  
 Check status for the new attempt. If integration remains uncertain, inspect the private ref and integration journal before retrying.
@@ -247,14 +248,56 @@ Policy reports goal-registration, task-registration, and integration defaults. P
 Review the proposed paths, verification result, digest, and policy before answering each gate.
 
 **Human involvement**  
-The operator updates local main, pushes branches, and opens pull requests. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep secrets out of command arguments, repository files, and agent context.
+The operator updates local main, pushes branches, and opens pull requests. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep API keys in Keychain. In config-dir mode, processes inside a Claude VM can read the mounted group directory. Researcher and verification receive neither the directory nor its egress policy.
+
+## credentials
+
+Manage the encrypted volume for persistent Claude Code configuration directories per actor group, signed in with the CLI's own /login.
+
+**Prerequisites**
+
+A private config.json with the volume path, Keychain service name and actor groups. API-key mode remains the default.
+
+**Expected output**
+
+Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. Detach clears a stale attachment when no run still holds it.
+
+**Next action**
+
+If integrity fails, inspect the evidence path and use credentials verify --accept from an operator terminal. Use the same target and authentication options as the failing run.
+
+**Human involvement**
+
+The operator inspects and accepts any intended changes to the group's configuration.
+
+## login
+
+Open Claude Code in an audited terminal for a configured actor group.
+
+**Prerequisites**
+
+Config-dir mode and a configured encrypted volume. Use a terminal with OSC 52 clipboard access disabled.
+
+**Expected output**
+
+The CLI can reach the group's configured hosts and its additional login hosts.
+
+**Next action**
+
+Use the Claude Code CLI's own /login, then exit the CLI.
+
+**Human involvement**
+
+The operator signs in from the Claude Code CLI.
 
 ## Command reference
 
 - `agent-bootstrap help [topic] [--json] | help --agent` → { topics, commands, exitCodes }
-- `agent-bootstrap doctor [--target <path>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.
+- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap setup [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
-- `agent-bootstrap concierge [--target <path>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
+- `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
+- `agent-bootstrap credentials <status|init|attach|detach|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]` → { mounted, active, stale } for status or { status } after a completed action.
+- `agent-bootstrap login --group <name> [--target <path>] [--claude-auth <mode>] [--json]` → { status } after a successful interactive session. Transcript goes to stderr in JSON mode.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }
 - `agent-bootstrap proposals [--status <pending|approved|rejected|registered>]` → Array of proposals with effective policy.
 - `agent-bootstrap show <proposalId|goalId|taskId>` → One proposal, Goal, or Task object.

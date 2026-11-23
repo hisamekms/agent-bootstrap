@@ -12,6 +12,7 @@ import {
   hostChecks,
   imageStatus,
   msb,
+  configureClaude,
   provisionKeychain,
   readLock,
   type Host,
@@ -45,11 +46,7 @@ export async function setupPlan(root: string, extended: boolean) {
     ),
     images: { base: ALPINE_3_23.reference, profiles },
     keychain: {
-      commands: [
-        "export LO_CLAUDE_KEYCHAIN=agent-bootstrap-claude",
-        provisionKeychain,
-        "export LO_CLAUDE_AUTH=operator:ANTHROPIC_API_KEY:x-api-key",
-      ],
+      commands: [...configureClaude, provisionKeychain],
       promptValue: "<ANTHROPIC_API_KEY>",
     },
   };

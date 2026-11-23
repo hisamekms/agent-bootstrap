@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { symlink } from "node:fs/promises";
 import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -1095,6 +1095,7 @@ test("one runtime binds its single credential to at most one provider", () => {
   const provider = {
     host: "api.anthropic.com",
     secretEnv: "ANTHROPIC_API_KEY",
+    header: "x-api-key" as const,
   };
   assert.throws(
     () =>
@@ -1376,6 +1377,7 @@ async function interactiveFixture(t: TestContext) {
   const provider = {
     host: "api.anthropic.com",
     secretEnv: "ANTHROPIC_API_KEY",
+    header: "x-api-key" as const,
   };
   const runtime = new MicrosandboxRuntime({
     ...f.config,
@@ -1691,6 +1693,7 @@ test("create checks gateway availability after asynchronous provider credential 
   const provider = {
     host: "api.anthropic.com",
     secretEnv: "ANTHROPIC_API_KEY",
+    header: "x-api-key" as const,
   };
   let grant = true;
   const runtime = new MicrosandboxRuntime({
@@ -1716,4 +1719,63 @@ test("create checks gateway availability after asynchronous provider credential 
     (await events()).some(({ args }) => args[0] === "create"),
     false,
   );
+});
+
+test("Claude configuration and managed settings create mounts without a provider substitution", async (t) => {
+  const { config, events } = await fixture(t);
+  const root = dirname(config.home);
+  const managed = join(root, "managed.json");
+  const group = join(root, "actors");
+  await writeFile(managed, "{}", { mode: 0o600 });
+  await mkdir(group, { mode: 0o700 });
+  const runtime = new MicrosandboxRuntime({
+    ...config,
+    profiles: new ProfileCatalog({ base: { image }, concierge: { image } }),
+    gatewayPassword: () => gatewayPassword,
+  });
+
+  for (const extra of [
+    {},
+    { profile: "concierge", interactive: { login: true } },
+  ] as const) {
+    const spec = {
+      ...extra,
+      claude: true,
+      claudeMounts: { managed, group },
+      egressGateway: gateway,
+    } as const;
+    const handle = await runtime.create(spec);
+    try {
+      const create = (await events())
+        .filter(({ args }) => args[0] === "create")
+        .at(-1)!;
+      assert.equal(
+        create.args[create.args.indexOf("--mount-file") + 1],
+        `${managed}:/etc/claude-code/managed-settings.json:ro`,
+      );
+      assert.equal(
+        create.args[create.args.indexOf("--mount-dir") + 1],
+        `${group}:/claude-config`,
+      );
+      assert.ok(!create.args.includes("--secret"));
+      assert.ok(!create.args.includes("--tls-intercept"));
+      assert.ok(!create.args.includes("--vsock"));
+      assert.ok(!create.args.includes("--mount-named"));
+      assert.deepEqual(
+        create.envKeys.filter((key) => key.startsWith("ANTHROPIC")),
+        [],
+      );
+      if ("interactive" in extra) {
+        assert.deepEqual(
+          await runtime.attachTerminal(handle, {
+            argv: ["claude"],
+            workdir: "/",
+          }),
+          { exitCode: 0 },
+        );
+      }
+    } finally {
+      await runtime.destroy(handle);
+    }
+  }
 });

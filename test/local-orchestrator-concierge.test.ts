@@ -158,6 +158,7 @@ for (const failure of [undefined, ...failures]) {
               assert.deepEqual(plan, {
                 sandbox: {
                   profile: "concierge",
+                  claude: true,
                   tools: claudeCodeTools(install, "alpine"),
                   provider: claudeCodeProvider(auth),
                   maxLifetimeMs: 28_800_000,
@@ -403,8 +404,8 @@ test("Concierge guest command admits only validated options and uses a fixed rel
     script!.includes("test \"$ANTHROPIC_API_KEY\" = '$MSB_ANTHROPIC_API_KEY'"),
   );
   assert.ok(script!.includes('["STDIO","VSOCK-CONNECT:2:5000"]'));
-  assert.ok(script!.includes('"deny":["WebFetch","Bash"]'));
-  assert.ok(script!.includes('"allow":["mcp__orchestrator"]'));
+  assert.doesNotMatch(script!, /managed-settings/);
+  assert.match(script!, /--strict-mcp-config --setting-sources ''/);
   assert.match(script!, /exec env -i .*HOME=\/state\/home/);
   assert.ok(script!.includes("CLAUDE_CONFIG_DIR=/state/claude"));
   assert.ok(

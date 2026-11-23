@@ -1,3 +1,4 @@
+import { ClaudeRunError } from "../src/local-orchestrator/credentials-volume.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -1736,7 +1737,11 @@ test("Coordinator session send refuses further guest work after gateway quaranti
 const conciergePlan = {
   sandbox: {
     profile: "concierge",
-    provider: { host: "api.anthropic.com", secretEnv: "ANTHROPIC_API_KEY" },
+    provider: {
+      host: "api.anthropic.com",
+      secretEnv: "ANTHROPIC_API_KEY",
+      header: "x-api-key",
+    },
     interactive: {
       vsock: { hostPath: "/fixture/api.sock", port: 5000 },
       stateVolume: "lo-session",
@@ -2235,4 +2240,229 @@ test("Concierge volume operations refuse side effects without durable request an
       await assert.rejects(result, HostAuditError);
     }
   }
+});
+
+test("Claude directory grants go only to Claude actors and login uses its additional hosts", async (t) => {
+  const mounts = { managed: "/fixture/managed.json", group: "/fixture/actors" };
+  const created: SandboxSpec[] = [];
+  const finished: boolean[] = [];
+  const notes: string[] = [];
+  let tampered = false;
+  let exitCode = 0;
+  const { host, db, fake } = observedFixture(
+    t,
+    {
+      async createBound(spec, id) {
+        created.push(spec);
+        return { id, netRuleDigest: ruleDigest };
+      },
+      async exec() {
+        return {
+          status: "exited",
+          exitCode,
+          stdout: Buffer.from(
+            exitCode ? '{"result":"HTTP 401","is_error":true}' : "",
+          ),
+          stderr: Buffer.alloc(0),
+        };
+      },
+      async attachTerminal() {
+        return { exitCode: 0 };
+      },
+    },
+    undefined,
+    {
+      claude: {
+        managedSettings: () => mounts.managed,
+        note: (note) => notes.push(note),
+        configDir: {
+          egress: ["models.example.test"],
+          loginEgress: ["signin.example.test"],
+          errors: [],
+          groupFor: () => "actors",
+          begin(group) {
+            assert.equal(group, "actors");
+            return {
+              path: mounts.group,
+              prepare() {},
+              ready() {},
+              quarantine() {
+                assert.fail("Unexpected quarantine");
+              },
+              finish(succeeded) {
+                finished.push(succeeded);
+                if (tampered) throw new ClaudeRunError("config-tampered");
+              },
+            };
+          },
+        },
+      },
+    },
+  );
+
+  const run = () =>
+    host.runPlanner({ sandbox: { claude: true }, command: plan.command });
+  const first = await run();
+  assert.equal(first.outcome, "ok");
+  assert.deepEqual(created.at(-1)?.claudeMounts, mounts);
+  assert.equal(created.at(-1)?.provider, undefined);
+  assert.equal(fake.opened!.policy.providerBinding, undefined);
+  assert.deepEqual(fake.opened!.policy.allow, [
+    { hostname: "api.anthropic.com", port: 443 },
+    { hostname: "models.example.test", port: 443 },
+  ]);
+  assert.deepEqual(
+    db
+      .read(first.id)
+      .find(
+        ({ operation, kind }) =>
+          operation === "provider.egress" && kind === "operation.requested",
+      )?.detail,
+    { plainHosts: ["api.anthropic.com", "models.example.test"] },
+  );
+
+  exitCode = 7;
+  const failed = await run();
+  assert.equal(failed.code, "auth-required");
+  assert.deepEqual(db.read(failed.id).at(-1)?.detail, {
+    code: "auth-required",
+  });
+  assert.equal(notes.at(-1), "next: agent-bootstrap login --group actors");
+
+  exitCode = 0;
+  tampered = true;
+  const stopped = await run();
+  assert.deepEqual(stopped, {
+    id: stopped.id,
+    outcome: "failed",
+    code: "config-tampered",
+  });
+  assert.deepEqual(db.read(stopped.id).at(-1)?.detail, {
+    code: "config-tampered",
+  });
+  tampered = false;
+
+  await host.runVerification({ sandbox: {}, command: plan.command });
+  assert.equal(created.at(-1)?.claudeMounts, undefined);
+  assert.equal(created.at(-1)?.egressGateway, undefined);
+  await assert.rejects(
+    host.runVerification({
+      sandbox: { claude: true } as never,
+      command: plan.command,
+    }),
+    /Verification accepts only/,
+  );
+
+  const login = await host.runClaudeLogin("actors", [], { argv: ["claude"] });
+  assert.equal(login.outcome, "ok");
+  assert.deepEqual(created.at(-1)?.interactive, { login: true });
+  assert.deepEqual(created.at(-1)?.claudeMounts, mounts);
+  assert.deepEqual(
+    fake.opened!.policy.allow.map(({ hostname }) => hostname),
+    ["api.anthropic.com", "models.example.test", "signin.example.test"],
+  );
+  assert.deepEqual(
+    db
+      .read(login.id)
+      .find(
+        ({ operation, kind }) =>
+          operation === "sandbox.create" && kind === "operation.requested",
+      )?.detail,
+    { mode: "login", group: "actors" },
+  );
+  assert.deepEqual(finished, [true, false, true, true]);
+});
+
+test("the trusted host refuses authorization substitution on Anthropic hosts before audit or create", async (t) => {
+  const { host, calls } = observedFixture(t);
+  for (const header of [undefined, "authorization"] as const) {
+    const provider = {
+      host: "api.anthropic.com",
+      secretEnv: "GATEWAY_KEY",
+      ...(header ? { header } : {}),
+    };
+    await assert.rejects(
+      host.runWorker({ ...plan, sandbox: { provider } }),
+      /operator gateway host/,
+    );
+  }
+  assert.deepEqual(calls, []);
+});
+
+test("Claude group authorization must commit before the volume lease is acquired", async (t) => {
+  const { host } = observedFixture(
+    t,
+    undefined,
+    "operation.allowed sandbox.create",
+    {
+      claude: {
+        managedSettings: () => "/fixture/managed.json",
+        note() {},
+        configDir: {
+          egress: [],
+          loginEgress: [],
+          errors: [],
+          groupFor: () => "actors",
+          begin() {
+            return assert.fail(
+              "Volume access before durable group authorization",
+            );
+          },
+        },
+      },
+    },
+  );
+  await assert.rejects(
+    host.runPlanner({ sandbox: { claude: true }, command: plan.command }),
+    HostAuditError,
+  );
+});
+
+test("Claude keeps a volume lease quarantined when a partial create survives cleanup", async (t) => {
+  let quarantined = false;
+  const { host, db } = observedFixture(
+    t,
+    {
+      async createBound(_spec, id) {
+        throw new SandboxRuntimeError("backend-failure", true, id);
+      },
+    },
+    undefined,
+    {
+      claude: {
+        managedSettings: () => "/fixture/managed.json",
+        note() {},
+        configDir: {
+          egress: [],
+          loginEgress: [],
+          errors: [],
+          groupFor: () => "actors",
+          begin() {
+            return {
+              path: "/fixture/actors",
+              prepare() {},
+              ready() {
+                assert.fail("The partial VM survived");
+              },
+              finish() {
+                assert.fail("Volume lease released with a live mount");
+              },
+              quarantine() {
+                quarantined = true;
+              },
+            };
+          },
+        },
+      },
+    },
+  );
+  const result = await host.runPlanner({
+    sandbox: { claude: true },
+    command: plan.command,
+  });
+  assert.equal(quarantined, true);
+  assert.equal(result.code, "credentials-detached");
+  assert.deepEqual(db.read(result.id).at(-1)?.detail, {
+    code: "credentials-detached",
+  });
 });

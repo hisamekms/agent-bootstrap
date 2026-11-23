@@ -1921,6 +1921,7 @@ export class OrchestratorStore {
       mode: string;
       status: "succeeded" | "failed";
       exitCode: number | null;
+      code?: string;
     },
   ): void {
     const id = identifier(sessionId);

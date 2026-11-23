@@ -142,6 +142,8 @@ const topics = [
   "targets",
   "troubleshoot",
   "safety",
+  "credentials",
+  "login",
 ];
 
 describe("agent-bootstrap", () => {
@@ -158,6 +160,8 @@ describe("agent-bootstrap", () => {
       "doctor",
       "setup",
       "concierge",
+      "credentials",
+      "login",
       "status",
       "proposals",
       "show",
@@ -225,10 +229,7 @@ describe("agent-bootstrap", () => {
       status: string;
     }>;
     assert.equal(checks.find(({ id }) => id === "msb-home")?.status, "missing");
-    assert.equal(
-      checks.find(({ id }) => id === "claude-auth")?.status,
-      "missing",
-    );
+    assert.equal(checks.find(({ id }) => id === "keychain")?.status, "missing");
   });
 
   test("invalid commands and refused commands use distinct exits and one JSON object", async () => {
@@ -273,7 +274,6 @@ describe("agent-bootstrap", () => {
     const root = await fixture();
     const { host, calls, images } = fakeHost(root);
     host.bun = "1.2.0";
-    host.env.LO_CLAUDE_AUTH = "operator:ANTHROPIC_API_KEY:authorization";
     host.env.MSB_HOME = "/tmp";
     // /tmp resolves within the limit on macOS and Linux, unlike mkdtemp under macOS TMPDIR.
     const lock = JSON.parse(await readFile(join(root, lockFile), "utf8"));
@@ -307,7 +307,8 @@ describe("agent-bootstrap", () => {
       "image:db": "missing",
       "image:browser": "missing",
       keychain: "ok",
-      "claude-auth": "wrong",
+      "claude-auth": "ok",
+      "claude-config-warning-1": "skipped",
       duckdb: "ok",
     });
     for (const check of checks)

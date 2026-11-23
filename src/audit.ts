@@ -1,3 +1,9 @@
+import {
+  CLAUDE_FAILURE_CODES,
+  validClaudeHostname,
+  validGroup,
+  type ClaudeFailureCode,
+} from "./local-orchestrator/claude-config.ts";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
@@ -16,8 +22,12 @@ type AuditDetail =
       readonly vsockPort: number;
       readonly snapshotDir: string;
       readonly volumeName: string;
+      readonly group?: string;
     }
-  | { readonly volumeName: string; readonly reused?: boolean };
+  | { readonly volumeName: string; readonly reused?: boolean }
+  | { readonly plainHosts: readonly string[] }
+  | { readonly mode: "login" | "config-dir"; readonly group: string }
+  | { readonly code: ClaudeFailureCode };
 
 export type AuditInput = {
   readonly invocationId: string;
@@ -643,6 +653,39 @@ function parseAuditDetail(
   },
 ): AuditDetail | undefined {
   const { kind, operation, role, profile, outcome } = event;
+  const claudeRole =
+    role === "Concierge" ||
+    role === "Worker" ||
+    role === "Planner" ||
+    role === "Reviewer";
+  if (
+    present &&
+    claudeRole &&
+    kind === "invocation.finished" &&
+    outcome === "failed"
+  ) {
+    const { code } = dataFields(value, ["code"]);
+    return {
+      code: enumField(code, CLAUDE_FAILURE_CODES),
+    };
+  }
+  if (
+    present &&
+    claudeRole &&
+    kind === "operation.requested" &&
+    operation === "provider.egress"
+  ) {
+    const { plainHosts } = dataFields(value, ["plainHosts"]);
+    if (
+      !Array.isArray(plainHosts) ||
+      plainHosts.length < 1 ||
+      plainHosts.length > 65 ||
+      !plainHosts.every(validClaudeHostname) ||
+      plainHosts[0] !== "api.anthropic.com"
+    )
+      return invalidEvent();
+    return { plainHosts: [...plainHosts] };
+  }
   if (operation === "volume.create" || operation === "volume.remove") {
     const recordsReuse =
       operation === "volume.create" &&
@@ -659,6 +702,23 @@ function parseAuditDetail(
     return { volumeName: detail.volumeName, reused: detail.reused };
   }
   if (
+    present &&
+    claudeRole &&
+    kind === "operation.requested" &&
+    operation === "sandbox.create" &&
+    value &&
+    typeof value === "object" &&
+    Object.hasOwn(value, "mode")
+  ) {
+    const { mode, group } = dataFields(value, ["mode", "group"]);
+    if (
+      !validGroup(group) ||
+      (role === "Concierge" ? mode !== "login" : mode !== "config-dir")
+    )
+      return invalidEvent();
+    return { mode: role === "Concierge" ? "login" : "config-dir", group };
+  }
+  if (
     role === "Concierge" &&
     profile === "concierge" &&
     operation === "sandbox.create" &&
@@ -669,13 +729,15 @@ function parseAuditDetail(
       "vsockPort",
       "snapshotDir",
       "volumeName",
+      "group",
     ]);
-    const { socketPath, snapshotDir, volumeName } = detail;
+    const { socketPath, snapshotDir, volumeName, group } = detail;
     if (
       !isInteractiveAuditPath(socketPath) ||
       Buffer.byteLength(socketPath) >= 100 ||
       !isInteractiveAuditPath(snapshotDir) ||
-      !isConciergeVolumeName(volumeName)
+      !isConciergeVolumeName(volumeName) ||
+      (group !== undefined && !validGroup(group))
     )
       return invalidEvent();
     return {
@@ -683,6 +745,7 @@ function parseAuditDetail(
       vsockPort: integer(detail.vsockPort, 1024, 65535),
       snapshotDir,
       volumeName,
+      ...(group ? { group } : {}),
     };
   }
   if (present) return invalidEvent();

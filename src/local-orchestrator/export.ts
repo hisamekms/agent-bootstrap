@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { readClaudeRunMetrics } from "../claude-code.ts";
 import { JsonlWriter } from "../jsonl-files.ts";
+import { CLAUDE_FAILURE_CODES } from "./claude-config.ts";
 import { ACTOR_KINDS } from "./model.ts";
 import { readTokenReport } from "./token-usage.ts";
 
@@ -37,6 +38,7 @@ const known = (value: unknown, names: readonly string[]) =>
   typeof value === "string" && names.includes(value) ? value : null;
 
 const failureCodes = [
+  ...CLAUDE_FAILURE_CODES,
   "actor-failed",
   "approval-forbidden",
   "branch-collision",

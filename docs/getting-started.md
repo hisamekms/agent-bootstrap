@@ -33,19 +33,24 @@ Debian snapshot recipe over HTTP with signed, hash-pinned release metadata.
 An explicitly authorized operator agent can use
 `--allow-network --yes`.
 
-From an operator terminal, provision the key at the prompt and configure
-authentication.
+API-key mode is the default. Create the private configuration file and
+provision the API key from an operator terminal.
 
 ```sh
-export LO_CLAUDE_KEYCHAIN=agent-bootstrap-claude
-security add-generic-password -s "$LO_CLAUDE_KEYCHAIN" -a "$USER" -w
-export LO_CLAUDE_AUTH=operator:ANTHROPIC_API_KEY:x-api-key
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"
+mkdir -p "$config_dir"
+(umask 077; set -C; printf '%s\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")
+security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 target=/path/to/project
 agent-bootstrap doctor --target "$target"
 ```
 
-Enter your Anthropic API key at the Keychain prompt. The linked command uses
-settings exported by the operator and ignores the current directory’s `.env`. Doctor checks presence
+Enter your Anthropic API key at the Keychain prompt. If the file already
+exists, edit it in place and keep mode `0600`. The linked command ignores the
+current directory's `.env`. For persistent Claude Code configuration
+directories per actor group, kept on an encrypted volume and signed in
+with the CLI's own `/login`, see [Claude Code authentication](claude-code-auth.md).
+Doctor checks presence
 without reading the password. When required checks pass, doctor exits 0.
 Exit 3 means a required check needs attention. DuckDB is optional and uses
 `mise --no-config --no-env --no-hooks install duckdb@1.5.6`.

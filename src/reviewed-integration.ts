@@ -56,7 +56,7 @@ type IntegrationGit = Pick<
 /** Extra sandbox inputs for model-driven roles. Verification gets none. */
 type RoleSandbox = Pick<
   SandboxSpec,
-  "tools" | "provider" | "hostTcpPort" | "profile"
+  "tools" | "provider" | "hostTcpPort" | "profile" | "claude"
 >;
 
 export type Verification = {
@@ -185,6 +185,7 @@ type Plan = {
 const roleSandbox = (extra?: RoleSandbox): RoleSandbox => ({
   ...(extra?.tools ? { tools: extra.tools.map((tool) => ({ ...tool })) } : {}),
   ...(extra?.provider ? { provider: { ...extra.provider } } : {}),
+  ...(extra?.claude ? { claude: true } : {}),
   ...(extra?.hostTcpPort !== undefined
     ? { hostTcpPort: extra.hostTcpPort }
     : {}),

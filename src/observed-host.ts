@@ -19,6 +19,7 @@ import type {
 } from "./sandbox-runtime.ts";
 import {
   TrustedHost,
+  type ClaudeHostPolicy,
   type HostGateway,
   type HostObserver,
 } from "./trusted-host.ts";
@@ -44,6 +45,7 @@ export interface ObservedHostOptions {
     readonly credentials: NonNullable<MicrosandboxConfig["credentials"]>;
   }[];
   readonly observers?: readonly ObservedHostObserver[];
+  readonly claude?: ClaudeHostPolicy;
   /** Host-side override for fixtures. The same factory serves startup and runs. */
   readonly openGateway?: (
     options: EgressGatewayOptions,
@@ -114,6 +116,7 @@ export async function createObservedHost({
   auditPath,
   msb,
   profiles,
+  claude,
   credentials,
   providers,
   providerBindings,
@@ -281,6 +284,7 @@ export async function createObservedHost({
       config,
       observers: [...activeObservers, ...samplingObservers],
       ...(required ? { gatewayFactory } : {}),
+      ...(claude ? { claude } : {}),
     });
 
     if (required) {

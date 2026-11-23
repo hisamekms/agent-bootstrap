@@ -1,6 +1,7 @@
+import { CLAUDE_GROUP_PATH, CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, lstatSync } from "node:fs";
+import { createReadStream, lstatSync, realpathSync } from "node:fs";
 import {
   copyFile,
   cp,
@@ -25,6 +26,7 @@ import {
   INTERACTIVE_MAX_LIFETIME_MS,
   isConciergeVolumeName,
   isSafeCredentialVariable,
+  permitsProviderHeader,
   sameProvider,
   SandboxRuntimeError,
   WORKER_MESSAGE_LIMIT,
@@ -261,16 +263,26 @@ function interactiveArgs(spec: SandboxSpec): string[] {
     return [];
   }
   if (
-    !interactive?.vsock ||
+    !interactive ||
     spec.profile !== "concierge" ||
     !spec.egressGateway ||
-    !spec.provider ||
+    (!spec.provider && !spec.claudeMounts?.group) ||
     spec.repository !== undefined ||
     spec.readOnlyFiles !== undefined ||
     spec.files !== undefined ||
     spec.hostTcpPort !== undefined
   )
     invalid();
+  if ("login" in interactive) {
+    if (
+      interactive.login !== true ||
+      spec.provider ||
+      !spec.claudeMounts?.group
+    )
+      invalid();
+    return [];
+  }
+  if (!interactive.vsock) invalid();
   const {
     vsock: { hostPath, port },
     stateVolume,
@@ -295,6 +307,54 @@ function interactiveArgs(spec: SandboxSpec): string[] {
     "--mount-dir",
     `${snapshotDir}:/repo:ro`,
   ];
+}
+
+function claudeMountArgs(spec: SandboxSpec): string[] {
+  const mounts = spec.claudeMounts;
+  if (!mounts) return [];
+  if (
+    spec.claude !== true ||
+    !spec.egressGateway ||
+    (mounts.group && spec.provider)
+  )
+    invalid();
+  for (const path of [
+    mounts.managed,
+    ...(mounts.group ? [mounts.group] : []),
+  ]) {
+    if (
+      typeof path !== "string" ||
+      !isAbsolute(path) ||
+      resolve(path) !== path ||
+      /[\0:=,\r\n]/.test(path)
+    )
+      invalid();
+  }
+  return [
+    "--mount-file",
+    `${mounts.managed}:${CLAUDE_MANAGED_PATH}:ro`,
+    ...(mounts.group
+      ? ["--mount-dir", `${mounts.group}:${CLAUDE_GROUP_PATH}`]
+      : []),
+  ];
+}
+
+function checkClaudeMounts(mounts: NonNullable<SandboxSpec["claudeMounts"]>) {
+  for (const [path, directory] of [
+    [mounts.managed, false],
+    [mounts.group, true],
+  ] as const) {
+    if (path === undefined) continue;
+    const info = lstatSync(path, { throwIfNoEntry: false });
+    if (
+      !info ||
+      !(directory ? info.isDirectory() : info.isFile() && info.nlink === 1) ||
+      info.uid !== process.getuid?.() ||
+      (info.mode & 0o7777) !== (directory ? 0o700 : 0o600) ||
+      realpathSync(path) !== path
+    )
+      invalid();
+  }
 }
 
 function checkInteractivePaths(spec: InteractiveSpec): void {
@@ -340,7 +400,8 @@ function terminalArgs(command: TerminalCommand): string[] {
     ) ||
     (command.workdir !== undefined &&
       command.workdir !== "/repo" &&
-      command.workdir !== "/state")
+      command.workdir !== "/state" &&
+      command.workdir !== "/")
   )
     invalid();
   const assignments = terminalEnvEntries(command.env).map(
@@ -529,6 +590,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       provider &&
       (port !== undefined ||
         !this.#config.credentials ||
+        !permitsProviderHeader(provider) ||
         typeof provider.host !== "string" ||
         !this.#config.providers?.some((allowed) =>
           sameProvider(allowed, provider),
@@ -603,6 +665,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     return digestNetworkArgs([
       ...this.#network(spec).args,
       ...interactiveArgs(spec),
+      ...claudeMountArgs(spec),
     ]);
   }
 
@@ -612,6 +675,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     gateway?: SandboxEgressGateway,
     provider?: SandboxProvider,
     interactive?: InteractiveSpec,
+    mounts?: SandboxSpec["claudeMounts"],
   ): Promise<void> {
     const create = async (env: Record<string, string>) => {
       if (gateway) {
@@ -634,6 +698,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       }
       const args = buildArgs();
       if (interactive) checkInteractivePaths(interactive);
+      if (mounts) checkClaudeMounts(mounts);
       // A failed CLI create can leave a partially created sandbox.
       state.removed = false;
       return this.#checked(args, env);
@@ -714,17 +779,18 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     const requestedInteractive = spec.interactive;
-    if (requestedInteractive !== undefined && !requestedInteractive?.vsock)
-      invalid();
-    const interactive = requestedInteractive
-      ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
-      : undefined;
-    const channels = interactiveArgs(
-      interactive ? { ...spec, interactive } : spec,
-    );
+    const interactive =
+      requestedInteractive && "vsock" in requestedInteractive
+        ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
+        : undefined;
+    const mounts = spec.claudeMounts && { ...spec.claudeMounts };
+    const channels = [
+      ...interactiveArgs(interactive ? { ...spec, interactive } : spec),
+      ...claudeMountArgs(spec),
+    ];
     boundedInteger(
       lifetime,
-      interactive
+      requestedInteractive
         ? MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs
         : MICROSANDBOX_LIMITS.maxLifetimeMs,
     );
@@ -842,7 +908,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           : {}),
         directory,
         deadline: performance.now() + lifetime,
-        interactive: interactive !== undefined,
+        interactive: requestedInteractive !== undefined,
         busy: false,
         closed: false,
         removed: true,
@@ -882,6 +948,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         gateway,
         provider,
         interactive,
+        mounts,
       );
       if (stagedTree) {
         const extracted = await this.#execute(

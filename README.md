@@ -25,7 +25,7 @@ agent-bootstrap concierge --target /path/to/project
 
 Follow the first doctor result to prepare mise, pinned Microsandbox, and a short
 `MSB_HOME`. Review the setup plan before authorizing downloads and image builds.
-Use the Keychain provisioning commands it prints, then rerun doctor. The target
+Configure the Keychain service for default API-key mode and rerun doctor. The target
 must be a local Git worktree rooted at the supplied directory with a local
 `main` commit. Start Concierge from a terminal with OSC 52 access disabled.
 

@@ -603,6 +603,7 @@ export class ActorRunner {
       );
       if (run.outcome === "timed-out")
         return { status: "timed-out", result: { code: "timed-out" } };
+      if (run.code) return { status: "failed", result: { code: run.code } };
       if (run.outcome !== "ok") {
         code = "actor-failed";
         continue;
@@ -740,7 +741,7 @@ export class ActorRunner {
     if (run.outcome !== "ok" || result?.isError)
       return {
         status: timedOut ? "timed-out" : "failed",
-        result: { code: timedOut ? "timed-out" : "actor-failed" },
+        result: { code: run.code ?? (timedOut ? "timed-out" : "actor-failed") },
       };
 
     let verdict: ReturnType<typeof approvalVerdict>;

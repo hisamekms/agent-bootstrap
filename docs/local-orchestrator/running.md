@@ -20,12 +20,9 @@ for details.
   or set `LO_CLAUDE_BINARY` to its absolute path. Stage the pinned Alpine
   packages under `.local/alpine/v3.23/main/aarch64/`. The filenames and
   checksums are in `src/claude-code.ts`.
-- Provision a generic password in macOS Keychain for your current account
-  (`$USER`). Set `LO_CLAUDE_KEYCHAIN` to its service name and
-  `LO_CLAUDE_AUTH` to `operator:ANTHROPIC_API_KEY:x-api-key` for an
-  Anthropic API key. The launcher reads the value from Keychain and the
-  Claude guest receives a backend placeholder. `LO_CLAUDE_MODEL` defaults
-  to `claude-opus-5-5`.
+- For default API-key mode, provision the API key in Keychain and configure
+  its service name in the [private config file](../claude-code-auth.md#setup).
+  `LO_CLAUDE_MODEL` defaults to `claude-opus-5-5`.
 
 ## Start or resume
 
@@ -37,7 +34,7 @@ From the repository root, preview the launch with the first command. The
 second command starts an audited session with egress to
 `api.anthropic.com:443` and `platform.claude.com:443`. The platform host
 supports Claude Code's startup connectivity check. The gateway relays its
-traffic without credential substitution.
+traffic without API key substitution. This is the default API-key policy.
 Repository context and conversation content can reach the provider.
 
 ```sh
@@ -46,7 +43,11 @@ agent-bootstrap concierge
 ```
 
 Run one Concierge per target. Launchers for the same target in the same
-agent-bootstrap checkout share the conversation volume. The launcher prints its session ID and audit database
+agent-bootstrap checkout share the named volume. In API-key mode it holds
+the Concierge's configuration and guest home. In config-dir mode the
+named volume holds the guest home, and conversation state lives in the
+group's persistent Claude Code configuration directory on the encrypted
+volume. The launcher prints its session ID and audit database
 path. Exit Claude Code to end the session and remove temporary files. If
 the launcher process is terminated abruptly, its session record and
 temporary files can remain until host-side cleanup, and the backend
@@ -101,7 +102,8 @@ agent-bootstrap --target "$target" verification clear
 
 `set` and `clear` require a host terminal and the exact confirmation phrase
 shown in the prompt. The CLI records changes in the target's state database
-and stores the configuration in its private `config.json`. `show` prints
+and stores the verification configuration in its private `config.json`.
+The optional `claude` section shares that file. `show` prints
 `null` when verification is unset. The launcher reads the configuration at
 startup. Keep it in place until existing integration proposals are
 resolved, so integration can recheck each candidate with the same command.

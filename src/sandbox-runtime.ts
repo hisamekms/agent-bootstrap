@@ -30,7 +30,7 @@ export function isSafeCredentialVariable(name: unknown): name is string {
     )
   )
     return false;
-  return !/_PROXY$/.test(name);
+  return !name.endsWith("_PROXY");
 }
 
 export interface SandboxProvider {
@@ -76,10 +76,19 @@ export interface InteractiveSpec {
   readonly snapshotDir: string;
 }
 
+export type InteractiveSandbox = InteractiveSpec | { readonly login: true };
+
+export function permitsProviderHeader(provider: SandboxProvider): boolean {
+  return (
+    provider.header === "x-api-key" ||
+    !/(?:^|\.)(?:anthropic\.com|claude\.(?:ai|com))\.?$/i.test(provider.host)
+  );
+}
+
 export interface TerminalCommand {
   readonly argv: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
-  readonly workdir?: "/repo" | "/state";
+  readonly workdir?: "/repo" | "/state" | "/";
 }
 
 export const INTERACTIVE_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
@@ -138,7 +147,10 @@ export interface SandboxSpec {
   readonly provider?: SandboxProvider;
   /** Immutable host-provided snapshot, mounted under /review. */
   readonly readOnlyFiles?: readonly SandboxFile[];
-  readonly interactive?: InteractiveSpec;
+  readonly interactive?: InteractiveSandbox;
+  /** The host assigns and validates paths for Claude runs. */
+  readonly claude?: true;
+  readonly claudeMounts?: { readonly managed: string; readonly group?: string };
   readonly maxLifetimeMs?: number;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
   readonly invocationId?: string;

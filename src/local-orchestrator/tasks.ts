@@ -50,6 +50,7 @@ type TaskHost = Pick<
 >;
 type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
   outcome?: string;
+  code?: string;
   invocationId?: string;
   tokens?: number;
   usage?: TokenUsage;
@@ -366,6 +367,7 @@ export function createTaskExecutor(options: {
         async runWorker(...args) {
           const run = await host.runWorker(...args);
           workerResult.outcome = run.outcome;
+          if (run.code) workerResult.code = run.code;
           workerResult.invocationId = run.id;
           return run;
         },
@@ -373,6 +375,7 @@ export function createTaskExecutor(options: {
           const run = await host.runReviewer(...args);
           reviewerResponse = run.response;
           reviewerResult.outcome = run.outcome;
+          if (run.code) reviewerResult.code = run.code;
           reviewerResult.invocationId = run.id;
           if (reviewer.harness === "claude") {
             const result = parseClaudeCodeResult(run.response);
@@ -606,7 +609,8 @@ export async function runTask(
     const timedOut =
       mode !== "verification" && observed.outcome === "timed-out";
     if (mode !== "verification") {
-      if (timedOut) failure = "timed-out";
+      if (observed.code) failure = observed.code;
+      else if (timedOut) failure = "timed-out";
       else if (
         (observed.outcome && observed.outcome !== "ok") ||
         observed.isError
