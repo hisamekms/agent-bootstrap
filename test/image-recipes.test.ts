@@ -101,6 +101,7 @@ describe("image recipes", () => {
     assert.ok(!script.includes("--allow-untrusted"));
     assert.ok(script.includes("--no-network"));
     assert.ok(script.includes("agent-bootstrap-postgres"));
+    assert.match(script, /postgres:[^\n]+20779:[^\n]+\/etc\/shadow/);
   });
 
   test("db smoke checks Git after SQLite and Postgres", () => {

@@ -1,35 +1,49 @@
 # agent-bootstrap
 
-An experimental TypeScript bootstrap for auditable multi-agent software development.
-The current baseline provides provider-neutral role contracts, an offline
-Microsandbox runtime, and a trusted Worker host with SQLite audit records.
+agent-bootstrap runs coding agents in isolated Microsandbox VMs and records
+their actions in a durable host audit. The local orchestrator opens an
+interactive **Concierge** that works with a **Planner** to turn a Goal into
+Tasks. An **Executor** implements each eligible Task and a **Reviewer** reviews
+the candidate. The trusted host authorizes tools, checks approvals, and
+integrates approved work into a private Goal branch.
+
+## Quick start
+
+On an Apple silicon Mac with Bun 1.4.4, clone this repository and link the
+command. Put `$HOME/.bun/bin` on your PATH if your shell needs it.
 
 ```sh
-bun install --frozen-lockfile --ignore-scripts
-bun fmt
-bun lint
-bun typecheck
-bun run build
-bun test
+git clone https://github.com/hisamekms/agent-bootstrap.git
+cd agent-bootstrap
+bun install --frozen-lockfile --ignore-scripts && bun link
+agent-bootstrap doctor
+agent-bootstrap setup
+agent-bootstrap setup --allow-network
+agent-bootstrap doctor --target /path/to/project
+agent-bootstrap concierge --target /path/to/project
 ```
 
-Use Bun 1.4.4. `bun verify` runs the non-mutating format check, lint, typecheck,
-build, and tests. The build emits JavaScript and TypeScript declarations in
-`dist/`.
+Follow the first doctor result to prepare mise, pinned Microsandbox, and a short
+`MSB_HOME`. Review the setup plan before authorizing downloads and image builds.
+Use the Keychain provisioning commands it prints, then rerun doctor. The target
+must be a local Git worktree rooted at the supplied directory with a local
+`main` commit. Start Concierge from a terminal with OSC 52 access disabled.
 
-The intended MVP runs Coordinator, Planner, Worker, and Reviewer in separate
-sandbox invocations. Coordinator chooses when to delegate or ask a human. A
-trusted host enforces permissions, persists audit evidence, and integrates
-changes after human approval. The local [Worker audit smoke test](docs/milestones.md#m2-trusted-worker-and-durable-audit)
-covers authorization and trace inspection. The [reviewed integration smoke](docs/milestones.md#m3-reviewed-integration)
-uses a disposable repository and requires an explicit terminal decision.
-The [runtime smoke test](docs/microsandbox-runtime.md) and
-[subscription credential PoC](docs/codex-subscription-credential-poc.md)
-record the verified sandbox and synthetic Codex paths.
+Use `agent-bootstrap help --agent` to give an AI agent the operating manual,
+or `agent-bootstrap help --json` for help topics and machine-readable command
+contracts. Read [Getting started](docs/getting-started.md) for the setup,
+Goal and Task, audit, and performance workflows.
 
-DAGQ Lite architecture, a fixed role sequence, distributed scheduling, remote
-workers, and a dashboard are outside the MVP scope. See the
-[trust model](docs/trust-model.md) and [milestone checks](docs/milestones.md).
+## Reference
+
+- [Concierge and operator commands](docs/local-orchestrator/running.md)
+- [DuckDB analysis](docs/local-orchestrator/analysis.md)
+- [Authentication](docs/claude-code-auth.md#setup) and [sandbox profiles](docs/sandbox-profiles.md)
+- [Trust model](docs/trust-model.md) and [milestone checks](docs/milestones.md)
+
+Contributors can use `bun run lo` and `bun run concierge` from the checkout.
+Run `bun fmt` before review and `bun verify` for the local acceptance checks.
+The build emits JavaScript and TypeScript declarations in `dist/`.
 
 Licensed under the [MIT License](LICENSE). The project is experimental and
 provided as is, with no guaranteed maintenance, support, or security updates.

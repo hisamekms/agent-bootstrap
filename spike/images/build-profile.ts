@@ -19,6 +19,8 @@ import {
   recipeFor,
   smokeTest,
 } from "../../src/image-recipes.ts";
+import { checkDirectory } from "../../src/local-orchestrator/target.ts";
+import { MISE_MSB, offlineMiseEnv } from "../../src/mise-tools.ts";
 import {
   layoutTar,
   normalizeLayer,
@@ -41,14 +43,18 @@ function sha256(bytes: Uint8Array): string {
 
 let msb = "";
 let msbHome = "";
+let locked = false;
 
 function run(args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
-      msb,
-      args,
+      locked ? "mise" : msb,
+      locked ? [...MISE_MSB, ...args] : args,
       {
-        env: { PATH: "/usr/bin:/bin", MSB_HOME: msbHome },
+        env: {
+          ...(locked ? offlineMiseEnv(process.env) : { PATH: "/usr/bin:/bin" }),
+          MSB_HOME: msbHome,
+        },
         encoding: "utf8",
         killSignal: "SIGKILL",
         timeout: timeoutMs,
@@ -117,25 +123,34 @@ function guestExec(name: string, script: string, timeoutMs: number) {
 
 async function main(): Promise<void> {
   const [binary, profile] = process.argv.slice(2);
+  locked = binary === "--locked";
   const home = process.env["MSB_HOME"];
   if (
     binary === undefined ||
-    !isAbsolute(binary) ||
+    (!locked && !isAbsolute(binary)) ||
     profile === undefined ||
     home === undefined ||
     !isAbsolute(home)
   )
     throw new Error(
-      "usage: MSB_HOME=<abs> build-profile.ts <abs msb> <profile>",
+      "usage: MSB_HOME=<abs> build-profile.ts <abs msb|--locked> <profile>",
     );
   msb = binary;
   msbHome = home;
   const recipe = recipeFor(profile);
+  const expected = locked
+    ? parseProfileLock(await readFile(join(root, PROFILE_LOCK_PATH), "utf8"))
+        .profiles[profile]
+    : undefined;
+  if (locked && !expected) throw new Error("Profile is absent from the lock");
   const imageName = `localhost/agent-bootstrap/${profile}`;
 
   stage = "work directory";
+  if (locked) await checkDirectory(root);
   await mkdir(join(root, ".local"), { recursive: true });
+  if (locked) await checkDirectory(join(root, ".local"));
   const work = await mkdtemp(join(root, ".local", "images-"));
+  let temporaryImage: string | undefined;
   try {
     const copyArgs: string[] = [];
     if (recipe.base.kind === "alpine") {
@@ -221,25 +236,57 @@ async function main(): Promise<void> {
     const digest = image.manifestDigest;
     const reference = `${imageName}@sha256:${digest}`;
 
+    if (expected) {
+      stage = "locked digest verification";
+      const entry = lockEntry(profile, digest, packages);
+      if (
+        entry.image !== expected.image ||
+        JSON.stringify(entry.packages) !== JSON.stringify(expected.packages)
+      )
+        throw new Error("Build differs from the checked-in profile lock");
+    }
+
+    const smokeReference = locked
+      ? `${imageName}:setup-${randomBytes(8).toString("hex")}`
+      : reference;
+    if (locked) temporaryImage = smokeReference;
     stage = "image load";
     await run(
-      ["load", "-q", "-i", join(work, "image.tar"), "-t", reference],
+      ["load", "-q", "-i", join(work, "image.tar"), "-t", smokeReference],
       5 * MINUTE,
     );
     const inspected = JSON.parse(
-      await run(["image", "inspect", "--format", "json", reference], MINUTE),
+      await run(
+        ["image", "inspect", "--format", "json", smokeReference],
+        MINUTE,
+      ),
     ) as { digest?: unknown };
     if (inspected.digest !== `sha256:${digest}`)
       throw new Error("loaded image digest differs");
 
     stage = "smoke test";
     const smoke = smokeTest(profile);
-    const output = await withSandbox(reference, recipe.memoryMiB, [], (name) =>
-      guestExec(name, smoke.script, 5 * MINUTE),
+    const output = await withSandbox(
+      smokeReference,
+      recipe.memoryMiB,
+      [],
+      (name) => guestExec(name, smoke.script, 5 * MINUTE),
     );
     const lines = output.split("\n").filter((l) => l !== "");
     if (lines.join("\n") !== smoke.expected.join("\n"))
       throw new Error("smoke test output differs");
+
+    if (locked) {
+      stage = "smoke image cleanup";
+      await run(["image", "rm", smokeReference], MINUTE);
+      temporaryImage = undefined;
+      stage = "locked image load";
+      await run(
+        ["load", "-q", "-i", join(work, "image.tar"), "-t", reference],
+        5 * MINUTE,
+      );
+      return;
+    }
 
     stage = "lock update";
     const lockPath = join(root, PROFILE_LOCK_PATH);
@@ -282,6 +329,8 @@ async function main(): Promise<void> {
       }),
     );
   } finally {
+    if (temporaryImage)
+      await run(["image", "rm", temporaryImage], MINUTE).catch(() => undefined);
     // IMAGE_KEEP=1 keeps the work directory for comparing builds.
     if (process.env.IMAGE_KEEP === "1") console.error(`kept ${work}`);
     else await rm(work, { recursive: true, force: true });

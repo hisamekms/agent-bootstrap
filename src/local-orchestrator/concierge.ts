@@ -620,3 +620,22 @@ export async function startConcierge(
   if (cleanupErrors.length) throw new Error(cleanupErrors.join(", "));
   return { sessionId, outcome, exitCode };
 }
+
+export function parseConciergeArgs(args: readonly string[]) {
+  let run = false;
+  let resume = false;
+  let target: string | undefined;
+  let mode: ReturnType<typeof parseConciergeMode> | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--run" && !run) run = true;
+    else if (args[i] === "--continue" && !resume) resume = true;
+    else if (args[i] === "--mode" && mode === undefined)
+      mode = parseConciergeMode(args[++i]);
+    else if (args[i] === "--target" && target === undefined) {
+      target = args[++i];
+      if (!target || target.startsWith("--") || target.includes("\0"))
+        throw new Error("Invalid Concierge arguments");
+    } else throw new Error("Invalid Concierge arguments");
+  }
+  return { run, mode: mode ?? "auto", continue: resume, target };
+}

@@ -16,6 +16,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
 import { exportAudit } from "../audit-export.ts";
+import { MISE_DUCKDB as miseArgs, offlineMiseEnv } from "../mise-tools.ts";
 import { checkPrivateDirectory } from "../private-journal.ts";
 import { exportOrchestrator } from "./export.ts";
 import {
@@ -29,17 +30,6 @@ export type AnalysisCommand =
   | { kind: "analyze"; out?: string; sql?: string; audit?: string }
   | { kind: "denials"; since?: string; limit?: number };
 
-const miseArgs = [
-  "--no-config",
-  "--no-env",
-  "--no-hooks",
-  "exec",
-  "duckdb@1.5.6",
-  "--",
-  "duckdb",
-  "-init",
-  "/dev/null",
-];
 const terminalControls = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 export function escapeTerminalControls(text: string): string {
   return text.replace(terminalControls, (character) =>
@@ -52,12 +42,7 @@ export function escapeTerminalControls(text: string): string {
 
 export function runDuckDb(args: readonly string[], input?: string) {
   return spawnSync("mise", [...miseArgs, ...args], {
-    env: {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME,
-      MISE_OFFLINE: "1",
-      MISE_NOT_FOUND_AUTO_INSTALL: "false",
-    },
+    env: offlineMiseEnv(process.env),
     input,
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
@@ -252,7 +237,7 @@ ${orchestrator}
       options.kind === "denials"
         ? report.trim().replaceAll("\n", " ")
         : "SELECT * FROM actor_summary LIMIT 40;";
-    const manual = `env MISE_OFFLINE=1 MISE_NOT_FOUND_AUTO_INSTALL=false mise ${miseArgs.join(" ")} :memory: -f ${shellLiteral(loaderPath)} -c ${shellLiteral(query)}`;
+    const manual = `env MISE_OFFLINE=1 MISE_NOT_FOUND_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false mise ${miseArgs.join(" ")} :memory: -f ${shellLiteral(loaderPath)} -c ${shellLiteral(query)}`;
     io.stdout.write(
       `Analysis export ${escapeTerminalControls(JSON.stringify(out))}\nAd-hoc queries\n${manual}\n`,
     );

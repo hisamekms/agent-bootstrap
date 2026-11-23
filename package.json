@@ -4,7 +4,12 @@
   "private": true,
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "agent-bootstrap": "bin/agent-bootstrap.ts"
+  },
   "scripts": {
+    "lo": "bun run src/local-orchestrator/cli.ts",
+    "concierge": "bun run spike/local-orchestrator/concierge.ts",
     "build": "tsc -p tsconfig.build.json",
     "lint": "oxlint src test",
     "typecheck": "bun check -p tsconfig.json",

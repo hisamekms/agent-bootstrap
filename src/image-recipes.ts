@@ -123,7 +123,7 @@ const CXX_RUNTIME_PACKAGES = [
   ),
 ] as const;
 
-const BUN_VERSION = "1.4.4";
+export const BUN_VERSION = "1.4.4";
 const BUN_ARCHIVE = {
   name: "bun-linux-aarch64-musl.zip",
   source: `.local/bun/${BUN_VERSION}/bun-linux-aarch64-musl.zip`,
@@ -603,6 +603,11 @@ export function BUILD_SCRIPT(name: string): string {
     "set -e",
     "apk add --no-network --repositories-file /dev/null /tmp/pkgs/*.apk >/dev/null",
     ...setupsOf(recipe),
+    // The pinned PostgreSQL apk creates this system account with the current UTC day.
+    // Keep the day from the 2026-11-22 locked build as part of archive normalization.
+    ...(name === "db"
+      ? ["sed -i -E 's/^(postgres:[^:]*):[0-9]+:/\\1:20779:/' /etc/shadow"]
+      : []),
     "rm -rf /tmp/pkgs /var/cache/apk/*",
     ...archiveLines(),
     "rm -f /var/log/apk.log",

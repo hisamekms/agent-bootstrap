@@ -41,7 +41,8 @@ import {
   type VerificationConfig,
 } from "./verification.ts";
 
-interface CliIo {
+export interface CliIo {
+  json?(serialized: string): void;
   stdin: NodeJS.ReadableStream;
   stdout: { write(text: string): unknown };
   stderr: { write(text: string): unknown };
@@ -278,7 +279,8 @@ function writeJson(io: CliIo, value: unknown): void {
   // JSON escapes ASCII control characters. Escape C1 and Unicode formatting
   // characters in both keys and values, preserving JSON's own newlines.
   const output = json.split("\n").map(escapeTerminalControls).join("\n");
-  io.stdout.write(`${output}\n`);
+  if (io.json) io.json(output);
+  else io.stdout.write(`${output}\n`);
 }
 
 function projectDefaults(store: OrchestratorStore): Record<Gate, Policy> {

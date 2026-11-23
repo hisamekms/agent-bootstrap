@@ -7,12 +7,12 @@ import {
   CLAUDE_CODE,
   claudeCodeProvider,
   claudeCodeTools,
-  type ClaudeCodeAuth,
+  parseOperatorClaudeAuth,
 } from "../../src/claude-code.ts";
 import { ALPINE_3_23 } from "../../src/image-recipes.ts";
 import {
   conciergeCommand,
-  parseConciergeMode,
+  parseConciergeArgs,
   snapshotConciergeRepo,
   startConcierge,
 } from "../../src/local-orchestrator/concierge.ts";
@@ -29,6 +29,7 @@ import {
   configuredVerification,
   readVerificationConfig,
 } from "../../src/local-orchestrator/verification.ts";
+import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../../src/mise-tools.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
 import { createObservedHost } from "../../src/observed-host.ts";
 import {
@@ -42,37 +43,6 @@ const usage =
   "Usage: bun run spike/local-orchestrator/concierge.ts --run [--continue] [--mode <m>] [--target <path>]";
 const operatorCli = "bun run src/local-orchestrator/cli.ts status";
 const runFile = promisify(execFile);
-
-function parseArgs(args: readonly string[]) {
-  let run = false;
-  let resume = false;
-  let target: string | undefined;
-  let mode: ReturnType<typeof parseConciergeMode> | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--run" && !run) run = true;
-    else if (args[i] === "--continue" && !resume) resume = true;
-    else if (args[i] === "--mode" && mode === undefined)
-      mode = parseConciergeMode(args[++i]);
-    else if (args[i] === "--target" && target === undefined) {
-      target = args[++i];
-      if (!target || target.startsWith("--") || target.includes("\0"))
-        throw new Error(usage);
-    } else throw new Error(usage);
-  }
-  return { run, mode: mode ?? "auto", continue: resume, target };
-}
-
-function operatorAuth(value: string | undefined): ClaudeCodeAuth {
-  const [mode, variable, header, extra] = (value ?? "").split(":");
-  if (
-    mode !== "operator" ||
-    !variable ||
-    (header !== "authorization" && header !== "x-api-key") ||
-    extra !== undefined
-  )
-    throw new Error("Set LO_CLAUDE_AUTH to operator:<VARIABLE>:<header>");
-  return { mode: "operator-credential", variable, header };
-}
 
 async function fromKeychain(service: string | undefined): Promise<string> {
   const account = process.env.USER;
@@ -103,16 +73,9 @@ async function microsandboxBinary() {
   try {
     const { stdout } = await runFile(
       "mise",
-      ["--no-config", "--no-env", "--no-hooks", "where", "microsandbox@0.7.16"],
+      [...MISE_FLAGS, "where", MSB_TOOL],
       {
-        env: {
-          PATH: process.env.PATH,
-          HOME: process.env.HOME,
-          MISE_DATA_DIR: process.env.MISE_DATA_DIR,
-          XDG_DATA_HOME: process.env.XDG_DATA_HOME,
-          MISE_OFFLINE: "1",
-          MISE_NOT_FOUND_AUTO_INSTALL: "false",
-        },
+        env: offlineMiseEnv(process.env),
         timeout: 15_000,
         maxBuffer: 4096,
       },
@@ -128,7 +91,12 @@ async function microsandboxBinary() {
 }
 
 async function main(args: readonly string[]) {
-  const flags = parseArgs(args);
+  let flags: ReturnType<typeof parseConciergeArgs>;
+  try {
+    flags = parseConciergeArgs(args);
+  } catch {
+    throw new Error(usage);
+  }
   if (!flags.run) {
     console.log(
       `Dry run. The launcher would open the audited Concierge VM in ${flags.mode} mode${flags.continue ? " and resume the last conversation" : ""}, expose the Host API over vsock, and queue Planner runs.`,
@@ -163,7 +131,7 @@ async function main(args: readonly string[]) {
     throw new Error(
       "MSB_HOME must be at most 40 bytes after resolving symlinks",
     );
-  const auth = operatorAuth(LO_CLAUDE_AUTH);
+  const auth = parseOperatorClaudeAuth(LO_CLAUDE_AUTH);
   const model = LO_CLAUDE_MODEL ?? "claude-opus-5-5";
   const options = { model, mode: flags.mode, continue: flags.continue };
   conciergeCommand(options, auth);

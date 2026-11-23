@@ -109,6 +109,22 @@ function credentialOf(auth: ClaudeCodeAuth): {
   throw new ClaudeCodeUnsupportedError("native CLI authentication");
 }
 
+export function parseOperatorClaudeAuth(
+  value: string | undefined,
+): ClaudeCodeAuth {
+  const [mode, variable, header, extra] = (value ?? "").split(":");
+  if (
+    mode !== "operator" ||
+    !variable ||
+    (header !== "authorization" && header !== "x-api-key") ||
+    extra !== undefined
+  )
+    throw new Error("Set LO_CLAUDE_AUTH to operator:<VARIABLE>:<header>");
+  const auth = { mode: "operator-credential", variable, header } as const;
+  credentialOf(auth);
+  return auth;
+}
+
 /** Provider egress for the Anthropic API host. */
 export function claudeCodeProvider(
   auth: ClaudeCodeAuth,

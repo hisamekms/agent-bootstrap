@@ -211,8 +211,9 @@ and adding the `bunx` symlink. The smoke test checks Bun 1.4.4 and Git.
    copies it out with `msb copy`.
 4. **Normalize the layer.** The host rewrites the tar deterministically:
    entries sorted by path, mtime 0, and ownership and mode kept. Builds of the
-   same inputs then tend to give the same digest. This is best effort: file
-   contents such as account dates may differ.
+   same inputs then tend to give the same digest. This is best effort. The db
+   build normalizes the PostgreSQL account date to the day recorded in the
+   checked-in image.
 5. **Assemble the image.** The host builds an OCI image layout:
    - one squashed layer;
    - a config derived from the base config (env, cmd and working directory),

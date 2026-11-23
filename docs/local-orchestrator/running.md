@@ -1,5 +1,9 @@
 # Run the local Concierge
 
+From the agent-bootstrap checkout, use `bun run src/local-orchestrator/cli.ts`
+with the same operator arguments as an alternative to the linked command.
+To launch Concierge directly, use `bun run spike/local-orchestrator/concierge.ts --run`.
+
 Use a macOS operator terminal with OSC 52 clipboard access disabled. Guest
 output reaches that terminal directly. See the [terminal trust boundary](../trust-model.md)
 for details.
@@ -38,7 +42,7 @@ Repository context and conversation content can reach the provider.
 
 ```sh
 bun run spike/local-orchestrator/concierge.ts
-bun run spike/local-orchestrator/concierge.ts --run
+agent-bootstrap concierge
 ```
 
 Run one Concierge per target. Launchers for the same target in the same
@@ -50,7 +54,7 @@ lifetime still applies. To continue the latest conversation, use the same
 target and `MSB_HOME` from the same agent-bootstrap checkout.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run --continue
+agent-bootstrap concierge --continue
 ```
 
 The default Claude Code permission mode is `auto`. If Claude Code reports
@@ -71,8 +75,8 @@ docs.
 
 ```sh
 target="$HOME/ghq/github.com/hisamekms/dagq-lite"
-bun run spike/local-orchestrator/concierge.ts --run --target "$target"
-bun run src/local-orchestrator/cli.ts --target "$target" status
+agent-bootstrap concierge --target "$target"
+agent-bootstrap --target "$target" status
 ```
 
 Each external target uses
@@ -90,9 +94,9 @@ Preload the pinned Bun profile image and include it in the agent-bootstrap
 profile lock. Configure the command before starting the launcher.
 
 ```sh
-bun run src/local-orchestrator/cli.ts --target "$target" verification set --profile bun -- bun test
-bun run src/local-orchestrator/cli.ts --target "$target" verification show
-bun run src/local-orchestrator/cli.ts --target "$target" verification clear
+agent-bootstrap --target "$target" verification set --profile bun -- bun test
+agent-bootstrap --target "$target" verification show
+agent-bootstrap --target "$target" verification clear
 ```
 
 `set` and `clear` require a host terminal and the exact confirmation phrase
@@ -122,7 +126,7 @@ credential substitution. Update to a checkout that includes it, then rerun
 the launcher.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run
+agent-bootstrap concierge
 ```
 
 ### MCP tool calls return invalid-arguments
@@ -134,7 +138,7 @@ launcher. To continue the conversation, use the same checkout and
 `MSB_HOME`.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run --continue
+agent-bootstrap concierge --continue
 ```
 
 ## Recover after a crash
@@ -144,7 +148,7 @@ host terminal. If you use an explicit database, pass the same `--db`
 you use for the other operator commands.
 
 ```sh
-bun run src/local-orchestrator/cli.ts reconcile
+agent-bootstrap reconcile
 ```
 
 The command displays the active sessions, queued or running executions,
@@ -171,8 +175,8 @@ When available, the execution result contains a bounded `rawAnswer`.
 The CLI escapes terminal control characters in that model text.
 
 ```sh
-bun run src/local-orchestrator/cli.ts show-execution <executionId>
-bun run src/local-orchestrator/cli.ts retry-task <taskId>
+agent-bootstrap show-execution <executionId>
+agent-bootstrap retry-task <taskId>
 ```
 
 For a failed Task, type `retry-task <taskId>` with the full ID at the host
@@ -190,7 +194,7 @@ Goal already has a pinned branch and its Tasks need changes from a newer
 local `main`, update it from a host terminal.
 
 ```sh
-bun run src/local-orchestrator/cli.ts update-goal-base <goalId>
+agent-bootstrap update-goal-base <goalId>
 ```
 
 Use the full Goal ID. Review the two commit IDs, then type
@@ -217,10 +221,10 @@ Use another host terminal for approval. The Concierge can draft proposals
 and request Planner executions through its MCP tools.
 
 ```sh
-bun run src/local-orchestrator/cli.ts status
-bun run src/local-orchestrator/cli.ts proposals --status pending
-bun run src/local-orchestrator/cli.ts show <proposalId>
-bun run src/local-orchestrator/cli.ts approve <proposalId>
+agent-bootstrap status
+agent-bootstrap proposals --status pending
+agent-bootstrap show <proposalId>
+agent-bootstrap approve <proposalId>
 ```
 
 With a custom `--db <path>`, also supply `--target <path>` when
@@ -243,7 +247,7 @@ picked up on its next launch. Use `show <taskId>` to check for
 When the Goal branch is ready for handoff, run:
 
 ```sh
-bun run src/local-orchestrator/cli.ts [--target <path>] export-goal-branch <goalId> [--target <checkout>]
+agent-bootstrap [--target <path>] export-goal-branch <goalId> [--target <checkout>]
 ```
 
 Type `export-goal-branch <goalId> <first 12 hex of new head>` as shown.
