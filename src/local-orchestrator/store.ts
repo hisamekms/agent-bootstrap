@@ -40,8 +40,14 @@ export type Origin =
       sessionId?: string;
       executionId?: string;
     };
+type HumanDelegate = {
+  agent: "claude-code";
+  session: string;
+  authorization: string;
+};
 export type Answerer =
-  { kind: "human" } | { kind: "agent"; executionId: string; model: string };
+  | { kind: "human"; delegate?: HumanDelegate }
+  | { kind: "agent"; executionId: string; model: string };
 
 type Binding = string | number | null;
 interface Connection {
@@ -189,12 +195,38 @@ function parseOrigin(value: unknown): Origin {
   };
 }
 
+export function parseHumanDelegate(value: unknown): HumanDelegate {
+  const { agent, session, authorization } = fields(value, [
+    "agent",
+    "session",
+    "authorization",
+  ]);
+  if (
+    typeof authorization !== "string" ||
+    authorization.length < 1 ||
+    authorization.length > 500 ||
+    /\p{Cc}/u.test(authorization)
+  )
+    throw new ContractError();
+  return {
+    agent: oneOf(agent, ["claude-code"]),
+    session: identifier(session),
+    authorization,
+  };
+}
+
 function parseAnswerer(value: unknown): Answerer {
-  const input = fields(value, ["kind", "executionId", "model"]);
+  const input = fields(value, ["kind", "delegate", "executionId", "model"]);
   if (input.kind === "human") {
-    fields(input, ["kind"]);
-    return { kind: "human" };
+    fields(input, ["kind", "delegate"]);
+    return {
+      kind: "human",
+      ...(Object.hasOwn(input, "delegate") && {
+        delegate: parseHumanDelegate(input.delegate),
+      }),
+    };
   }
+  fields(input, ["kind", "executionId", "model"]);
   return {
     kind: oneOf(input.kind, ["agent"]),
     executionId: identifier(input.executionId),
@@ -894,6 +926,12 @@ export class OrchestratorStore {
           source,
           decision,
           answererKind: answerer.kind,
+          ...(answerer.kind === "human" &&
+            answerer.delegate && {
+              delegated: true,
+              agent: answerer.delegate.agent,
+              session: answerer.delegate.session,
+            }),
         },
         correlation,
       );
@@ -1348,7 +1386,10 @@ export class OrchestratorStore {
     this.#activeGoal(content.goalId);
   }
 
-  getProposalDetails(proposalId: string) {
+  getProposalDetails(
+    proposalId: string,
+    { includeDelegation = false }: { includeDelegation?: boolean } = {},
+  ) {
     const id = identifier(proposalId);
     return this.#read(() => {
       const row = this.#proposal(id);
@@ -1359,11 +1400,17 @@ export class OrchestratorStore {
           gate: Gate;
           policy: ApprovalPolicy["policy"];
           source: ApprovalPolicy["source"];
+          answererJson: string;
         }>(
-          "SELECT gate, policy, policy_source AS source FROM approvals WHERE proposal_id = ?",
+          "SELECT gate, policy, policy_source AS source, answerer_json AS answererJson FROM approvals WHERE proposal_id = ?",
         )
         .get(id);
-      const policy = { ...this.#proposalGate(proposal), ...decision };
+      const { answererJson, ...recordedPolicy } = decision ?? {};
+      const policy = { ...this.#proposalGate(proposal), ...recordedPolicy };
+      const answerer =
+        includeDelegation && answererJson
+          ? parseAnswerer(JSON.parse(answererJson))
+          : undefined;
       return freeze({
         ...proposal,
         ...policy,
@@ -1373,6 +1420,8 @@ export class OrchestratorStore {
           policy.loosening,
         ),
         origin: proposal.source,
+        ...(answerer?.kind === "human" &&
+          answerer.delegate && { approval: { delegated: true, answerer } }),
       });
     });
   }

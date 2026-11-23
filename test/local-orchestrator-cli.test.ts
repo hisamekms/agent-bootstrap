@@ -36,6 +36,18 @@ const origin = {
   actor: "Planner",
   executionId: "execution-1",
 } as const;
+const delegate = {
+  agent: "claude-code",
+  session: "session_01",
+  authorization: 'Operator said "approved" \u202e',
+};
+const delegationFlags = [
+  "--on-behalf",
+  "--delegate-session",
+  delegate.session,
+  "--authorization",
+  delegate.authorization,
+];
 
 let folder: string;
 let filename: string;
@@ -211,13 +223,91 @@ test("a TTY approval shows the proposal first and records a human answer bound t
     },
   });
   assert.equal(result.code, 0);
+  assert.doesNotMatch(result.stdout, /delegated/);
   assert.equal(store.getProposal(id)?.status, "approved");
-  assert.partialDeepStrictEqual(
-    store.listEvents({ subjectId: id, limit: 1 })[0],
-    {
+  const event = store.listEvents({ subjectId: id, limit: 1 })[0];
+  assert.ok(event);
+  assert.partialDeepStrictEqual(event, {
+    kind: "proposal.decided",
+    data: { decision: "approve", digest, answererKind: "human" },
+  });
+  assert.doesNotMatch(JSON.stringify(event.data), /"delegated"/);
+});
+
+test("delegated approvals and rejections use the normal confirmation and display attribution", async () => {
+  for (const decision of ["approve", "reject"]) {
+    const { id, digest } = store.proposeGoal(goal, origin);
+    const phrase = `${decision} ${digest.slice(0, 12)}`;
+    const result = await cli([decision, id, ...delegationFlags], {
+      isTTY: true,
+      answer: () => phrase,
+    });
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
+    assert.match(result.stdout, /\nAnswer recorded as delegated\.\n$/);
+    const shown = await cli(["show", id]);
+    assert.equal(shown.code, 0);
+    assert.match(shown.stdout, /\\u202e/);
+    assert.doesNotMatch(shown.stdout, /\u202e/u);
+    assert.deepEqual(JSON.parse(shown.stdout).approval, {
+      delegated: true,
+      answerer: { kind: "human", delegate },
+    });
+    assert.equal(
+      Object.hasOwn(store.getProposalDetails(id)!, "approval"),
+      false,
+    );
+
+    const events = await cli(["events", "--subject", id, "--limit", "1"]);
+    assert.equal(events.code, 0);
+    assert.partialDeepStrictEqual(JSON.parse(events.stdout)[0], {
       kind: "proposal.decided",
-      data: { decision: "approve", digest, answererKind: "human" },
-    },
+      data: {
+        decision,
+        answererKind: "human",
+        delegated: true,
+        agent: delegate.agent,
+        session: delegate.session,
+      },
+    });
+    assert.doesNotMatch(events.stdout, /authorization|Operator said/);
+  }
+});
+
+test("delegation flags must be complete and valid before prompting", async () => {
+  const { id } = store.proposeGoal(goal, origin);
+  for (const flags of [
+    ["--on-behalf"],
+    delegationFlags.slice(1),
+    delegationFlags.slice(0, 3),
+    delegationFlags.slice(0, 4),
+    ["--on-behalf", ...delegationFlags.slice(3)],
+    [...delegationFlags, "--on-behalf"],
+    [
+      "--on-behalf",
+      "--delegate-session",
+      "invalid id",
+      ...delegationFlags.slice(3),
+    ],
+    [
+      "--on-behalf",
+      "--delegate-session",
+      "s".repeat(201),
+      ...delegationFlags.slice(3),
+    ],
+    [...delegationFlags.slice(0, 4), ""],
+    [...delegationFlags.slice(0, 4), "a".repeat(501)],
+    [...delegationFlags.slice(0, 4), "line\nbreak"],
+  ]) {
+    const result = await cli(["approve", id, ...flags], { isTTY: true });
+    assert.equal(result.code, 2, JSON.stringify(flags));
+    assert.match(result.stderr, /^Usage:/);
+    assert.deepEqual(result.questions, []);
+  }
+  assert.equal(store.getProposal(id)?.status, "pending");
+  assert.deepEqual(
+    store.listEvents({ subjectId: id, limit: 10 }).map(({ kind }) => kind),
+    ["goal.proposed"],
   );
 });
 
@@ -250,6 +340,8 @@ test("mutating commands refuse non-TTY input without prompting or writing", asyn
   for (const args of [
     ["approve", id],
     ["reject", id],
+    ["approve", id, ...delegationFlags],
+    ["reject", id, ...delegationFlags],
     ["policy", "set", "integration", "agent"],
   ]) {
     const result = await cli(args, {

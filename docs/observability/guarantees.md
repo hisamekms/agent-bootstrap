@@ -132,6 +132,8 @@ Coordinator and Reviewer, Codex Worker: `done`).
 - Use shallow clones and make deeper history available by request.
 - Add credential fallback between invocations.
 - Record who answered each human gate (Coordinator questions and candidate
-  approval): the operator, or an agent acting for the operator. Today the
-  audit and the integration journal record the decision only. The 2026-11-23
-  live runs kept this in a local log.
+  approval). Addressed for local-orchestrator proposal decisions, which
+  identify the answerer and distinguish an operator-authorized Claude Code
+  session from a direct human answer. The dagq-lite audit and integration
+  journal still record only the decision. The 2026-11-23 live runs kept
+  answerer attribution in a local log.
