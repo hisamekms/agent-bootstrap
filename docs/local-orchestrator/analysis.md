@@ -1,15 +1,18 @@
 # Analyze local orchestrator runs with DuckDB
 
+From the agent-bootstrap checkout, use `bun run src/local-orchestrator/cli.ts`
+with the same operator arguments as an alternative to the linked command.
+
 Run the operator CLI from the agent-bootstrap checkout. It uses that
 checkout's local orchestrator state and can analyze any project run through
 `--target`.
 
 ```sh
-bun run src/local-orchestrator/cli.ts analyze
-bun run src/local-orchestrator/cli.ts --target /path/to/dagq-lite analyze
-bun run src/local-orchestrator/cli.ts --all-targets analyze
-bun run src/local-orchestrator/cli.ts --all-targets analyze --out ./private-analysis --sql ./report.sql
-bun run src/local-orchestrator/cli.ts --target /path/to/dagq-lite analyze --audit ./audit-backup.sqlite
+agent-bootstrap analyze
+agent-bootstrap --target /path/to/dagq-lite analyze
+agent-bootstrap --all-targets analyze
+agent-bootstrap --all-targets analyze --out ./private-analysis --sql ./report.sql
+agent-bootstrap --target /path/to/dagq-lite analyze --audit ./audit-backup.sqlite
 ```
 
 The command works without a TTY or a running Concierge. It prints
@@ -84,8 +87,8 @@ the orchestrator.
 ## Denial reports
 
 ```sh
-bun run src/local-orchestrator/cli.ts --target /path/to/dagq-lite denials
-bun run src/local-orchestrator/cli.ts --all-targets denials --since 2026-11-23T00:00:00Z --limit 20
+agent-bootstrap --target /path/to/dagq-lite denials
+agent-bootstrap --all-targets denials --since 2026-11-23T00:00:00Z --limit 20
 ```
 
 `denials` reads the selected targets and writes a private analysis export.

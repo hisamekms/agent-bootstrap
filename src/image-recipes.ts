@@ -123,7 +123,7 @@ const CXX_RUNTIME_PACKAGES = [
   ),
 ] as const;
 
-const BUN_VERSION = "1.4.4";
+export const BUN_VERSION = "1.4.4";
 const BUN_ARCHIVE = {
   name: "bun-linux-aarch64-musl.zip",
   source: `.local/bun/${BUN_VERSION}/bun-linux-aarch64-musl.zip`,
@@ -603,6 +603,11 @@ export function BUILD_SCRIPT(name: string): string {
     "set -e",
     "apk add --no-network --repositories-file /dev/null /tmp/pkgs/*.apk >/dev/null",
     ...setupsOf(recipe),
+    // The pinned PostgreSQL apk creates this system account with the current UTC day.
+    // Keep the day from the 2026-11-22 locked build as part of archive normalization.
+    ...(name === "db"
+      ? ["sed -i -E 's/^(postgres:[^:]*):[0-9]+:/\\1:20779:/' /etc/shadow"]
+      : []),
     "rm -rf /tmp/pkgs /var/cache/apk/*",
     ...archiveLines(),
     "rm -f /var/log/apk.log",
@@ -614,13 +619,14 @@ export function BUILD_SCRIPT(name: string): string {
   ].join("\n");
 }
 
-/** Where the build VM may connect, as `msb create --net-rule` values. */
-export function buildNetRules(name: string): string[] {
+/** The recipe's complete network allowlist for the build gateway. */
+export function buildEgress(
+  name: string,
+): { hostname: string; port: number }[] {
   const { base } = recipeFor(name);
   if (base.kind === "alpine") return [];
-  const [host, port] = base.egress.split(":");
-  // The allow@dns rule is unscoped and permits queries for any name.
-  return ["allow@dns", `allow@${host}:tcp:${port}`];
+  const [hostname, port] = base.egress.split(":");
+  return [{ hostname: hostname!, port: Number(port) }];
 }
 
 /** A shell script run in a VM of the finished image, and the exact output

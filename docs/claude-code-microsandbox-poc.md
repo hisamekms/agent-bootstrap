@@ -36,13 +36,10 @@ The results were verified on 2026-11-22.
 The Claude Code facts come from the official docs, read on 2026-11-22:
 
 - [Authentication](https://code.claude.com/docs/en/authentication.md):
-  - The CLI checks credentials in a documented order. `ANTHROPIC_AUTH_TOKEN`
-    and `ANTHROPIC_API_KEY` come before `apiKeyHelper` and before CLI-managed
-    credentials.
   - `ANTHROPIC_API_KEY` is sent as `X-Api-Key`.
   - In `-p` mode the key is used without an approval prompt.
-- [Headless mode](https://code.claude.com/docs/en/headless.md): `--bare`
-  never reads OAuth credentials or the keychain.
+- [Headless mode](https://code.claude.com/docs/en/headless.md) documents
+  `--bare` for API-key runs with the CLI's automatic configuration loading disabled.
 - [Environment variables](https://code.claude.com/docs/en/env-vars.md):
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` disables updates, telemetry,
   error reporting and feature-flag fetches.
@@ -97,7 +94,8 @@ On 2026-11-22 it passed in about 23 seconds:
 
 The smoke also runs a Worker and a Reviewer in `operator-credential` mode.
 By default it substitutes `ANTHROPIC_AUTH_TOKEN` into `authorization`,
-without `--bare`, using a separate runtime bound to that provider entry.
+without `--bare`, using a separate runtime bound to the explicitly
+allowed non-Anthropic gateway fixture `gateway.fixture.invalid`.
 `M6_OPERATOR_VARIABLE` selects another variable without changing any
 assertion. The inputs are:
 

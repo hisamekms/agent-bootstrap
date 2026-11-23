@@ -11,5 +11,11 @@
     "verbatimModuleSyntax": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "bin/**/*.ts",
+    "spike/images/build-profile.ts",
+    "spike/local-orchestrator/concierge.ts"
+  ]
 }

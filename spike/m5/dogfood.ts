@@ -667,7 +667,11 @@ async function main() {
       }
     : undefined;
   if (uses("claude")) {
-    claudeProvider = claudeCodeProvider(auth, claudeBinding);
+    claudeProvider = claudeCodeProvider(
+      auth,
+      claudeBinding,
+      claudeBinding ? [claudeBinding.host] : [],
+    );
     const harness = (profile: ProfileName) => {
       const guest = guestOf(profile);
       const binary =
@@ -685,7 +689,9 @@ async function main() {
           { binary, packageDir: join(local, "alpine/v3.23/main/aarch64") },
           guest,
         ),
-        ...(claudeBinding ? { fixture: claudeBinding } : {}),
+        ...(claudeBinding
+          ? { fixture: claudeBinding, gatewayHosts: [claudeBinding.host] }
+          : {}),
       });
     };
     claudeHarness = harness("base");
@@ -778,6 +784,7 @@ async function main() {
       msb: msbConfig,
       profiles,
       providerBindings,
+      gatewayHosts: providerBindings.map(({ provider }) => provider.host),
       observers: [
         {
           ...telemetryObserver,

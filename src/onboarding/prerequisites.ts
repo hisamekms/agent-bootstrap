@@ -1,0 +1,657 @@
+import { execFile, spawn } from "node:child_process";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { userInfo } from "node:os";
+import {
+  ClaudeConfigError,
+  loadClaudeConfig,
+  userStateDirectory,
+  validService,
+  type ClaudeAuthMode,
+} from "../local-orchestrator/claude-config.ts";
+import { CredentialsVolume } from "../local-orchestrator/credentials-volume.ts";
+import { ALPINE_3_23, BUN_VERSION } from "../image-recipes.ts";
+import {
+  checkDirectory,
+  resolveTarget,
+  TargetError,
+} from "../local-orchestrator/target.ts";
+import { readVerificationConfig } from "../local-orchestrator/verification.ts";
+import {
+  MISE_DUCKDB,
+  MISE_FLAGS,
+  MISE_MSB,
+  MSB_TOOL,
+  offlineMiseEnv,
+} from "../mise-tools.ts";
+import {
+  parseProfileLock,
+  PROFILE_LOCK_PATH,
+  type ProfileLock,
+} from "../profile-lock.ts";
+import {
+  allProfiles,
+  artifactStatus,
+  artifacts,
+  defaultProfiles,
+} from "./artifacts.ts";
+
+export type Status = "ok" | "missing" | "wrong" | "skipped";
+
+export interface Check {
+  id: string;
+  status: Status;
+  detail: string;
+  fix: string[];
+  needsNetwork: boolean;
+  needsHuman: boolean;
+}
+
+interface CommandResult {
+  code: number | null;
+  stdout: string;
+  stderr?: string;
+}
+
+export interface Host {
+  platform: string;
+  arch: string;
+  bun: string;
+  env: NodeJS.ProcessEnv;
+  command(
+    file: string,
+    args: readonly string[],
+    env?: NodeJS.ProcessEnv,
+    timeout?: number,
+  ): Promise<CommandResult>;
+  fetch: typeof fetch;
+}
+
+export const systemHost: Host = {
+  platform: process.platform,
+  arch: process.arch,
+  bun: process.versions.bun ?? "",
+  env: process.env,
+  command(file, args, env, timeout = 15_000) {
+    // Always discard Keychain metadata too. Never request the password.
+    if (file === "/usr/bin/security") {
+      return new Promise((resolve) => {
+        const probe = spawn(file, args, {
+          env,
+          stdio: "ignore",
+          timeout,
+          killSignal: "SIGKILL",
+        });
+        probe.once("error", () => resolve({ code: null, stdout: "" }));
+        probe.once("close", (code) => resolve({ code, stdout: "" }));
+      });
+    }
+    return new Promise((resolve) => {
+      execFile(
+        file,
+        args,
+        { env, timeout, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) =>
+          resolve({
+            code: error
+              ? typeof error.code === "number"
+                ? error.code
+                : null
+              : 0,
+            stdout,
+            stderr,
+          }),
+      );
+    });
+  },
+  fetch: globalThis.fetch,
+};
+
+export const install = "bun install --frozen-lockfile --ignore-scripts";
+export const provisionKeychain =
+  'security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w';
+export const configureClaude = [
+  'config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"',
+  'mkdir -p "$config_dir"',
+  `(umask 077; set -C; printf '%s\\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")`,
+];
+const setup = "agent-bootstrap setup --allow-network";
+const msbHomeFix = ['mkdir -p "$HOME/.msb"', 'export MSB_HOME="$HOME/.msb"'];
+
+export function check(
+  id: string,
+  status: Status,
+  detail: string,
+  fix: string[] = [],
+  needsNetwork = false,
+  needsHuman = false,
+): Check {
+  return {
+    id,
+    status,
+    detail,
+    fix: status === "ok" ? [] : fix,
+    needsNetwork: status !== "ok" && needsNetwork,
+    needsHuman: status !== "ok" && needsHuman,
+  };
+}
+
+export function readLock(root: string): Promise<ProfileLock> {
+  return readFile(join(root, PROFILE_LOCK_PATH), "utf8").then(parseProfileLock);
+}
+
+export async function imageStatus(
+  host: Host,
+  home: string,
+  reference: string,
+): Promise<Status> {
+  const result = await msb(host, home, [
+    "image",
+    "inspect",
+    "--format",
+    "json",
+    reference,
+  ]);
+  if (result.code === null) return "skipped";
+  if (result.code !== 0)
+    return result.stderr?.includes(`error: image not found: ${reference}`)
+      ? "missing"
+      : "skipped";
+  try {
+    return JSON.parse(result.stdout)?.digest ===
+      reference.slice(reference.lastIndexOf("@") + 1)
+      ? "ok"
+      : "wrong";
+  } catch {
+    return "wrong";
+  }
+}
+
+export function msb(
+  host: Host,
+  home: string,
+  args: string[],
+  timeout?: number,
+) {
+  return host.command(
+    "mise",
+    [...MISE_MSB, ...args],
+    { ...offlineMiseEnv(host.env), MSB_HOME: home },
+    timeout,
+  );
+}
+
+export async function hostChecks(root: string, host: Host) {
+  const { env } = host;
+  const checks: Check[] = [];
+  checks.push(
+    host.platform === "darwin" && host.arch === "arm64"
+      ? check("platform", "ok", "macOS arm64")
+      : check(
+          "platform",
+          "wrong",
+          "Run the local orchestrator on an Apple silicon Mac.",
+          [],
+          false,
+          true,
+        ),
+  );
+  checks.push(
+    check(
+      "bun",
+      host.bun === BUN_VERSION ? "ok" : "wrong",
+      `Required Bun ${BUN_VERSION}.`,
+      [`mise install bun@${BUN_VERSION}`],
+      true,
+      true,
+    ),
+  );
+
+  const miseEnv = offlineMiseEnv(env);
+  const mise = await host.command("mise", ["--version"], miseEnv);
+  checks.push(
+    check(
+      "mise",
+      mise.code === 0 ? "ok" : "missing",
+      mise.code === 0
+        ? "mise is available."
+        : "mise is required to run the pinned Microsandbox.",
+      ["brew install mise"],
+      true,
+      true,
+    ),
+  );
+
+  const installPath =
+    mise.code === 0
+      ? await host.command("mise", [...MISE_FLAGS, "where", MSB_TOOL], miseEnv)
+      : undefined;
+  const expectedVersion = MSB_TOOL.split("@")[1];
+  const version =
+    installPath?.code === 0 && isAbsolute(installPath.stdout.trim())
+      ? await host.command("mise", [...MISE_MSB, "--version"], miseEnv)
+      : undefined;
+  checks.push(
+    check(
+      "microsandbox",
+      !installPath
+        ? "skipped"
+        : !version
+          ? "missing"
+          : version.code === 0 &&
+              version.stdout.trim() === `msb ${expectedVersion}`
+            ? "ok"
+            : "wrong",
+      !installPath
+        ? "Install mise before checking Microsandbox."
+        : `Required local Microsandbox ${expectedVersion}.`,
+      [`mise --no-config --no-env --no-hooks install ${MSB_TOOL}`],
+      true,
+      true,
+    ),
+  );
+
+  const candidate = env.MSB_HOME;
+  const realHome =
+    candidate && isAbsolute(candidate)
+      ? await realpath(candidate).catch(() => undefined)
+      : undefined;
+  const home =
+    realHome &&
+    Buffer.byteLength(realHome) <= 40 &&
+    (await stat(realHome).catch(() => undefined))?.isDirectory()
+      ? realHome
+      : undefined;
+  checks.push(
+    check(
+      "msb-home",
+      !candidate ? "missing" : home ? "ok" : "wrong",
+      home
+        ? "MSB_HOME is an accessible absolute directory within 40 bytes."
+        : "Set MSB_HOME to an existing absolute directory at most 40 bytes after realpath.",
+      msbHomeFix,
+      false,
+      true,
+    ),
+  );
+
+  const manifest = JSON.parse(
+    await readFile(join(root, "package.json"), "utf8"),
+  ) as {
+    dependencies: Record<string, string>;
+    devDependencies: Record<string, string>;
+  };
+  const dependencyStatuses = await Promise.all(
+    Object.keys({ ...manifest.dependencies, ...manifest.devDependencies }).map(
+      async (name) =>
+        (
+          await stat(join(root, "node_modules", name, "package.json")).catch(
+            () => undefined,
+          )
+        )?.isFile(),
+    ),
+  );
+  const installed = dependencyStatuses.every(Boolean);
+  checks.push(
+    check(
+      "dependencies",
+      installed ? "ok" : "missing",
+      installed
+        ? "Checkout dependencies are installed."
+        : "Install the checkout dependencies from bun.lock.",
+      [install],
+      true,
+      true,
+    ),
+  );
+  return { checks, home };
+}
+
+export async function doctor(
+  root: string,
+  host: Host,
+  path?: string,
+  concierge = false,
+  override?: ClaudeAuthMode,
+) {
+  const { checks, home } = await hostChecks(root, host);
+  const required = new Set(checks.map(({ id }) => id));
+  function add(item: Check, isRequired = true) {
+    checks.push(item);
+    if (isRequired) required.add(item.id);
+  }
+
+  const profiles = concierge ? ["concierge"] : allProfiles;
+  const lock = await readLock(root).catch(() => undefined);
+  const hasProfiles =
+    !!lock &&
+    defaultProfiles.every((name) => lock.profiles[name] !== undefined);
+  add(
+    check(
+      "profile-lock",
+      hasProfiles ? "ok" : "wrong",
+      hasProfiles
+        ? "The checked-in lock validates against the pinned recipes."
+        : "Restore the checked-in profile lock and matching recipes.",
+      [],
+      false,
+      true,
+    ),
+  );
+
+  let verifyProfile: string | undefined;
+  let targetDirectory: string | undefined;
+  if (path !== undefined || concierge) {
+    const target = await resolveTarget(path ?? root, root).catch(
+      (error: unknown) => error,
+    );
+    if (
+      target &&
+      typeof target === "object" &&
+      "directory" in target &&
+      typeof target.directory === "string"
+    ) {
+      add(
+        check(
+          "target",
+          "ok",
+          "Git worktree root has a local SHA-1 main commit.",
+        ),
+      );
+      try {
+        await checkDirectory(target.directory).catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          },
+        );
+        targetDirectory = target.directory;
+        const verification = readVerificationConfig(target.directory);
+        verifyProfile = verification?.profile;
+        const valid =
+          !verifyProfile ||
+          verifyProfile === "base" ||
+          !!lock?.profiles[verifyProfile];
+        add(
+          check(
+            "verification",
+            !valid ? "wrong" : verification ? "ok" : "skipped",
+            !valid
+              ? "The configured Verification profile is not locked."
+              : verification
+                ? "Target verification configuration is valid."
+                : "Target has no verification configuration.",
+            ["agent-bootstrap help targets"],
+            false,
+            true,
+          ),
+          !valid,
+        );
+      } catch {
+        add(
+          check(
+            "verification",
+            "wrong",
+            "Target verification configuration could not be read safely.",
+            ["agent-bootstrap help targets"],
+            false,
+            true,
+          ),
+        );
+      }
+    } else {
+      add(
+        check(
+          "target",
+          "wrong",
+          target instanceof TargetError
+            ? target.message
+            : "Target could not be inspected.",
+          ["agent-bootstrap help targets"],
+          false,
+          true,
+        ),
+      );
+      add(
+        check("verification", "skipped", "A valid target is required."),
+        false,
+      );
+    }
+  }
+
+  const alternate = host.env.LO_CLAUDE_BINARY;
+  const requiredProfiles = new Set<string>(
+    concierge ? ["concierge"] : defaultProfiles,
+  );
+  if (verifyProfile && verifyProfile !== "base")
+    requiredProfiles.add(verifyProfile);
+  const inputs = artifacts(profiles, alternate);
+  const mainInputs = new Set(
+    artifacts(concierge ? ["concierge"] : defaultProfiles, alternate).map(
+      ({ path }) => path,
+    ),
+  );
+  for (const item of inputs) {
+    const custom = alternate !== undefined && item.path === alternate;
+    const status =
+      custom && !isAbsolute(item.path)
+        ? "wrong"
+        : await artifactStatus(
+            isAbsolute(item.path) ? item.path : join(root, item.path),
+            item.sha256,
+          );
+    const fix = custom
+      ? ["unset LO_CLAUDE_BINARY"]
+      : [
+          status === "wrong"
+            ? "agent-bootstrap setup --json"
+            : mainInputs.has(item.path)
+              ? setup
+              : `${setup} --profiles`,
+        ];
+    add(
+      check(
+        `artifact:${custom ? "LO_CLAUDE_BINARY" : item.path}`,
+        status,
+        status === "ok"
+          ? "SHA-256 matches."
+          : status === "missing"
+            ? "Pinned file is missing."
+            : "Pinned file is unsafe, unreadable, or has the wrong SHA-256. Inspect it against the setup plan before replacing it.",
+        fix,
+        status === "missing" && !custom,
+        custom || status === "wrong",
+      ),
+      mainInputs.has(item.path),
+    );
+  }
+
+  const images = {
+    base: ALPINE_3_23.reference,
+    ...Object.fromEntries(
+      Object.entries(lock?.profiles ?? {}).map(([name, profile]) => [
+        name,
+        profile.image,
+      ]),
+    ),
+  };
+  const canInspect =
+    !!home &&
+    checks.some(({ id, status }) => id === "microsandbox" && status === "ok");
+  for (const [name, reference] of Object.entries(images)) {
+    const isRequired = name === "base" || requiredProfiles.has(name);
+    if (concierge && !isRequired) continue;
+    const status = canInspect
+      ? await imageStatus(host, home, reference)
+      : "skipped";
+    add(
+      check(
+        `image:${name}`,
+        status,
+        status === "ok"
+          ? "Local image digest matches."
+          : status === "skipped"
+            ? "Local image inspection requires pinned Microsandbox and a valid MSB_HOME."
+            : status === "missing"
+              ? "Pinned reference could not be inspected in MSB_HOME."
+              : "Local image did not report the locked digest.",
+        [
+          name === "base" || defaultProfiles.some((profile) => profile === name)
+            ? setup
+            : `${setup} --profiles`,
+        ],
+        status === "missing",
+        status === "wrong",
+      ),
+      isRequired,
+    );
+  }
+
+  try {
+    if (path === undefined && !concierge) {
+      const target = await resolveTarget(undefined, root);
+      await checkDirectory(target.directory).catch(
+        (error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        },
+      );
+      targetDirectory = target.directory;
+    }
+    const effective = loadClaudeConfig(host.env, targetDirectory, override);
+    add(
+      check(
+        "claude-auth",
+        "ok",
+        `Claude auth is ${effective.auth} (source: ${effective.source}).`,
+      ),
+    );
+    for (const [index, warning] of effective.warnings.entries())
+      add(
+        check(`claude-config-warning-${index + 1}`, "skipped", warning),
+        false,
+      );
+
+    const directory = effective.configDir;
+    const service =
+      directory?.volume.keychainService ?? effective.keychainService;
+    const account = host === systemHost ? userInfo().username : host.env.USER;
+    const configured = validService(account) && validService(service);
+    const keychain =
+      configured && host.platform === "darwin"
+        ? await host.command(
+            "/usr/bin/security",
+            ["find-generic-password", "-s", service, "-a", account],
+            { PATH: "/usr/bin:/bin" },
+          )
+        : undefined;
+    const status = !configured
+      ? "missing"
+      : !keychain || keychain.code === null
+        ? "skipped"
+        : keychain.code === 0
+          ? "ok"
+          : keychain.code === 44
+            ? "missing"
+            : "wrong";
+    add(
+      check(
+        "keychain",
+        status,
+        status === "ok"
+          ? "The configured Keychain item exists."
+          : status === "skipped"
+            ? "Keychain presence could not be checked on this host."
+            : "Keychain did not confirm the configured service and account.",
+        directory
+          ? ["See agent-bootstrap help credentials."]
+          : service
+            ? ["Provision the configured API key service in Keychain."]
+            : [...configureClaude, provisionKeychain],
+        false,
+        true,
+      ),
+    );
+
+    if (directory && host.platform === "darwin") {
+      try {
+        const image = await stat(directory.volume.image).catch(() => undefined);
+        const volume = new CredentialsVolume(
+          directory,
+          userStateDirectory(host.env),
+        );
+        const volumeStatus = volume.status();
+        add(
+          check(
+            "credentials-volume",
+            volumeStatus.stale ? "wrong" : image?.isFile() ? "ok" : "missing",
+            volumeStatus.stale
+              ? "The Claude configuration volume has a stale attachment or lease. Confirm no VM is running before clearing it."
+              : volumeStatus.mounted
+                ? "The Claude configuration volume is attached."
+                : image?.isFile()
+                  ? "The Claude configuration volume attaches when a run begins."
+                  : "The Claude configuration volume image is missing.",
+            volumeStatus.stale
+              ? ["agent-bootstrap credentials detach --force"]
+              : image?.isFile()
+                ? []
+                : ["agent-bootstrap credentials init"],
+          ),
+        );
+      } catch {
+        add(
+          check(
+            "credentials-volume",
+            "wrong",
+            "The Claude configuration volume status could not be checked.",
+            ["agent-bootstrap credentials status"],
+          ),
+        );
+      }
+    }
+  } catch (error) {
+    add(
+      check(
+        "claude-auth",
+        "wrong",
+        error instanceof ClaudeConfigError
+          ? error.message
+          : "Invalid Claude configuration.",
+        ["agent-bootstrap help setup"],
+      ),
+    );
+  }
+  if (!concierge) {
+    const duck = miseAvailable(checks)
+      ? await host.command(
+          "mise",
+          [...MISE_DUCKDB, "-version"],
+          offlineMiseEnv(host.env),
+        )
+      : undefined;
+    add(
+      check(
+        "duckdb",
+        !duck
+          ? "skipped"
+          : duck.code !== 0
+            ? "missing"
+            : /\bv?1\.5\.6\b/.test(duck.stdout)
+              ? "ok"
+              : "wrong",
+        "DuckDB 1.5.6 is optional for live analysis queries.",
+        ["mise --no-config --no-env --no-hooks install duckdb@1.5.6"],
+        true,
+        true,
+      ),
+      false,
+    );
+  }
+  const first = checks.find(
+    ({ id, status }) => status !== "ok" && required.has(id),
+  );
+  return { checks, first };
+}
+
+function miseAvailable(checks: Check[]): boolean {
+  return checks.some(({ id, status }) => id === "mise" && status === "ok");
+}

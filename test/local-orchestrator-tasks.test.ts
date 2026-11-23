@@ -1,3 +1,4 @@
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -42,6 +43,8 @@ import {
 import { configuredVerification } from "../src/local-orchestrator/verification.ts";
 import {
   createTaskExecutor,
+  previewGoalBranchExport,
+  runTask,
   type TaskExecutor,
   type TaskFlow,
 } from "../src/local-orchestrator/tasks.ts";
@@ -2177,6 +2180,21 @@ test("export creates and fast-forwards only the local Goal ref and refuses diver
 
   approve(proposal);
   await f.work.drain();
+  const notes: string[] = [];
+  await assert.rejects(
+    previewGoalBranchExport(
+      store,
+      checkout,
+      f.directory,
+      f.goalId,
+      createCredentialScanner({ leakPatterns: ["Candidate 1"] }, root, (note) =>
+        notes.push(note),
+      ),
+    ),
+    { code: "credential-leak" },
+  );
+  assert.equal(notes.length, 1);
+  assert.equal(operator(["rev-parse", f.ref]), f.base);
   const advanced = await exportAt(proposal.content.candidate);
   assert.equal(advanced.code, 0, advanced.stderr.join(""));
   assert.equal(operator(["show", `${branch}:docs/a.md`]), "Candidate 1");
@@ -2250,4 +2268,90 @@ test("export refuses an unaudited private head before and after confirmation", a
       .listEvents({ subjectId: f.goalId, limit: 50 })
       .every(({ kind }) => !kind.startsWith("goal.export")),
   );
+});
+
+test("credential text in candidate content, commit messages, or review answers fails the Task", async () => {
+  const repoRoot = join(root, "repo");
+  mkdirSync(repoRoot);
+  const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
+  git(["init", "--template=", "--initial-branch=main"]);
+  mkdirSync(join(repoRoot, "docs"));
+  writeFileSync(join(repoRoot, "docs", "file"), "before\n");
+  git(["add", "."]);
+  git(["commit", "-m", "initial"]);
+  const target = await resolveTarget(repoRoot, root);
+  const { directory } = target;
+  await prepareTargetDirectory(target.bootstrapRoot, directory);
+  const scratch = join(root, "scratch");
+  mkdirSync(join(scratch, "docs"), { recursive: true });
+  const secret = "sk-ant-6XX4TbRwxwZyOuIuFZzWa5vP6KJ";
+  for (const input of ["file", "message", "review"] as const) {
+    const notes: string[] = [];
+    let reviews = 0;
+    const scan = createCredentialScanner({}, root, (note) => notes.push(note));
+    const executor = createTaskExecutor({
+      store,
+      repoRoot,
+      directory,
+      scan,
+      worker: () => harness,
+      reviewer: harness,
+      host: {
+        async runWorker(_, id) {
+          writeFileSync(
+            join(scratch, "docs", "file"),
+            input === "file" ? secret : "after\n",
+          );
+          return {
+            id: id!,
+            outcome: "ok",
+            artifacts: {
+              files: [],
+              tree: Buffer.from(
+                command("/usr/bin/tar", scratch, [
+                  "--format",
+                  "ustar",
+                  "-cf",
+                  "-",
+                  "docs",
+                ]),
+              ),
+              ...(input === "message" ? { message: Buffer.from(secret) } : {}),
+            },
+          };
+        },
+        async runVerification() {
+          throw new Error("Unexpected verification");
+        },
+        async runReviewer(_, id) {
+          reviews++;
+          return {
+            id: id!,
+            outcome: "ok",
+            response: Buffer.from(
+              JSON.stringify({
+                result: JSON.stringify({ review: "revise", notes: secret }),
+              }),
+            ),
+          };
+        },
+      },
+    });
+    const goalId = goal();
+    const id = task(goalId);
+    await runTask(store, executor, id, undefined, scan);
+    assert.equal(store.getTask(id)?.status, "failed");
+    assert.equal(store.pendingIntegrations(goalId).length, 0);
+    assert.deepEqual(store.listEvents({ subjectId: id, limit: 1 })[0]?.data, {
+      status: "failed",
+      code: "credential-leak",
+    });
+    assert.ok(
+      !JSON.stringify(store.listEvents({ subjectId: id, limit: 50 })).includes(
+        secret,
+      ),
+    );
+    assert.equal(reviews, input === "review" ? 1 : 0);
+    assert.equal(notes.length, 1);
+  }
 });

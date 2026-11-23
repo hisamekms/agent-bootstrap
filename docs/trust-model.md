@@ -14,8 +14,8 @@ before calling any privileged implementation.
 | Worker      | One writable isolated workspace   | Local tests and a local commit or receipt                                              |
 | Reviewer    | Read-only pinned diff or snapshot | Writable scratch and structured review evidence                                        |
 
-Each role runs in a separate sandbox. Agent sandboxes have no host credentials
-or direct host Git integration. Worker cannot push. The host binds explicit
+Each role runs in a separate sandbox. Direct Git integration belongs to
+the host. Claude guest access depends on the configured authentication mode. Worker cannot push. The host binds explicit
 human approval to the request and pinned candidate and base. Before integrating,
 it rechecks the expected base, review evidence, and verification results.
 
@@ -23,7 +23,7 @@ it rechecks the expected base, review evidence, and verification results.
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Hostile repository instructions                | Treat file content as data. Capability checks and sandbox permissions apply regardless of agent instructions.                                                                                                 |
 | Malicious tool output or fabricated references | Treat tool output as data. Validate schemas, scope references to the task and invocation, and verify host-computed artifact digests.                                                                          |
-| Secret leakage                                 | Keep credentials out of sandbox mounts, inheritance, output, and audit records. Use controlled provider connectivity and artifact access. Check with synthetic canaries before real use.                      |
+| Secret leakage                                 | Keep API keys in Keychain and out of guest inheritance, output, and audit records. Restrict persistent configuration mounts and gateway policy to the configured Claude actor groups.                         |
 | Host or cross-workspace access                 | Restrict mounts, writable roots, and network. Test negative access using disposable canaries, including the Coordinator. A sandbox or host compromise remains a residual risk.                                |
 | Unauthorized or stale integration              | Restrict effects to the host, independently authenticate human approval, and bind it to the exact reviewed candidate and expected Git base. Reject stale inputs.                                              |
 | Audit loss or repeated effects after failure   | Durably record attempts, denials, authorizations, and outcomes. Require committed prerequisite events before effects. Reconcile incomplete operations and scope idempotency keys to the caller and operation. |
@@ -37,17 +37,31 @@ provides partial observation.
 The Concierge runs in an interactive VM with a read-only repository snapshot
 and a named session volume. It reaches the Host API through a dedicated
 Unix socket exposed over vsock. The Host API binds actions to the session
-and reserves approval for the operator. The audited gateway allows
-`api.anthropic.com:443` with a guest credential placeholder. Concierge
-alone can also reach `platform.claude.com:443` without credential substitution.
-The gateway relays TCP without terminating TLS and audits DNS and connection
-decisions. When both DNS names have an active pin for the same IP address,
-the gateway attributes TCP connections to the provider binding. The Claude
-Code startup check probes both hosts.
-On 2026-11-23, interactive v2.1.330 exited with `ENOTFOUND` for the
-platform host, which the gateway recorded as `dns-not-allowlisted` while
-allowing API provider egress. Claude Code settings, hooks, MCP and tool
-allowlists are auxiliary controls. The VM and trusted host enforce the boundary.
+and reserves approval for the operator.
+
+In default API-key mode, Microsandbox substitutes the API key into
+`x-api-key` at `api.anthropic.com:443`. The guest can read the placeholder.
+Concierge can also reach `platform.claude.com:443` with plain HTTPS.
+Authorization-header substitution is confined to operator-configured
+gateway hosts outside Anthropic domains.
+
+In config-dir mode, persistent Claude Code configuration directories per
+actor group are kept on an encrypted volume and signed in with the CLI's
+own `/login`. Claude Code and other processes in its VM can read and write
+the mounted group directory. Actors configured in the same group share
+that directory, including while runs overlap. Group members can change
+shared files between integrity checks. Use separate groups for roles that
+should not share writable state. The host reads contents only from the paths covered by
+the integrity check and never parses or copies CLI state or sign-in files.
+Researcher and verification receive neither the directory nor its egress
+hosts. Config-dir runs use plain HTTPS through the audited gateway to the
+API host and configured egress hosts. Login can also reach the configured
+login hosts.
+
+The gateway relays TCP without terminating TLS and audits DNS and
+connection decisions. Host-generated managed settings are mounted
+read-only in the Claude VMs. They constrain hooks, MCP and permissions.
+The VM and trusted host enforce isolation, network access, and approval.
 
 The adapter checks each component of the socket and snapshot paths from the
 root using `lstat`, and repeats the checks immediately before launching VM

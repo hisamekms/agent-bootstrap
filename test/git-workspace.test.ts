@@ -656,3 +656,18 @@ test("diff refuses unsafe tree entries, extra parents and empty candidates", asy
   for (const bad of [gitlink, typeChange, unsafeSymlink, collision, merge, c3])
     await assert.rejects(integration.diff(c3, bad), /invalid-candidate/);
 });
+
+test("input workspace and file snapshots reject absolute and escaping symlinks", async (t) => {
+  const { repository, integration } = await fixture(t);
+  for (const target of ["/absolute", "../escape"]) {
+    const blob = git(repository, ["hash-object", "-w", "--stdin"], target);
+    const tree = git(repository, ["mktree"], `120000 blob ${blob}\tlink\n`);
+    const base = git(repository, ["commit-tree", tree, "-m", "unsafe base"]);
+    const error = {
+      code: "unsafe-input-symlink",
+      message: /Replace absolute or escaping symlinks/,
+    };
+    await assert.rejects(integration.prepareWorkspace({ base }), error);
+    await assert.rejects(integration.snapshot(base, "link"), error);
+  }
+});

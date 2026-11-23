@@ -40,15 +40,13 @@ const rejectedGrantWarning =
 const statePath = fileURLToPath(
   new URL("../../.local/siwc-smoke/", import.meta.url),
 );
-// The operator chooses which live runner receives the access token.
-const runners: Record<string, string> = {
-  "--authorize-and-run": fileURLToPath(
-    new URL("./subscription-smoke.ts", import.meta.url),
-  ),
-  "--authorize-and-run-m5": fileURLToPath(
-    new URL("../m5/dogfood.ts", import.meta.url),
-  ),
-};
+const dogfoodRunner = fileURLToPath(
+  new URL("../m5/dogfood.ts", import.meta.url),
+);
+const usage =
+  "Usage: bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 [--keychain] /absolute/path/to/msb /absolute/path/to/codex\n" +
+  "       bun spike/m1/subscription-authorize.ts --forget";
+class UsageError extends Error {}
 const validId = (value: unknown) =>
   typeof value === "string" && /^[a-zA-Z0-9_-]{1,256}$/.test(value);
 const isIssuedClientId = (value: unknown): value is string =>
@@ -375,8 +373,7 @@ async function waitForConsent(
   }
 }
 
-async function runSmoke(
-  smoke: string,
+async function runDogfood(
   msb: string,
   codex: string,
   home: string,
@@ -384,7 +381,7 @@ async function runSmoke(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const child = spawn(process.execPath, [smoke, "--live", msb, codex], {
+  const child = spawn(process.execPath, [dogfoodRunner, "--live", msb, codex], {
     // Only the non-secret M5 settings (and USER, for the keychain
     // lookup) pass through; the token goes on stdin.
     env: {
@@ -621,7 +618,7 @@ export async function runSubscription(
       await keychain.write(refresh);
       kept = true;
     }
-    stage = "subscription smoke";
+    stage = "M5 dogfood run";
     await run(accessToken);
   } finally {
     if (kept) {
@@ -711,19 +708,27 @@ export async function loadRegistration(
 
 export function parseArgs(argv: readonly string[]) {
   const [optIn, ...args] = argv;
-  if (optIn === "--forget") {
-    assert.ok(args.length === 0);
+  if (optIn === "--forget" && args.length === 0) {
     return { forget: true } as const;
   }
-  assert.ok(optIn && Object.hasOwn(runners, optIn));
-  const runner = runners[optIn]!;
+  if (optIn === "--authorize-and-run") {
+    throw new UsageError(
+      "--authorize-and-run has been retired. Use --authorize-and-run-m5 for the audited gateway.",
+    );
+  }
   const useKeychain = args[0] === "--keychain";
   const positional = useKeychain ? args.slice(1) : args;
-  assert.ok(positional.length === 2);
   const [msb, codex] = positional;
-  assert.ok(msb && msb.startsWith("/") && !/[\0:\r\n]/.test(msb));
-  assert.ok(codex && codex.startsWith("/"));
-  return { forget: false, useKeychain, runner, msb, codex } as const;
+  if (
+    optIn !== "--authorize-and-run-m5" ||
+    positional.length !== 2 ||
+    !msb?.startsWith("/") ||
+    /[\0:\r\n]/.test(msb) ||
+    !codex?.startsWith("/")
+  ) {
+    throw new UsageError(usage);
+  }
+  return { forget: false, useKeychain, msb, codex } as const;
 }
 
 async function main() {
@@ -778,14 +783,7 @@ async function main() {
       },
       save: (updated) => saveRegistration(file, updated),
       run: (token) =>
-        runSmoke(
-          options.runner,
-          options.msb,
-          options.codex,
-          home!,
-          token,
-          controller.signal,
-        ),
+        runDogfood(options.msb, options.codex, home!, token, controller.signal),
       report: console.log,
       warn: console.error,
       onUnconfirmedRevocation() {
@@ -804,8 +802,12 @@ async function main() {
 if (import.meta.main) {
   try {
     await main();
-  } catch {
-    console.error(`Subscription authorization stopped at ${stage}.`);
+  } catch (error) {
+    console.error(
+      error instanceof UsageError
+        ? error.message
+        : `Subscription authorization stopped at ${stage}.`,
+    );
     process.exitCode = 1;
   }
 }

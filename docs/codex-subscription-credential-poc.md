@@ -55,7 +55,7 @@ does not introduce an OpenSandbox dependency.
 ## Gate A and Gate B status
 
 **Gate A synthetic checks passed on macOS arm64.** The runtime lifecycle
-smoke passed. [The credential smoke](../spike/m1/credential-smoke.ts) used
+smoke passed. The historical credential smoke used
 official Linux arm64 Codex, a fresh synthetic host-only token, and a
 loopback TLS origin with a scoped fixture CA. The real CLI completed an
 HTTP/SSE turn. The approved HTTPS server observed the exact substituted
@@ -64,16 +64,9 @@ synthetic token in captured CLI output. A second live loopback listener
 received the host control request and no guest request. These observations
 cover the tested routes and output surfaces.
 
-```sh
-bun spike/m1/credential-smoke.ts /absolute/path/to/codex /absolute/path/to/msb
-```
-
-Use the same short dedicated `MSB_HOME`, cached arm64 image and
-SHA-verified Codex binary used by the [M1 smoke tests](milestones.md).
-The fixture also needs local OpenSSL to create its disposable CA. It uses
-the documented Secrets path with automatic WebSocket transport disabled
-for the fixture provider. HTTPS and the completed SSE turn were observed.
-WebSocket frames, latency between SSE events, and refresh are unverified.
+The direct-network fixture is preserved in Git at `de26b1409fe8`.
+HTTPS and the completed SSE turn were observed. WebSocket frames, latency
+between SSE events, and refresh are unverified.
 
 **Gate A manual subscription turn passed on 2026-11-22.** Following
 browser consent, the operator reported the smoke runner's success line:
@@ -97,15 +90,24 @@ reproduction showed that `thread/start` rejects `environments: []` unless
 `initialize` advertises `experimentalApi`. The corrected configuration
 passed the network-disabled IPC test and the operator's live retry.
 
+The historical direct-network runner is preserved in Git at `de26b1409fe8`.
+It scoped outbound TLS to `api.openai.com:443` and requested a single,
+read-only, ephemeral thread with environment access disabled. The network
+rule scoped the destination. Method, path, request count, redirect handling,
+response handling, and provider request auditing were outside the scope of
+that evidence.
+
 ### Operator-only subscription run
 
-1. Run the [authorization launcher](../spike/m1/subscription-authorize.ts)
-   from the host terminal. Use the short `MSB_HOME`, cached image, pinned
-   Microsandbox and SHA-verified Linux Codex binary from the synthetic checks.
+1. Follow the [live M5 operator checklist](observability/dogfooding.md#live-m5-operator-checklist)
+   and run the [authorization launcher](../spike/m1/subscription-authorize.ts)
+   from the host terminal. Use a short `MSB_HOME`, the cached digest-pinned
+   images, pinned Microsandbox and a SHA-verified Linux Codex binary.
+   The M5 runner sends sandbox traffic through the audited egress gateway.
 
    ```sh
-   MSB_HOME=/absolute/short/msb-home \
-     bun spike/m1/subscription-authorize.ts --authorize-and-run \
+   M5_ACTORS=all=codex MSB_HOME=/absolute/short/msb-home \
+     bun spike/m1/subscription-authorize.ts --authorize-and-run-m5 \
      /absolute/path/to/msb /absolute/path/to/codex
    ```
 
@@ -113,38 +115,21 @@ passed the network-disabled IPC test and the operator's live retry.
    ChatGPT account and workspace, then approve plan usage for Agent Bootstrap.
    The launcher uses the documented [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
    and verifies the app-specific grant. It pipes the access token to the
-   smoke runner on the host and requests revocation of the refresh token
-   when the run ends. It stores the app registration and a hash of the
-   validated subject in `.local/siwc-smoke/`. A normal Codex CLI login
-   provides a separate session.
+   M5 runner on the host and requests revocation of the refresh token
+   when the run ends unless Keychain storage is enabled. It stores the app
+   registration and a hash of the validated subject in `.local/siwc-smoke/`.
+   A normal Codex CLI login provides a separate session.
 
 3. Record the outcome and confirm application attribution under Settings →
    Usage in the selected ChatGPT account. Under App limits, open Manage
    limits for the app and look for current-period usage alongside the
    configured limit. See the official
    [usage documentation](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites).
-   The harness reports turn completion or a
-   fixed failure stage, with a fixed Codex error category and HTTP status
-   where available. It checks documented token claims as a
-   preflight; authorization is established by the provisioned session and
-   checked by OpenAI. If revocation cannot be confirmed, the terminal
+   Review the M5 run report and audit export using the live checklist.
+   The launcher checks documented token claims during preflight. OpenAI
+   checks authorization using the provisioned session. If revocation cannot
+   be confirmed, the terminal
    directs the operator to disconnect Agent Bootstrap in ChatGPT settings.
-
-If the operator already has an authorized Agent Bootstrap grant, a trusted
-host credential command can pipe its access token straight to the runner.
-The credential provider owns refresh and session cleanup for that route.
-
-```sh
-read_agent_bootstrap_access_token |
-  bun spike/m1/subscription-smoke.ts --live /absolute/path/to/msb /absolute/path/to/codex
-```
-
-The harness scopes outbound TLS to `api.openai.com:443` and uses gateway DNS.
-It requests a single, read-only, ephemeral thread with environment access
-disabled. The network allowlist scopes the destination. Method, path, and
-request-count enforcement are outside that network rule. Real deployment
-will need a decision on redirect and response handling and an audit path
-for provider requests. The manual smoke cannot establish these properties.
 
 **Gate B is deferred.** The denial check covers one loopback port and two
 address forms. Broader DNS, IPv6, LAN and metadata checks, redirects and
@@ -155,9 +140,9 @@ live VMs. That run had no credential projection.
 
 ### Keeping the refresh token
 
-On macOS, put `--keychain` immediately after `--authorize-and-run` or
-`--authorize-and-run-m5` to keep the refresh token in the generic-password
-Keychain item for `$USER`. Each checkout has one item, with a service name
+On macOS, put `--keychain` immediately after `--authorize-and-run-m5` to keep
+the refresh token in the generic-password Keychain item for `$USER`.
+Each checkout has one item, with a service name
 formed by appending a dot and the first 16 hex characters of the registration
 host ID's SHA-256 hash to `agent-bootstrap.siwc.refresh`. The app registration
 and subject hash stay in `.local/siwc-smoke/registration.json`.

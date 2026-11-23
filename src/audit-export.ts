@@ -465,6 +465,25 @@ export function exportAudit(
   obsDir: string,
   options: JsonlWriterOptions = {},
 ): void {
+  for (const _ of auditExportRecords(filename, obsDir, options)) {
+    // The synchronous exporter consumes the same projected records.
+  }
+}
+
+export async function exportAuditChecked(
+  filename: string,
+  obsDir: string,
+  scan: (text: string) => Promise<void>,
+): Promise<void> {
+  for (const batch of auditExportRecords(filename, obsDir, {}))
+    await scan(batch.map((line) => JSON.stringify(line)).join("\n"));
+}
+
+function* auditExportRecords(
+  filename: string,
+  obsDir: string,
+  options: JsonlWriterOptions,
+): Generator<AuditLine[], void> {
   const database = resolve(filename);
   const stat = fs.statSync(database, { bigint: true });
   if (!stat.isFile()) throw new AuditStoreError("open-failed");
@@ -502,13 +521,21 @@ export function exportAudit(
       const watermark = { ...state.watermark };
       for (const row of rows) watermark[row.table] = row.sequence;
       const derived: AuditLine[] = [];
+      const pending: AuditLine[] = [];
+      function* publish() {
+        if (!pending.length) return;
+        yield pending;
+        for (const line of pending) writer.write(line);
+        pending.length = 0;
+      }
       for (const { line, open } of projectBatch(
         audit,
         rows,
         state.watermark,
         watermark,
       )) {
-        if (!published.has(line.auditId)) writer.write(line);
+        if (!published.has(line.auditId)) pending.push(line);
+        if (pending.length >= 256) yield* publish();
         if (open) {
           const auditId = `derived_${line.auditId}`;
           if (!published.has(auditId)) {
@@ -522,7 +549,11 @@ export function exportAudit(
           }
         }
       }
-      for (const line of derived) writer.write(line);
+      for (const line of derived) {
+        pending.push(line);
+        if (pending.length >= 256) yield* publish();
+      }
+      yield* publish();
       writer.close();
       const files = { ...state.files };
       for (const name of finalizedFiles(dir, state.files)) {

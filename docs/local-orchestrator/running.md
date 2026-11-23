@@ -1,5 +1,9 @@
 # Run the local Concierge
 
+From the agent-bootstrap checkout, use `bun run src/local-orchestrator/cli.ts`
+with the same operator arguments as an alternative to the linked command.
+To launch Concierge directly, use `bun run spike/local-orchestrator/concierge.ts --run`.
+
 Use a macOS operator terminal with OSC 52 clipboard access disabled. Guest
 output reaches that terminal directly. See the [terminal trust boundary](../trust-model.md)
 for details.
@@ -16,12 +20,9 @@ for details.
   or set `LO_CLAUDE_BINARY` to its absolute path. Stage the pinned Alpine
   packages under `.local/alpine/v3.23/main/aarch64/`. The filenames and
   checksums are in `src/claude-code.ts`.
-- Provision a generic password in macOS Keychain for your current account
-  (`$USER`). Set `LO_CLAUDE_KEYCHAIN` to its service name and
-  `LO_CLAUDE_AUTH` to `operator:ANTHROPIC_API_KEY:x-api-key` for an
-  Anthropic API key. The launcher reads the value from Keychain and the
-  Claude guest receives a backend placeholder. `LO_CLAUDE_MODEL` defaults
-  to `claude-opus-5-5`.
+- For default API-key mode, provision the API key in Keychain and configure
+  its service name in the [private config file](../claude-code-auth.md#setup).
+  `LO_CLAUDE_MODEL` defaults to `claude-opus-5-5`.
 
 ## Start or resume
 
@@ -33,16 +34,20 @@ From the repository root, preview the launch with the first command. The
 second command starts an audited session with egress to
 `api.anthropic.com:443` and `platform.claude.com:443`. The platform host
 supports Claude Code's startup connectivity check. The gateway relays its
-traffic without credential substitution.
+traffic without API key substitution. This is the default API-key policy.
 Repository context and conversation content can reach the provider.
 
 ```sh
 bun run spike/local-orchestrator/concierge.ts
-bun run spike/local-orchestrator/concierge.ts --run
+agent-bootstrap concierge
 ```
 
 Run one Concierge per target. Launchers for the same target in the same
-agent-bootstrap checkout share the conversation volume. The launcher prints its session ID and audit database
+agent-bootstrap checkout share the named volume. In API-key mode it holds
+the Concierge's configuration and guest home. In config-dir mode the
+named volume holds the guest home, and conversation state lives in the
+group's persistent Claude Code configuration directory on the encrypted
+volume. The launcher prints its session ID and audit database
 path. Exit Claude Code to end the session and remove temporary files. If
 the launcher process is terminated abruptly, its session record and
 temporary files can remain until host-side cleanup, and the backend
@@ -50,7 +55,7 @@ lifetime still applies. To continue the latest conversation, use the same
 target and `MSB_HOME` from the same agent-bootstrap checkout.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run --continue
+agent-bootstrap concierge --continue
 ```
 
 The default Claude Code permission mode is `auto`. If Claude Code reports
@@ -71,8 +76,8 @@ docs.
 
 ```sh
 target="$HOME/ghq/github.com/hisamekms/dagq-lite"
-bun run spike/local-orchestrator/concierge.ts --run --target "$target"
-bun run src/local-orchestrator/cli.ts --target "$target" status
+agent-bootstrap concierge --target "$target"
+agent-bootstrap --target "$target" status
 ```
 
 Each external target uses
@@ -90,14 +95,15 @@ Preload the pinned Bun profile image and include it in the agent-bootstrap
 profile lock. Configure the command before starting the launcher.
 
 ```sh
-bun run src/local-orchestrator/cli.ts --target "$target" verification set --profile bun -- bun test
-bun run src/local-orchestrator/cli.ts --target "$target" verification show
-bun run src/local-orchestrator/cli.ts --target "$target" verification clear
+agent-bootstrap --target "$target" verification set --profile bun -- bun test
+agent-bootstrap --target "$target" verification show
+agent-bootstrap --target "$target" verification clear
 ```
 
 `set` and `clear` require a host terminal and the exact confirmation phrase
 shown in the prompt. The CLI records changes in the target's state database
-and stores the configuration in its private `config.json`. `show` prints
+and stores the verification configuration in its private `config.json`.
+The optional `claude` section shares that file. `show` prints
 `null` when verification is unset. The launcher reads the configuration at
 startup. Keep it in place until existing integration proposals are
 resolved, so integration can recheck each candidate with the same command.
@@ -122,7 +128,7 @@ credential substitution. Update to a checkout that includes it, then rerun
 the launcher.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run
+agent-bootstrap concierge
 ```
 
 ### MCP tool calls return invalid-arguments
@@ -134,7 +140,7 @@ launcher. To continue the conversation, use the same checkout and
 `MSB_HOME`.
 
 ```sh
-bun run spike/local-orchestrator/concierge.ts --run --continue
+agent-bootstrap concierge --continue
 ```
 
 ## Recover after a crash
@@ -144,7 +150,7 @@ host terminal. If you use an explicit database, pass the same `--db`
 you use for the other operator commands.
 
 ```sh
-bun run src/local-orchestrator/cli.ts reconcile
+agent-bootstrap reconcile
 ```
 
 The command displays the active sessions, queued or running executions,
@@ -171,8 +177,8 @@ When available, the execution result contains a bounded `rawAnswer`.
 The CLI escapes terminal control characters in that model text.
 
 ```sh
-bun run src/local-orchestrator/cli.ts show-execution <executionId>
-bun run src/local-orchestrator/cli.ts retry-task <taskId>
+agent-bootstrap show-execution <executionId>
+agent-bootstrap retry-task <taskId>
 ```
 
 For a failed Task, type `retry-task <taskId>` with the full ID at the host
@@ -190,7 +196,7 @@ Goal already has a pinned branch and its Tasks need changes from a newer
 local `main`, update it from a host terminal.
 
 ```sh
-bun run src/local-orchestrator/cli.ts update-goal-base <goalId>
+agent-bootstrap update-goal-base <goalId>
 ```
 
 Use the full Goal ID. Review the two commit IDs, then type
@@ -217,10 +223,10 @@ Use another host terminal for approval. The Concierge can draft proposals
 and request Planner executions through its MCP tools.
 
 ```sh
-bun run src/local-orchestrator/cli.ts status
-bun run src/local-orchestrator/cli.ts proposals --status pending
-bun run src/local-orchestrator/cli.ts show <proposalId>
-bun run src/local-orchestrator/cli.ts approve <proposalId>
+agent-bootstrap status
+agent-bootstrap proposals --status pending
+agent-bootstrap show <proposalId>
+agent-bootstrap approve <proposalId>
 ```
 
 With a custom `--db <path>`, also supply `--target <path>` when
@@ -243,7 +249,7 @@ picked up on its next launch. Use `show <taskId>` to check for
 When the Goal branch is ready for handoff, run:
 
 ```sh
-bun run src/local-orchestrator/cli.ts [--target <path>] export-goal-branch <goalId> [--target <checkout>]
+agent-bootstrap [--target <path>] export-goal-branch <goalId> [--target <checkout>]
 ```
 
 Type `export-goal-branch <goalId> <first 12 hex of new head>` as shown.

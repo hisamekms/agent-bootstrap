@@ -12,7 +12,8 @@ import {
   SqliteAudit,
   type NetworkInput,
 } from "../src/audit.ts";
-import { exportAudit } from "../src/audit-export.ts";
+import { exportAudit, exportAuditChecked } from "../src/audit-export.ts";
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { JsonlFileError, scan } from "../src/jsonl-files.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 
@@ -324,7 +325,7 @@ test("after a crash, replays the partial and deduplicates a file published befor
   audit.close();
   const script = `
     import * as fs from "node:fs";
-    import { exportAudit } from ${JSON.stringify(moduleUrl.href)};
+    import { exportAudit, exportAuditChecked } from ${JSON.stringify(moduleUrl.href)};
     let writes = 0;
     exportAudit(${JSON.stringify(db)}, ${JSON.stringify(obs)}, {
       now: () => new Date(${JSON.stringify(now().toISOString())}),
@@ -486,4 +487,26 @@ test("exports Concierge create channels and volume reuse with the existing JSONL
   assert.equal(allowed?.operationId, requested?.operationId);
   assert.deepEqual(finished?.attributes, { ...volume.detail, reused: true });
   assert.deepEqual(bun?.attributes, { profile: "bun", image: policyId });
+});
+
+test("checked audit export screens projected records before publication", async (t) => {
+  const { root, db, obs, dir, audit } = fixture(t);
+  audit.append({ ...start, role: "Worker" });
+  const notes: string[] = [];
+  const scanner = createCredentialScanner(
+    { leakPatterns: ["Worker"] },
+    root,
+    (note) => notes.push(note),
+  );
+  await assert.rejects(exportAuditChecked(db, obs, scanner), {
+    code: "credential-leak",
+  });
+  assert.deepEqual(files(dir), []);
+  assert.equal(notes.length, 1);
+  await exportAuditChecked(
+    db,
+    obs,
+    createCredentialScanner({}, root, () => {}),
+  );
+  assert.equal(lines(dir)[0]?.actor, "Worker");
 });

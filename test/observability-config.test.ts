@@ -243,7 +243,7 @@ test("handles aliases of the directory and protected roots through existing syml
   );
 });
 
-test("requires an explicit opt-in for each unaudited agent spec", () => {
+test("disallows each unaudited agent spec", () => {
   const disabled = parseObservabilityConfig(
     { directory, audit: { mode: "disabled" } },
     roots,
@@ -260,37 +260,10 @@ test("requires an explicit opt-in for each unaudited agent spec", () => {
   ];
   for (const spec of agentSpecs) {
     assert.doesNotThrow(() => requireAudited(spec, required));
-    assert.throws(() => requireAudited(spec, disabled), /allowUnauditedRun/);
     assert.throws(
-      () => requireAudited(spec, disabled, { allowUnauditedRun: false }),
-      /allowUnauditedRun/,
-    );
-    assert.doesNotThrow(() =>
-      requireAudited(spec, disabled, { allowUnauditedRun: true }),
+      () => requireAudited(spec, disabled),
+      /require durable audit/,
     );
   }
   assert.doesNotThrow(() => requireAudited({ files: [] }, disabled));
-});
-
-test("does not accept inherited, accessor, or truthy non-boolean opt-ins", () => {
-  const config = parseObservabilityConfig(
-    { directory, audit: { mode: "disabled" } },
-    roots,
-  );
-  const spec = { tools: [] };
-  const accessor = {
-    get allowUnauditedRun(): boolean {
-      return assert.fail("guard must not invoke an accessor");
-    },
-  };
-  for (const options of [
-    Object.create({ allowUnauditedRun: true }) as typeof accessor,
-    accessor,
-    { allowUnauditedRun: "true" } as unknown as typeof accessor,
-  ]) {
-    assert.throws(
-      () => requireAudited(spec, config, options),
-      /allowUnauditedRun/,
-    );
-  }
 });

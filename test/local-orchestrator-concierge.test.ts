@@ -158,6 +158,7 @@ for (const failure of [undefined, ...failures]) {
               assert.deepEqual(plan, {
                 sandbox: {
                   profile: "concierge",
+                  claude: true,
                   tools: claudeCodeTools(install, "alpine"),
                   provider: claudeCodeProvider(auth),
                   maxLifetimeMs: 28_800_000,
@@ -403,8 +404,8 @@ test("Concierge guest command admits only validated options and uses a fixed rel
     script!.includes("test \"$ANTHROPIC_API_KEY\" = '$MSB_ANTHROPIC_API_KEY'"),
   );
   assert.ok(script!.includes('["STDIO","VSOCK-CONNECT:2:5000"]'));
-  assert.ok(script!.includes('"deny":["WebFetch","Bash"]'));
-  assert.ok(script!.includes('"allow":["mcp__orchestrator"]'));
+  assert.doesNotMatch(script!, /managed-settings/);
+  assert.match(script!, /--strict-mcp-config --setting-sources ''/);
   assert.match(script!, /exec env -i .*HOME=\/state\/home/);
   assert.ok(script!.includes("CLAUDE_CONFIG_DIR=/state/claude"));
   assert.ok(
@@ -469,7 +470,7 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
       join(repoRoot, "docs/local-orchestrator/stage1.md"),
       "docs",
     );
-    await symlink("../state.db", join(repoRoot, "README.md"));
+    await symlink("AGENTS.md", join(repoRoot, "README.md"));
     git(
       "add",
       "AGENTS.md",
@@ -527,6 +528,31 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
     assert.ok(!snapshot.files.includes(".local/secret"));
     assert.ok(!snapshot.files.includes("docs/local-orchestrator/feature.md"));
     assert.equal(snapshot.commit, git("rev-parse", "refs/heads/main").trim());
+    for (const target of ["../outside", "/absolute"]) {
+      await rm(join(repoRoot, "README.md"));
+      await symlink(target, join(repoRoot, "README.md"));
+      git("add", "README.md");
+      git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "unsafe link",
+      );
+      await assert.rejects(
+        snapshotConciergeRepo(
+          repoRoot,
+          randomUUID(),
+          git("rev-parse", "HEAD").trim(),
+        ),
+        {
+          code: "unsafe-input-symlink",
+          message: /Replace absolute or escaping symlinks/,
+        },
+      );
+    }
   });
 });
 

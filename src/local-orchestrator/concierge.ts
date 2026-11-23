@@ -1,3 +1,7 @@
+import {
+  requireCredentialScan,
+  type CredentialScanner,
+} from "./credential-scan.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
@@ -18,12 +22,15 @@ import { claudeRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
+  CLAUDE_GROUP_PATH,
   claudeCodeGuestSetup,
   claudeCodeProvider,
   claudeCodeTools,
   type ClaudeCodeAuth,
   type ClaudeCodeInstall,
 } from "../claude-code.ts";
+import { GitIntegrationError } from "../git-integration.ts";
+import { isSafeSymlinkTarget } from "../workspace-tree.ts";
 import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
 import {
   INTERACTIVE_MAX_LIFETIME_MS,
@@ -31,6 +38,12 @@ import {
   type TerminalCommand,
 } from "../sandbox-runtime.ts";
 import type { TrustedHost } from "../trusted-host.ts";
+import {
+  parseClaudeAuthMode,
+  validGroup,
+  type ClaudeAuthMode,
+} from "./claude-config.ts";
+import { orchestratorMcp } from "./claude-policy.ts";
 import { HostApiServer } from "./host-api.ts";
 import { gitCommit } from "./model.ts";
 import { ActorRunner } from "./runner.ts";
@@ -77,6 +90,7 @@ type ConciergeHost = Pick<
   Partial<Pick<TrustedHost, "runWorker" | "runVerification">>;
 
 export interface ConciergeDeps {
+  readonly scan?: CredentialScanner;
   readonly host: ConciergeHost;
   readonly store: OrchestratorStore;
   readonly snapshot: (
@@ -129,27 +143,47 @@ export function conciergeCommand(
   const mode = parseConciergeMode(
     options.mode === undefined ? "auto" : options.mode,
   );
-  const { secretEnv } = claudeCodeProvider(auth);
+  const secretEnv =
+    auth.mode === "config-dir" ? undefined : claudeCodeProvider(auth).secretEnv;
+  const mcp = JSON.stringify({ mcpServers: { orchestrator: orchestratorMcp } });
   const script = `
 ${claudeCodeGuestSetup(secretEnv, "alpine")}    umask 077
-    mkdir -p /state/claude /state/home /etc/claude-code
-    chmod 700 /state/claude /state/home
+    mkdir -p /state/home
+    chmod 700 /state/home
+    ${secretEnv ? "mkdir -p /state/claude && chmod 700 /state/claude" : `test -d ${CLAUDE_GROUP_PATH}`}
     cat > /tmp/lo-mcp.json <<'EOF'
-{"mcpServers":{"orchestrator":{"type":"stdio","command":"socat","args":["STDIO","VSOCK-CONNECT:2:${PORT}"]}}}
-EOF
-    cat > /etc/claude-code/managed-settings.json <<'EOF'
-{"permissions":{"deny":["WebFetch","Bash"],"allow":["mcp__orchestrator"]}}
+${mcp}
 EOF
     cd /repo
     exec env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/state/home \\
-      CLAUDE_CONFIG_DIR=/state/claude ${secretEnv}="$${secretEnv}" \\
+      CLAUDE_CONFIG_DIR=${secretEnv ? `/state/claude ${secretEnv}="$${secretEnv}"` : CLAUDE_GROUP_PATH} \\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" TERM=xterm-256color \\
-      ${CLAUDE_CODE.guestPath} --mcp-config /tmp/lo-mcp.json --strict-mcp-config \\
+      ${CLAUDE_CODE.guestPath} --mcp-config /tmp/lo-mcp.json --strict-mcp-config --setting-sources '' \\
       --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""}
   `;
   return { argv: ["/bin/sh", "-ec", script], workdir: "/repo" };
+}
+
+export function claudeLoginCommand(): TerminalCommand {
+  return {
+    workdir: "/",
+    argv: [
+      "/bin/sh",
+      "-ec",
+      `
+${claudeCodeGuestSetup(undefined, "alpine")}    umask 077
+    test -d ${CLAUDE_GROUP_PATH}
+    home=$(mktemp -d)
+    cd "$home"
+    exec env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$home" \\
+      CLAUDE_CONFIG_DIR=${CLAUDE_GROUP_PATH} TERM=xterm-256color \\
+      DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
+      ${CLAUDE_CODE.guestPath} --strict-mcp-config --setting-sources '' --tools '' --permission-mode default
+  `,
+    ],
+  };
 }
 
 function exited(child: ReturnType<typeof spawn>): Promise<void> {
@@ -223,6 +257,39 @@ export async function snapshotConciergeRepo(
         { cwd: metadata, env: gitEnv, timeout: 15_000, maxBuffer: 4096 },
       );
       const env = { ...gitEnv, GIT_OBJECT_DIRECTORY: objects };
+      const gitOptions = {
+        cwd: metadata,
+        env,
+        timeout: 15_000,
+        maxBuffer: 8 * 1024 * 1024,
+      };
+      const { stdout: listing } = await runFile(
+        git,
+        ["ls-tree", "-r", "-l", "-z", base],
+        gitOptions,
+      );
+      const files: string[] = [];
+      for (const entry of listing.split("\0")) {
+        if (!entry) continue;
+        const tab = entry.indexOf("\t");
+        if (tab < 0) throw new Error("Concierge tree listing failed");
+        const path = entry.slice(tab + 1);
+        if (/^\.local(?:\/|$)/i.test(path)) continue;
+        files.push(path);
+        if (!entry.startsWith("120000 ")) continue;
+        const link = /^120000 blob ([a-f0-9]{40}|[a-f0-9]{64}) +(\d+)$/.exec(
+          entry.slice(0, tab),
+        );
+        if (!link || Number(link[2]) > 4096)
+          throw new GitIntegrationError("unsafe-input-symlink");
+        const { stdout: bytes } = await runFile(
+          git,
+          ["cat-file", "blob", link[1]!],
+          { ...gitOptions, encoding: "buffer", maxBuffer: 4096 },
+        );
+        if (!isSafeSymlinkTarget(path, bytes))
+          throw new GitIntegrationError("unsafe-input-symlink");
+      }
       const archive = spawn(
         git,
         [
@@ -260,23 +327,7 @@ export async function snapshotConciergeRepo(
       if (results.some(({ status }) => status === "rejected"))
         throw new Error("Concierge archive failed");
       await privateSubdirectories(dir);
-      const { stdout: listing } = await runFile(
-        git,
-        ["ls-tree", "-r", "-z", "--name-only", base],
-        {
-          cwd: metadata,
-          env,
-          timeout: 15_000,
-          maxBuffer: 8 * 1024 * 1024,
-        },
-      );
-      return {
-        dir,
-        commit: base,
-        files: listing
-          .split("\0")
-          .filter((path) => path && !/^\.local(?:\/|$)/i.test(path)),
-      };
+      return { dir, commit: base, files };
     } finally {
       await rm(metadata, { recursive: true, force: true });
     }
@@ -389,7 +440,8 @@ export async function startConcierge(
     lifetime > INTERACTIVE_MAX_LIFETIME_MS
   )
     throw new Error("Invalid Concierge lifetime");
-  const provider = claudeCodeProvider(auth);
+  const provider =
+    auth.mode === "config-dir" ? undefined : claudeCodeProvider(auth);
   const tools = claudeCodeTools(install, "alpine");
   const harness = claudeRoleHarness({
     auth,
@@ -400,6 +452,12 @@ export async function startConcierge(
   const { repoRoot, target } = options;
   const bootstrapRoot = target?.bootstrapRoot ?? resolve(repoRoot);
   const stateVolume = target?.volume ?? conciergeVolumeName(repoRoot);
+  if (auth.mode === "config-dir") {
+    if (!deps.scan) throw new Error("Credential screening is required");
+    requireCredentialScan(
+      await prepareTargetDirectory(bootstrapRoot, target?.directory),
+    );
+  }
 
   const invocationId = randomUUID();
   const { id: sessionId } = store.startSession("Concierge", invocationId, true);
@@ -413,6 +471,7 @@ export async function startConcierge(
   let failed = false;
   let outcome: Awaited<ReturnType<ConciergeHost["runConcierge"]>>["outcome"];
   let exitCode: number | null = null;
+  let code: Awaited<ReturnType<ConciergeHost["runConcierge"]>>["code"];
   const cleanupErrors: string[] = [];
   const queued = new Set<string>();
   const cancelQueued = (id: string) => {
@@ -434,6 +493,7 @@ export async function startConcierge(
     const context = await conciergeContext(snapshot, target?.isDefault);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
+    const scan = deps.scan;
     const tasks =
       host.runWorker && host.runVerification
         ? createTaskExecutor({
@@ -442,6 +502,7 @@ export async function startConcierge(
               target?.directory,
             ),
             repoRoot,
+            ...(scan ? { scan } : {}),
             store,
             snapshotCommit: snapshot.commit,
             host: {
@@ -479,6 +540,7 @@ export async function startConcierge(
         : undefined;
 
     const runner = new ActorRunner({
+      ...(scan ? { scan } : {}),
       store,
       ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
       runPlanner: (...args) => {
@@ -525,6 +587,7 @@ export async function startConcierge(
       );
     };
     server = await (deps.listen ?? HostApiServer.listen)({
+      ...(scan ? { scan } : {}),
       store,
       socketPath: socket,
       sessionId,
@@ -550,12 +613,13 @@ export async function startConcierge(
       scheduler = setInterval(scheduleDrain, 1000);
       scheduler.unref();
     }
-    ({ outcome } = await host.runConcierge(
+    ({ outcome, code } = await host.runConcierge(
       {
         sandbox: {
           profile: "concierge",
           tools,
-          provider,
+          claude: true,
+          ...(provider ? { provider } : {}),
           maxLifetimeMs: lifetime,
           interactive: {
             vsock: { hostPath: socket, port: PORT },
@@ -597,6 +661,7 @@ export async function startConcierge(
             ? "succeeded"
             : "failed",
         exitCode,
+        ...(code ? { code } : {}),
       }),
     );
     const closing = cleanup("concierge-close-api-failed", () =>
@@ -618,5 +683,38 @@ export async function startConcierge(
     if (failed && cleanupErrors.length) console.error(cleanupErrors.join(", "));
   }
   if (cleanupErrors.length) throw new Error(cleanupErrors.join(", "));
-  return { sessionId, outcome, exitCode };
+  return { sessionId, outcome, exitCode, ...(code ? { code } : {}) };
+}
+
+export function parseConciergeArgs(args: readonly string[]) {
+  let run = false;
+  let resume = false;
+  let target: string | undefined;
+  let claudeAuth: ClaudeAuthMode | undefined;
+  let loginGroup: string | undefined;
+  let mode: ReturnType<typeof parseConciergeMode> | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--run" && !run) run = true;
+    else if (args[i] === "--continue" && !resume) resume = true;
+    else if (args[i] === "--claude-auth" && claudeAuth === undefined)
+      claudeAuth = parseClaudeAuthMode(args[++i]);
+    else if (args[i] === "--login-group" && loginGroup === undefined) {
+      loginGroup = args[++i];
+      if (!validGroup(loginGroup)) throw new Error("Invalid Claude group");
+    } else if (args[i] === "--mode" && mode === undefined)
+      mode = parseConciergeMode(args[++i]);
+    else if (args[i] === "--target" && target === undefined) {
+      target = args[++i];
+      if (!target || target.startsWith("--") || target.includes("\0"))
+        throw new Error("Invalid Concierge arguments");
+    } else throw new Error("Invalid Concierge arguments");
+  }
+  return {
+    run,
+    mode: mode ?? "auto",
+    continue: resume,
+    target,
+    ...(claudeAuth ? { claudeAuth } : {}),
+    ...(loginGroup ? { loginGroup } : {}),
+  };
 }

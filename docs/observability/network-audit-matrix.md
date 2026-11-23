@@ -3,8 +3,8 @@
 This matrix covers each outbound method a guest (root) can try. For each one
 it gives:
 
-- what happens with today's adapter flags, which have no gateway;
-- what happens with the v0.1 design: Microsandbox with the gateway rule set
+- historical Phase 0 behavior before the adapter used a gateway;
+- what happens on the audited product path: Microsandbox with the gateway rule set
   from [ADR 0001](adr-0001-observability.md), plus the host Egress Audit
   Gateway (SOCKS5 + DNS);
 - the evidence. Experiment IDs refer to [feasibility.md](feasibility.md),
@@ -38,7 +38,7 @@ Status legend:
 
 ## Matrix
 
-| ID   | Method                                                                                                                          | Today (no gateway)                                                                        | v0.1: allowed / denied                                                                                                                         | v0.1: audit record                                                                                                                  | v0.1: bypassable                                                  | Evidence                                                                                                      |
+| ID   | Method                                                                                                                          | Historical Phase 0 (no gateway)                                                           | v0.1: allowed / denied                                                                                                                         | v0.1: audit record                                                                                                                  | v0.1: bypassable                                                  | Evidence                                                                                                      |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | N-01 | TCP to an allowlisted destination (host:port, by name)                                                                          | Allowed by an msb rule. No per-connection record.                                         | Allowed by the gateway policy                                                                                                                  | **Yes**: requested + decided (durable, before connect) → finished (result, bytes, duration, end reason). Hostname from DNS pinning. | No known bypass                                                   | proxy path verified (exp3, exp7, exp10); gateway records: design                                              |
 | N-02 | TCP to a non-allowlisted public destination                                                                                     | Denied by msb, with no record. Non-443 ports complete a _local_ handshake, then close.    | Denied by the gateway                                                                                                                          | **Yes**: requested + decided(deny, reason)                                                                                          | No                                                                | verified via SOCKS refusal (P2, H6, K7); record: design                                                       |
@@ -71,26 +71,14 @@ Status legend:
 
 ## Gate decision
 
-Each observed method is either audited by the gateway or blocked. That holds
-once the verified rule set, a per-sandbox gateway, and the refusal of direct
-`hostTcpPort` are all in place. So the audit-required mode **is not blocked**.
-It still depends on these conditions:
+Each observed method is either audited by the gateway or blocked by the
+adapter rule set. Product VM creation uses that rule set with the per-VM
+gateway, or `--no-net` for offline runs. Direct host-port egress and the
+ungated provider path have been removed. The same gateway controls apply
+to image builds and operator sandbox shells. Their policies allow only the
+build recipe or operator destinations, respectively.
 
-1. **N-11, N-12, N-16, N-17 are real bypasses of a naive "everything through
-   `--proxy`" design.** Only the exact rule set closes them. The adapter must
-   emit it from one constant. A VM regression test must fail the build if a
-   future `msb` version reopens any of them.
-2. **Today's provider mode (`allow@dns` without `--dns-nameserver`) does not
-   meet the requirement.** Its DNS is unaudited and unscoped (N-09 today).
-   Until the gateway lands, credentialed runs are not audit-required
-   compliant.
-3. **Gap G1.** Pre-gateway refusals (N-07, N-10, N-13, N-15, N-16, N-18) are
-   enforced but have no per-attempt record. The reference requires
-   "connections refused before the gateway are also audited". That
-   requirement is **not met** in v0.1 and is listed as a non-guarantee.
-   Closing it needs a Microsandbox change: a structured, synchronous
-   deny-event stream (for example, a JSON Lines socket or a callback per
-   denied flow). The gateway cases listed above also lack guaranteed
-   per-attempt coverage. Aggregate counts will describe refusal volume.
-4. The Phase 1 gate is not passed until N-22, N-25, N-26 and the gateway
-   records in N-01 to N-09 and N-24 pass with the real backend.
+Microsandbox enforces N-11, N-12, N-16 and N-17 through the exact rule set.
+Gap G1 still limits pre-gateway evidence to available aggregate counts.
+Individual pre-gateway refusals have no SQLite record. See the current
+[guarantees](guarantees.md) and [real-VM evidence](phase1-evidence.md).

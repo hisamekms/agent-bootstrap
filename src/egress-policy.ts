@@ -269,6 +269,21 @@ function canonicalEntries<T extends object>(
   );
 }
 
+/** Versioned policy fingerprint recorded alongside the policy ID in audit. */
+export function gatewayPolicyDigest(policy: EgressPolicy): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        version: 1,
+        allow: policy.allow,
+        allowIps: policy.allowIps,
+        hostServices: policy.hostServices,
+        providerBinding: policy.providerBinding ?? null,
+      }),
+    )
+    .digest("hex");
+}
+
 export class EgressPolicy {
   readonly allow: readonly HostPort[];
   readonly allowIps: readonly IpPort[];

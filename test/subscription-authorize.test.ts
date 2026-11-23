@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   acceptCallback,
   forgetRefreshToken,
@@ -15,31 +17,57 @@ import {
   verifyIdentity,
 } from "../spike/m1/subscription-authorize.ts";
 
-test("launcher arguments allow Keychain opt-in immediately after the runner flag", () => {
-  const direct = parseArgs(["--authorize-and-run", "/msb", "/codex"]);
+test("M5 launcher arguments allow Keychain opt-in immediately after the mode flag", () => {
+  assert.deepEqual(parseArgs(["--authorize-and-run-m5", "/msb", "/codex"]), {
+    forget: false,
+    useKeychain: false,
+    msb: "/msb",
+    codex: "/codex",
+  });
   const keychain = parseArgs([
     "--authorize-and-run-m5",
     "--keychain",
     "/msb",
     "/codex",
   ]);
-  assert.ok(!direct.forget && !keychain.forget);
-  assert.equal(direct.useKeychain, false);
+  assert.ok(!keychain.forget);
   assert.equal(keychain.useKeychain, true);
   assert.equal(keychain.msb, "/msb");
   assert.equal(keychain.codex, "/codex");
-  assert.match(direct.runner, /\/subscription-smoke\.ts$/);
-  assert.match(keychain.runner, /\/dogfood\.ts$/);
   assert.deepEqual(parseArgs(["--forget"]), { forget: true });
   for (const argv of [
-    ["--authorize-and-run", "/msb"],
-    ["--authorize-and-run", "/msb", "/codex", "--keychain"],
-    ["--authorize-and-run", "/msb", "--keychain", "/codex"],
-    ["--authorize-and-run", "--keychain", "/msb", "/codex", "/extra"],
+    ["--authorize-and-run-m5", "/msb"],
+    ["--authorize-and-run-m5", "/msb", "/codex", "--keychain"],
+    ["--authorize-and-run-m5", "/msb", "--keychain", "/codex"],
+    ["--authorize-and-run-m5", "--keychain", "/msb", "/codex", "/extra"],
     ["--forget", "--keychain"],
   ]) {
-    assert.throws(() => parseArgs(argv));
+    assert.throws(
+      () => parseArgs(argv),
+      /^Error: Usage: .* --authorize-and-run-m5 .*\n +.* --forget$/,
+    );
   }
+});
+
+test("the launcher rejects the retired mode and directs the operator to M5", () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(
+        new URL("../spike/m1/subscription-authorize.ts", import.meta.url),
+      ),
+      "--authorize-and-run",
+      "/msb",
+      "/codex",
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    "--authorize-and-run has been retired. Use --authorize-and-run-m5 for the audited gateway.\n",
+  );
 });
 
 test("consent callback checks state and binds the issued app client", () => {
