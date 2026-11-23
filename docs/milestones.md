@@ -1020,3 +1020,5 @@ because one credential is exhausted, the host moves to the next one.
 | M3 reviewed integration              | Use a disposable repository. Produce a commit and pinned review, demonstrate rejection or stale-base denial, then approve and integrate a valid candidate with trace evidence.        |
 | M4 Coordinator and human interaction | Submit a natural-language task. Observe Coordinator choose its delegation path, pause for an answer or approval, and resume with the same request IDs.                                |
 | M5 dogfood                           | Complete one small local change. Collect timing, available usage, retries, review iterations, human interventions, and known audit gaps.                                              |
+
+See the [proposed local orchestrator](local-orchestrator/) for the dagq-lite development stages.
