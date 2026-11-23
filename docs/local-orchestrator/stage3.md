@@ -4,6 +4,8 @@ The Concierge launcher checks SQLite once per second for operator decisions.
 The scheduler takes the current approved integration proposal for an active
 Goal and processes one integration at a time in the actor slot. Approval
 rejections fail the Task. Successful integration releases its dependents.
+A scheduling race skips that integration for the current drain, logs
+`concierge-integration-skipped`, and lets other Goals continue.
 
 Before writing an M5 decision, the host recomputes the proposal digest,
 checks it against the stored approval, checks that the Task is still
@@ -25,7 +27,9 @@ between candidate review and integration.
 
 The host records the start in SQLite before calling
 `ReviewedIntegration.decide`. Its M5 `human.decided` event carries the
-SQLite approval ID as `approvalId`, even for a permitted agent decision.
+SQLite approval ID as `approvalId`, the `answererKind` (`human` or
+`agent`), and whether the answer was `delegated`. Older journal entries
+can omit the last two fields.
 The ID joins to `proposal.decided` and the stored approval row, which holds
 the answerer kind, the Reviewer execution ID and model for agent answers,
 or the delegated session and authorization for delegated human answers.
@@ -36,7 +40,10 @@ new head and marks the Task succeeded in the same transaction. The next
 Task starts at that audited head. The Goal's original `baseCommit` stays
 available for planning. M5 denials fail the Task with the journal's reason.
 
-An uncertain Git result leaves the Task running with
+A failure before Git authorization fails the Task with
+`integration-evidence` when the private ref is still at the proposal base
+and the journal shows no integration authorization. An uncertain Git
+result leaves the Task running with
 `integration-uncertain`. An abrupt stop can leave
 `integration-in-progress`. Both pause scheduling for that Goal. After the
 launcher stops, `reconcile` compares the private ref with the candidate and
@@ -51,7 +58,11 @@ destination and the old and new heads and confirm with the displayed
 phrase. The command allows branch creation or a fast-forward and refuses
 to update a branch checked out in any linked worktree. SQLite records
 `goal.export-authorized` before the transfer and `goal.exported` after
-the local branch update. See [the operator guide](running.md#approve-and-export-a-goal-branch)
+the local branch update. Preview and apply require the private ref to
+match the last audited integration head or the recorded Goal base if no
+integration has completed. A mismatch returns `export-head-mismatch`.
+With a custom `--db`, pass the leading `--repo <launcher-root>`.
+See [the operator guide](running.md#approve-and-export-a-goal-branch)
 for the checkout option and manual PR steps.
 
 Stage 3 is covered by local Git and SQLite tests with fake actor and

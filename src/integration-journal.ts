@@ -70,6 +70,8 @@ type EventDetails = {
     readonly protectedDigest?: string;
     /** Joins the host decision to its authenticated approval record. */
     readonly approvalId?: string;
+    readonly answererKind?: "human" | "agent";
+    readonly delegated?: boolean;
   };
 };
 type Event = {
@@ -112,9 +114,18 @@ function decode(value: unknown): IntegrationEvent {
     kind === "human.decided" && Object.hasOwn(data, "protectedDigest");
   const hasApprovalId =
     kind === "human.decided" && Object.hasOwn(data, "approvalId");
+  const hasAnswererKind =
+    kind === "human.decided" && Object.hasOwn(data, "answererKind");
+  const hasDelegated =
+    kind === "human.decided" && Object.hasOwn(data, "delegated");
   if (
-    hasApprovalId &&
-    (typeof data.approvalId !== "string" || !uuidPattern.test(data.approvalId))
+    (hasApprovalId &&
+      (typeof data.approvalId !== "string" ||
+        !uuidPattern.test(data.approvalId))) ||
+    (hasAnswererKind &&
+      data.answererKind !== "human" &&
+      data.answererKind !== "agent") ||
+    (hasDelegated && typeof data.delegated !== "boolean")
   )
     throw new Error("Invalid integration event fields");
   const optional = [
@@ -123,6 +134,8 @@ function decode(value: unknown): IntegrationEvent {
     hasMessageDigest,
     hasProtectedDigest,
     hasApprovalId,
+    hasAnswererKind,
+    hasDelegated,
   ].filter(Boolean).length;
   if (
     hasProtectedCount &&

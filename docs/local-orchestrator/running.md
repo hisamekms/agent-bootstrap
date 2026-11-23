@@ -172,8 +172,8 @@ Type `export-goal-branch <goalId> <first 12 hex of new head>` as shown.
 The trailing `--repo` selects a destination checkout. By default, the
 launcher checkout is also the destination. To locate a launcher in a
 different checkout, use the leading `--repo <launcher-root>` before the
-command. Supply the same leading `--db <path>` as the launcher if you
-set a custom database path.
+command. If you set a custom database path, supply both the leading
+`--db <path>` and `--repo <launcher-root>`.
 
 The branch is created or fast-forwarded locally. A divergent branch or
 one checked out in any worktree must be resolved before exporting.

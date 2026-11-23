@@ -275,7 +275,7 @@ async function execute(
       const { from, to, branch, apply } = await previewGoalBranchExport(
         store,
         checkout,
-        directory ?? join(repoRoot, ".local", "local-orchestrator"),
+        directory!,
         command.id,
       );
       writeJson(io, { goalId: command.id, checkout, branch, from, to });
@@ -509,6 +509,16 @@ export async function runCli(
   )
     return refuse(io, "This command requires a terminal on stdin and stdout.");
 
+  if (
+    command.kind === "export-goal-branch" &&
+    db !== undefined &&
+    repo === undefined
+  )
+    return refuse(
+      io,
+      "With a custom --db, pass --repo for the launcher checkout before the command.",
+    );
+
   try {
     if (command.kind === "policy-set") {
       if (command.value === "agent")
@@ -545,6 +555,8 @@ export async function runCli(
       command.kind === "export-goal-branch" &&
       error instanceof OrchestratorStoreError
     ) {
+      if (error.code === "export-head-mismatch")
+        return refuse(io, `Goal branch export refused (${error.code}).`);
       if (error.code === "goal-export-record-failed")
         return refuse(
           io,

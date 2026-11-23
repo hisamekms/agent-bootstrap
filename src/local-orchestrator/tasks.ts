@@ -244,17 +244,26 @@ export async function previewGoalBranchExport(
   directory: string,
   goalId: string,
 ) {
-  if (!store.getGoal(goalId)) throw new OrchestratorStoreError("not-found");
+  const goal = store.getGoal(goalId);
+  if (!goal) throw new OrchestratorStoreError("not-found");
   store.assertGoalScheduling(goalId);
   const git = localGit(directory, goalBranch(goalId));
-  const { from, to, branch, apply } = await git.previewGoalExport(checkout);
+  const { from, to, branch, apply } = await git.previewGoalExport(
+    checkout,
+    store.goalIntegrationHead(goalId) ?? goal.baseCommit,
+  );
+  if (
+    (await goalBranchHead(git)) !== to ||
+    (store.goalIntegrationHead(goalId) ?? store.getGoal(goalId)?.baseCommit) !==
+      to
+  )
+    throw new GitIntegrationError("export-head-mismatch");
   return {
     from,
     to,
     branch,
     async apply() {
-      store.auditGoalExport(goalId, branch, from, to, false);
-      await apply();
+      await apply(() => store.auditGoalExport(goalId, branch, from, to, false));
       try {
         store.auditGoalExport(goalId, branch, from, to, true);
       } catch {
@@ -741,7 +750,7 @@ export async function integrateApprovedProposal(
     journal: IntegrationJournal,
   ) => ReviewedIntegration,
 ): Promise<void> {
-  let begun = false;
+  let isPreGitFailure: (() => Promise<boolean>) | undefined;
   let outcome: "completed" | "denied" | "uncertain";
   let code = "integration-evidence";
   try {
@@ -787,9 +796,17 @@ export async function integrateApprovedProposal(
     if ((await goalBranchHead(git)) !== base)
       throw new GitIntegrationError("stale-base");
     store.beginIntegration(proposalId, proposal.digest, approvalId);
-    begun = true;
+    isPreGitFailure = () =>
+      Promise.all([goalBranchHead(git), journal.read()]).then(
+        ([head, events]) =>
+          head === base &&
+          !events.some((event) => event.kind === "integration.authorized"),
+        () => false,
+      );
     await integration.decide(pin, "approve", {
       approvalId,
+      answererKind: answerer.kind,
+      delegated: answerer.kind === "human" && answerer.delegate !== undefined,
       ...(protectedPaths.length
         ? { acknowledgeProtected: protectedPaths }
         : {}),
@@ -815,7 +832,7 @@ export async function integrateApprovedProposal(
       ].includes(error.code)
     )
       throw error;
-    if (!begun) {
+    if (!isPreGitFailure) {
       if (
         error instanceof OrchestratorStoreError ||
         error instanceof GitIntegrationError
@@ -825,7 +842,7 @@ export async function integrateApprovedProposal(
       store.rejectApprovedIntegration(proposalId, code);
       return;
     }
-    outcome = "uncertain";
+    outcome = (await isPreGitFailure()) ? "denied" : "uncertain";
   }
   store.finishIntegration(proposalId, outcome, code);
 }

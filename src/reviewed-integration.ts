@@ -33,6 +33,8 @@ type Decision = "approve" | "reject";
 export type DecisionOptions = {
   acknowledgeProtected?: readonly string[];
   approvalId?: string;
+  answererKind?: "human" | "agent";
+  delegated?: boolean;
 };
 type Event = Parameters<IntegrationJournal["append"]>[1];
 type IntegrationGit = Pick<
@@ -954,6 +956,8 @@ export class ReviewedIntegration {
       kind: "human.decided",
       ...expected.pin,
       decision,
+      answererKind: options?.answererKind ?? "human",
+      delegated: options?.delegated ?? false,
       ...(protectedDigest ? { protectedDigest } : {}),
       ...(options?.approvalId ? { approvalId: options.approvalId } : {}),
     });

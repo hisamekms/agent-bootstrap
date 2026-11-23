@@ -337,9 +337,10 @@ export class ActorRunner {
 
   drain(): Promise<void> {
     this.#draining ??= Promise.resolve().then(async () => {
+      const skippedIntegrations = new Set<string>();
       try {
         for (;;) {
-          await this.#scheduleTasks();
+          await this.#scheduleTasks(skippedIntegrations);
           const job = this.#queue.shift();
           if (!job) break;
           if (job.kind === "task") {
@@ -351,8 +352,22 @@ export class ActorRunner {
                 this.#deps.canScheduleTasks,
               );
           } else if (job.kind === "integration") {
-            if (this.#deps.canScheduleTasks?.() !== false)
+            if (this.#deps.canScheduleTasks?.() === false) continue;
+            try {
               await this.#deps.tasks!.integrate!(job.id);
+            } catch (error) {
+              if (
+                !(error instanceof OrchestratorStoreError) ||
+                ![
+                  "invalid-transition",
+                  "goal-inactive",
+                  "integration-uncertain",
+                ].includes(error.code)
+              )
+                throw error;
+              skippedIntegrations.add(job.id);
+              console.error("concierge-integration-skipped");
+            }
           } else {
             await this.#run(job);
           }
@@ -364,7 +379,7 @@ export class ActorRunner {
     return this.#draining;
   }
 
-  async #scheduleTasks() {
+  async #scheduleTasks(skippedIntegrations: ReadonlySet<string>) {
     const { store, tasks, canScheduleTasks } = this.#deps;
     if (
       !tasks ||
@@ -376,7 +391,7 @@ export class ActorRunner {
       tasks.integrate &&
       !this.#queue.some(({ kind }) => kind === "integration")
     ) {
-      const id = store.nextApprovedIntegration();
+      const id = store.nextApprovedIntegration(skippedIntegrations);
       if (id) this.#queue.unshift({ id, kind: "integration" });
     }
     for (const proposal of store.pendingIntegrations()) {

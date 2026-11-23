@@ -196,12 +196,34 @@ test("approval binds one candidate, the target and the verifier, and applies onc
   assert.deepEqual(calls, ["worker", "reviewer", "verify"]);
   const events = await journal.read();
   assert.equal(events.at(-1)?.kind, "integration.completed");
+  assert.partialDeepStrictEqual(
+    events.find(({ kind }) => kind === "human.decided"),
+    {
+      answererKind: "human",
+      delegated: false,
+    },
+  );
   const recordedReview = events.find(
     (event) => event.kind === "review.submitted",
   );
   assert.ok(recordedReview);
   assert.equal(audit.read(recordedReview.run).at(-1)?.role, "Reviewer");
   await assert.rejects(flow.integrate(), /already been attempted/);
+});
+
+test("integration reads legacy decisions without answerer metadata", async (t) => {
+  const { flow, journal, git } = await fixture(t);
+  const { base, candidate, digest } = await flow.prepare();
+  const events = await journal.read();
+  await journal.append(events.length, {
+    kind: "human.decided",
+    base,
+    candidate,
+    digest,
+    decision: "approve",
+  });
+  assert.equal(await flow.integrate(), "completed");
+  assert.equal(await git.head(), candidate);
 });
 
 test("single-file review refuses a multi-file candidate from the Git adapter", async (t) => {

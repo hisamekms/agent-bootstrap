@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -30,7 +31,10 @@ import {
   type TaskContent,
 } from "../src/local-orchestrator/model.ts";
 import { ActorRunner } from "../src/local-orchestrator/runner.ts";
-import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
+import {
+  OrchestratorStore,
+  OrchestratorStoreError,
+} from "../src/local-orchestrator/store.ts";
 import {
   createTaskExecutor,
   type TaskExecutor,
@@ -561,20 +565,29 @@ function goalBaseFixture(recordBase = true, policies?: PolicySet) {
     args: string[],
     isTTY = true,
     prompt: (question: string) => string = () => phrase,
+    dbOnly?: string,
   ) {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const questions: string[] = [];
-    const code = await runCli(["--db", filename, "--repo", repoRoot, ...args], {
-      stdin: new PassThrough(),
-      stdout: { write: (text) => stdout.push(text) },
-      stderr: { write: (text) => stderr.push(text) },
-      isTTY,
-      prompt(question) {
-        questions.push(question);
-        return prompt(question);
+    const code = await runCli(
+      [
+        "--db",
+        dbOnly ?? filename,
+        ...(dbOnly === undefined ? ["--repo", repoRoot] : []),
+        ...args,
+      ],
+      {
+        stdin: new PassThrough(),
+        stdout: { write: (text) => stdout.push(text) },
+        stderr: { write: (text) => stderr.push(text) },
+        isTTY,
+        prompt(question) {
+          questions.push(question);
+          return prompt(question);
+        },
       },
-    });
+    );
     return { code, stdout, stderr, questions };
   }
   return {
@@ -1685,6 +1698,7 @@ test("approval keeps usage when a human answers while the Reviewer runs", async 
 function stage3Fixture(
   policies?: PolicySet,
   verification?: "pass" | "deny-integration",
+  runnerOverrides?: Parameters<typeof runner>[1],
 ) {
   const f = goalBaseFixture(true, policies);
   const taskId = task(f.goalId);
@@ -1751,7 +1765,7 @@ function stage3Fixture(
     join(f.directory, "integrations", taskId),
     taskId,
   );
-  const work = runner(executor);
+  const work = runner(executor, runnerOverrides);
   return {
     ...f,
     taskId,
@@ -1803,6 +1817,8 @@ test("integrates a verified approval and uses its committed head for a dependent
     ({ kind }) => kind === "human.decided",
   );
   assert.ok(decision?.kind === "human.decided");
+  assert.equal(decision.answererKind, "human");
+  assert.equal(decision.delegated, false);
   assert.equal(
     decision.approvalId,
     (approval.data as { approvalId: string }).approvalId,
@@ -1827,6 +1843,74 @@ test("integration verification denial fails the Task before moving the branch", 
     status: "failed",
     code: "verification",
   });
+});
+
+test("a deterministic M5 decision failure leaves the Goal schedulable", async () => {
+  const f = stage3Fixture();
+  const proposal = await f.proposal();
+  const dependent = task(f.goalId);
+  const events = await f.journal.read();
+  await f.journal.append(events.length, { kind: "denied", reason: "evidence" });
+  approve(proposal);
+  await f.work.drain();
+  assert.deepEqual(failure(f.taskId), {
+    status: "failed",
+    code: "integration-evidence",
+  });
+  assert.equal(f.head(), f.base);
+  assert.equal(store.getTask(dependent)?.status, "awaiting-integration");
+  assert.equal((await f.journal.read()).at(-1)?.kind, "denied");
+});
+
+test("runner skips raced integrations and processes another Goal in the same drain", async () => {
+  const codes = [
+    "invalid-transition",
+    "goal-inactive",
+    "integration-uncertain",
+  ] as const;
+  for (let i = 0; i <= codes.length; i++) task(goal());
+  const { executor } = fixture();
+  await runner(executor).drain();
+  const proposals = store.pendingIntegrations();
+  assert.equal(proposals.length, codes.length + 1);
+  for (const proposal of proposals) approve(proposal);
+  const calls: string[] = [];
+  await runner({
+    ...executor,
+    async integrate(id) {
+      calls.push(id);
+      const index = proposals.findIndex((proposal) => proposal.id === id);
+      const code = codes[index];
+      if (code) throw new OrchestratorStoreError(code);
+      store.rejectApprovedIntegration(id, "integration-evidence");
+    },
+  }).drain();
+  assert.deepEqual(
+    calls,
+    proposals.map(({ id }) => id),
+  );
+});
+
+test("a verified agent approval records the agent answer in M5", async () => {
+  const f = stage3Fixture({ integration: "agent" }, "pass", {
+    async runReviewer(_plan, id) {
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(
+          JSON.stringify({
+            result: '{"decision":"approve","reasons":[]}',
+          }),
+        ),
+      };
+    },
+  });
+  await f.work.drain();
+  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+  assert.partialDeepStrictEqual(
+    (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
+    { answererKind: "agent", delegated: false },
+  );
 });
 
 test("a legacy unverified proposal can be approved and integrated without a rewrite", async () => {
@@ -1890,6 +1974,10 @@ test("unverified integration refuses an agent answer and accepts a delegated hum
   assert.equal(f.verifications(), 0);
   assert.equal(f.head(), proposal.content.candidate);
   assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+  assert.partialDeepStrictEqual(
+    (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
+    { answererKind: "human", delegated: true },
+  );
 });
 
 for (const mismatch of [
@@ -2061,4 +2149,50 @@ test("export creates and fast-forwards only the local Goal ref and refuses diver
   const checkedOut = await exportAt(proposal.content.candidate);
   assert.equal(checkedOut.code, 1);
   assert.match(checkedOut.stderr.join(""), /branch-checked-out/);
+});
+
+test("export refuses an unaudited private head before and after confirmation", async () => {
+  const f = stage3Fixture();
+  const proposal = await f.proposal();
+  approve(proposal);
+  await f.work.drain();
+  const head = proposal.content.candidate;
+  const args = ["export-goal-branch", f.goalId];
+  const setHead = (to: string) => f.bareGit(["update-ref", f.ref, to]);
+  const reply = () => `export-goal-branch ${f.goalId} ${head.slice(0, 12)}`;
+  const unusedDb = join(root, "unused-export.db");
+  const missingRepo = await f.cli(
+    [...args, "--repo", f.repoRoot],
+    true,
+    reply,
+    unusedDb,
+  );
+  assert.equal(missingRepo.code, 1);
+  assert.match(
+    missingRepo.stderr.join(""),
+    /custom --db, pass --repo for the launcher checkout/,
+  );
+  assert.deepEqual(missingRepo.questions, []);
+  assert.equal(existsSync(unusedDb), false);
+
+  setHead(f.base);
+  const preview = await f.cli(args, true, reply);
+  assert.equal(preview.code, 1);
+  assert.match(preview.stderr.join(""), /export-head-mismatch/);
+  assert.deepEqual(preview.questions, []);
+
+  setHead(head);
+  const apply = await f.cli(args, true, () => {
+    setHead(f.base);
+    return reply();
+  });
+  assert.equal(apply.code, 1);
+  assert.match(apply.stderr.join(""), /export-head-mismatch/);
+  assert.equal(apply.questions.length, 1);
+  assert.equal(f.git(["for-each-ref", f.ref]), "");
+  assert.ok(
+    store
+      .listEvents({ subjectId: f.goalId, limit: 50 })
+      .every(({ kind }) => !kind.startsWith("goal.export")),
+  );
 });

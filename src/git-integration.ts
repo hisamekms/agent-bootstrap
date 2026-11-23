@@ -29,6 +29,7 @@ export type GitIntegrationCode =
   | "output-limit"
   | "unsupported-entry"
   | "cleanup-failed"
+  | "export-head-mismatch"
   | "branch-checked-out"
   | "non-fast-forward";
 
@@ -957,13 +958,25 @@ export class LocalGitIntegration {
   }
 
   /** Fetch a pinned Goal head and CAS only its corresponding local branch. */
-  async previewGoalExport(checkout: string) {
+  async previewGoalExport(checkout: string, to: string | null) {
     if (
       !/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch) ||
       !isAbsolute(checkout)
     )
       throw new GitIntegrationError("invalid-input");
-    const to = await this.head();
+    if (to === null) throw new GitIntegrationError("export-head-mismatch");
+    const requireSourceHead = async () => {
+      const head = await this.head().catch((error: unknown) => {
+        if (
+          error instanceof GitIntegrationError &&
+          error.code === "invalid-object"
+        )
+          return null;
+        throw error;
+      });
+      if (head !== to) throw new GitIntegrationError("export-head-mismatch");
+    };
+    await requireSourceHead();
     const [inside, format] = await Promise.all([
       this.#git(["rev-parse", "--is-inside-work-tree"], checkout),
       this.#git(["rev-parse", "--show-object-format"], checkout),
@@ -1000,12 +1013,11 @@ export class LocalGitIntegration {
       from,
       to,
       branch: this.#config.branch,
-      apply: async () => {
-        if (
-          (await this.head()) !== to ||
-          (await this.#reference(this.#ref, checkout)) !== from
-        )
+      apply: async (authorize: () => void) => {
+        await requireSourceHead();
+        if ((await this.#reference(this.#ref, checkout)) !== from)
           throw new GitIntegrationError("stale-base");
+        authorize();
         await this.#run(
           [
             "-c",
@@ -1031,8 +1043,7 @@ export class LocalGitIntegration {
             timeout: 120_000,
           },
         );
-        if ((await this.head()) !== to)
-          throw new GitIntegrationError("stale-base");
+        await requireSourceHead();
         await this.#compareAndSwap(this.#ref, to, from, checkout);
       },
     };

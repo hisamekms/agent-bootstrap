@@ -92,6 +92,7 @@ type ErrorCode =
   | "goal-base-stale"
   | "goal-base-record-failed"
   | "goal-export-record-failed"
+  | "export-head-mismatch"
   | "task-constraints"
   | "context-mismatch"
   | "session-busy"
@@ -1228,7 +1229,7 @@ export class OrchestratorStore {
     });
   }
 
-  nextApprovedIntegration() {
+  nextApprovedIntegration(excluded?: ReadonlySet<string>) {
     return this.#read(() => {
       const rows = this.#db
         .query<{ id: string; goalId: string; taskId: string }>(
@@ -1242,6 +1243,7 @@ export class OrchestratorStore {
         .all();
       return rows.find(
         ({ goalId, taskId, id }) =>
+          !excluded?.has(id) &&
           this.#latestIntegrationProposalId(taskId) === id &&
           !this.#goalIntegrationInProgress(goalId),
       )?.id;
@@ -1390,11 +1392,15 @@ export class OrchestratorStore {
     completed: boolean,
   ) {
     this.#write((at) => {
-      if (!this.#goal(goalId)) throw new OrchestratorStoreError("not-found");
+      const goal = required(this.#goal(goalId));
       if (!this.#ownsGoalBranch(goalId) || branch !== goalBranch(goalId))
         throw new OrchestratorStoreError("context-mismatch");
-      if (!completed && this.#goalIntegrationInProgress(goalId))
-        throw new OrchestratorStoreError("integration-uncertain");
+      if (!completed) {
+        if (this.#goalIntegrationInProgress(goalId))
+          throw new OrchestratorStoreError("integration-uncertain");
+        if ((this.goalIntegrationHead(goalId) ?? goal.baseCommit) !== to)
+          throw new OrchestratorStoreError("export-head-mismatch");
+      }
       this.#event(
         at,
         completed ? "goal.exported" : "goal.export-authorized",
