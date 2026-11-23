@@ -47,6 +47,7 @@ export interface HostApiOptions {
   readonly sessionId: string;
   readonly requester: ExecutionRequester;
   readonly maxLineBytes?: number;
+  readonly onTaskRegistered?: () => void;
 }
 
 function schema(
@@ -124,9 +125,21 @@ function isTool(value: unknown): value is Tool {
 
 function readExecution(store: OrchestratorStore, id: string) {
   const execution = store.getExecution(id);
-  return (
-    execution && { id, status: execution.status, result: execution.result }
-  );
+  if (!execution) return null;
+  const { status, result } = execution;
+  if (
+    result &&
+    typeof result === "object" &&
+    Object.hasOwn(result, "rawAnswer")
+  ) {
+    // Raw reviewer diagnostics are for the operator CLI.
+    const { rawAnswer: _rawAnswer, ...visible } = result as Record<
+      string,
+      unknown
+    >;
+    return { id, status, result: visible };
+  }
+  return { id, status, result };
 }
 
 async function waitForExecution(
@@ -173,11 +186,16 @@ function prepareTool(
         ? { status: oneOf(input.status, proposalStatuses) }
         : {};
       return () =>
-        store.listProposals(filter).map(({ id, kind, content, status }) => ({
-          id,
-          kind,
-          title: content.title,
-          status,
+        store.listProposals(filter).map((proposal) => ({
+          id: proposal.id,
+          kind: proposal.kind,
+          status: proposal.status,
+          ...(proposal.kind === "integration"
+            ? {
+                goalId: proposal.content.goalId,
+                taskId: proposal.content.taskId,
+              }
+            : { title: proposal.content.title }),
         }));
     }
     case "get_proposal": {
@@ -195,7 +213,21 @@ function prepareTool(
       const id = identifier(input.id);
       return () => {
         const goal = store.getGoal(id);
-        return goal && { ...goal, tasks: store.listTasks(id) };
+        return (
+          goal && {
+            ...goal,
+            tasks: store.listTasks(id).map((task) => {
+              const usage = store.taskUsage(task.id);
+              return {
+                ...task,
+                ...usage,
+                budgetTokens: usage.tokens,
+                totalTokens: store.taskTokens(task.id),
+              };
+            }),
+            pendingIntegrations: store.pendingIntegrations(id),
+          }
+        );
       };
     }
     case "get_execution": {
@@ -226,7 +258,7 @@ function prepareTool(
               ...receipt,
               message: "The operator approves this proposal with the host CLI.",
             }
-          : { ...receipt, gate: null, policy: null };
+          : receipt;
       };
     }
     case "request_planner": {
@@ -325,6 +357,7 @@ async function callTool(
   let outcome: "ok" | "denied" | "error" =
     code === "audit-unavailable" ? "error" : "denied";
   let result: string | undefined;
+  let taskRegistered = false;
   let executionId: string | undefined;
   if (run) {
     try {
@@ -348,6 +381,8 @@ async function callTool(
         outcome = "error";
       } else {
         if (isObject(value)) {
+          if (tool === "draft_task")
+            taskRegistered = value.status === "registered";
           if (tool === "request_planner")
             executionId = identifier(value.executionId);
           if (tool === "get_execution" || tool === "wait_execution")
@@ -375,6 +410,7 @@ async function callTool(
   } catch {
     return toolError("audit-unavailable");
   }
+  if (taskRegistered) options.onTaskRegistered?.();
   return result === undefined ? toolError(code) : toolResult(result);
 }
 

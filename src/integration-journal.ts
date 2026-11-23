@@ -35,6 +35,7 @@ const eventFields = {
   "candidate.authorized": ["run", "digest"],
   "candidate.created": ["candidate", "digest"],
   "candidate.failed": ["cleanup"],
+  "candidate.rejected": ["digest", "notes"],
   "review.authorized": ["base", "candidate", "digest"],
   "review.noted": ["run", "notes"],
   "review.submitted": ["run", "digest", "review"],
@@ -67,6 +68,10 @@ type EventDetails = {
   "human.decided": {
     /** Digest of the sorted protected paths the operator acknowledged. */
     readonly protectedDigest?: string;
+    /** Joins the host decision to its authenticated approval record. */
+    readonly approvalId?: string;
+    readonly answererKind?: "human" | "agent";
+    readonly delegated?: boolean;
   };
 };
 type Event = {
@@ -107,11 +112,30 @@ function decode(value: unknown): IntegrationEvent {
     kind === "candidate.created" && Object.hasOwn(data, "messageDigest");
   const hasProtectedDigest =
     kind === "human.decided" && Object.hasOwn(data, "protectedDigest");
+  const hasApprovalId =
+    kind === "human.decided" && Object.hasOwn(data, "approvalId");
+  const hasAnswererKind =
+    kind === "human.decided" && Object.hasOwn(data, "answererKind");
+  const hasDelegated =
+    kind === "human.decided" && Object.hasOwn(data, "delegated");
+  if (
+    (hasApprovalId &&
+      (typeof data.approvalId !== "string" ||
+        !uuidPattern.test(data.approvalId))) ||
+    (hasAnswererKind &&
+      data.answererKind !== "human" &&
+      data.answererKind !== "agent") ||
+    (hasDelegated && typeof data.delegated !== "boolean")
+  )
+    throw new Error("Invalid integration event fields");
   const optional = [
     hasTests,
     hasProtectedCount,
     hasMessageDigest,
     hasProtectedDigest,
+    hasApprovalId,
+    hasAnswererKind,
+    hasDelegated,
   ].filter(Boolean).length;
   if (
     hasProtectedCount &&
@@ -156,7 +180,7 @@ function decode(value: unknown): IntegrationEvent {
 
 // The first candidate and integration take up to 13 events; each revision
 // adds up to 6.
-const eventLimit = 13 + 6 * MAX_REVISIONS;
+const eventLimit = 15 + 8 * MAX_REVISIONS;
 
 export class IntegrationJournal {
   readonly #journal: PrivateJournal<IntegrationEvent>;

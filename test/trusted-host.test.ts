@@ -112,8 +112,8 @@ test("only Worker delivers the bounded stderr tail to an opt-in host callback", 
   const audit = new SqliteAudit(fixture(t));
   t.after(() => audit.close());
   const { calls, runtime } = adapter("");
-  const tail = Buffer.from("x".repeat(4076) + "private fixture data");
-  assert.equal(tail.length, 4096);
+  const tail = Buffer.from("x".repeat(66 * 1024 - 20) + "private fixture data");
+  assert.equal(tail.length, 66 * 1024);
   const stderr = Buffer.concat([Buffer.from("discarded prefix"), tail]);
   runtime.exec = async () => {
     calls.push("exec");

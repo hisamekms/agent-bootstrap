@@ -196,12 +196,34 @@ test("approval binds one candidate, the target and the verifier, and applies onc
   assert.deepEqual(calls, ["worker", "reviewer", "verify"]);
   const events = await journal.read();
   assert.equal(events.at(-1)?.kind, "integration.completed");
+  assert.partialDeepStrictEqual(
+    events.find(({ kind }) => kind === "human.decided"),
+    {
+      answererKind: "human",
+      delegated: false,
+    },
+  );
   const recordedReview = events.find(
     (event) => event.kind === "review.submitted",
   );
   assert.ok(recordedReview);
   assert.equal(audit.read(recordedReview.run).at(-1)?.role, "Reviewer");
   await assert.rejects(flow.integrate(), /already been attempted/);
+});
+
+test("integration reads legacy decisions without answerer metadata", async (t) => {
+  const { flow, journal, git } = await fixture(t);
+  const { base, candidate, digest } = await flow.prepare();
+  const events = await journal.read();
+  await journal.append(events.length, {
+    kind: "human.decided",
+    base,
+    candidate,
+    digest,
+    decision: "approve",
+  });
+  assert.equal(await flow.integrate(), "completed");
+  assert.equal(await git.head(), candidate);
 });
 
 test("single-file review refuses a multi-file candidate from the Git adapter", async (t) => {
@@ -300,4 +322,31 @@ test("a failed authorization write prevents the integration ref update", async (
   await assert.rejects(failing.integrate(), /Fixture audit write failed/);
   assert.equal(await git.head(), pin.base);
   assert.equal((await journal.read()).at(-1)?.kind, "verification.finished");
+  const before = await journal.read();
+  await assert.rejects(
+    flow.reviewCandidate(),
+    /review has already been attempted/,
+  );
+  await assert.rejects(
+    flow.integrate(),
+    /Integration has already been attempted/,
+  );
+  assert.deepEqual(await journal.read(), before);
+});
+
+test("verification must be configured unless the caller explicitly opts out", async (t) => {
+  const { git, host, journal, plan } = await fixture(t);
+  const { verification: _verification, ...unverified } = plan;
+  assert.throws(
+    () => new ReviewedIntegration(git, host, journal, unverified),
+    /Verification is required/,
+  );
+  const flow = new ReviewedIntegration(git, host, journal, {
+    ...unverified,
+    allowUnverified: true,
+  });
+  const pin = await flow.prepare();
+  await flow.decide(pin, "approve");
+  await assert.rejects(flow.integrate(), /Verification is not configured/);
+  assert.equal(await git.head(), pin.base);
 });

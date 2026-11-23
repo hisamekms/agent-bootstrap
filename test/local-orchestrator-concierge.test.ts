@@ -62,6 +62,8 @@ async function fixture<T>(
   }
 }
 
+const snapshotCommit = "a".repeat(40);
+
 const failures = [
   "start",
   "snapshot",
@@ -118,7 +120,11 @@ for (const failure of [undefined, ...failures]) {
               await rm(snapshotDir, { recursive: true });
               await writeFile(snapshotDir, "not a directory");
             }
-            return { dir: snapshotDir, files: ["AGENTS.md"] };
+            return {
+              dir: snapshotDir,
+              commit: snapshotCommit,
+              files: ["AGENTS.md"],
+            };
           },
           async listen(options) {
             assert.equal(options.sessionId, sessionId);
@@ -199,14 +205,25 @@ for (const failure of [undefined, ...failures]) {
             store.isActiveConciergeSession(sessionId),
             failure === "end",
           );
+          const events = store.listEvents({ subjectId: sessionId, limit: 3 });
+          const snapshotted = failure !== "snapshot";
           assert.deepEqual(
-            store
-              .listEvents({ subjectId: sessionId, limit: 2 })
-              .map(({ kind }) => kind),
-            failure === "end"
-              ? ["session.started"]
-              : ["session.ended", "session.started"],
+            events.map(({ kind }) => kind),
+            [
+              ...(failure === "end" ? [] : ["session.ended"]),
+              ...(snapshotted ? ["session.snapshot"] : []),
+              "session.started",
+            ],
           );
+          assert.equal(
+            store.sessionSnapshotCommit(sessionId),
+            snapshotted ? snapshotCommit : null,
+          );
+          if (snapshotted)
+            assert.deepEqual(
+              events.find(({ kind }) => kind === "session.snapshot")?.data,
+              { snapshotCommit },
+            );
         }
         for (const dir of [snapshotDir, socketDir])
           if (dir) await assert.rejects(lstat(dir), { code: "ENOENT" });
@@ -246,6 +263,7 @@ test("Concierge drains a single active Planner and cancels queued work on exit",
         install,
         snapshot: async () => ({
           dir: await mkdtemp(join(repoRoot, "snapshot-")),
+          commit: snapshotCommit,
           files: [],
         }),
         async listen(options) {
@@ -322,6 +340,7 @@ test("Concierge refuses further Planner work after a failed execution audit writ
       install,
       snapshot: async () => ({
         dir: await mkdtemp(join(repoRoot, "snapshot-")),
+        commit: snapshotCommit,
         files: [],
       }),
       async listen(options) {
@@ -421,7 +440,7 @@ test("Concierge guest command admits only validated options and uses a fixed rel
   assert.match(conciergeVolumeName("/repo/one"), /^lo-concierge-[0-9a-f]{16}$/);
 });
 
-test("snapshot uses committed HEAD, skips .local, and keeps directories private", async () => {
+test("snapshot uses committed local main, skips .local, and keeps directories private", async () => {
   await fixture(async (repoRoot) => {
     const git = (...args: string[]) =>
       execFileSync("/usr/bin/git", args, {
@@ -431,9 +450,10 @@ test("snapshot uses committed HEAD, skips .local, and keeps directories private"
           GIT_CONFIG_NOSYSTEM: "1",
           GIT_CONFIG_GLOBAL: "/dev/null",
         },
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
       });
-    git("init");
+    git("init", "--initial-branch=main");
     await mkdir(join(repoRoot, ".local"));
     await mkdir(join(repoRoot, "docs/local-orchestrator"), { recursive: true });
     await writeFile(
@@ -467,6 +487,21 @@ test("snapshot uses committed HEAD, skips .local, and keeps directories private"
       "-m",
       "fixture",
     );
+    git("checkout", "-b", "feature");
+    await writeFile(
+      join(repoRoot, "docs/local-orchestrator/feature.md"),
+      "feature",
+    );
+    git("add", "docs/local-orchestrator/feature.md");
+    git(
+      "-c",
+      "user.name=Fixture",
+      "-c",
+      "user.email=fixture@example.invalid",
+      "commit",
+      "-m",
+      "feature only",
+    );
     git("config", "filter.fixture.smudge", "printf filtered");
     git("config", "filter.fixture.required", "true");
     await writeFile(join(repoRoot, "AGENTS.md"), "worktree version");
@@ -490,6 +525,8 @@ test("snapshot uses committed HEAD, skips .local, and keeps directories private"
       ["files.txt", "AGENTS.md", "docs/local-orchestrator/stage1.md"],
     );
     assert.ok(!snapshot.files.includes(".local/secret"));
+    assert.ok(!snapshot.files.includes("docs/local-orchestrator/feature.md"));
+    assert.equal(snapshot.commit, git("rev-parse", "refs/heads/main").trim());
   });
 });
 

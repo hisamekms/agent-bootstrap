@@ -112,7 +112,12 @@ test("the JSON result is parsed defensively", () => {
         result: "FIXTURE-OK",
         is_error: false,
         total_cost_usd: 0.00006,
-        usage: { input_tokens: 5, output_tokens: 2 },
+        usage: {
+          input_tokens: 5,
+          output_tokens: 2,
+          cache_read_input_tokens: 3,
+          cache_creation_input_tokens: 4,
+        },
       }),
     ),
   );
@@ -122,6 +127,8 @@ test("the JSON result is parsed defensively", () => {
     costUsd: 0.00006,
     inputTokens: 5,
     outputTokens: 2,
+    cacheReadInputTokens: 3,
+    cacheCreationInputTokens: 4,
   });
   assert.equal(parseClaudeCodeResult(Buffer.from("not json")), null);
   assert.equal(parseClaudeCodeResult(Buffer.from("{}")), null);

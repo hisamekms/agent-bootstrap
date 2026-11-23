@@ -217,14 +217,7 @@ describe("orchestrator contracts", () => {
     });
     assert.deepEqual(fitsScope(approved, outside, 2), {
       ok: false,
-      reasons: [
-        "profile",
-        "actor",
-        "maxExecutionMs",
-        "maxRetries",
-        "maxTokens",
-        "maxTasks",
-      ],
+      reasons: ["profile", "actor", "maxExecutionMs", "maxRetries", "maxTasks"],
     });
   });
 

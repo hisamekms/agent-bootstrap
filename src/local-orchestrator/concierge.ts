@@ -14,9 +14,10 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { claudeRoleHarness } from "../actors.ts";
+import { claudeRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
+  CLAUDE_CODE_BUILDS,
   claudeCodeGuestSetup,
   claudeCodeProvider,
   claudeCodeTools,
@@ -31,8 +32,11 @@ import {
 } from "../sandbox-runtime.ts";
 import type { TrustedHost } from "../trusted-host.ts";
 import { HostApiServer } from "./host-api.ts";
+import { gitCommit } from "./model.ts";
 import { ActorRunner } from "./runner.ts";
 import type { OrchestratorStore } from "./store.ts";
+import { createTaskExecutor, localMainCommit } from "./tasks.ts";
+import type { Verification } from "../reviewed-integration.ts";
 
 /** macOS limits Unix socket paths to 104 bytes; /private/tmp keeps the Host API
  * socket short there. Other hosts use the OS temporary directory. */
@@ -56,13 +60,15 @@ const gitEnv = {
 
 export interface ConciergeSnapshot {
   readonly dir: string;
+  readonly commit: string;
   readonly files: readonly string[];
 }
 
 type ConciergeHost = Pick<
   TrustedHost,
   "runConcierge" | "runPlanner" | "runReviewer" | "prepareConciergeVolume"
->;
+> &
+  Partial<Pick<TrustedHost, "runWorker" | "runVerification">>;
 
 export interface ConciergeDeps {
   readonly host: ConciergeHost;
@@ -70,9 +76,12 @@ export interface ConciergeDeps {
   readonly snapshot: (
     repoRoot: string,
     sessionId: string,
+    commit?: string,
+    goalRepository?: boolean,
   ) => Promise<ConciergeSnapshot>;
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
+  readonly verification?: Verification;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
   ) => Promise<Pick<HostApiServer, "close">>;
@@ -183,10 +192,12 @@ async function privateSubdirectories(dir: string): Promise<void> {
   }
 }
 
-/** Export one pinned HEAD tree without reading worktree files or downloading objects. */
+/** Export a pinned local main tree without reading worktree files or downloading objects. */
 export async function snapshotConciergeRepo(
   repoRoot: string,
   sessionId: string,
+  commit?: string,
+  goalRepository = false,
 ): Promise<ConciergeSnapshot> {
   if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error("Invalid session ID");
   const root = await prepareConciergeDirectory(repoRoot);
@@ -199,21 +210,17 @@ export async function snapshotConciergeRepo(
     await chmod(dir, 0o700);
     const git = "/usr/bin/git";
     const cwd = resolve(repoRoot);
-    const { stdout } = await runFile(git, ["rev-parse", "--verify", "HEAD"], {
-      cwd,
-      env: gitEnv,
-      timeout: 15_000,
-      maxBuffer: 1024,
-    });
-    const head = stdout.trim();
-    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head))
-      throw new Error("Invalid repository HEAD");
-    const { stdout: objectPath } = await runFile(
-      git,
-      ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
-      { cwd, env: gitEnv, timeout: 15_000, maxBuffer: 8192 },
-    );
-    const objects = objectPath.replace(/\n$/, "");
+    const base =
+      commit === undefined ? await localMainCommit(cwd) : gitCommit(commit);
+    const objects = goalRepository
+      ? join(root, "repository.git", "objects")
+      : (
+          await runFile(
+            git,
+            ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+            { cwd, env: gitEnv, timeout: 15_000, maxBuffer: 8192 },
+          )
+        ).stdout.replace(/\n$/, "");
     if (!isAbsolute(objects) || objects.includes("\n"))
       throw new Error("Invalid Git object directory");
 
@@ -227,7 +234,7 @@ export async function snapshotConciergeRepo(
           "init",
           "--bare",
           "--template=",
-          head.length === 64
+          base.length === 64
             ? "--object-format=sha256"
             : "--object-format=sha1",
         ],
@@ -239,7 +246,7 @@ export async function snapshotConciergeRepo(
         [
           "archive",
           "--format=tar",
-          head,
+          base,
           "--",
           ".",
           ":(exclude,icase,top).local",
@@ -273,7 +280,7 @@ export async function snapshotConciergeRepo(
       await privateSubdirectories(dir);
       const { stdout: listing } = await runFile(
         git,
-        ["ls-tree", "-r", "-z", "--name-only", head],
+        ["ls-tree", "-r", "-z", "--name-only", base],
         {
           cwd: metadata,
           env,
@@ -283,6 +290,7 @@ export async function snapshotConciergeRepo(
       );
       return {
         dir,
+        commit: base,
         files: listing
           .split("\0")
           .filter((path) => path && !/^\.local(?:\/|$)/i.test(path)),
@@ -324,7 +332,7 @@ function missing(error: NodeJS.ErrnoException) {
 
 /** Provisional Planner context, leaving room for the runner's request.json. */
 export async function conciergeContext(
-  snapshot: ConciergeSnapshot,
+  snapshot: Pick<ConciergeSnapshot, "dir" | "files">,
 ): Promise<SandboxFile[]> {
   const { fileBytes, files, workspaceBytes } = MICROSANDBOX_LIMITS;
   const listing: string[] = [];
@@ -409,12 +417,13 @@ export async function startConcierge(
   const stateVolume = conciergeVolumeName(options.repoRoot);
 
   const invocationId = randomUUID();
-  const { id: sessionId } = store.startSession("Concierge", invocationId);
+  const { id: sessionId } = store.startSession("Concierge", invocationId, true);
   let snapshotDir: string | undefined;
   let socketDir: string | undefined;
   let server: Pick<HostApiServer, "close"> | undefined;
   let drain: Promise<void> | undefined;
   let drainFailed = false;
+  let scheduler: ReturnType<typeof setInterval> | undefined;
   let stopping = false;
   let failed = false;
   let outcome: Awaited<ReturnType<ConciergeHost["runConcierge"]>>["outcome"];
@@ -430,11 +439,54 @@ export async function startConcierge(
     options.onSession?.(sessionId);
     const snapshot = await deps.snapshot(options.repoRoot, sessionId);
     snapshotDir = snapshot.dir;
+    store.recordSessionSnapshot(sessionId, snapshot.commit);
     const context = await conciergeContext(snapshot);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
+    const tasks =
+      host.runWorker && host.runVerification
+        ? createTaskExecutor({
+            directory: await prepareConciergeDirectory(options.repoRoot),
+            repoRoot: options.repoRoot,
+            store,
+            snapshotCommit: snapshot.commit,
+            host: {
+              runWorker: host.runWorker.bind(host),
+              runReviewer: host.runReviewer.bind(host),
+              runVerification: host.runVerification.bind(host),
+            },
+            worker(profile) {
+              const guest = guestOf(profile);
+              const workerInstall =
+                guest === "alpine"
+                  ? install
+                  : {
+                      ...install,
+                      binary: join(
+                        options.repoRoot,
+                        ".local",
+                        "claude-code",
+                        CLAUDE_CODE.version,
+                        CLAUDE_CODE_BUILDS.debian.platform,
+                        "claude",
+                      ),
+                    };
+              return claudeRoleHarness({
+                auth,
+                model: options.model,
+                profile,
+                reportWorkerUsage: true,
+                tools: claudeCodeTools(workerInstall, guest),
+              });
+            },
+            reviewer: harness,
+            ...(deps.verification ? { verification: deps.verification } : {}),
+          })
+        : undefined;
+
     const runner = new ActorRunner({
       store,
+      ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
       runPlanner: (...args) => {
         if (stopping) throw new Error("Concierge session ended");
         return host.runPlanner(...args);
@@ -442,10 +494,26 @@ export async function startConcierge(
       runReviewer: (...args) => host.runReviewer(...args),
       harness,
       model: options.model,
-      context: async () => context,
+      context: async (commit, goalRepository) => {
+        if (commit === null || commit === snapshot.commit) return context;
+        const pinned = await deps.snapshot(
+          options.repoRoot,
+          randomUUID(),
+          commit,
+          goalRepository,
+        );
+        try {
+          if (pinned.commit !== commit)
+            throw new Error("Planner snapshot mismatch");
+          return await conciergeContext(pinned);
+        } finally {
+          await rm(pinned.dir, { recursive: true, force: true });
+        }
+      },
     });
     let drainRequested = false;
     const scheduleDrain = () => {
+      if (stopping || drainFailed) return;
       drainRequested = true;
       if (drain) return;
       drainRequested = false;
@@ -465,6 +533,7 @@ export async function startConcierge(
       store,
       socketPath: socket,
       sessionId,
+      ...(tasks ? { onTaskRegistered: scheduleDrain } : {}),
       requester: {
         async requestPlanner(input) {
           if (stopping) throw new Error("Concierge session ended");
@@ -480,6 +549,12 @@ export async function startConcierge(
       },
     });
     await host.prepareConciergeVolume(stateVolume);
+    if (tasks) {
+      scheduleDrain();
+      // Operator decisions can arrive from another process via state.db.
+      scheduler = setInterval(scheduleDrain, 1000);
+      scheduler.unref();
+    }
     ({ outcome } = await host.runConcierge(
       {
         sandbox: {
@@ -511,6 +586,7 @@ export async function startConcierge(
     throw error;
   } finally {
     stopping = true;
+    clearInterval(scheduler);
     const cleanup = async (code: string, effect: () => unknown) => {
       try {
         await effect();

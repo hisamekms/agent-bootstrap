@@ -180,6 +180,8 @@ export interface ClaudeCodeTask {
   readonly baseUrl?: string;
   /** Opt-in Bash for the Worker only. Pre-approved through `--allowedTools`. */
   readonly shell?: boolean;
+  /** Emit a bounded result envelope to the host's existing Worker stderr hook. */
+  readonly reportWorkerUsage?: boolean;
 }
 
 /** Verify the staged CLI and packages, install offline, and check the placeholder. */
@@ -205,6 +207,8 @@ ${bashSetup}    command -v bash >/dev/null
     test "$${variable}" = '$MSB_${variable}'
 `;
 }
+
+export const CLAUDE_WORKER_USAGE_MARKER = "agent-bootstrap-claude-result ";
 
 /**
  * A guest command running the pinned CLI headlessly. Every flag is a constant
@@ -262,10 +266,17 @@ export function claudeCodeCommand(
       ? `test "$(wc -c < /review/control.json)" -le 65536
     prompt=$(cat /review/control.json)`
       : `prompt="$1"`;
-  const output =
-    task.role === "Worker"
-      ? `printf '%s' '{"tool":"collect"}'`
-      : "head -c 65536 /tmp/claude-out.json";
+  const worker = task.role === "Worker";
+  const usageOutput =
+    worker && task.reportWorkerUsage
+      ? `if test "$(wc -c < /tmp/claude-out.json)" -le 65536; then
+      printf '\n%s' '${CLAUDE_WORKER_USAGE_MARKER}' >&2
+      head -c 65537 /tmp/claude-out.json >&2
+    fi`
+      : "";
+  const output = worker
+    ? `printf '%s' '{"tool":"collect"}'`
+    : "head -c 65536 /tmp/claude-out.json";
   const script = `
 ${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pre-seeded CLI state: config and home are fresh.
     # One check per line: under sh -e, a failure inside an && list does not
@@ -278,6 +289,7 @@ ${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pr
     test -z "$(ls -A "$claude_config")"
     cd ${cwd}
     ${promptSetup}
+    claude_status=0
     env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
       ${credential.variable}="$${credential.variable}" \\
@@ -290,7 +302,9 @@ ${claudeCodeGuestSetup(credential.variable, guest)}    # No managed policy or pr
         --model '${task.model}' --max-turns ${task.maxTurns} \\
         --permission-mode ${tools.mode} \\
         ${toolFlags} \\
-        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/dev/null
+        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/dev/null || claude_status=$?
+    ${usageOutput}
+    if test "$claude_status" -ne 0; then exit "$claude_status"; fi
     ${output}
   `;
   return {
@@ -305,6 +319,19 @@ export interface ClaudeCodeResult {
   readonly costUsd: number | null;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
+  readonly cacheReadInputTokens: number | null;
+  readonly cacheCreationInputTokens: number | null;
+}
+
+export function parseClaudeWorkerResult(
+  bytes: Uint8Array,
+): ClaudeCodeResult | null {
+  const stderr = Buffer.from(bytes);
+  const marker = Buffer.from("\n" + CLAUDE_WORKER_USAGE_MARKER);
+  const start = stderr.lastIndexOf(marker);
+  return start < 0
+    ? null
+    : parseClaudeCodeResult(stderr.subarray(start + marker.length));
 }
 
 /** Parse the CLI's `--output-format json` result. Untrusted guest data. */
@@ -337,6 +364,8 @@ export function parseClaudeCodeResult(
           : null,
       inputTokens: count("input_tokens"),
       outputTokens: count("output_tokens"),
+      cacheReadInputTokens: count("cache_read_input_tokens"),
+      cacheCreationInputTokens: count("cache_creation_input_tokens"),
     };
   } catch {
     return null;

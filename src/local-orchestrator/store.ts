@@ -5,11 +5,14 @@ import {
   ACTOR_KINDS,
   GATES,
   ContractError,
+  allowsPath,
   canonicalJson,
   contentDigest,
   fields,
   fitsScope,
   freeze,
+  gitCommit,
+  goalBranch,
   identifier,
   integer,
   oneOf,
@@ -17,15 +20,23 @@ import {
   resolvePolicy,
   taskLimitReasons,
   validateGoalContent,
+  validateIntegrationContent,
   validatePolicies,
   validateTaskContent,
   type ActorKind,
   type Gate,
   type GoalContent,
+  type IntegrationContent,
   type PolicyLayers,
   type PolicySet,
   type TaskContent,
 } from "./model.ts";
+
+import {
+  compareTokenBudget,
+  emptyTokenUsage,
+  readTokenReport,
+} from "./token-usage.ts";
 
 export type Operator = { kind: "operator" };
 export type Origin =
@@ -73,15 +84,29 @@ type ErrorCode =
   | "not-found"
   | "stale-digest"
   | "invalid-transition"
+  | "task-retry-limit"
+  | "task-retry-changed"
   | "approval-forbidden"
   | "goal-inactive"
+  | "goal-base-ineligible"
+  | "goal-base-stale"
+  | "goal-base-record-failed"
+  | "goal-export-record-failed"
+  | "export-head-mismatch"
   | "task-constraints"
-  | "context-mismatch";
+  | "context-mismatch"
+  | "session-busy"
+  | "reconcile-changed"
+  | "integration-uncertain";
 
 export class OrchestratorStoreError extends Error {
   readonly code: ErrorCode;
   constructor(code: ErrorCode) {
-    super(`Local orchestrator store: ${code}`);
+    super(
+      code === "session-busy"
+        ? "Local orchestrator is busy. If the launcher stopped, use the operator CLI reconcile command."
+        : `Local orchestrator store: ${code}`,
+    );
     this.name = "OrchestratorStoreError";
     this.code = code;
   }
@@ -106,29 +131,39 @@ type Decision = "approve" | "reject";
 type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
 
 const applicationId = 0x4c4f5231;
+const schemaVersion = 4;
+export const MAX_TASK_RETRIES = 3;
+const proposalColumnsSql = `
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
+    content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'registered')),
+    created_at TEXT NOT NULL, decided_at TEXT
+  `;
+const taskColumnsSql = `
+    id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id),
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
+    content_json TEXT NOT NULL, digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'awaiting-integration', 'succeeded', 'failed', 'cancelled')),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0), created_at TEXT NOT NULL
+  `;
+const approvalRunColumnsSql = `
+    proposal_id TEXT NOT NULL REFERENCES proposals(id),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
+    PRIMARY KEY (proposal_id, execution_id)
+  `;
 const schema = `
   CREATE TABLE project_policy (
     id INTEGER PRIMARY KEY CHECK (id = 1), policies_json TEXT NOT NULL
   ) STRICT;
   INSERT INTO project_policy VALUES (1, '{"goal-registration":"human","task-registration":"human","integration":"human"}');
-  CREATE TABLE proposals (
-    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task')),
-    content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'registered')),
-    created_at TEXT NOT NULL, decided_at TEXT
-  ) STRICT;
+  CREATE TABLE proposals (${proposalColumnsSql}) STRICT;
   CREATE TABLE goals (
     id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
     content_json TEXT NOT NULL, digest TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'done', 'cancelled')), created_at TEXT NOT NULL
+    status TEXT NOT NULL CHECK (status IN ('active', 'done', 'cancelled')), created_at TEXT NOT NULL,
+    planning_commit TEXT, base_commit TEXT
   ) STRICT;
-  CREATE TABLE tasks (
-    id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id),
-    proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
-    content_json TEXT NOT NULL, digest TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'succeeded', 'failed', 'cancelled')),
-    attempts INTEGER NOT NULL CHECK (attempts >= 0), created_at TEXT NOT NULL
-  ) STRICT;
+  CREATE TABLE tasks (${taskColumnsSql}) STRICT;
   CREATE INDEX tasks_goal ON tasks(goal_id);
   CREATE TABLE approvals (
     id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
@@ -144,9 +179,11 @@ const schema = `
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'timed-out', 'cancelled')),
     result_json TEXT, started_at TEXT, finished_at TEXT
   ) STRICT;
+  CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
   CREATE TABLE actor_sessions (
     id TEXT PRIMARY KEY, actor TEXT NOT NULL, runtime_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT
+    status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT,
+    snapshot_commit TEXT
   ) STRICT;
   CREATE TABLE events (
     id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
@@ -225,7 +262,7 @@ function parseAnswerer(value: unknown): Answerer {
 
 type ProposalRow = {
   id: string;
-  kind: "goal" | "task";
+  kind: "goal" | "task" | "integration";
   contentJson: string;
   digest: string;
   sourceJson: string;
@@ -240,11 +277,22 @@ type RegisteredRow = {
   digest: string;
   createdAt: string;
 };
-type GoalRow = RegisteredRow & { status: "active" | "done" | "cancelled" };
+type GoalRow = RegisteredRow & {
+  status: "active" | "done" | "cancelled";
+  planningCommit: string | null;
+  baseCommit: string | null;
+};
 type TaskRow = RegisteredRow & {
   goalId: string;
-  status: "registered" | "running" | "succeeded" | "failed" | "cancelled";
+  status:
+    | "registered"
+    | "running"
+    | "awaiting-integration"
+    | "succeeded"
+    | "failed"
+    | "cancelled";
   attempts: number;
+  retries: number;
 };
 type ExecutionRow = {
   id: string;
@@ -273,7 +321,10 @@ const proposalColumns =
   "id, kind, content_json AS contentJson, digest, source_json AS sourceJson, status, created_at AS createdAt, decided_at AS decidedAt";
 const registeredColumns =
   "id, proposal_id AS proposalId, content_json AS contentJson, digest, status, created_at AS createdAt";
-const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts`;
+const goalColumns = `${registeredColumns}, planning_commit AS planningCommit, base_commit AS baseCommit`;
+const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts,
+  (SELECT count(*) FROM events WHERE subject_id = tasks.id AND subject_kind = 'task'
+    AND kind = 'task.retried') AS retries`;
 const executionColumns =
   "id, actor, mode, requested_by_json AS requestedByJson, goal_id AS goalId, task_id AS taskId, status, result_json AS resultJson, started_at AS startedAt, finished_at AS finishedAt";
 const eventColumns =
@@ -287,9 +338,29 @@ function proposalRecord({
 }: ProposalRow) {
   const raw: unknown = JSON.parse(contentJson);
   const source = parseOrigin(JSON.parse(sourceJson));
-  return kind === "goal"
-    ? freeze({ ...row, kind, source, content: validateGoalContent(raw) })
-    : freeze({ ...row, kind, source, content: validateTaskContent(raw) });
+  switch (kind) {
+    case "goal":
+      return freeze({
+        ...row,
+        kind,
+        source,
+        content: validateGoalContent(raw),
+      });
+    case "task":
+      return freeze({
+        ...row,
+        kind,
+        source,
+        content: validateTaskContent(raw),
+      });
+    case "integration":
+      return freeze({
+        ...row,
+        kind,
+        source,
+        content: validateIntegrationContent(raw),
+      });
+  }
 }
 
 function proposalAnswerRequirements(
@@ -297,14 +368,17 @@ function proposalAnswerRequirements(
   policy: ApprovalPolicy["policy"] | null,
   loosening: readonly Gate[],
 ) {
+  const humanAnswerRequired =
+    (policy === "agent" &&
+      proposal.kind === "task" &&
+      proposal.content.policies?.["task-registration"] === "human") ||
+    (proposal.kind === "integration" &&
+      (proposal.content.verified !== true ||
+        proposal.content.symlinks?.length !== 0));
   return {
     ...(policy === "agent" &&
       loosening.length > 0 && { humanApprovalRequired: true }),
-    ...(policy === "agent" &&
-      proposal.kind === "task" &&
-      proposal.content.policies?.["task-registration"] === "human" && {
-        humanAnswerRequired: true,
-      }),
+    ...(humanAnswerRequired && { humanAnswerRequired: true }),
   };
 }
 
@@ -361,17 +435,25 @@ type DecisionReceipt = Readonly<{
 type GoalReceipt = ProposalReceipt &
   ApprovalPolicy &
   Readonly<{ gate: "goal-registration" }>;
-type RegisteredReceipt = ProposalReceipt &
+type RegisteredReceipt = Omit<ProposalReceipt, "loosening"> &
   Readonly<{
     status: "registered";
     taskId: string;
-    reasons: readonly string[];
+    autoRegistered: true;
+    reason: "in-scope";
   }>;
+
+type Reconciliation = {
+  sessions: string[];
+  executions: { id: string; status: "queued" | "running" }[];
+  tasks: string[];
+};
 
 export class OrchestratorStore {
   readonly #db: Connection;
   #closed = false;
   #writeFailed = false;
+  #updatingGoalBase = false;
 
   private constructor(db: Connection) {
     this.#db = db;
@@ -401,7 +483,7 @@ export class OrchestratorStore {
       });
       db = connection;
       connection.exec(
-        "PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL",
+        "PRAGMA busy_timeout=1000; PRAGMA foreign_keys=OFF; PRAGMA synchronous=FULL",
       );
       connection
         .transaction(() => {
@@ -412,12 +494,58 @@ export class OrchestratorStore {
             id === 0 &&
             !connection.query("SELECT name FROM sqlite_schema LIMIT 1").get()
           ) {
-            connection.exec(`${schema} PRAGMA application_id=${applicationId}`);
+            connection.exec(
+              `${schema} PRAGMA application_id=${applicationId}; PRAGMA user_version=${schemaVersion}`,
+            );
           } else if (id !== applicationId) {
             throw new Error();
+          } else {
+            const version = connection
+              .query<{ user_version: number }>("PRAGMA user_version")
+              .get()?.user_version;
+            if (version === 0) {
+              // SQLite requires rebuilding tables to extend CHECK constraints.
+              for (const [table, definition] of [
+                ["proposals", proposalColumnsSql],
+                ["tasks", taskColumnsSql],
+              ]) {
+                connection.exec(`
+                  CREATE TABLE next_${table} (${definition}) STRICT;
+                  INSERT INTO next_${table} SELECT * FROM ${table};
+                  DROP TABLE ${table};
+                  ALTER TABLE next_${table} RENAME TO ${table};
+                `);
+              }
+              connection.exec(`
+                CREATE INDEX tasks_goal ON tasks(goal_id);
+                CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
+              `);
+              if (connection.query("PRAGMA foreign_key_check").get())
+                throw new Error();
+            } else if (version === 2) {
+              connection.exec(`
+                CREATE TABLE next_integration_approval_runs (${approvalRunColumnsSql}) STRICT;
+                INSERT INTO next_integration_approval_runs SELECT * FROM integration_approval_runs;
+                DROP TABLE integration_approval_runs;
+                ALTER TABLE next_integration_approval_runs RENAME TO integration_approval_runs;
+              `);
+              if (connection.query("PRAGMA foreign_key_check").get())
+                throw new Error();
+            } else if (version !== 3 && version !== schemaVersion) {
+              throw new Error();
+            }
+            if (version !== schemaVersion) {
+              connection.exec(`
+                ALTER TABLE actor_sessions ADD COLUMN snapshot_commit TEXT;
+                ALTER TABLE goals ADD COLUMN planning_commit TEXT;
+                ALTER TABLE goals ADD COLUMN base_commit TEXT;
+                PRAGMA user_version=${schemaVersion};
+              `);
+            }
           }
         })
         .immediate();
+      connection.exec("PRAGMA foreign_keys=ON");
       if (
         connection
           .query<{ journal_mode: string }>("PRAGMA journal_mode=WAL")
@@ -457,7 +585,8 @@ export class OrchestratorStore {
 
   #write<T>(write: (at: string) => T): T {
     if (this.#closed) throw new OrchestratorStoreError("closed");
-    if (this.#writeFailed) throw new OrchestratorStoreError("write-failed");
+    if (this.#writeFailed || this.#updatingGoalBase)
+      throw new OrchestratorStoreError("write-failed");
     try {
       return this.#db
         .transaction(() => write(new Date().toISOString()))
@@ -562,7 +691,7 @@ export class OrchestratorStore {
 
   #newProposal(
     kind: ProposalRow["kind"],
-    content: GoalContent | TaskContent,
+    content: GoalContent | TaskContent | IntegrationContent,
     source: Origin,
     status: ProposalStatus,
     at: string,
@@ -644,7 +773,7 @@ export class OrchestratorStore {
 
   #goal(id: string) {
     return this.#db
-      .query<GoalRow>(`SELECT ${registeredColumns} FROM goals WHERE id = ?`)
+      .query<GoalRow>(`SELECT ${goalColumns} FROM goals WHERE id = ?`)
       .get(id);
   }
 
@@ -731,8 +860,8 @@ export class OrchestratorStore {
           digest: row.digest,
           status: "registered",
           taskId,
-          loosening,
-          reasons,
+          autoRegistered: true,
+          reason: "in-scope",
         });
       }
       const row = this.#newProposal("task", task, source, "pending", at);
@@ -778,10 +907,12 @@ export class OrchestratorStore {
         proposal.kind === "task"
           ? goalRecord(required(this.#goal(proposal.content.goalId)))
           : undefined;
-      const { gate, policy, source, loosening } =
-        proposal.kind === "goal"
-          ? this.#goalPolicy(proposal.content)
-          : this.#taskPolicy(proposal.content, goal!.content);
+      const { gate, policy, source, loosening } = this.#proposalGate(proposal);
+      if (gate === null || policy === null || source === null)
+        throw new OrchestratorStoreError("invalid-transition");
+      const integration =
+        proposal.kind === "integration" ? proposal.content : null;
+      if (integration) this.#checkIntegrationTask(integration, id);
       const task = proposal.kind === "task" ? proposal.content : undefined;
       const origin = proposal.source;
       if (answerer.kind === "agent") {
@@ -799,7 +930,14 @@ export class OrchestratorStore {
           execution.mode !== "approval" ||
           execution.status !== "running" ||
           parseOrigin(JSON.parse(execution.requestedByJson)).kind !== "host" ||
-          (task && execution.goalId !== task.goalId)
+          (task && execution.goalId !== task.goalId) ||
+          (integration &&
+            (execution.taskId !== integration.taskId ||
+              !this.#db
+                .query(
+                  "SELECT 1 FROM integration_approval_runs WHERE proposal_id = ? AND execution_id = ?",
+                )
+                .get(id, execution.id)))
         )
           throw new OrchestratorStoreError("approval-forbidden");
       }
@@ -861,6 +999,16 @@ export class OrchestratorStore {
         },
         correlation,
       );
+      if (integration) {
+        if (decision === "reject")
+          this.#setTaskStatus(
+            integration.taskId,
+            "failed",
+            "integration-rejected",
+            at,
+          );
+        return freeze({ status });
+      }
       if (decision === "reject") return freeze({ status });
       if (task) {
         const taskId = this.#registerTask(row, task, at);
@@ -874,14 +1022,19 @@ export class OrchestratorStore {
         );
         return freeze({ status, taskId });
       }
+      const planningCommit =
+        origin.kind === "actor" && origin.sessionId
+          ? this.#sessionSnapshotCommit(origin.sessionId)
+          : null;
       const goalId = randomUUID();
       this.#run(
-        "INSERT INTO goals VALUES (?, ?, ?, ?, 'active', ?)",
+        "INSERT INTO goals VALUES (?, ?, ?, ?, 'active', ?, ?, NULL)",
         goalId,
         id,
         row.contentJson,
         row.digest,
         at,
+        planningCommit,
       );
       this.#event(
         at,
@@ -895,12 +1048,425 @@ export class OrchestratorStore {
     });
   }
 
+  #ready(task: ReturnType<typeof taskRecord>): boolean {
+    return (
+      task.status === "registered" &&
+      task.content.actor === "Executor" &&
+      this.#goal(task.goalId)?.status === "active" &&
+      !this.#goalIntegrationInProgress(task.goalId) &&
+      task.content.dependsOn.every((id) => {
+        const dependency = this.#task(id);
+        return (
+          dependency?.goalId === task.goalId &&
+          dependency.status === "succeeded"
+        );
+      })
+    );
+  }
+
+  readyTasks(limit: number, excluding: readonly string[]) {
+    return this.#read(() => {
+      const ready: ReturnType<typeof taskRecord>[] = [];
+      if (!limit) return ready;
+      for (const row of this.#db
+        .query<TaskRow>(
+          `SELECT ${taskColumns} FROM tasks WHERE status = 'registered' ORDER BY rowid`,
+        )
+        .all()) {
+        if (excluding.includes(row.id)) continue;
+        const task = taskRecord(row);
+        if (this.#ready(task)) ready.push(task);
+        if (ready.length === limit) break;
+      }
+      return ready;
+    });
+  }
+
+  #setTaskStatus(
+    id: string,
+    status: TaskRow["status"],
+    code: string | null,
+    at: string,
+    proposalId?: string,
+  ) {
+    this.#run("UPDATE tasks SET status = ? WHERE id = ?", status, id);
+    this.#event(at, "task.status", "task", id, {
+      status,
+      code,
+      ...(proposalId && { proposalId }),
+    });
+  }
+
+  claimTask(taskId: string) {
+    const id = identifier(taskId);
+    return this.#write((at) => {
+      const task = taskRecord(required(this.#task(id)));
+      if (!this.#ready(task)) return null;
+      if (!this.#ownsGoalBranch(task.goalId)) {
+        this.#setTaskStatus(id, "failed", "branch-collision", at);
+        return null;
+      }
+      this.#setTaskStatus(id, "running", null, at);
+      return task;
+    });
+  }
+
+  failTask(taskId: string, code: string) {
+    const id = identifier(taskId);
+    const reason = identifier(code);
+    this.#write((at) => {
+      if (required(this.#task(id)).status !== "running")
+        throw new OrchestratorStoreError("invalid-transition");
+      this.#setTaskStatus(id, "failed", reason, at);
+    });
+  }
+
+  retryTask(taskId: string, expectedRetries: number) {
+    const id = identifier(taskId);
+    return this.#write((at) => {
+      const task = required(this.#task(id));
+      if (task.status !== "failed")
+        throw new OrchestratorStoreError("invalid-transition");
+      if (task.retries !== expectedRetries)
+        throw new OrchestratorStoreError("task-retry-changed");
+      if (task.retries >= MAX_TASK_RETRIES)
+        throw new OrchestratorStoreError("task-retry-limit");
+      const status = "registered";
+      const retries = task.retries + 1;
+      this.#setTaskStatus(id, status, null, at);
+      this.#event(at, "task.retried", "task", id, {
+        retries,
+        origin: "operator",
+        budgetReset: true,
+      });
+      return { id, status, retries } as const;
+    });
+  }
+
+  proposeIntegration(value: IntegrationContent, reviewedBy: string) {
+    const content = validateIntegrationContent(value);
+    const executionId = identifier(reviewedBy);
+    return this.#write((at) => {
+      const task = taskRecord(required(this.#task(content.taskId)));
+      const execution = required(this.#execution(executionId));
+      this.#activeGoal(task.goalId);
+      const result = execution.resultJson
+        ? JSON.parse(execution.resultJson)
+        : null;
+      if (
+        task.status !== "running" ||
+        task.goalId !== content.goalId ||
+        execution.taskId !== task.id ||
+        execution.actor !== "Reviewer" ||
+        execution.mode !== "review" ||
+        execution.status !== "succeeded" ||
+        result?.review !== "pass" ||
+        result.pin?.base !== content.base ||
+        result.pin?.candidate !== content.candidate ||
+        result.pin?.digest !== content.digest ||
+        content.changedPaths.some(
+          (path) => !allowsPath(task.content.paths, path),
+        )
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      const row = this.#newProposal(
+        "integration",
+        content,
+        { kind: "host" },
+        "pending",
+        at,
+      );
+      this.#event(
+        at,
+        "proposal.created",
+        "proposal",
+        row.id,
+        {
+          kind: "integration",
+          digest: row.digest,
+          taskId: task.id,
+          goalId: task.goalId,
+        },
+        { executionId },
+      );
+      this.#setTaskStatus(task.id, "awaiting-integration", null, at);
+      return this.getProposalDetails(row.id)!;
+    });
+  }
+
+  #integrationProgress(taskId: string) {
+    return this.#db
+      .query<{ proposalId: string | null; code: string | null }>(
+        `SELECT json_extract(data, '$.proposalId') AS proposalId, json_extract(data, '$.code') AS code
+         FROM events WHERE subject_kind = 'task' AND subject_id = ? AND kind = 'task.status'
+         ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(taskId);
+  }
+
+  #goalIntegrationInProgress(goalId: string) {
+    return this.#db
+      .query<{ id: string }>(
+        "SELECT id FROM tasks WHERE goal_id = ? AND status = 'running'",
+      )
+      .all(goalId)
+      .some(({ id }) => this.#integrationProgress(id)?.proposalId);
+  }
+
+  #latestIntegrationProposalId(taskId: string) {
+    return this.#db
+      .query<{ id: string }>(
+        `SELECT id FROM proposals WHERE kind = 'integration'
+       AND json_extract(content_json, '$.taskId') = ? ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(taskId)?.id;
+  }
+
+  assertGoalScheduling(goalId: string) {
+    this.#read(() => {
+      if (this.#goalIntegrationInProgress(identifier(goalId)))
+        throw new OrchestratorStoreError("integration-uncertain");
+    });
+  }
+
+  nextApprovedIntegration(excluded?: ReadonlySet<string>) {
+    return this.#read(() => {
+      const rows = this.#db
+        .query<{ id: string; goalId: string; taskId: string }>(
+          `SELECT proposals.id, tasks.id AS taskId, tasks.goal_id AS goalId FROM proposals
+         JOIN tasks ON tasks.id = json_extract(proposals.content_json, '$.taskId')
+         JOIN goals ON goals.id = tasks.goal_id
+         WHERE proposals.kind = 'integration' AND proposals.status = 'approved'
+           AND tasks.status = 'awaiting-integration' AND goals.status = 'active'
+         ORDER BY proposals.rowid`,
+        )
+        .all();
+      return rows.find(
+        ({ goalId, taskId, id }) =>
+          !excluded?.has(id) &&
+          this.#latestIntegrationProposalId(taskId) === id &&
+          !this.#goalIntegrationInProgress(goalId),
+      )?.id;
+    });
+  }
+
+  #approvedIntegration(id: string) {
+    const proposal = proposalRecord(required(this.#proposal(id)));
+    if (proposal.kind !== "integration" || proposal.status !== "approved")
+      throw new OrchestratorStoreError("invalid-transition");
+    this.#checkIntegrationTask(proposal.content, proposal.id);
+    this.assertGoalScheduling(proposal.content.goalId);
+    const approval = this.#db
+      .query<{
+        id: string;
+        digest: string;
+        answererJson: string;
+        answererKind: Answerer["kind"];
+        policy: ApprovalPolicy["policy"];
+        decision: Decision;
+        gate: Gate;
+      }>(
+        "SELECT id, digest, answerer_json AS answererJson, answerer_kind AS answererKind, policy, decision, gate FROM approvals WHERE proposal_id = ?",
+      )
+      .get(id);
+    if (
+      approval?.decision !== "approve" ||
+      approval.gate !== "integration" ||
+      approval.digest !== proposal.digest ||
+      contentDigest(proposal.content) !== proposal.digest
+    )
+      throw new OrchestratorStoreError("stale-digest");
+    const answerer = parseAnswerer(JSON.parse(approval.answererJson));
+    if (
+      answerer.kind !== approval.answererKind ||
+      (answerer.kind === "agent" &&
+        (approval.policy !== "agent" ||
+          proposalAnswerRequirements(proposal, "agent", [])
+            .humanAnswerRequired))
+    )
+      throw new OrchestratorStoreError("approval-forbidden");
+    const task = taskRecord(required(this.#task(proposal.content.taskId)));
+    if (!this.#ownsGoalBranch(task.goalId))
+      throw new OrchestratorStoreError("context-mismatch");
+    return { proposal, task, approvalId: approval.id, answerer };
+  }
+
+  approvedIntegration(id: string) {
+    return this.#read(() =>
+      this.#db.transaction(() => this.#approvedIntegration(id)).deferred(),
+    );
+  }
+
+  beginIntegration(id: string, digest: string, approvalId: string) {
+    this.#write((at) => {
+      const current = this.#approvedIntegration(id);
+      if (
+        current.proposal.digest !== digest ||
+        current.approvalId !== approvalId
+      )
+        throw new OrchestratorStoreError("stale-digest");
+      this.#setTaskStatus(
+        current.task.id,
+        "running",
+        "integration-in-progress",
+        at,
+        id,
+      );
+    });
+  }
+
+  rejectApprovedIntegration(id: string, code: string) {
+    this.#write((at) => {
+      const proposal = proposalRecord(required(this.#proposal(id)));
+      if (proposal.kind !== "integration" || proposal.status !== "approved")
+        throw new OrchestratorStoreError("invalid-transition");
+      const task = required(this.#task(proposal.content.taskId));
+      if (
+        task.status !== "awaiting-integration" ||
+        this.#latestIntegrationProposalId(task.id) !== id
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      this.#setTaskStatus(task.id, "failed", identifier(code), at);
+    });
+  }
+
+  #integrationSucceeded(
+    at: string,
+    id: string,
+    content: IntegrationContent,
+    reconciled = false,
+  ) {
+    const { taskId, branch, base, candidate } = content;
+    this.#setTaskStatus(taskId, "succeeded", null, at);
+    this.#event(at, "task.integrated", "task", taskId, {
+      proposalId: id,
+      branch,
+      base,
+      head: candidate,
+      ...(reconciled && { reconciled }),
+    });
+  }
+
+  finishIntegration(
+    id: string,
+    outcome: "completed" | "denied" | "uncertain",
+    code: string,
+  ) {
+    this.#write((at) => {
+      const proposal = proposalRecord(required(this.#proposal(id)));
+      if (proposal.kind !== "integration" || proposal.status !== "approved")
+        throw new OrchestratorStoreError("invalid-transition");
+      const { taskId } = proposal.content;
+      if (
+        required(this.#task(taskId)).status !== "running" ||
+        this.#integrationProgress(taskId)?.proposalId !== id
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      if (outcome === "completed")
+        this.#integrationSucceeded(at, id, proposal.content);
+      else if (outcome === "uncertain")
+        this.#setTaskStatus(taskId, "running", "integration-uncertain", at, id);
+      else this.#setTaskStatus(taskId, "failed", identifier(code), at);
+    });
+  }
+
+  goalIntegrationHead(goalId: string) {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ head: string }>(
+            `SELECT json_extract(events.data, '$.head') AS head FROM events
+       JOIN tasks ON tasks.id = events.subject_id
+       WHERE events.kind = 'task.integrated' AND events.subject_kind = 'task' AND tasks.goal_id = ?
+       ORDER BY events.rowid DESC LIMIT 1`,
+          )
+          .get(identifier(goalId))?.head ?? null,
+    );
+  }
+
+  auditGoalExport(
+    goalId: string,
+    branch: string,
+    from: string | null,
+    to: string,
+    completed: boolean,
+  ) {
+    this.#write((at) => {
+      const goal = required(this.#goal(goalId));
+      if (!this.#ownsGoalBranch(goalId) || branch !== goalBranch(goalId))
+        throw new OrchestratorStoreError("context-mismatch");
+      if (!completed) {
+        if (this.#goalIntegrationInProgress(goalId))
+          throw new OrchestratorStoreError("integration-uncertain");
+        if ((this.goalIntegrationHead(goalId) ?? goal.baseCommit) !== to)
+          throw new OrchestratorStoreError("export-head-mismatch");
+      }
+      this.#event(
+        at,
+        completed ? "goal.exported" : "goal.export-authorized",
+        "goal",
+        goalId,
+        {
+          branch,
+          from: from === null ? null : gitCommit(from),
+          to: gitCommit(to),
+        },
+      );
+    });
+  }
+
+  pendingIntegrations(goalId?: string) {
+    const id = goalId === undefined ? undefined : identifier(goalId);
+    return this.#read(() =>
+      this.#db
+        .query<ProposalRow>(
+          `SELECT ${proposalColumns} FROM proposals WHERE kind = 'integration' AND status = 'pending'
+       AND (? IS NULL OR json_extract(content_json, '$.goalId') = ?) ORDER BY rowid`,
+        )
+        .all(id ?? null, id ?? null)
+        .map((row) => {
+          const proposal = proposalRecord(row);
+          const gate = this.#proposalGate(proposal);
+          return freeze({
+            ...proposal,
+            ...gate,
+            ...proposalAnswerRequirements(
+              proposal,
+              gate.policy,
+              gate.loosening,
+            ),
+          });
+        }),
+    );
+  }
+
+  canRequestIntegrationApproval(proposalId: string) {
+    return this.#read(() => {
+      const runs = this.#db
+        .query<{ status: ExecutionStatus; code: string | null }>(
+          `
+          SELECT executions.status, json_extract(executions.result_json, '$.code') AS code FROM integration_approval_runs
+          JOIN executions ON executions.id = execution_id WHERE proposal_id = ?
+        `,
+        )
+        .all(identifier(proposalId));
+      const [first] = runs;
+      if (!first) return true;
+      return (
+        runs.length === 1 &&
+        (first.status === "failed" || first.status === "timed-out") &&
+        first.code !== "interrupted"
+      );
+    });
+  }
+
   createExecution(request: {
     actor: ActorKind;
     mode: string;
     requestedBy: Origin;
     goalId?: string;
     taskId?: string;
+    approvalProposalId?: string;
   }) {
     const input = fields(request, [
       "actor",
@@ -908,6 +1474,7 @@ export class OrchestratorStore {
       "requestedBy",
       "goalId",
       "taskId",
+      "approvalProposalId",
     ]);
     const actor = oneOf(input.actor, ACTOR_KINDS);
     const mode = identifier(input.mode);
@@ -930,6 +1497,38 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("context-mismatch");
       const goalId = task?.goalId ?? requestedGoalId;
       if (goalId !== null) required(this.#goal(goalId));
+      const approvalProposalId =
+        input.approvalProposalId === undefined
+          ? null
+          : identifier(input.approvalProposalId);
+      if (approvalProposalId !== null) {
+        const proposal = this.getProposalForAgentApproval(approvalProposalId);
+        if (
+          proposal.kind !== "integration" ||
+          actor !== "Reviewer" ||
+          mode !== "approval" ||
+          origin.kind !== "host" ||
+          taskId !== proposal.content.taskId
+        )
+          throw new OrchestratorStoreError("context-mismatch");
+        if (!this.canRequestIntegrationApproval(approvalProposalId))
+          throw new OrchestratorStoreError("invalid-transition");
+      }
+      if (
+        (actor === "Executor" && mode === "task") ||
+        mode === "verification"
+      ) {
+        if (mode === "verification" && actor !== "Reviewer")
+          throw new OrchestratorStoreError("context-mismatch");
+        if (task?.status !== "running" || origin.kind !== "host")
+          throw new OrchestratorStoreError("invalid-transition");
+      }
+      if (actor === "Executor" && mode === "task") {
+        this.#run(
+          "UPDATE tasks SET attempts = attempts + 1 WHERE id = ?",
+          task!.id,
+        );
+      }
       const id = randomUUID();
       this.#run(
         "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL)",
@@ -940,6 +1539,12 @@ export class OrchestratorStore {
         goalId,
         taskId,
       );
+      if (approvalProposalId !== null)
+        this.#run(
+          "INSERT INTO integration_approval_runs VALUES (?, ?)",
+          approvalProposalId,
+          id,
+        );
       this.#event(
         at,
         "execution.queued",
@@ -982,6 +1587,24 @@ export class OrchestratorStore {
     });
   }
 
+  #executionMaxTokens(row: ExecutionRow): number | null {
+    if (row.taskId !== null)
+      return taskRecord(required(this.#task(row.taskId))).content.budgets
+        .maxTokens;
+    if (row.goalId !== null)
+      return goalRecord(required(this.#goal(row.goalId))).content.scope.budgets
+        .maxTokens;
+    return null;
+  }
+
+  #executionUsage(row: ExecutionRow, result: unknown) {
+    const finished = row.startedAt !== null && row.finishedAt !== null;
+    return compareTokenBudget(
+      readTokenReport(result, finished),
+      this.#executionMaxTokens(row),
+    );
+  }
+
   finishExecution(
     executionId: string,
     status: FinalExecutionStatus,
@@ -998,31 +1621,90 @@ export class OrchestratorStore {
         !(row.status === "queued" && next === "cancelled")
       )
         throw new OrchestratorStoreError("invalid-transition");
+      const recorded: unknown =
+        resultJson === null ? null : JSON.parse(resultJson);
+      const report = this.#executionUsage(row, recorded);
+      const taskId = row.taskId;
+      const maxTokens = report.maxTokens;
+      const previousTokens =
+        taskId !== null &&
+        maxTokens !== null &&
+        report.tokens !== null &&
+        report.tokens > 0
+          ? this.#taskWindowUsage(taskId, maxTokens, id).tokens
+          : null;
+      const usageResult =
+        recorded &&
+        typeof recorded === "object" &&
+        Object.hasOwn(recorded, "usage")
+          ? canonicalJson({ ...recorded, ...report }, 256 * 1024)
+          : resultJson;
       this.#run(
         "UPDATE executions SET status = ?, result_json = ?, finished_at = ? WHERE id = ?",
         next,
-        resultJson,
+        usageResult,
         at,
         id,
       );
+      const correlation = {
+        ...parseOrigin(JSON.parse(row.requestedByJson)),
+        executionId: id,
+      };
       this.#event(
         at,
         "execution.finished",
         "execution",
         id,
         { status: next },
-        { ...parseOrigin(JSON.parse(row.requestedByJson)), executionId: id },
+        correlation,
       );
+
+      if (
+        taskId !== null &&
+        maxTokens !== null &&
+        report.tokens !== null &&
+        previousTokens !== null &&
+        previousTokens <= maxTokens &&
+        previousTokens + report.tokens > maxTokens
+      ) {
+        const window = this.#taskWindowUsage(taskId, maxTokens, id);
+        if (window.overBudget)
+          this.#event(
+            at,
+            "task.budget-exceeded",
+            "task",
+            taskId,
+            window,
+            correlation,
+          );
+      }
     });
   }
 
-  startSession(actor: ActorKind, runtimeId: string) {
+  startSession(actor: ActorKind, runtimeId: string, exclusive = false) {
     const kind = oneOf(actor, ACTOR_KINDS);
     const runtime = identifier(runtimeId);
     return this.#write((at) => {
+      if (
+        exclusive &&
+        this.#db
+          .query(
+            `
+        SELECT 1 WHERE EXISTS (
+          SELECT 1 FROM actor_sessions WHERE actor = ? AND status = 'active'
+        ) OR EXISTS (
+          SELECT 1 FROM executions WHERE status IN ('queued', 'running')
+        ) OR EXISTS (
+          SELECT 1 FROM tasks WHERE status = 'running'
+        )
+      `,
+          )
+          .get(kind)
+      )
+        throw new OrchestratorStoreError("session-busy");
       const id = randomUUID();
       this.#run(
-        "INSERT INTO actor_sessions VALUES (?, ?, ?, 'active', ?, NULL)",
+        "INSERT INTO actor_sessions VALUES (?, ?, ?, 'active', ?, NULL, NULL)",
         id,
         kind,
         runtime,
@@ -1038,6 +1720,169 @@ export class OrchestratorStore {
       );
       return freeze({ id, status: "active" as const });
     });
+  }
+
+  #sessionSnapshotCommit(id: string): string | null {
+    return (
+      this.#db
+        .query<{ snapshotCommit: string | null }>(
+          "SELECT snapshot_commit AS snapshotCommit FROM actor_sessions WHERE id = ?",
+        )
+        .get(id)?.snapshotCommit ?? null
+    );
+  }
+
+  sessionSnapshotCommit(sessionId: string): string | null {
+    return this.#read(() => this.#sessionSnapshotCommit(identifier(sessionId)));
+  }
+
+  recordSessionSnapshot(sessionId: string, commit: string): void {
+    const id = identifier(sessionId);
+    const snapshotCommit = gitCommit(commit);
+    this.#write((at) => {
+      this.#run(
+        "UPDATE actor_sessions SET snapshot_commit = ? WHERE id = ? AND actor = 'Concierge' AND status = 'active' AND snapshot_commit IS NULL",
+        snapshotCommit,
+        id,
+      );
+      this.#event(
+        at,
+        "session.snapshot",
+        "session",
+        id,
+        { snapshotCommit },
+        { sessionId: id },
+      );
+    });
+  }
+
+  recordGoalCommit(
+    goalId: string,
+    commit: string,
+    kind: "planning" | "base",
+  ): void {
+    const id = identifier(goalId);
+    const value = gitCommit(commit);
+    this.#write((at) => {
+      const { planningCommit, baseCommit } = required(this.#goal(id));
+      const pinned = baseCommit ?? planningCommit;
+      if (pinned !== null && pinned !== value)
+        throw new OrchestratorStoreError("context-mismatch");
+      if (kind === "planning" ? pinned !== null : baseCommit !== null) return;
+      if (kind === "planning") {
+        this.#run(
+          "UPDATE goals SET planning_commit = ? WHERE id = ?",
+          value,
+          id,
+        );
+        this.#event(at, "goal.planning-pinned", "goal", id, {
+          planningCommit: value,
+        });
+      } else {
+        this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", value, id);
+        this.#event(at, "goal.base-pinned", "goal", id, { baseCommit: value });
+      }
+    });
+  }
+
+  #ownsGoalBranch(id: string): boolean {
+    return (
+      this.#db
+        .query<{ id: string }>(
+          "SELECT id FROM goals WHERE substr(id, 1, 8) = substr(?, 1, 8) ORDER BY rowid LIMIT 1",
+        )
+        .get(id)?.id === id
+    );
+  }
+
+  #eligibleGoalBase(id: string): string | null {
+    const goal = this.#goal(id);
+    if (
+      goal?.status !== "active" ||
+      !this.#ownsGoalBranch(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM tasks WHERE goal_id = ? AND status IN ('running', 'awaiting-integration', 'succeeded') LIMIT 1",
+        )
+        .get(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM proposals WHERE kind = 'integration' AND (status = 'pending' OR ? IS NULL) AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
+        )
+        .get(goal.baseCommit, id)
+    )
+      throw new OrchestratorStoreError("goal-base-ineligible");
+    if (goal.baseCommit !== null) return gitCommit(goal.baseCommit);
+    if (
+      this.#db
+        .query(
+          `SELECT 1 FROM tasks JOIN events ON events.subject_id = tasks.id
+          WHERE tasks.goal_id = ? AND events.subject_kind = 'task'
+            AND events.kind = 'task.status'
+            AND json_extract(events.data, '$.status') IN ('awaiting-integration', 'succeeded')
+          LIMIT 1`,
+        )
+        .get(id) ||
+      this.#db
+        .query(
+          "SELECT 1 FROM events WHERE subject_id = ? AND subject_kind = 'goal' AND kind = 'goal.base-updated' LIMIT 1",
+        )
+        .get(id)
+    )
+      throw new OrchestratorStoreError("goal-base-ineligible");
+    return null;
+  }
+
+  goalBaseForUpdate(goalId: string): string | null {
+    return this.#read(() => this.#eligibleGoalBase(identifier(goalId)));
+  }
+
+  async updateGoalBase(
+    goalId: string,
+    from: string,
+    to: string,
+    moveRef: () => Promise<void>,
+    legacyBase = false,
+  ) {
+    const id = identifier(goalId);
+    gitCommit(from);
+    gitCommit(to);
+    if (this.#closed) throw new OrchestratorStoreError("closed");
+    if (this.#writeFailed || this.#updatingGoalBase)
+      throw new OrchestratorStoreError("write-failed");
+
+    // Hold the SQLite writer lock from the final eligibility check through
+    // the Git CAS and audit commit. This prevents a concurrent Task claim.
+    try {
+      this.#db.exec("BEGIN IMMEDIATE");
+    } catch {
+      throw new OrchestratorStoreError("write-failed");
+    }
+    this.#updatingGoalBase = true;
+    let moved = false;
+    try {
+      if (this.#eligibleGoalBase(id) !== (legacyBase ? null : from))
+        throw new OrchestratorStoreError("goal-base-stale");
+      await moveRef();
+      moved = true;
+      this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", to, id);
+      this.#event(new Date().toISOString(), "goal.base-updated", "goal", id, {
+        from,
+        to,
+        ...(legacyBase && { legacyBase: true }),
+      });
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch {
+        this.#writeFailed = true;
+      }
+      if (moved) throw new OrchestratorStoreError("goal-base-record-failed");
+      throw error;
+    } finally {
+      this.#updatingGoalBase = false;
+    }
   }
 
   endSession(sessionId: string): void {
@@ -1058,6 +1903,113 @@ export class OrchestratorStore {
         id,
       );
       this.#event(at, "session.ended", "session", id, {}, { sessionId: id });
+    });
+  }
+
+  #interrupted(): Reconciliation {
+    const ids = (sql: string) =>
+      this.#db
+        .query<{ id: string }>(sql)
+        .all()
+        .map(({ id }) => id);
+    return {
+      sessions: ids(
+        "SELECT id FROM actor_sessions WHERE status = 'active' ORDER BY id",
+      ),
+      executions: this.#db
+        .query<Reconciliation["executions"][number]>(
+          "SELECT id, status FROM executions WHERE status IN ('queued', 'running') ORDER BY id",
+        )
+        .all(),
+      tasks: ids("SELECT id FROM tasks WHERE status = 'running' ORDER BY id"),
+    };
+  }
+
+  reconciliationPreview() {
+    return this.#read(() =>
+      this.#db.transaction(() => this.#interrupted()).deferred(),
+    );
+  }
+
+  interruptedIntegrations(taskIds: readonly string[]) {
+    return this.#read(() =>
+      taskIds.flatMap((taskId) => {
+        const proposalId = this.#integrationProgress(taskId)?.proposalId;
+        if (!proposalId) return [];
+        const proposal = proposalRecord(required(this.#proposal(proposalId)));
+        if (
+          proposal.kind !== "integration" ||
+          proposal.content.taskId !== taskId
+        )
+          throw new OrchestratorStoreError("context-mismatch");
+        const task = taskRecord(required(this.#task(taskId)));
+        return [
+          { id: proposalId, content: proposal.content, retries: task.retries },
+        ];
+      }),
+    );
+  }
+
+  reconcile(
+    expected: Reconciliation,
+    integrationHeads: ReadonlyMap<string, string> = new Map(),
+  ) {
+    return this.#write((at) => {
+      const rows = this.#interrupted();
+      if (JSON.stringify(rows) !== JSON.stringify(expected))
+        throw new OrchestratorStoreError("reconcile-changed");
+      for (const id of rows.sessions) {
+        this.#run(
+          "UPDATE actor_sessions SET status = 'ended', ended_at = ? WHERE id = ?",
+          at,
+          id,
+        );
+        this.#event(
+          at,
+          "session.ended",
+          "session",
+          id,
+          { code: "interrupted", origin: "operator" },
+          { sessionId: id },
+        );
+      }
+      for (const { id } of rows.executions) {
+        this.#run(
+          "UPDATE executions SET status = 'failed', result_json = ?, finished_at = ? WHERE id = ?",
+          '{"code":"interrupted"}',
+          at,
+          id,
+        );
+        this.#event(
+          at,
+          "execution.finished",
+          "execution",
+          id,
+          { status: "failed", code: "interrupted", origin: "operator" },
+          { executionId: id },
+        );
+      }
+      const integrating = this.interruptedIntegrations(rows.tasks);
+      for (const { id, content } of integrating) {
+        const head = integrationHeads.get(id);
+        if (head === content.candidate)
+          this.#integrationSucceeded(at, id, content, true);
+        else if (head === content.base)
+          this.#setTaskStatus(
+            content.taskId,
+            "failed",
+            "integration-interrupted",
+            at,
+          );
+        else throw new OrchestratorStoreError("integration-uncertain");
+      }
+      const integrationTasks = new Set(
+        integrating.map(({ content }) => content.taskId),
+      );
+      for (const id of rows.tasks)
+        if (!integrationTasks.has(id))
+          this.#setTaskStatus(id, "failed", "interrupted", at);
+      return rows;
     });
   }
 
@@ -1082,7 +2034,32 @@ export class OrchestratorStore {
     if (proposal.status === "registered")
       return { gate: null, policy: null, source: null, loosening: [] };
     const goal = goalRecord(required(this.#goal(proposal.content.goalId)));
+    if (proposal.kind === "integration") {
+      const task = taskRecord(required(this.#task(proposal.content.taskId)));
+      if (task.goalId !== goal.id)
+        throw new OrchestratorStoreError("context-mismatch");
+      return {
+        gate: "integration" as const,
+        loosening: [],
+        ...resolvePolicy("integration", {
+          ...this.#goalLayers(goal.content),
+          task: task.content.policies ?? {},
+        }),
+      };
+    }
     return this.#taskPolicy(proposal.content, goal.content);
+  }
+
+  #checkIntegrationTask(content: IntegrationContent, proposalId: string) {
+    const task = required(this.#task(content.taskId));
+    if (task.goalId !== content.goalId)
+      throw new OrchestratorStoreError("context-mismatch");
+    if (
+      task.status !== "awaiting-integration" ||
+      this.#latestIntegrationProposalId(task.id) !== proposalId
+    )
+      throw new OrchestratorStoreError("invalid-transition");
+    this.#activeGoal(content.goalId);
   }
 
   getProposalDetails(
@@ -1138,9 +2115,14 @@ export class OrchestratorStore {
             throw new OrchestratorStoreError("stale-digest");
           if (!permitsAgentAnswer(proposal.origin, proposal, "approve"))
             throw new OrchestratorStoreError("approval-forbidden");
+          if (proposal.kind === "integration") {
+            this.#checkIntegrationTask(proposal.content, proposal.id);
+            this.assertGoalScheduling(proposal.content.goalId);
+          }
           if (proposal.kind === "task") {
             const task = proposal.content;
             const goal = goalRecord(required(this.#goal(task.goalId)));
+            this.assertGoalScheduling(goal.id);
             const error = this.#taskApprovalError(task, goal);
             if (error) throw new OrchestratorStoreError(error);
           }
@@ -1174,22 +2156,42 @@ export class OrchestratorStore {
               return {
                 id: proposal.id,
                 kind: proposal.kind,
-                title: proposal.content.title,
+                ...(proposal.kind === "integration"
+                  ? {
+                      goalId: proposal.content.goalId,
+                      taskId: proposal.content.taskId,
+                    }
+                  : { title: proposal.content.title }),
                 gate,
                 policy,
               };
             });
-          const recentExecutions = this.#db
-            .query<Pick<ExecutionRow, "id" | "actor" | "mode" | "status">>(
-              "SELECT id, actor, mode, status FROM executions ORDER BY rowid DESC LIMIT 20",
+          const recentExecutions = this.#recentExecutions();
+          const recentTasks = this.#db
+            .query<TaskRow>(
+              `SELECT ${taskColumns} FROM tasks ORDER BY rowid DESC LIMIT 20`,
             )
-            .all();
+            .all()
+            .map((row) => {
+              const task = taskRecord(row);
+              return {
+                id: task.id,
+                goalId: task.goalId,
+                status: task.status,
+                ...this.#runningIntegrationState(task),
+                ...this.#taskWindowUsage(
+                  task.id,
+                  task.content.budgets.maxTokens,
+                ),
+              };
+            });
           return freeze({
             goals: counts("goals"),
             tasks: counts("tasks"),
             proposals: counts("proposals"),
             pendingProposals,
             recentExecutions,
+            recentTasks,
           });
         })
         .deferred(),
@@ -1225,13 +2227,132 @@ export class OrchestratorStore {
     return this.#read(() =>
       freeze(
         this.#db
-          .query<GoalRow>(
-            `SELECT ${registeredColumns} FROM goals ORDER BY rowid`,
-          )
+          .query<GoalRow>(`SELECT ${goalColumns} FROM goals ORDER BY rowid`)
           .all()
           .map(goalRecord),
       ),
     );
+  }
+
+  #runningIntegrationState(task: Pick<TaskRow, "id" | "status">) {
+    const code =
+      task.status === "running"
+        ? this.#integrationProgress(task.id)?.code
+        : null;
+    return code === "integration-in-progress" ||
+      code === "integration-uncertain"
+      ? { code }
+      : {};
+  }
+
+  getTask(taskId: string) {
+    const id = identifier(taskId);
+    return this.#read(() => {
+      const row = this.#task(id);
+      return row
+        ? freeze({ ...taskRecord(row), ...this.#runningIntegrationState(row) })
+        : null;
+    });
+  }
+
+  taskTokens(taskId: string): number {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ tokens: number }>(
+            "SELECT total(json_extract(result_json, '$.tokens')) AS tokens FROM executions WHERE task_id = ?",
+          )
+          .get(identifier(taskId))!.tokens,
+    );
+  }
+
+  /** Queue order assigns each execution to a retry window, even if it finishes late. */
+  #taskWindowUsage(
+    taskId: string,
+    maxTokens: number,
+    executionId: string | null = null,
+  ) {
+    const rows = this.#db
+      .query<Pick<ExecutionRow, "resultJson">>(
+        `
+      WITH anchor AS (
+        SELECT CASE WHEN ?2 IS NULL THEN (SELECT max(rowid) FROM events) ELSE
+          (SELECT rowid FROM events WHERE subject_id = ?2 AND subject_kind = 'execution' AND kind = 'execution.queued')
+        END AS position
+      ), bounds AS (
+        SELECT coalesce(max(CASE WHEN events.rowid <= position THEN events.rowid END), -1) AS lower,
+          min(CASE WHEN events.rowid > position THEN events.rowid END) AS upper
+        FROM anchor JOIN events
+          ON subject_id = ?1 AND subject_kind = 'task' AND kind = 'task.retried'
+      )
+      SELECT executions.result_json AS resultJson
+      FROM executions CROSS JOIN bounds
+      LEFT JOIN events AS queued ON queued.subject_id = executions.id
+        AND queued.subject_kind = 'execution' AND queued.kind = 'execution.queued'
+      WHERE executions.task_id = ?1 AND executions.started_at IS NOT NULL
+        AND executions.finished_at IS NOT NULL
+        AND coalesce(queued.rowid, 0) > lower AND (upper IS NULL OR queued.rowid < upper)
+    `,
+      )
+      .all(taskId, executionId);
+    let tokens = 0;
+    let unavailable = false;
+    const raw = { ...emptyTokenUsage };
+    for (const { resultJson } of rows) {
+      const report = readTokenReport(
+        resultJson === null ? null : JSON.parse(resultJson),
+        true,
+      );
+      tokens += report.tokens ?? 0;
+      unavailable ||= report.usage === "unavailable";
+      const usage = report.rawUsage ?? report.usage;
+      if (usage && usage !== "unavailable" && !Array.isArray(usage)) {
+        raw.input += usage.input;
+        raw.output += usage.output;
+        raw.cacheCreation += usage.cacheCreation;
+        raw.cacheRead += usage.cacheRead;
+      }
+    }
+    return compareTokenBudget(
+      unavailable
+        ? ({ tokens, usage: "unavailable", rawUsage: raw } as const)
+        : { tokens, usage: raw },
+      maxTokens,
+    );
+  }
+
+  taskUsage(taskId: string) {
+    const id = identifier(taskId);
+    return this.#read(() => {
+      const task = required(this.#task(id));
+      return freeze(
+        this.#taskWindowUsage(id, taskRecord(task).content.budgets.maxTokens),
+      );
+    });
+  }
+
+  taskBudgetTokens(taskId: string): number {
+    return this.taskUsage(taskId).tokens;
+  }
+
+  #recentExecutions() {
+    return this.#db
+      .query<ExecutionRow>(
+        `SELECT ${executionColumns} FROM executions ORDER BY rowid DESC LIMIT 20`,
+      )
+      .all()
+      .map((row) => {
+        const { id, actor, mode, status } = row;
+        const result: unknown =
+          row.resultJson === null ? null : JSON.parse(row.resultJson);
+        return {
+          id,
+          actor,
+          mode,
+          status,
+          ...this.#executionUsage(row, result),
+        };
+      });
   }
 
   listTasks(goalId: string) {
@@ -1243,7 +2364,10 @@ export class OrchestratorStore {
             `SELECT ${taskColumns} FROM tasks WHERE goal_id = ? ORDER BY rowid`,
           )
           .all(id)
-          .map(taskRecord),
+          .map((row) => ({
+            ...taskRecord(row),
+            ...this.#runningIntegrationState(row),
+          })),
       ),
     );
   }
@@ -1259,6 +2383,7 @@ export class OrchestratorStore {
       return freeze({
         ...execution,
         requestedBy: parseOrigin(JSON.parse(requestedByJson)),
+        tokenUsage: this.#executionUsage(row, result),
         result,
       });
     });

@@ -228,9 +228,11 @@ and attempts emergency VM teardown.
 
 Fake CLI tests cover argument construction, channel validation, digest
 compatibility and attach deadlines. The prior PoC exercised vsock, mounts
-and initial TTY behavior individually. The combined gateway and interactive
-session path, guest environment wrapper, and live TTY resize still need
-real-VM verification.
+and initial TTY behavior individually. The
+[Stage 1 live runs](stage1-live.md) exercised the combined gateway and
+interactive session path, including the launcher environment wrapper,
+auto mode, vsock Host API calls, session continuation and Planner dispatch.
+Live TTY resize and credential rotation remain unverified.
 
 Follow-up work
 
@@ -246,7 +248,7 @@ Follow-up work
 
 The [operator launcher](running.md) starts an audited Concierge session and
 uses the host invocation UUID as the session's runtime ID. The host exports
-one committed HEAD tree to a private, disposable directory under
+the pinned local `main` tree to a private, disposable directory under
 `.local/local-orchestrator/snapshots/`. The VM mounts it read-only at
 `/repo`. The export excludes `.local/` and contains only committed paths
 selected by Git's archive rules. A repository-path hash names the persistent
@@ -263,7 +265,9 @@ MCP tools. These settings are auxiliary. The VM and trusted host enforce
 isolation, egress policy, and approval authority.
 
 Each accepted Planner request triggers the serial actor runner. Its
-provisional repository context is selected from the same snapshot. It
+provisional repository context for new Goals comes from the same
+snapshot. Existing Goals use their pinned commit as described in
+[Stage 2](stage2.md). The context
 includes regular files at `AGENTS.md`, `README.md` and
 `docs/local-orchestrator/*.md` where they fit, plus a truncated
 `files.txt` index of tracked paths. It reserves space for the runner's

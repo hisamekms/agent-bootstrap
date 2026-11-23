@@ -52,6 +52,79 @@ export interface TaskContent {
   readonly policies?: PolicySet;
 }
 
+export interface IntegrationContent {
+  readonly taskId: string;
+  readonly goalId: string;
+  readonly branch: string;
+  readonly base: string;
+  readonly candidate: string;
+  readonly digest: string;
+  readonly changedPaths: readonly string[];
+  readonly symlinks?: readonly string[];
+  readonly verified?: boolean;
+  readonly review: { readonly result: "pass"; readonly notes?: string };
+}
+
+export function goalBranch(goalId: string): string {
+  const prefix = goalId.split("-")[0];
+  if (!prefix || !/^[a-f0-9]{8}$/.test(prefix)) throw new ContractError();
+  return `lo/goal-${prefix}`;
+}
+
+export function validateIntegrationContent(value: unknown): IntegrationContent {
+  const input = fields(value, [
+    "taskId",
+    "goalId",
+    "branch",
+    "base",
+    "candidate",
+    "digest",
+    "changedPaths",
+    "symlinks",
+    "verified",
+    "review",
+  ]);
+  const goalId = identifier(input.goalId);
+  const branch = goalBranch(goalId);
+  const oid = (value: unknown, length: number) => {
+    const hash = string(value, length, length);
+    if (!/^[a-f0-9]+$/.test(hash)) throw new ContractError();
+    return hash;
+  };
+  if (input.branch !== branch) throw new ContractError();
+  const review = fields(input.review, ["result", "notes"]);
+  const changedPaths = unique(input.changedPaths, 1, 10_000, (value) => {
+    const name = path(value);
+    if (name.endsWith("/")) throw new ContractError();
+    return name;
+  });
+  const symlinks = Object.hasOwn(input, "symlinks")
+    ? unique(input.symlinks, 0, changedPaths.length, path)
+    : undefined;
+  const verified = input.verified;
+  if (Object.hasOwn(input, "verified") && typeof verified !== "boolean")
+    throw new ContractError();
+  const changed = new Set(changedPaths);
+  if (symlinks?.some((name) => !changed.has(name))) throw new ContractError();
+  return freeze({
+    taskId: identifier(input.taskId),
+    goalId,
+    branch,
+    base: oid(input.base, 40),
+    candidate: oid(input.candidate, 40),
+    digest: oid(input.digest, 64),
+    changedPaths,
+    ...(symlinks === undefined ? {} : { symlinks }),
+    ...(typeof verified === "boolean" ? { verified } : {}),
+    review: {
+      result: oneOf(review.result, ["pass"]),
+      ...(Object.hasOwn(review, "notes")
+        ? { notes: string(review.notes, 1, 2048) }
+        : {}),
+    },
+  });
+}
+
 export class ContractError extends Error {
   constructor() {
     super("Invalid local orchestrator input");
@@ -111,6 +184,15 @@ function string(value: unknown, min: number, max: number): string {
     value.length < min ||
     value.length > max ||
     value.includes("\0")
+  )
+    throw new ContractError();
+  return value;
+}
+
+export function gitCommit(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value)
   )
     throw new ContractError();
   return value;
@@ -319,11 +401,18 @@ export function taskLimitReasons(
   registeredTaskCount: number,
 ): string[] {
   const reasons: string[] = [];
-  for (const key of budgetKeys) {
+  for (const key of ["maxExecutionMs", "maxRetries"] as const) {
     if (task.budgets[key] > goal.scope.budgets[key]) reasons.push(key);
   }
   if (registeredTaskCount >= goal.scope.maxTasks) reasons.push("maxTasks");
   return reasons;
+}
+
+export function allowsPath(paths: readonly string[], path: string): boolean {
+  return paths.some(
+    (scope) =>
+      path === scope || (scope.endsWith("/") && path.startsWith(scope)),
+  );
 }
 
 export function fitsScope(
@@ -332,15 +421,7 @@ export function fitsScope(
   registeredTaskCount: number,
 ): { ok: true } | { ok: false; reasons: string[] } {
   const reasons: string[] = [];
-  if (
-    task.paths.some(
-      (path) =>
-        !goal.scope.paths.some(
-          (scope) =>
-            path === scope || (scope.endsWith("/") && path.startsWith(scope)),
-        ),
-    )
-  )
+  if (task.paths.some((path) => !allowsPath(goal.scope.paths, path)))
     reasons.push("paths");
   if (!goal.scope.profiles.includes(task.profile)) reasons.push("profile");
   if (!goal.scope.actors.includes(task.actor)) reasons.push("actor");

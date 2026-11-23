@@ -96,6 +96,8 @@ test("status reports counts and pending gates, and show and proposals include co
   assert.equal(status.code, 0);
   assert.deepEqual(JSON.parse(status.stdout), {
     counts: { goals: 0, tasks: 0, proposals: 1, pending: 1 },
+    recentTasks: [],
+    recentExecutions: [],
     pending: [
       {
         id,
@@ -207,6 +209,7 @@ test("show matches store details after the project policy changes", async () => 
     ...proposal,
     effectivePolicy,
     policySource,
+    baseCommit: null,
   });
 });
 
@@ -468,4 +471,261 @@ test("events filters by subject and limits the newest results", async () => {
   const invalid = await cli(["events", "--limit", "1001"]);
   assert.equal(invalid.code, 2);
   assert.match(invalid.stderr, /^Usage:/);
+});
+
+test("reconcile requires typed confirmation, audits recovery and releases exclusive start", async () => {
+  const proposal = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const task = store.proposeTask(
+    {
+      goalId,
+      title: "Task",
+      description: "",
+      acceptance: ["Done"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["docs/"],
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    origin,
+  );
+  assert.equal(task.status, "registered");
+  const session = store.startSession("Concierge", "runtime", true);
+  assert.ok(store.claimTask(task.taskId));
+  const requestedBy = { kind: "host" } as const;
+  const running = store.createExecution({
+    actor: "Executor",
+    mode: "task",
+    taskId: task.taskId,
+    requestedBy,
+  });
+  store.startExecution(running.id);
+  const queued = store.createExecution({
+    actor: "Planner",
+    mode: "goal-design",
+    requestedBy,
+  });
+  assert.throws(
+    () => store.startSession("Concierge", "new", true),
+    /use the operator CLI reconcile command/,
+  );
+  const nonTTY = await cli(["reconcile"]);
+  assert.equal(nonTTY.code, 1);
+  assert.equal(nonTTY.questions.length, 0);
+  assert.equal(
+    (await cli(["reconcile"], { isTTY: true, answer: () => "reconcile 3" }))
+      .code,
+    1,
+  );
+  const changed = await cli(["reconcile"], {
+    isTTY: true,
+    answer: () => {
+      store.startExecution(queued.id);
+      return "reconcile 4";
+    },
+  });
+  assert.match(changed.stderr, /list changed/);
+  assert.equal(store.getTask(task.taskId)?.status, "running");
+
+  const db = new Database(filename);
+  try {
+    db.query(
+      "CREATE TRIGGER deny_reconcile BEFORE INSERT ON events WHEN NEW.kind = 'task.status' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
+    ).run();
+    const blocked = await cli(["reconcile"], {
+      isTTY: true,
+      answer: () => "reconcile 4",
+    });
+    assert.equal(blocked.code, 1);
+    assert.equal(store.getExecution(running.id)?.status, "running");
+    assert.equal(
+      store.listEvents({ subjectId: session.id, limit: 1 })[0]?.kind,
+      "session.started",
+    );
+    db.query("DROP TRIGGER deny_reconcile").run();
+  } finally {
+    db.close();
+  }
+
+  const stillQueued = store.createExecution({
+    actor: "Planner",
+    mode: "goal-design",
+    requestedBy,
+  });
+  const recovered = await cli(["reconcile"], {
+    isTTY: true,
+    answer: () => "reconcile 5",
+  });
+  assert.equal(recovered.code, 0);
+  assert.match(recovered.stdout, /"reconciled"/);
+  assert.match(recovered.stdout, new RegExp(stillQueued.id));
+  for (const id of [running.id, queued.id, stillQueued.id]) {
+    assert.partialDeepStrictEqual(store.getExecution(id), {
+      status: "failed",
+      result: { code: "interrupted" },
+    });
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: id, limit: 1 })[0],
+      {
+        kind: "execution.finished",
+        executionId: id,
+        data: { status: "failed", code: "interrupted", origin: "operator" },
+      },
+    );
+  }
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: session.id, limit: 1 })[0],
+    {
+      kind: "session.ended",
+      sessionId: session.id,
+    },
+  );
+  assert.deepEqual(
+    store.listEvents({ subjectId: task.taskId, limit: 1 })[0]?.data,
+    {
+      status: "failed",
+      code: "interrupted",
+    },
+  );
+  const empty = await cli(["reconcile"], { isTTY: true });
+  assert.equal(empty.code, 0);
+  assert.deepEqual(JSON.parse(empty.stdout).reconciled, {
+    sessions: [],
+    executions: [],
+    tasks: [],
+  });
+  assert.ok(store.startSession("Concierge", "new", true));
+});
+
+test("retry-task confirms on a terminal, records retries and rejects ineligible states", async () => {
+  const proposal = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const registered = store.proposeTask(
+    {
+      goalId,
+      title: "Task",
+      description: "",
+      acceptance: ["Done"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["docs/"],
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    origin,
+  );
+  assert.equal(registered.status, "registered");
+  const id = registered.taskId;
+  const args = ["retry-task", id];
+  const phrase = `retry-task ${id}`;
+  const tty = { isTTY: true, answer: () => phrase };
+  assert.equal((await cli(args, tty)).code, 1);
+  assert.ok(store.claimTask(id));
+  assert.equal((await cli(args, tty)).code, 1);
+  store.failTask(id, "review-concern");
+  const nonTTY = await cli(args);
+  assert.match(nonTTY.stderr, /requires a terminal/);
+  assert.deepEqual(nonTTY.questions, []);
+  const wrong = await cli(args, { ...tty, answer: () => "yes" });
+  assert.equal(wrong.code, 1);
+  assert.equal(store.getTask(id)?.status, "failed");
+
+  const auditDb = new Database(filename);
+  try {
+    auditDb
+      .query(
+        "CREATE TRIGGER deny_retry BEFORE INSERT ON events WHEN NEW.kind = 'task.retried' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
+      )
+      .run();
+    assert.equal((await cli(args, tty)).code, 1);
+    assert.equal(store.getTask(id)?.status, "failed");
+    assert.equal(store.getTask(id)?.retries, 0);
+    auditDb.query("DROP TRIGGER deny_retry").run();
+  } finally {
+    auditDb.close();
+  }
+
+  for (let retries = 1; retries <= 3; retries++) {
+    const result = await cli(args, tty);
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      id,
+      status: "registered",
+      retries,
+    });
+    assert.equal(store.readyTasks(1, [])[0]?.id, id);
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: id, limit: 1 })[0],
+      {
+        kind: "task.retried",
+        data: { retries, origin: "operator", budgetReset: true },
+      },
+    );
+    assert.ok(store.claimTask(id));
+    store.failTask(id, "review-concern");
+  }
+  assert.match((await cli(args, tty)).stderr, /retry limit/);
+  assert.throws(() => store.retryTask(id, 3), { code: "task-retry-limit" });
+  assert.equal(store.getTask(id)?.status, "failed");
+  assert.equal(store.getTask(id)?.retries, 3);
+
+  const db = new Database(filename);
+  try {
+    for (const status of ["awaiting-integration", "succeeded", "cancelled"]) {
+      db.query("UPDATE tasks SET status = ? WHERE id = ?").run(status, id);
+      assert.match((await cli(args, tty)).stderr, /Only failed Tasks/);
+      assert.throws(() => store.retryTask(id, 3), {
+        code: "invalid-transition",
+      });
+      assert.equal(store.getTask(id)?.status, status);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("show-execution escapes raw reviewer answers for the terminal", async () => {
+  const proposed = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposed.id, {
+    digest: proposed.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  assert.ok(goalId);
+  const { id } = store.createExecution({
+    actor: "Reviewer",
+    mode: "approval",
+    requestedBy: { kind: "host" },
+    goalId,
+  });
+  const rawAnswer = "untrusted\u001b[31m\u009b\u202e";
+  store.startExecution(id);
+  const usage = {
+    tokens: 501,
+    usage: { input: 500, output: 1, cacheCreation: 0, cacheRead: 0 },
+  };
+  store.finishExecution(id, "failed", { rawAnswer, ...usage });
+  const result = await cli(["show-execution", id]);
+  assert.equal(result.code, 0);
+  const report = { ...usage, maxTokens: 500, overBudget: true };
+  assert.partialDeepStrictEqual(JSON.parse(result.stdout), {
+    result: { rawAnswer, ...report },
+    tokenUsage: report,
+  });
+  const status = await cli(["status"]);
+  assert.partialDeepStrictEqual(JSON.parse(status.stdout), {
+    recentExecutions: [{ id, ...report }],
+  });
+  for (const control of ["\u001b", "\u009b", "\u202e"])
+    assert.equal(result.stdout.includes(control), false);
 });

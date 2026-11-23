@@ -17,7 +17,10 @@ import {
   snapshotConciergeRepo,
   startConcierge,
 } from "../../src/local-orchestrator/concierge.ts";
-import { OrchestratorStore } from "../../src/local-orchestrator/store.ts";
+import {
+  OrchestratorStore,
+  OrchestratorStoreError,
+} from "../../src/local-orchestrator/store.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
 import { createObservedHost } from "../../src/observed-host.ts";
 import {
@@ -233,7 +236,12 @@ async function main(args: readonly string[]) {
       `Concierge outcome ${result.outcome}, exit code ${result.exitCode ?? "unavailable"}`,
     );
     if (result.outcome !== "ok" || result.exitCode !== 0) process.exitCode = 1;
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof OrchestratorStoreError &&
+      error.code === "session-busy"
+    )
+      throw new Error(error.message);
     throw new Error(`Concierge failed to ${stage}`);
   } finally {
     credential = "";

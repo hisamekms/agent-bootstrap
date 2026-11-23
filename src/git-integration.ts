@@ -28,7 +28,10 @@ export type GitIntegrationCode =
   | "git-failed"
   | "output-limit"
   | "unsupported-entry"
-  | "cleanup-failed";
+  | "cleanup-failed"
+  | "export-head-mismatch"
+  | "branch-checked-out"
+  | "non-fast-forward";
 
 export class GitIntegrationError extends Error {
   readonly code: GitIntegrationCode;
@@ -299,7 +302,9 @@ export class LocalGitIntegration {
     }
     if (
       typeof config.branch !== "string" ||
-      !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(config.branch)
+      !/^(?:[A-Za-z][A-Za-z0-9_-]{0,63}|lo\/goal-[a-f0-9]{8})$/.test(
+        config.branch,
+      )
     )
       throw new GitIntegrationError("invalid-input");
     this.#config = { ...config };
@@ -390,20 +395,23 @@ export class LocalGitIntegration {
     });
   }
 
-  async #reference(ref: string): Promise<string | null> {
+  async #reference(ref: string, checkout?: string): Promise<string | null> {
     const symbolic = (
-      await this.#git(["symbolic-ref", "--quiet", ref], undefined, true)
+      await this.#git(["symbolic-ref", "--quiet", ref], checkout, true)
     )
       .toString("utf8")
       .trim();
     if (symbolic) throw new GitIntegrationError("unsafe-repository");
     const entry = (
-      await this.#git([
-        "for-each-ref",
-        "--format=%(refname)%00%(symref)%00%(objectname)%00",
-        "--",
-        ref,
-      ])
+      await this.#git(
+        [
+          "for-each-ref",
+          "--format=%(refname)%00%(symref)%00%(objectname)%00",
+          "--",
+          ref,
+        ],
+        checkout,
+      )
     ).toString("utf8");
     if (entry === "") return null;
     const fields = entry.split("\0");
@@ -421,15 +429,17 @@ export class LocalGitIntegration {
     ref: string,
     next: string,
     previous: string | null,
+    checkout?: string,
   ): Promise<void> {
     // --no-deref alone can replace a symbolic ref whose referent matches the
     // old OID. Prepare locks this exact ref; inspect it while that lock is held
     // and commit only for a direct ref (or absence for candidate-pin creation).
-    await this.#git(["update-ref", "--stdin"], undefined, false, {
+    await this.#git(["update-ref", "--stdin"], checkout, false, {
       input: `start\noption no-deref\nupdate ${ref} ${next} ${previous ?? "0".repeat(40)}\nprepare\n`,
       validate: async () => {
-        if ((await this.#reference(ref)) !== previous)
+        if ((await this.#reference(ref, checkout)) !== previous)
           throw new GitIntegrationError("stale-base");
+        if (checkout) await this.#requireBranchNotCheckedOut(checkout);
       },
     });
   }
@@ -730,7 +740,7 @@ export class LocalGitIntegration {
     base: string,
     candidate: string,
     expectation?: FileExpectation,
-  ): Promise<{ path: string; newMode: string }[]> {
+  ) {
     oid(base);
     oid(candidate);
     await this.#commit(base);
@@ -817,7 +827,10 @@ export class LocalGitIntegration {
     }
     if (changes.length === 0)
       throw new GitIntegrationError("invalid-candidate");
-    if (symlinks.length) await this.#checkCandidateSymlinks(symlinks);
+    const links = symlinks.length
+      ? await this.#checkCandidateSymlinks(symlinks)
+      : [];
+    const targets = new Map(links.map(({ path, target }) => [path, target]));
     if (!expectation) {
       const entries = await this.#entries(
         this.#config.repository,
@@ -830,12 +843,16 @@ export class LocalGitIntegration {
         throw new GitIntegrationError("invalid-candidate");
       }
     }
-    return changes;
+    return changes.map(({ path, newMode }) => ({
+      path,
+      newMode,
+      target: targets.get(path),
+    }));
   }
 
   async #checkCandidateSymlinks(
     entries: readonly { path: string; oid: string }[],
-  ): Promise<void> {
+  ) {
     // Recheck pinned commits, including candidates produced by older hosts.
     const batch = await this.#run(["cat-file", "--batch"], {
       gitDir: this.#config.repository,
@@ -845,22 +862,191 @@ export class LocalGitIntegration {
       timeout: 60_000,
     });
     let offset = 0;
+    const links: { path: string; target: string | null }[] = [];
     for (const entry of entries) {
       const newline = batch.indexOf(10, offset);
       if (newline < 0) throw new GitIntegrationError("invalid-candidate");
       const header = batch.toString("latin1", offset, newline);
       const match = /^([a-f0-9]{40}) blob (\d+)$/.exec(header);
       const end = newline + 1 + Number(match?.[2]);
+      const bytes = batch.subarray(newline + 1, end);
       if (
         match?.[1] !== entry.oid ||
         batch[end] !== 10 ||
-        !isSafeSymlinkTarget(entry.path, batch.subarray(newline + 1, end))
+        !isSafeSymlinkTarget(entry.path, bytes)
       )
         throw new GitIntegrationError("invalid-candidate");
+      const target = bytes.toString("utf8");
+      links.push({
+        path: entry.path,
+        target: Buffer.from(target).equals(bytes) ? target : null,
+      });
       offset = end + 1;
     }
     if (offset !== batch.length)
       throw new GitIntegrationError("invalid-candidate");
+    return links;
+  }
+
+  async candidateChanges(base: string, candidate: string) {
+    await this.#repository();
+    return (await this.#candidate(base, candidate)).sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+    );
+  }
+
+  async diffStat(base: string, candidate: string): Promise<string> {
+    await this.#repository();
+    await this.#candidate(base, candidate);
+    return (
+      await this.#git([
+        "-c",
+        `attr.tree=${emptyTree}`,
+        "diff",
+        "--stat",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        base,
+        candidate,
+        "--",
+      ])
+    ).toString("utf8");
+  }
+
+  /** Initialize an absent direct Goal ref without moving an existing branch. */
+  async initializeGoalBranch(base: string): Promise<void> {
+    if (!/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch))
+      throw new GitIntegrationError("invalid-input");
+    await this.#repository();
+    await this.#commit(base);
+    if ((await this.#reference(this.#ref)) === null)
+      await this.#compareAndSwap(this.#ref, base, null);
+  }
+
+  /** Move a direct Goal branch only if it still points to the recorded base. */
+  async updateGoalBranch(from: string, to: string): Promise<void> {
+    if (!/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch))
+      throw new GitIntegrationError("invalid-input");
+    oid(from);
+    await this.#repository();
+    await this.#commit(to);
+    if ((await this.#reference(this.#ref)) !== from)
+      throw new GitIntegrationError("stale-base");
+    try {
+      await this.#compareAndSwap(this.#ref, to, from);
+    } catch (error) {
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "git-failed" &&
+        (await this.#reference(this.#ref)) !== from
+      )
+        throw new GitIntegrationError("stale-base");
+      throw error;
+    }
+  }
+
+  async #requireBranchNotCheckedOut(checkout: string) {
+    const entries = (
+      await this.#git(["worktree", "list", "--porcelain", "-z"], checkout)
+    )
+      .toString("utf8")
+      .split("\0");
+    if (entries.includes(`branch ${this.#ref}`))
+      throw new GitIntegrationError("branch-checked-out");
+  }
+
+  /** Fetch a pinned Goal head and CAS only its corresponding local branch. */
+  async previewGoalExport(checkout: string, to: string | null) {
+    if (
+      !/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch) ||
+      !isAbsolute(checkout)
+    )
+      throw new GitIntegrationError("invalid-input");
+    if (to === null) throw new GitIntegrationError("export-head-mismatch");
+    const requireSourceHead = async () => {
+      const head = await this.head().catch((error: unknown) => {
+        if (
+          error instanceof GitIntegrationError &&
+          error.code === "invalid-object"
+        )
+          return null;
+        throw error;
+      });
+      if (head !== to) throw new GitIntegrationError("export-head-mismatch");
+    };
+    await requireSourceHead();
+    const [inside, format] = await Promise.all([
+      this.#git(["rev-parse", "--is-inside-work-tree"], checkout),
+      this.#git(["rev-parse", "--show-object-format"], checkout),
+    ]);
+    if (
+      inside.toString().trim() !== "true" ||
+      format.toString().trim() !== "sha1"
+    )
+      throw new GitIntegrationError("invalid-input");
+    const from = await this.#reference(this.#ref, checkout);
+    await this.#requireBranchNotCheckedOut(checkout);
+    if (from !== null) {
+      // The trusted source has the complete ancestry of 'to'. A local
+      // object missing there cannot be its ancestor.
+      const history = await this.#git([
+        "merge-base",
+        "--is-ancestor",
+        from,
+        to,
+      ]).then(
+        () => true,
+        (error: unknown) => {
+          if (
+            error instanceof GitIntegrationError &&
+            error.code === "git-failed"
+          )
+            return false;
+          throw error;
+        },
+      );
+      if (!history) throw new GitIntegrationError("non-fast-forward");
+    }
+    return {
+      from,
+      to,
+      branch: this.#config.branch,
+      apply: async (authorize: () => void) => {
+        await requireSourceHead();
+        if ((await this.#reference(this.#ref, checkout)) !== from)
+          throw new GitIntegrationError("stale-base");
+        authorize();
+        await this.#run(
+          [
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "--",
+            this.#config.repository,
+            to,
+          ],
+          {
+            cwd: checkout,
+            env: { GIT_ALLOW_PROTOCOL: "file" },
+            timeout: 120_000,
+          },
+        );
+        await requireSourceHead();
+        await this.#compareAndSwap(this.#ref, to, from, checkout);
+      },
+    };
   }
 
   async protectedPaths(

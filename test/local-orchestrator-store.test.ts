@@ -512,18 +512,11 @@ test("registers explicit scope exceptions and policy changes, while rechecking h
     () => approve(loosened, agent),
     new OrchestratorStoreError("approval-forbidden"),
   );
-  const overBudget = store.proposeTask(
-    { ...task, goalId: id, budgets: { ...budgets, maxTokens: 501 } },
+  const otherBudget = store.proposeTask(
+    { ...task, goalId: goalId(), budgets: { ...budgets, maxTokens: 501 } },
     operator,
   );
-  assert.partialDeepStrictEqual(overBudget, {
-    status: "pending",
-    reasons: ["maxTokens"],
-  });
-  assert.throws(
-    () => approve(overBudget),
-    new OrchestratorStoreError("task-constraints"),
-  );
+  assert.partialDeepStrictEqual(otherBudget, { status: "registered" });
   assert.ok(approve(outOfScope).taskId);
   assert.throws(
     () => approve(loosened),

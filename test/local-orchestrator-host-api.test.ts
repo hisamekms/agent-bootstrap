@@ -431,10 +431,11 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   });
   assert.partialDeepStrictEqual(task.data, {
     status: "registered",
-    gate: null,
-    policy: null,
-    loosening: [],
+    autoRegistered: true,
+    reason: "in-scope",
   });
+  for (const key of ["gate", "policy", "reasons"])
+    assert.equal(Object.hasOwn(task.data as object, key), false);
   const pendingTask = await client.call("draft_task", {
     content: { ...taskContent, goalId, policies: { integration: "agent" } },
   });
@@ -444,12 +445,29 @@ test("handles split UTF-8 and exercises each tool against the real store", async
     policy: "human",
     loosening: ["integration"],
   });
+  const baseCommit = "a".repeat(40);
+  store.recordGoalCommit(goalId, baseCommit, "base");
+  const taskUsage = {
+    tokens: 0,
+    maxTokens: 500,
+    usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+    overBudget: false,
+  };
   assert.partialDeepStrictEqual(
     (await client.call("get_goal", { id: goalId })).data,
     {
       id: goalId,
       content: goalContent,
-      tasks: [{ id: task.data.taskId, content: { ...taskContent, goalId } }],
+      baseCommit,
+      tasks: [
+        {
+          id: task.data.taskId,
+          content: { ...taskContent, goalId },
+          ...taskUsage,
+          budgetTokens: 0,
+          totalTokens: 0,
+        },
+      ],
     },
   );
   const planned = await client.call("request_planner", {
@@ -489,7 +507,18 @@ test("handles split UTF-8 and exercises each tool against the real store", async
       },
     ],
     recentExecutions: [
-      { id, actor: "Planner", mode: "task-decomposition", status: "succeeded" },
+      {
+        id,
+        actor: "Planner",
+        mode: "task-decomposition",
+        status: "succeeded",
+        tokens: null,
+        maxTokens: 500,
+        usage: "unavailable",
+      },
+    ],
+    recentTasks: [
+      { id: task.data.taskId, goalId, status: "registered", ...taskUsage },
     ],
   });
   const calls = apiCalls();
@@ -541,16 +570,29 @@ test("handles split UTF-8 and exercises each tool against the real store", async
 });
 
 test(
-  "wait_execution returns a finished execution immediately",
+  "wait_execution and get_execution omit operator-only diagnostics",
   { timeout: 2000 },
   async () => {
     const client = await listen();
-    const id = await queuePlanner(client);
+    const { id } = store.createExecution({
+      actor: "Reviewer",
+      mode: "approval",
+      requestedBy: { kind: "host" },
+    });
     store.startExecution(id);
-    store.finishExecution(id, "succeeded", { tasks: 1 });
+    store.finishExecution(id, "failed", {
+      code: "contract-violation",
+      rawAnswer: "untrusted reviewer text",
+    });
+    const current = await client.call("get_execution", { id });
+    assert.deepEqual(current.data, {
+      id,
+      status: "failed",
+      result: { code: "contract-violation" },
+    });
     assert.deepEqual(
       await client.call("wait_execution", { id, timeoutSeconds: 60 }),
-      await client.call("get_execution", { id }),
+      current,
     );
   },
 );
