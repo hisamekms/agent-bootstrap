@@ -60,6 +60,7 @@ export interface IntegrationContent {
   readonly candidate: string;
   readonly digest: string;
   readonly changedPaths: readonly string[];
+  readonly symlinks?: readonly string[];
   readonly review: { readonly result: "pass"; readonly notes?: string };
 }
 
@@ -78,6 +79,7 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
     "candidate",
     "digest",
     "changedPaths",
+    "symlinks",
     "review",
   ]);
   const goalId = identifier(input.goalId);
@@ -89,6 +91,16 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
   };
   if (input.branch !== branch) throw new ContractError();
   const review = fields(input.review, ["result", "notes"]);
+  const changedPaths = unique(input.changedPaths, 1, 10_000, (value) => {
+    const name = path(value);
+    if (name.endsWith("/")) throw new ContractError();
+    return name;
+  });
+  const symlinks = Object.hasOwn(input, "symlinks")
+    ? unique(input.symlinks, 0, changedPaths.length, path)
+    : undefined;
+  const changed = new Set(changedPaths);
+  if (symlinks?.some((name) => !changed.has(name))) throw new ContractError();
   return freeze({
     taskId: identifier(input.taskId),
     goalId,
@@ -96,11 +108,8 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
     base: oid(input.base, 40),
     candidate: oid(input.candidate, 40),
     digest: oid(input.digest, 64),
-    changedPaths: unique(input.changedPaths, 1, 10_000, (value) => {
-      const name = path(value);
-      if (name.endsWith("/")) throw new ContractError();
-      return name;
-    }),
+    changedPaths,
+    ...(symlinks === undefined ? {} : { symlinks }),
     review: {
       result: oneOf(review.result, ["pass"]),
       ...(Object.hasOwn(review, "notes")

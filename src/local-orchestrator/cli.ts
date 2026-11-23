@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -31,11 +31,10 @@ type ProposalDetails = NonNullable<
 >;
 type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
-const defaultDb = fileURLToPath(
-  new URL("../../.local/local-orchestrator/state.db", import.meta.url),
-);
+const defaultRepo = fileURLToPath(new URL("../../", import.meta.url));
 const maxFieldLength = 4000;
-const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] <command>
+const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--repo <root>] <command>
+  reconcile
   status
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId>
@@ -46,7 +45,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] <comma
   events [--subject <id>] [--limit <1-1000>]`;
 
 type Command =
-  | { kind: "status" | "policy-show" }
+  | { kind: "status" | "policy-show" | "reconcile" }
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
   | {
@@ -60,6 +59,7 @@ type Command =
 function parseCommand([kind, ...args]: readonly string[]): Command {
   switch (kind) {
     case "status":
+    case "reconcile":
       if (args.length === 0) return { kind };
       break;
     case "proposals":
@@ -219,9 +219,26 @@ async function execute(
   io: CliIo,
   store: OrchestratorStore,
   command: Command,
-  directory: string,
+  directory: string | undefined,
 ): Promise<0 | 1> {
   switch (command.kind) {
+    case "reconcile": {
+      const rows = store.reconciliationPreview();
+      const count =
+        rows.sessions.length + rows.executions.length + rows.tasks.length;
+      if (count > 0) {
+        writeJson(io, { pending: rows });
+        const phrase = `reconcile ${count}`;
+        if (
+          (await io.prompt(
+            `Stop the launcher first. Type "${phrase}" to confirm: `,
+          )) !== phrase
+        )
+          return refuse(io, "Confirmation did not match. Operation cancelled.");
+      }
+      writeJson(io, { reconciled: count === 0 ? rows : store.reconcile(rows) });
+      return 0;
+    }
     case "status": {
       const proposals = store.listProposals();
       const goals = store.listGoals();
@@ -271,10 +288,15 @@ async function execute(
         includeDelegation: command.kind === "show",
       });
       if (!proposal) return refuse(io, "Proposal was not found.");
-      const diffStat =
-        proposal.kind === "integration"
-          ? await candidateDiffStat(directory, proposal.content)
-          : undefined;
+      let diffStat: string | undefined;
+      if (proposal.kind === "integration") {
+        if (directory === undefined)
+          return refuse(
+            io,
+            "Integration proposals with --db also require --repo <root>.",
+          );
+        diffStat = await candidateDiffStat(directory, proposal.content);
+      }
       writeJson(io, {
         ...displayProposal(proposal),
         ...(diffStat === undefined ? {} : { diffStat }),
@@ -325,19 +347,30 @@ export async function runCli(
   argv: readonly string[],
   io: CliIo,
 ): Promise<0 | 1 | 2> {
-  const customDb = argv[0] === "--db";
-  const filename = customDb ? argv[1] : defaultDb;
+  let db: string | undefined;
+  let repo: string | undefined;
   let command: Command;
   try {
-    if (!filename || filename.startsWith("--") || filename.includes("\0"))
-      throw new ContractError();
-    command = parseCommand(customDb ? argv.slice(2) : argv);
+    let i = 0;
+    while (argv[i] === "--db" || argv[i] === "--repo") {
+      const flag = argv[i++];
+      const value = argv[i++];
+      if (!value || value.startsWith("--") || value.includes("\0"))
+        throw new ContractError();
+      if (flag === "--db" && db === undefined) db = value;
+      else if (flag === "--repo" && repo === undefined) repo = value;
+      else throw new ContractError();
+    }
+    command = parseCommand(argv.slice(i));
   } catch {
     io.stderr.write(`${usage}\n`);
     return 2;
   }
 
-  if (["approve", "reject", "policy-set"].includes(command.kind) && !io.isTTY)
+  if (
+    ["approve", "reject", "policy-set", "reconcile"].includes(command.kind) &&
+    !io.isTTY
+  )
     return refuse(io, "This command requires a terminal on stdin and stdout.");
 
   try {
@@ -350,11 +383,21 @@ export async function runCli(
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
     }
-    if (!customDb)
-      mkdirSync(dirname(defaultDb), { recursive: true, mode: 0o700 });
-    const store = OrchestratorStore.open(filename);
+    const directory = join(
+      resolve(repo ?? defaultRepo),
+      ".local",
+      "local-orchestrator",
+    );
+    if (db === undefined)
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const store = OrchestratorStore.open(db ?? join(directory, "state.db"));
     try {
-      return await execute(io, store, command, dirname(resolve(filename)));
+      return await execute(
+        io,
+        store,
+        command,
+        db !== undefined && repo === undefined ? undefined : directory,
+      );
     } finally {
       store.close();
     }
@@ -364,6 +407,14 @@ export async function runCli(
       error.code === "stale-digest"
     )
       return refuse(io, "Proposal content changed. Review the proposal again.");
+    if (
+      error instanceof OrchestratorStoreError &&
+      error.code === "reconcile-changed"
+    )
+      return refuse(
+        io,
+        "The reconciliation list changed. Run reconcile again.",
+      );
     return refuse(io, "Local orchestrator command failed.");
   }
 }

@@ -300,4 +300,31 @@ test("a failed authorization write prevents the integration ref update", async (
   await assert.rejects(failing.integrate(), /Fixture audit write failed/);
   assert.equal(await git.head(), pin.base);
   assert.equal((await journal.read()).at(-1)?.kind, "verification.finished");
+  const before = await journal.read();
+  await assert.rejects(
+    flow.reviewCandidate(),
+    /review has already been attempted/,
+  );
+  await assert.rejects(
+    flow.integrate(),
+    /Integration has already been attempted/,
+  );
+  assert.deepEqual(await journal.read(), before);
+});
+
+test("verification must be configured unless the caller explicitly opts out", async (t) => {
+  const { git, host, journal, plan } = await fixture(t);
+  const { verification: _verification, ...unverified } = plan;
+  assert.throws(
+    () => new ReviewedIntegration(git, host, journal, unverified),
+    /Verification is required/,
+  );
+  const flow = new ReviewedIntegration(git, host, journal, {
+    ...unverified,
+    allowUnverified: true,
+  });
+  const pin = await flow.prepare();
+  await flow.decide(pin, "approve");
+  await assert.rejects(flow.integrate(), /Verification is not configured/);
+  assert.equal(await git.head(), pin.base);
 });

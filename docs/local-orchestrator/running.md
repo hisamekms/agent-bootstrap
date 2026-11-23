@@ -53,6 +53,24 @@ The default Claude Code permission mode is `auto`. If Claude Code reports
 that it cannot start in that mode, rerun with `--mode default`. The launcher
 also accepts `--mode acceptEdits` and `--mode plan`.
 
+## Recover after a crash
+
+After confirming the launcher has stopped, run the operator CLI from a
+host terminal. If you use an explicit database, pass the same `--db`
+you use for the other operator commands.
+
+```sh
+bun run src/local-orchestrator/cli.ts reconcile
+```
+
+The command displays the active sessions, queued or running executions,
+and running Tasks. Type `reconcile <count>` with the combined count shown
+in the prompt. The transaction ends the sessions and marks the executions
+and Tasks failed with code `interrupted`. The CLI prints the affected
+records. Reconciliation performs no replay and leaves pending proposals
+available for operator review. If the preview changes before confirmation,
+run the command again to see the current records.
+
 ## Review proposals
 
 Use another host terminal for approval. The Concierge can draft proposals
@@ -64,6 +82,10 @@ bun run src/local-orchestrator/cli.ts proposals --status pending
 bun run src/local-orchestrator/cli.ts show <proposalId>
 bun run src/local-orchestrator/cli.ts approve <proposalId>
 ```
+
+With a custom `--db <path>`, also supply `--repo <root>` when
+showing, approving or rejecting an integration proposal. Use the same
+checkout root the launcher used so the CLI can find its pinned candidate.
 
 State stays in `.local/local-orchestrator/state.db`. The runtime audit is
 in `.local/local-orchestrator/audit.sqlite` and OTLP files are under

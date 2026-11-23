@@ -22,30 +22,55 @@ description, acceptance criteria and paths travel as a single prompt
 argument. A prompt that exceeds the runtime argument bound fails with
 `prompt-too-large`. The host compares the candidate to the pinned base
 before starting verification or review. A path ending in `/` grants
-descendants and other paths grant an exact match. A path rejection records
-`path-violation` and can start a revision. A Reviewer can also request a
-revision. Both share the Task retry budget, capped at the integration
-journal's three revisions. Host callers can provide a verification plan
-to `startConcierge`. The stock launcher has no suite configured.
+descendants and other paths grant an exact match. A changed symlink's
+normalized target must fit the Task's paths when resolved from the link's
+directory. A path rejection records `path-violation` and can start a
+revision. Verification failures and Reviewer requests for changes share
+the same retry budget, capped at three revisions. Every Executor Task
+that reaches review uses an automatic Reviewer run. Planners may mention
+review in acceptance criteria and can create Executor or Researcher Tasks.
 
-Each Worker attempt and candidate review has a correlated SQLite execution
-record and uses that ID for the TrustedHost invocation. Worker and Reviewer
-command timeouts are capped by the Task budget and the Microsandbox limit.
-The host records available Claude input and output token counts after each
-run and checks the cumulative total before proceeding. Missing usage
-remains unknown. Worker usage depends on a complete, bounded result
-envelope. A crash can leave a Task or session active for operator
-reconciliation. The scheduler avoids automatically replaying those
-invocations.
+Host callers can provide a verification suite to `startConcierge`. The
+stock launcher explicitly opts into review without a suite. Each Worker,
+verification and Reviewer run uses its SQLite execution ID as the
+TrustedHost invocation ID. SQLite records the verification suite under
+actor `Reviewer` in mode `verification`. TrustedHost uses its own
+credential-free Verification role. Only an immediately preceding
+pre-review verification pass for the same pin allows review to proceed.
+An interrupted integration stays terminal.
+
+The host counts Claude input, output, cache-read input and cache-creation
+input tokens. Tasks start from the recorded SQLite total, and approval
+runs share the same budget. Worker stdout carries the collect request.
+The opt-in guest command puts a marker and the complete Claude JSON result
+at the end of stderr when the result fits in 64 KiB. The host receives the
+last 66 KiB, parses the marked result for `usage` and `is_error` and
+persists the token count. An actor run with missing, invalid or oversized
+usage stops a budgeted Task with `usage-unavailable`.
+
+The exclusive launcher refuses to start while its database has an active
+Concierge session, unfinished executions or a running Task. After the
+launcher has stopped, use the terminal-only `reconcile` command to close
+out the displayed records in one audited transaction. Reconciliation
+ends sessions and marks unfinished executions and running Tasks
+`failed` with code `interrupted`. It leaves interrupted work terminal.
 
 A passing review creates one `integration` proposal and atomically sets
 the Task to `awaiting-integration`. The proposal binds the branch, base,
-candidate, diff digest, changed paths and review. The effective policy
-comes from the Task, then Goal, then project defaults. For a human gate,
-inspect the paths and diff stat with the operator CLI's `show` or
-`approve` command. For an agent gate, the host gives the pinned diff to
-a dedicated Reviewer in `approval` mode. An approval keeps the Task in
-`awaiting-integration`. A rejection fails the Task.
+candidate, diff digest, changed paths, symlink paths and review. The
+effective policy comes from the Task, then Goal, then project defaults.
+A proposal with symlink changes requires a human answer, as does a
+legacy proposal without recorded symlink evidence. The operator CLI
+shows the pinned candidate's diff stat using the empty Git attribute
+tree. Use `--repo` to identify the launcher's repository when specifying
+a custom `--db`.
+
+For an eligible agent gate, the host gives the pinned diff to a dedicated
+Reviewer in `approval` mode. A failed approval within the Task's known
+token budget allows one new request. An interrupted approval or an
+unknown or exceeded token budget leaves the proposal pending for a
+human. Approval keeps the Task in `awaiting-integration`. Rejection
+fails it.
 
 The Stage 3 entry point, `integrateApprovedProposal`, currently throws
 `stage-3`. Stage 3 will check approval evidence
@@ -63,6 +88,5 @@ runtime for node behavior that starts VMs.
 
 Local fixtures exercise the queue, real SQLite migration, real Git
 candidate pinning and path checks, optional verification ordering,
-the approval gate and operator CLI. A live run is still needed to verify
-Claude behavior, Microsandbox tree transport, profile provisioning and
-usage reporting in the assembled Concierge path.
+the approval gate and operator CLI. These review fixes were exercised
+with local fixtures. Live guest usage reporting was outside this review.

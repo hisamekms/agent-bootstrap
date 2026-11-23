@@ -171,7 +171,7 @@ export interface TrustedHostOptions {
 export interface TrustedHostRunOptions {
   readonly allowUnauditedRun?: boolean;
   readonly hostServices?: readonly HostService[];
-  /** Best-effort host callback for the last 4096 bytes of Worker stderr. */
+  /** Best-effort host callback for the last 66 KiB of Worker stderr. */
   readonly onWorkerStderr?: (bytes: Uint8Array, invocationId: string) => void;
 }
 
@@ -1270,7 +1270,7 @@ export class TrustedHost {
         if (role === "Worker" && result && input.options?.onWorkerStderr) {
           try {
             const delivery = input.options.onWorkerStderr(
-              new Uint8Array(result.stderr.subarray(-4096)),
+              new Uint8Array(result.stderr.subarray(-66 * 1024)),
               id,
             );
             void Promise.resolve(delivery).catch(() => {});

@@ -140,7 +140,7 @@ function taskContract(maxTasks: number) {
         },
       ],
     },
-    rules: `Return 1..${maxTasks} tasks in dependency order. Keys marked ? are optional, without the ? in the answer. Use only the specified keys.`,
+    rules: `Return 1..${maxTasks} tasks in dependency order. Every Executor Task is automatically reviewed by a Reviewer after it runs. Do not create separate Reviewer Tasks. Acceptance criteria may mention review. Keys marked ? are optional, without the ? in the answer. Use only the specified keys.`,
   };
 }
 
@@ -363,7 +363,7 @@ export class ActorRunner {
       if (this.#queue.length >= this.#maxQueued) break;
       if (
         proposal.policy !== "agent" ||
-        store.hasIntegrationApprovalRun(proposal.id)
+        !store.canRequestIntegrationApproval(proposal.id)
       )
         continue;
       try {
@@ -522,9 +522,10 @@ export class ActorRunner {
       }
 
       const usage = parseClaudeCodeResult(run.response);
-      if (usage && usage.inputTokens !== null && usage.outputTokens !== null) {
+      const total = reportedTokens(usage);
+      if (usage?.outputTokens != null && total !== undefined) {
         hasUsage = true;
-        tokens.input += usage.inputTokens;
+        tokens.input += total - usage.outputTokens;
         tokens.output += usage.outputTokens;
       }
 
@@ -585,17 +586,26 @@ export class ActorRunner {
         },
         origin,
       );
-      const { id, digest, status, reasons } = receipt;
-      dependencyIds.push(status === "registered" ? receipt.taskId : id);
-      return {
-        id,
-        digest,
-        status,
-        reasons,
-        ...(status === "pending"
-          ? { gate: receipt.gate, policy: receipt.policy }
-          : {}),
-      };
+      dependencyIds.push(
+        receipt.status === "registered" ? receipt.taskId : receipt.id,
+      );
+      const { id, digest, status } = receipt;
+      return status === "registered"
+        ? {
+            id,
+            digest,
+            status,
+            autoRegistered: receipt.autoRegistered,
+            reason: receipt.reason,
+          }
+        : {
+            id,
+            digest,
+            status,
+            reasons: receipt.reasons,
+            gate: receipt.gate,
+            policy: receipt.policy,
+          };
     });
   }
 
@@ -630,6 +640,8 @@ export class ActorRunner {
         path: "candidate.diff",
         bytes: await this.#deps.tasks.diff(proposal.content),
       });
+      if (store.taskTokens(task.id) > task.content.budgets.maxTokens)
+        return { status: "failed", result: { code: "budget-exceeded" } };
       if (this.#deps.canScheduleTasks?.() === false)
         return { status: "failed", result: { code: "session-ended" } };
     }
@@ -643,16 +655,21 @@ export class ActorRunner {
     );
     if (run.id !== id)
       return { status: "failed", result: { code: "host-error" } };
-    if (run.outcome === "timed-out")
-      return { status: "timed-out", result: { code: "timed-out" } };
-    if (run.outcome !== "ok")
-      return { status: "failed", result: { code: "actor-failed" } };
-
-    const tokens =
+    const result =
       task && harness.harness === "claude"
-        ? reportedTokens(parseClaudeCodeResult(run.response))
-        : undefined;
+        ? parseClaudeCodeResult(run.response)
+        : null;
+    const tokens = reportedTokens(result);
     const usage = tokens === undefined ? {} : { tokens };
+    if (task && tokens === undefined)
+      return {
+        status: run.outcome === "timed-out" ? "timed-out" : "failed",
+        result: { code: "usage-unavailable" },
+      };
+    if (run.outcome === "timed-out")
+      return { status: "timed-out", result: { code: "timed-out", ...usage } };
+    if (run.outcome !== "ok" || result?.isError)
+      return { status: "failed", result: { code: "actor-failed", ...usage } };
     if (
       task &&
       tokens !== undefined &&

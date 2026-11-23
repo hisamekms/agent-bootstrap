@@ -1,11 +1,14 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readdir } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, posix } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import type { RoleHarness } from "../actors.ts";
-import { parseClaudeCodeResult } from "../claude-code.ts";
+import {
+  parseClaudeCodeResult,
+  parseClaudeWorkerResult,
+} from "../claude-code.ts";
 import {
   GitIntegrationError,
   LocalGitIntegration,
@@ -29,7 +32,18 @@ type TaskHost = Pick<
   TrustedHost,
   "runWorker" | "runReviewer" | "runVerification"
 >;
-type ActorResult = { outcome?: string; invocationId?: string; tokens?: number };
+type ActorResult = {
+  outcome?: string;
+  invocationId?: string;
+  tokens?: number;
+  isError?: boolean;
+};
+type CandidateChange = {
+  path: string;
+  newMode: string;
+  target?: string | null | undefined;
+};
+type TaskRunMode = "task" | "review" | "verification";
 type CandidateReview = PinnedCandidate & {
   review: "pass" | "revise" | "concern";
   notes?: string;
@@ -42,9 +56,9 @@ export interface TaskFlow {
     observed: ActorResult,
   ): Promise<PinnedCandidate>;
   review(id: string, observed: ActorResult): Promise<CandidateReview>;
-  verify?: () => Promise<boolean>;
+  verify?: (id: string, observed: ActorResult) => Promise<boolean>;
   reject(candidate: PinnedCandidate): Promise<void>;
-  changedPaths(candidate: PinnedCandidate): Promise<string[]>;
+  changes(candidate: PinnedCandidate): Promise<CandidateChange[]>;
 }
 
 export interface TaskExecutor {
@@ -184,11 +198,19 @@ class TaskError extends Error {}
 export function reportedTokens(
   result: ReturnType<typeof parseClaudeCodeResult>,
 ): number | undefined {
-  if (result?.inputTokens == null || result.outputTokens == null)
+  if (
+    result?.inputTokens == null ||
+    result.outputTokens == null ||
+    result.cacheReadInputTokens == null ||
+    result.cacheCreationInputTokens == null
+  )
     return undefined;
   return Math.min(
     Number.MAX_SAFE_INTEGER,
-    result.inputTokens + result.outputTokens,
+    result.inputTokens +
+      result.outputTokens +
+      result.cacheReadInputTokens +
+      result.cacheCreationInputTokens,
   );
 }
 
@@ -250,6 +272,7 @@ export function createTaskExecutor(options: {
       const prompt = JSON.stringify({ title, description, acceptance, paths });
       let workerResult: ActorResult = {};
       let reviewerResult: ActorResult = {};
+      let verificationResult: ActorResult = {};
       const workerCommand = worker.command({
         role: "Worker",
         timeoutMs,
@@ -287,14 +310,21 @@ export function createTaskExecutor(options: {
             reviewerResult.outcome = run.outcome;
             reviewerResult.invocationId = run.id;
             if (reviewer.harness === "claude") {
-              const tokens = reportedTokens(
-                parseClaudeCodeResult(run.response),
-              );
+              const result = parseClaudeCodeResult(run.response);
+              const tokens = reportedTokens(result);
               if (tokens !== undefined) reviewerResult.tokens = tokens;
+              if (result?.isError) reviewerResult.isError = true;
             }
             return run;
           },
-          runVerification: (...args) => host.runVerification(...args),
+          async runVerification(...args) {
+            const run = await host.runVerification(...args);
+            verificationResult.outcome = run.outcome;
+            verificationResult.invocationId = run.id;
+            if (run.id !== args[1])
+              throw new Error("Verification invocation mismatch");
+            return run;
+          },
         },
         journal,
         {
@@ -305,8 +335,10 @@ export function createTaskExecutor(options: {
           ...(worker.harness === "claude"
             ? {
                 onWorkerStderr(bytes: Uint8Array) {
-                  const tokens = reportedTokens(parseClaudeCodeResult(bytes));
+                  const result = parseClaudeWorkerResult(bytes);
+                  const tokens = reportedTokens(result);
                   if (tokens !== undefined) workerResult.tokens = tokens;
+                  if (result?.isError) workerResult.isError = true;
                 },
               }
             : {}),
@@ -314,7 +346,7 @@ export function createTaskExecutor(options: {
           ...(reviewer.reviewerOutput
             ? { reviewerOutput: reviewer.reviewerOutput }
             : {}),
-          ...(verification ? { verification } : {}),
+          ...(verification ? { verification } : { allowUnverified: true }),
         },
       );
 
@@ -340,11 +372,15 @@ export function createTaskExecutor(options: {
             : result;
         },
         ...(verification
-          ? { verify: () => integration.verifyCandidate() }
+          ? {
+              async verify(id, observed) {
+                verificationResult = observed;
+                return integration.verifyCandidate(id);
+              },
+            }
           : {}),
         reject: (candidate) => integration.rejectCandidate(candidate),
-        changedPaths: ({ base, candidate }) =>
-          git.changedPaths(base, candidate),
+        changes: ({ base, candidate }) => git.candidateChanges(base, candidate),
       };
     },
     diff(content) {
@@ -363,9 +399,9 @@ export async function runTask(
   if (!task) return;
   const { budgets, paths } = task.content;
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
-  let tokens = 0;
+  let tokens = store.taskTokens(task.id);
   let code = "host-error";
-  const begin = (actor: "Executor" | "Reviewer", mode: "task" | "review") => {
+  const begin = (actor: "Executor" | "Reviewer", mode: TaskRunMode) => {
     const { id: execution } = store.createExecution({
       actor,
       mode,
@@ -378,7 +414,7 @@ export async function runTask(
 
   async function execute<T>(
     actor: "Executor" | "Reviewer",
-    mode: "task" | "review",
+    mode: TaskRunMode,
     run: (
       id: string,
       observed: ActorResult,
@@ -397,13 +433,23 @@ export async function runTask(
           ? "candidate-failed"
           : "host-error";
     }
-    if (observed.outcome && observed.outcome !== "ok")
-      failure = observed.outcome === "timed-out" ? "timed-out" : "actor-failed";
-    if (observed.tokens !== undefined) tokens += observed.tokens;
-    if (tokens > budgets.maxTokens) failure = "budget-exceeded";
+    const timedOut =
+      mode !== "verification" && observed.outcome === "timed-out";
+    if (mode !== "verification") {
+      if (timedOut) failure = "timed-out";
+      else if (
+        (observed.outcome && observed.outcome !== "ok") ||
+        observed.isError
+      )
+        failure = "actor-failed";
+      if (observed.tokens !== undefined) tokens += observed.tokens;
+      else if (observed.outcome !== undefined || completion)
+        failure = "usage-unavailable";
+      if (tokens > budgets.maxTokens) failure = "budget-exceeded";
+    }
     store.finishExecution(
       executionId,
-      failure === "timed-out" ? "timed-out" : failure ? "failed" : "succeeded",
+      timedOut ? "timed-out" : failure ? "failed" : "succeeded",
       {
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
@@ -417,6 +463,10 @@ export async function runTask(
   }
 
   try {
+    if (tokens > budgets.maxTokens) {
+      store.failTask(task.id, "budget-exceeded");
+      return;
+    }
     const flow = await executor.open(task);
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (!canContinue()) {
@@ -428,9 +478,24 @@ export async function runTask(
         "task",
         async (runId, observed) => {
           const pin = await flow.worker(runId, attempt > 0, observed);
-          const changedPaths = await flow.changedPaths(pin);
-          const value = { pin, changedPaths };
-          if (changedPaths.some((path) => !allowsPath(paths, path))) {
+          const changes = await flow.changes(pin);
+          const changedPaths = changes.map(({ path }) => path);
+          const links = changes.filter(({ newMode }) => newMode === "120000");
+          const symlinks = links.map(({ path }) => path);
+          const value = { pin, changedPaths, symlinks };
+          if (
+            changedPaths.some((path) => !allowsPath(paths, path)) ||
+            links.some(({ path, target }) => {
+              if (target == null || posix.isAbsolute(target)) return true;
+              const normalized = posix
+                .normalize(posix.join(posix.dirname(path), target))
+                .replace(/\/$/, "");
+              return (
+                !allowsPath(paths, normalized) &&
+                !paths.includes(normalized + "/")
+              );
+            })
+          ) {
             await flow.reject(pin);
             return { value, code: "path-violation" };
           }
@@ -446,16 +511,31 @@ export async function runTask(
         code = "session-ended";
         break;
       }
-      if (flow.verify && !(await flow.verify())) {
-        code = "verification-failed";
-        break;
+      if (flow.verify) {
+        const verify = flow.verify;
+        const verification = await execute(
+          "Reviewer",
+          "verification",
+          async (runId, observed) => {
+            const passed = await verify(runId, observed);
+            return {
+              value: passed,
+              ...(passed ? {} : { code: "verification-failed" }),
+            };
+          },
+        );
+        if (verification.failure) {
+          code = verification.failure;
+          if (code === "verification-failed") continue;
+          break;
+        }
       }
 
       if (!canContinue()) {
         code = "session-ended";
         break;
       }
-      const { pin, changedPaths } = worker.value;
+      const { pin, changedPaths, symlinks } = worker.value;
       const review = await execute(
         "Reviewer",
         "review",
@@ -489,6 +569,7 @@ export async function runTask(
           branch: goalBranch(task.goalId),
           ...pin,
           changedPaths,
+          symlinks,
           review: {
             result: "pass",
             ...(review.value.notes ? { notes: review.value.notes } : {}),

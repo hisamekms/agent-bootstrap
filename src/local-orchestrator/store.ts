@@ -79,12 +79,18 @@ type ErrorCode =
   | "approval-forbidden"
   | "goal-inactive"
   | "task-constraints"
-  | "context-mismatch";
+  | "context-mismatch"
+  | "session-busy"
+  | "reconcile-changed";
 
 export class OrchestratorStoreError extends Error {
   readonly code: ErrorCode;
   constructor(code: ErrorCode) {
-    super(`Local orchestrator store: ${code}`);
+    super(
+      code === "session-busy"
+        ? "Local orchestrator is busy. If the launcher stopped, use the operator CLI reconcile command."
+        : `Local orchestrator store: ${code}`,
+    );
     this.name = "OrchestratorStoreError";
     this.code = code;
   }
@@ -109,7 +115,7 @@ type Decision = "approve" | "reject";
 type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 2;
+const schemaVersion = 3;
 const proposalColumnsSql = `
     id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
     content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
@@ -124,8 +130,9 @@ const taskColumnsSql = `
     attempts INTEGER NOT NULL CHECK (attempts >= 0), created_at TEXT NOT NULL
   `;
 const approvalRunColumnsSql = `
-    proposal_id TEXT PRIMARY KEY REFERENCES proposals(id),
-    execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id)
+    proposal_id TEXT NOT NULL REFERENCES proposals(id),
+    execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
+    PRIMARY KEY (proposal_id, execution_id)
   `;
 const schema = `
   CREATE TABLE project_policy (
@@ -334,14 +341,16 @@ function proposalAnswerRequirements(
   policy: ApprovalPolicy["policy"] | null,
   loosening: readonly Gate[],
 ) {
+  const humanAnswerRequired =
+    (policy === "agent" &&
+      proposal.kind === "task" &&
+      proposal.content.policies?.["task-registration"] === "human") ||
+    (proposal.kind === "integration" &&
+      proposal.content.symlinks?.length !== 0);
   return {
     ...(policy === "agent" &&
       loosening.length > 0 && { humanApprovalRequired: true }),
-    ...(policy === "agent" &&
-      proposal.kind === "task" &&
-      proposal.content.policies?.["task-registration"] === "human" && {
-        humanAnswerRequired: true,
-      }),
+    ...(humanAnswerRequired && { humanAnswerRequired: true }),
   };
 }
 
@@ -398,12 +407,19 @@ type DecisionReceipt = Readonly<{
 type GoalReceipt = ProposalReceipt &
   ApprovalPolicy &
   Readonly<{ gate: "goal-registration" }>;
-type RegisteredReceipt = ProposalReceipt &
+type RegisteredReceipt = Omit<ProposalReceipt, "loosening"> &
   Readonly<{
     status: "registered";
     taskId: string;
-    reasons: readonly string[];
+    autoRegistered: true;
+    reason: "in-scope";
   }>;
+
+type Reconciliation = {
+  sessions: string[];
+  executions: { id: string; status: "queued" | "running" }[];
+  tasks: string[];
+};
 
 export class OrchestratorStore {
   readonly #db: Connection;
@@ -474,6 +490,16 @@ export class OrchestratorStore {
               connection.exec(`
                 CREATE INDEX tasks_goal ON tasks(goal_id);
                 CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
+                PRAGMA user_version=${schemaVersion};
+              `);
+              if (connection.query("PRAGMA foreign_key_check").get())
+                throw new Error();
+            } else if (version === 2) {
+              connection.exec(`
+                CREATE TABLE next_integration_approval_runs (${approvalRunColumnsSql}) STRICT;
+                INSERT INTO next_integration_approval_runs SELECT * FROM integration_approval_runs;
+                DROP TABLE integration_approval_runs;
+                ALTER TABLE next_integration_approval_runs RENAME TO integration_approval_runs;
                 PRAGMA user_version=${schemaVersion};
               `);
               if (connection.query("PRAGMA foreign_key_check").get())
@@ -796,8 +822,8 @@ export class OrchestratorStore {
           digest: row.digest,
           status: "registered",
           taskId,
-          loosening,
-          reasons,
+          autoRegistered: true,
+          reason: "in-scope",
         });
       }
       const row = this.#newProposal("task", task, source, "pending", at);
@@ -1118,15 +1144,26 @@ export class OrchestratorStore {
     );
   }
 
-  hasIntegrationApprovalRun(proposalId: string) {
-    return this.#read(
-      () =>
-        this.#db
-          .query(
-            "SELECT 1 FROM integration_approval_runs WHERE proposal_id = ?",
-          )
-          .get(identifier(proposalId)) !== null,
-    );
+  canRequestIntegrationApproval(proposalId: string) {
+    return this.#read(() => {
+      const runs = this.#db
+        .query<{ status: ExecutionStatus; code: string | null }>(
+          `
+          SELECT executions.status, json_extract(executions.result_json, '$.code') AS code FROM integration_approval_runs
+          JOIN executions ON executions.id = execution_id WHERE proposal_id = ?
+        `,
+        )
+        .all(identifier(proposalId));
+      const [first] = runs;
+      if (!first) return true;
+      return (
+        runs.length === 1 &&
+        (first.status === "failed" || first.status === "timed-out") &&
+        !["interrupted", "usage-unavailable", "budget-exceeded"].includes(
+          first.code ?? "",
+        )
+      );
+    });
   }
 
   createExecution(request: {
@@ -1180,13 +1217,22 @@ export class OrchestratorStore {
           taskId !== proposal.content.taskId
         )
           throw new OrchestratorStoreError("context-mismatch");
+        if (!this.canRequestIntegrationApproval(approvalProposalId))
+          throw new OrchestratorStoreError("invalid-transition");
       }
-      if (actor === "Executor" && mode === "task") {
+      if (
+        (actor === "Executor" && mode === "task") ||
+        mode === "verification"
+      ) {
+        if (mode === "verification" && actor !== "Reviewer")
+          throw new OrchestratorStoreError("context-mismatch");
         if (task?.status !== "running" || origin.kind !== "host")
           throw new OrchestratorStoreError("invalid-transition");
+      }
+      if (actor === "Executor" && mode === "task") {
         this.#run(
           "UPDATE tasks SET attempts = attempts + 1 WHERE id = ?",
-          task.id,
+          task!.id,
         );
       }
       const id = randomUUID();
@@ -1293,7 +1339,7 @@ export class OrchestratorStore {
         SELECT 1 WHERE EXISTS (
           SELECT 1 FROM actor_sessions WHERE actor = ? AND status = 'active'
         ) OR EXISTS (
-          SELECT 1 FROM executions WHERE status = 'running' AND actor IN ('Planner', 'Executor', 'Reviewer')
+          SELECT 1 FROM executions WHERE status IN ('queued', 'running')
         ) OR EXISTS (
           SELECT 1 FROM tasks WHERE status = 'running'
         )
@@ -1301,7 +1347,7 @@ export class OrchestratorStore {
           )
           .get(kind)
       )
-        throw new OrchestratorStoreError("invalid-transition");
+        throw new OrchestratorStoreError("session-busy");
       const id = randomUUID();
       this.#run(
         "INSERT INTO actor_sessions VALUES (?, ?, ?, 'active', ?, NULL)",
@@ -1340,6 +1386,73 @@ export class OrchestratorStore {
         id,
       );
       this.#event(at, "session.ended", "session", id, {}, { sessionId: id });
+    });
+  }
+
+  #interrupted(): Reconciliation {
+    const ids = (sql: string) =>
+      this.#db
+        .query<{ id: string }>(sql)
+        .all()
+        .map(({ id }) => id);
+    return {
+      sessions: ids(
+        "SELECT id FROM actor_sessions WHERE status = 'active' ORDER BY id",
+      ),
+      executions: this.#db
+        .query<Reconciliation["executions"][number]>(
+          "SELECT id, status FROM executions WHERE status IN ('queued', 'running') ORDER BY id",
+        )
+        .all(),
+      tasks: ids("SELECT id FROM tasks WHERE status = 'running' ORDER BY id"),
+    };
+  }
+
+  reconciliationPreview() {
+    return this.#read(() =>
+      this.#db.transaction(() => this.#interrupted()).deferred(),
+    );
+  }
+
+  reconcile(expected: Reconciliation) {
+    return this.#write((at) => {
+      const rows = this.#interrupted();
+      if (JSON.stringify(rows) !== JSON.stringify(expected))
+        throw new OrchestratorStoreError("reconcile-changed");
+      for (const id of rows.sessions) {
+        this.#run(
+          "UPDATE actor_sessions SET status = 'ended', ended_at = ? WHERE id = ?",
+          at,
+          id,
+        );
+        this.#event(
+          at,
+          "session.ended",
+          "session",
+          id,
+          { code: "interrupted", origin: "operator" },
+          { sessionId: id },
+        );
+      }
+      for (const { id } of rows.executions) {
+        this.#run(
+          "UPDATE executions SET status = 'failed', result_json = ?, finished_at = ? WHERE id = ?",
+          '{"code":"interrupted"}',
+          at,
+          id,
+        );
+        this.#event(
+          at,
+          "execution.finished",
+          "execution",
+          id,
+          { status: "failed", code: "interrupted", origin: "operator" },
+          { executionId: id },
+        );
+      }
+      for (const id of rows.tasks)
+        this.#setTaskStatus(id, "failed", "interrupted", at);
+      return rows;
     });
   }
 

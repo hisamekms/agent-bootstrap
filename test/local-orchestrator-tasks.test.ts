@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -14,6 +15,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
+import { CLAUDE_WORKER_USAGE_MARKER } from "../src/claude-code.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import {
   contentDigest,
@@ -125,9 +127,11 @@ function fixture(overrides: Partial<TaskFlow> = {}) {
       calls.push(revision ? "revise" : "worker");
       executions.push(id);
       observed.invocationId = id;
+      observed.tokens = 0;
       return pin;
     },
-    async review(id) {
+    async review(id, observed) {
+      observed.tokens = 0;
       calls.push("review");
       executions.push(id);
       return { ...pin, review: "pass", notes: "Good" };
@@ -135,8 +139,8 @@ function fixture(overrides: Partial<TaskFlow> = {}) {
     async reject() {
       calls.push("reject");
     },
-    async changedPaths() {
-      return ["docs/a.md"];
+    async changes() {
+      return [{ path: "docs/a.md", newMode: "100644" }];
     },
     ...overrides,
   };
@@ -186,7 +190,8 @@ test("drain serializes actors, bounds the queue and waits for integrated depende
   let active = 0;
   let peak = 0;
   const { executor } = fixture({
-    async worker() {
+    async worker(_id, _revision, observed) {
+      observed.tokens = 0;
       peak = Math.max(peak, ++active);
       if (++calls === 1) {
         entered.resolve();
@@ -195,7 +200,8 @@ test("drain serializes actors, bounds the queue and waits for integrated depende
       active--;
       return pin;
     },
-    async review() {
+    async review(_id, observed) {
+      observed.tokens = 0;
       peak = Math.max(peak, ++active);
       await Promise.resolve();
       active--;
@@ -246,6 +252,7 @@ test("pass creates one digest-bound human proposal with correlated executions", 
     taskId,
     branch: goalBranch(goalId),
     changedPaths: ["docs/a.md"],
+    symlinks: [],
     review: { result: "pass", notes: "Good" },
   });
   assert.equal(proposal.digest, contentDigest(proposal.content));
@@ -323,7 +330,12 @@ test("agent policy requests dedicated approval with the candidate diff under the
         response: Buffer.from(
           JSON.stringify({
             result: '{"decision":"approve","reasons":[]}',
-            usage: { input_tokens: 1, output_tokens: 2 },
+            usage: {
+              input_tokens: 1,
+              output_tokens: 2,
+              cache_read_input_tokens: 3,
+              cache_creation_input_tokens: 4,
+            },
           }),
         ),
       };
@@ -340,7 +352,7 @@ test("agent policy requests dedicated approval with the candidate diff under the
     actor: "Reviewer",
     mode: "approval",
     status: "succeeded",
-    result: { tokens: 3 },
+    result: { tokens: 10 },
   });
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
 });
@@ -350,10 +362,16 @@ test("revision and path violations share the retry cap", async () => {
   const revised = task(goalId, { budgets: { ...budgets, maxRetries: 1 } });
   let checked = 0;
   const { executor, calls } = fixture({
-    async changedPaths() {
-      return ++checked === 1 ? ["docs-other/a.md"] : ["docs/a.md"];
+    async changes() {
+      return [
+        {
+          path: ++checked === 1 ? "docs-other/a.md" : "docs/a.md",
+          newMode: "100644",
+        },
+      ];
     },
-    async review() {
+    async review(_id, observed) {
+      observed.tokens = 0;
       calls.push("review");
       return { ...pin, review: "revise" };
     },
@@ -367,8 +385,8 @@ test("revision and path violations share the retry cap", async () => {
   });
   const denied = task(goalId, { budgets: { ...budgets, maxRetries: 0 } });
   const other = fixture({
-    async changedPaths() {
-      return ["docs-other/a.md"];
+    async changes() {
+      return [{ path: "docs-other/a.md", newMode: "100644" }];
     },
   });
   await runner(other.executor).drain();
@@ -385,7 +403,8 @@ test("concerns, actor failures and cumulative token usage stop the task", async 
   const concerned = task(goalId);
   await runner(
     fixture({
-      async review() {
+      async review(_id, observed) {
+        observed.tokens = 0;
         return { ...pin, review: "concern" };
       },
     }).executor,
@@ -404,7 +423,10 @@ test("concerns, actor failures and cumulative token usage stop the task", async 
       },
     }).executor,
   ).drain();
-  assert.deepEqual(failure(timedOut), { status: "failed", code: "timed-out" });
+  assert.deepEqual(failure(timedOut), {
+    status: "failed",
+    code: "usage-unavailable",
+  });
 
   const capped = task(goalId);
   const { executor } = fixture({
@@ -466,10 +488,13 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   git(["add", "."]);
   git(["commit", "-m", "work only"]);
 
+  const directory = join(repoRoot, ".local", "local-orchestrator");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const scratch = join(root, "scratch");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   writeFileSync(join(scratch, "docs", "a.md"), "after\n");
-  writeFileSync(join(scratch, "out-of-scope"), "denied\n");
+  const link = join(scratch, "docs", "link");
+  symlinkSync("../README.md", link);
   const attack = "`printf INJECTED` $(printf INJECTED) ' \"";
   const goalId = goal();
   const taskId = task(goalId, { description: attack });
@@ -477,7 +502,7 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   const invocationIds: string[] = [];
   const executor = createTaskExecutor({
     repoRoot,
-    directory: root,
+    directory,
     worker: () =>
       claudeRoleHarness({
         auth: { mode: "api-key", credential: "host-secret" },
@@ -492,14 +517,21 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         assert.equal(plan.command.timeoutMs, 240_000);
         assert.match(
           plan.command.argv[2]!,
-          /head -c 4096 \/tmp\/claude-out\.json >&2/,
+          /head -c 65537 \/tmp\/claude-out\.json >&2/,
         );
         options?.onWorkerStderr?.(
           Buffer.from(
-            JSON.stringify({
-              result: "Done",
-              usage: { input_tokens: 1, output_tokens: 1 },
-            }),
+            "diagnostic\n" +
+              CLAUDE_WORKER_USAGE_MARKER +
+              JSON.stringify({
+                result: "x".repeat(10_000),
+                usage: {
+                  input_tokens: 1,
+                  output_tokens: 1,
+                  cache_read_input_tokens: 2,
+                  cache_creation_input_tokens: 3,
+                },
+              }),
           ),
           id!,
         );
@@ -511,12 +543,20 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         );
         assert.ok(plan.command.argv[4]?.includes("INJECTED"));
         invocationIds.push(id!);
-        const revision = calls.length > 0;
-        if (revision) {
+        if (calls.length === 1) {
+          unlinkSync(link);
+          symlinkSync("a.md", link);
+        }
+        if (calls.length > 0) {
           const note = plan.sandbox.readOnlyFiles?.find(
             ({ path }) => path === "review-notes.txt",
           );
-          assert.match(Buffer.from(note!.bytes).toString(), /outside the Task/);
+          assert.match(
+            Buffer.from(note!.bytes).toString(),
+            calls.at(-1) === "verification"
+              ? /verification suite failed/
+              : /outside the Task/,
+          );
         }
         calls.push("worker");
         return {
@@ -531,7 +571,6 @@ test("real Git composes tree mode, path rejection, verification, review and oper
                 "-cf",
                 "-",
                 "docs",
-                ...(revision ? [] : ["out-of-scope"]),
               ]),
             ),
           },
@@ -539,11 +578,16 @@ test("real Git composes tree mode, path rejection, verification, review and oper
       },
       async runVerification(plan, id) {
         calls.push("verification");
+        invocationIds.push(id!);
         assert.ok(plan.sandbox.repository);
+        const review =
+          calls.filter((call) => call === "verification").length === 1
+            ? "revise"
+            : "pass";
         return {
-          id: id ?? randomUUID(),
+          id: id!,
           outcome: "ok",
-          response: Buffer.from('{"review":"pass"}'),
+          response: Buffer.from(JSON.stringify({ review })),
         };
       },
       async runReviewer(plan, id) {
@@ -561,7 +605,12 @@ test("real Git composes tree mode, path rejection, verification, review and oper
           response: Buffer.from(
             JSON.stringify({
               result: '{"review":"pass","notes":"Looks good"}',
-              usage: { input_tokens: 5, output_tokens: 6 },
+              usage: {
+                input_tokens: 5,
+                output_tokens: 6,
+                cache_read_input_tokens: 1,
+                cache_creation_input_tokens: 1,
+              },
             }),
           ),
         };
@@ -571,7 +620,7 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   await runner(executor).drain();
   assert.deepEqual(
     calls,
-    ["worker", "worker", "verification", "review"],
+    ["worker", "worker", "verification", "worker", "verification", "review"],
     JSON.stringify(failure(taskId)),
   );
   const [proposal] = store.pendingIntegrations(goalId);
@@ -579,14 +628,15 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   assert.partialDeepStrictEqual(proposal.content, {
     base,
     taskId,
-    changedPaths: ["docs/a.md"],
+    changedPaths: ["docs/a.md", "docs/link"],
+    symlinks: ["docs/link"],
     review: { notes: "Looks good" },
   });
   assert.equal(git(["rev-parse", "main"]), base);
   const branch = String(
     command(
       "/usr/bin/git",
-      join(root, "repository.git"),
+      join(directory, "repository.git"),
       ["rev-parse", goalBranch(goalId)],
       "utf8",
     ),
@@ -594,10 +644,17 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   assert.equal(branch, base);
   assert.deepEqual(
     invocationIds.map((id) => store.getExecution(id)?.status),
-    ["failed", "succeeded", "succeeded"],
+    ["failed", "succeeded", "failed", "succeeded", "succeeded", "succeeded"],
   );
 
-  assert.equal(store.taskTokens(taskId), 15);
+  for (const index of [2, 4]) {
+    assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
+      taskId,
+      actor: "Reviewer",
+      mode: "verification",
+    });
+  }
+  assert.equal(store.taskTokens(taskId), 34);
   let output = "";
   const io = {
     stdin: new PassThrough(),
@@ -610,10 +667,26 @@ test("real Git composes tree mode, path rejection, verification, review and oper
     isTTY: true,
     prompt: () => `approve ${proposal.digest.slice(0, 12)}`,
   };
-  assert.equal(await runCli(["--db", filename, "show", proposal.id], io), 0);
-  assert.deepEqual(JSON.parse(output).content.changedPaths, ["docs/a.md"]);
+  assert.equal(await runCli(["--db", filename, "show", proposal.id], io), 1);
+  assert.equal(
+    await runCli(
+      ["--db", filename, "--repo", repoRoot, "show", proposal.id],
+      io,
+    ),
+    0,
+  );
+  assert.deepEqual(JSON.parse(output).content.changedPaths, [
+    "docs/a.md",
+    "docs/link",
+  ]);
   assert.match(JSON.parse(output).diffStat, /docs\/a\.md/);
-  assert.equal(await runCli(["--db", filename, "approve", proposal.id], io), 0);
+  assert.equal(
+    await runCli(
+      ["--db", filename, "--repo", repoRoot, "approve", proposal.id],
+      io,
+    ),
+    0,
+  );
   assert.equal(store.getProposal(proposal.id)?.status, "approved");
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
 });
@@ -748,4 +821,151 @@ test("opens a populated Stage 1 database and migrates its proposal and task chec
     upgraded.exec("UPDATE proposals SET kind = 'unrecognized'"),
   );
   upgraded.close();
+});
+
+test("out-of-scope symlink targets fail before review and in-scope links require a human", async () => {
+  const goalId = goal({ integration: "agent" });
+  const denied = task(goalId, { budgets: { ...budgets, maxRetries: 0 } });
+  const unsafe = fixture({
+    async changes() {
+      return [{ path: "docs/link", newMode: "120000", target: "../README.md" }];
+    },
+  });
+  await runner(unsafe.executor).drain();
+  assert.deepEqual(unsafe.calls, ["worker", "reject"]);
+  assert.deepEqual(failure(denied), {
+    status: "failed",
+    code: "path-violation",
+  });
+
+  task(goalId);
+  const safe = fixture({
+    async changes() {
+      return [{ path: "docs/sub/link", newMode: "120000", target: "../a.md" }];
+    },
+  });
+  const work = runner(safe.executor);
+  await work.drain();
+  const [proposal] = store.pendingIntegrations();
+  assert.ok(proposal?.kind === "integration");
+  assert.deepEqual(proposal.content.symlinks, ["docs/sub/link"]);
+  assert.equal(
+    store.getProposalDetails(proposal.id)?.humanAnswerRequired,
+    true,
+  );
+  await assert.rejects(work.requestApproval(proposal.id), {
+    code: "approval-forbidden",
+  });
+  const approval = store.createExecution({
+    actor: "Reviewer",
+    mode: "approval",
+    requestedBy: { kind: "host" },
+    taskId: proposal.content.taskId,
+  });
+  store.startExecution(approval.id);
+  for (const decision of ["approve", "reject"] as const) {
+    assert.throws(
+      () =>
+        store.decide(proposal.id, {
+          decision,
+          digest: proposal.digest,
+          answerer: { kind: "agent", executionId: approval.id, model },
+        }),
+      { code: "approval-forbidden" },
+    );
+  }
+  assert.equal(approve(proposal).status, "approved");
+});
+
+test("missing Task usage stops execution and an existing token balance carries into a rerun", async () => {
+  const goalId = goal();
+  const unknown = task(goalId);
+  const missing = fixture({
+    async worker() {
+      return pin;
+    },
+  });
+  await runner(missing.executor).drain();
+  assert.deepEqual(failure(unknown), {
+    status: "failed",
+    code: "usage-unavailable",
+  });
+  assert.deepEqual(missing.calls, []);
+
+  const rerun = task(goalId);
+  assert.ok(store.claimTask(rerun));
+  const prior = store.createExecution({
+    actor: "Executor",
+    mode: "task",
+    taskId: rerun,
+    requestedBy: { kind: "host" },
+  });
+  store.startExecution(prior.id);
+  store.finishExecution(prior.id, "failed", { tokens: 49 });
+  const db = new Database(filename);
+  db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(rerun);
+  db.close();
+  const next = fixture({
+    async worker(_id, _revise, observed) {
+      observed.tokens = 2;
+      return pin;
+    },
+  });
+  await runner(next.executor).drain();
+  assert.deepEqual(failure(rerun), {
+    status: "failed",
+    code: "budget-exceeded",
+  });
+  assert.equal(store.taskTokens(rerun), 51);
+  assert.deepEqual(next.calls, []);
+});
+
+test("a failed integration approval allows one retry and fails closed on missing usage", async () => {
+  const taskId = task(goal({ integration: "agent" }));
+  const { executor } = fixture();
+  const calls: string[] = [];
+  const work = runner(executor, {
+    async runReviewer(_plan, id) {
+      calls.push(id);
+      return {
+        id,
+        outcome: "ok",
+        response: Buffer.from(
+          JSON.stringify({
+            result:
+              calls.length === 1
+                ? "invalid verdict"
+                : '{"decision":"approve","reasons":[]}',
+            ...(calls.length === 2
+              ? {}
+              : {
+                  usage: {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 0,
+                  },
+                }),
+          }),
+        ),
+      };
+    },
+  });
+  await work.drain();
+  await work.drain();
+  assert.equal(calls.length, 2);
+  assert.partialDeepStrictEqual(store.getExecution(calls[0]!), {
+    status: "failed",
+    result: { code: "contract-violation", tokens: 5 },
+  });
+  assert.partialDeepStrictEqual(store.getExecution(calls[1]!), {
+    status: "failed",
+    result: { code: "usage-unavailable" },
+  });
+  const [proposal] = store.pendingIntegrations();
+  assert.ok(proposal);
+  await assert.rejects(work.requestApproval(proposal.id), {
+    code: "invalid-transition",
+  });
+  assert.equal(store.taskTokens(taskId), 5);
 });

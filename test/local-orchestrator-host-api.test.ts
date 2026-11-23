@@ -431,10 +431,11 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   });
   assert.partialDeepStrictEqual(task.data, {
     status: "registered",
-    gate: null,
-    policy: null,
-    loosening: [],
+    autoRegistered: true,
+    reason: "in-scope",
   });
+  for (const key of ["gate", "policy", "reasons"])
+    assert.equal(Object.hasOwn(task.data as object, key), false);
   const pendingTask = await client.call("draft_task", {
     content: { ...taskContent, goalId, policies: { integration: "agent" } },
   });

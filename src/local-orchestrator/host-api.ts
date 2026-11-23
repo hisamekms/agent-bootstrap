@@ -238,7 +238,7 @@ function prepareTool(
               ...receipt,
               message: "The operator approves this proposal with the host CLI.",
             }
-          : { ...receipt, gate: null, policy: null };
+          : receipt;
       };
     }
     case "request_planner": {

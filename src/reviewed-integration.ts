@@ -163,6 +163,7 @@ type Plan = {
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
   readonly verification?: Verification | undefined;
+  readonly allowUnverified?: true;
   readonly workerSandbox?: RoleSandbox;
   readonly reviewerSandbox?: RoleSandbox;
   readonly workerHostServices?: readonly HostService[];
@@ -353,6 +354,24 @@ function candidatePin(
   };
 }
 
+function preReviewVerification(
+  events: IntegrationEvent[],
+  pin: PinnedCandidate,
+) {
+  const [created, authorized, finished] = events.slice(-3);
+  if (
+    created?.kind === "candidate.created" &&
+    created.candidate === pin.candidate &&
+    created.digest === pin.digest &&
+    authorized?.kind === "verification.authorized" &&
+    samePin(authorized, pin) &&
+    finished?.kind === "verification.finished" &&
+    finished.digest === pin.digest
+  )
+    return finished.review;
+  return undefined;
+}
+
 function latestPin(events: IntegrationEvent[], target: string) {
   const pin = candidatePin(events, target);
   const created = events.findLastIndex(
@@ -397,6 +416,8 @@ export class ReviewedIntegration {
     });
     const verification =
       plan.verification && copyVerification(plan.verification);
+    if (!verification && plan.allowUnverified !== true)
+      throw new Error("Verification is required");
     if ((plan.path === undefined) === (plan.tree === undefined))
       throw new Error("A plan needs exactly one of path and tree");
     this.#plan = {
@@ -712,7 +733,11 @@ export class ReviewedIntegration {
     const last = events.at(-1);
     const rejected = last?.kind === "candidate.rejected";
     const pin = candidatePin(events, target);
-    const review = rejected ? undefined : latestPin(events, target);
+    const verification = preReviewVerification(events, pin);
+    const verificationFailed =
+      verification !== undefined && verification !== "pass";
+    const review =
+      rejected || verificationFailed ? undefined : latestPin(events, target);
     if (rejected && last.digest !== pin.digest)
       throw new Error("Candidate evidence does not match its durable pin");
     const rounds = events.filter(
@@ -720,6 +745,7 @@ export class ReviewedIntegration {
     ).length;
     if (
       !rejected &&
+      !verificationFailed &&
       (last?.kind !== "review.submitted" || review?.review === "pass")
     )
       throw new Error(
@@ -730,9 +756,13 @@ export class ReviewedIntegration {
     const noted = events.at(-2);
     const notes = rejected
       ? last.notes
-      : noted?.kind === "review.noted" && noted.run === review?.run
-        ? noted.notes
-        : NO_NOTES;
+      : verificationFailed
+        ? await this.#journal.saveNote(
+            "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
+          )
+        : noted?.kind === "review.noted" && noted.run === review?.run
+          ? noted.notes
+          : NO_NOTES;
     const append = this.#writer(events.length);
     // This sequence CAS wins before any snapshot or Worker VM.
     await append({
@@ -773,7 +803,7 @@ export class ReviewedIntegration {
   }
 
   /** Verify the pinned candidate before review when a host suite is configured. */
-  async verifyCandidate(): Promise<boolean> {
+  async verifyCandidate(id?: string): Promise<boolean> {
     const events = await this.#journal.read();
     const pin = candidatePin(events, await this.#target());
     if (events.at(-1)?.kind !== "candidate.created")
@@ -785,7 +815,7 @@ export class ReviewedIntegration {
     );
     if (sha256(diff) !== pin.digest)
       throw new Error("Candidate evidence does not match its durable pin");
-    return this.#verify(pin, diff, this.#writer(events.length));
+    return this.#verify(pin, diff, this.#writer(events.length), id);
   }
 
   /** The current candidate when its latest review passed, else null. */
@@ -807,11 +837,7 @@ export class ReviewedIntegration {
     const last = events.at(-1);
     if (
       last?.kind !== "candidate.created" &&
-      !(
-        last?.kind === "verification.finished" &&
-        last.review === "pass" &&
-        last.digest === pin.digest
-      )
+      preReviewVerification(events, pin) !== "pass"
     )
       throw new Error("Candidate review has already been attempted");
     const diff = await this.#git.diff(

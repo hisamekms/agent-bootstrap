@@ -74,7 +74,12 @@ function response(id: string, answer: unknown): ReviewerRun {
     response: Buffer.from(
       JSON.stringify({
         result: JSON.stringify(answer),
-        usage: { input_tokens: 10, output_tokens: 5 },
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 2,
+          cache_creation_input_tokens: 3,
+        },
       }),
     ),
   };
@@ -186,7 +191,7 @@ test("Planner keeps the brief and context in files, records usage and submits a 
         },
       ],
       attempts: 1,
-      tokens: { input: 10, output: 5 },
+      tokens: { input: 15, output: 5 },
     },
   });
 });
@@ -202,6 +207,10 @@ test("Planner submits decomposition in order, resolving existing IDs and registe
     runPlanner: async (plan, id) => {
       const request = JSON.parse(file(plan, "request.json"));
       assert.deepEqual(request.goal, { id: goalId, content: goal });
+      assert.match(
+        request.contract.rules,
+        /Every Executor Task is automatically reviewed by a Reviewer/,
+      );
       assert.deepEqual(request.tasks, [
         {
           id: existing.taskId,
@@ -213,7 +222,12 @@ test("Planner submits decomposition in order, resolving existing IDs and registe
       ]);
       return response(id, {
         tasks: [
-          { ...task, title: "First", dependsOn: [existing.taskId] },
+          {
+            ...task,
+            title: "First",
+            acceptance: ["A Reviewer checks the docs"],
+            dependsOn: [existing.taskId],
+          },
           { ...task, title: "Second", dependsOn: ["#0"] },
           { ...task, title: "Outside", paths: ["README.md"] },
           { ...task, title: "Blocked", dependsOn: ["#2"] },
@@ -233,6 +247,9 @@ test("Planner submits decomposition in order, resolving existing IDs and registe
     ["Existing", "First", "Second"],
   );
   assert.deepEqual(registered[1]?.content.dependsOn, [existing.taskId]);
+  assert.deepEqual(registered[1]?.content.acceptance, [
+    "A Reviewer checks the docs",
+  ]);
   assert.deepEqual(registered[2]?.content.dependsOn, [registered[1]?.id]);
   const [outside, blocked] = store.listProposals({ status: "pending" });
   assert.ok(outside?.kind === "task" && blocked?.kind === "task");
@@ -261,7 +278,7 @@ test("Planner retries a contract violation and validates the entire batch before
           retryOfExecutionId: calls[0],
         });
       calls.push(id);
-      return response(id, { tasks: [task, { ...task, dependsOn: ["#1"] }] });
+      return response(id, { tasks: [task, { ...task, actor: "Reviewer" }] });
     },
   });
   const id = await work.requestPlanner({

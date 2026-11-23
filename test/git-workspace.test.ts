@@ -592,6 +592,38 @@ test("review diff shows text even when base attributes mark it binary", async (t
     await integration.diff(base, candidate, { path: "README.md" }),
   ).toString();
   assert.match(patch, /^-readme 3\n\+review this change$/m);
+
+  const withAttributes = await integration.createCandidateTree(
+    c3,
+    [
+      {
+        path: ".gitattributes",
+        mode: "100644",
+        bytes: Buffer.from("* -diff\n"),
+      },
+      {
+        path: "README.md",
+        mode: "100644",
+        bytes: Buffer.from("review this change\n"),
+      },
+    ],
+    "candidate attributes",
+  );
+  assert.match(
+    git(repository, [
+      "-c",
+      `attr.tree=${withAttributes}`,
+      "diff",
+      "--stat",
+      c3,
+      withAttributes,
+    ]),
+    /README\.md\s+\|\s+Bin/,
+  );
+  assert.match(
+    await integration.diffStat(c3, withAttributes),
+    /README\.md\s+\|\s+2 \+-/,
+  );
 });
 
 test("diff refuses unsafe tree entries, extra parents and empty candidates", async (t) => {

@@ -732,7 +732,7 @@ export class LocalGitIntegration {
     base: string,
     candidate: string,
     expectation?: FileExpectation,
-  ): Promise<{ path: string; newMode: string }[]> {
+  ) {
     oid(base);
     oid(candidate);
     await this.#commit(base);
@@ -819,7 +819,10 @@ export class LocalGitIntegration {
     }
     if (changes.length === 0)
       throw new GitIntegrationError("invalid-candidate");
-    if (symlinks.length) await this.#checkCandidateSymlinks(symlinks);
+    const links = symlinks.length
+      ? await this.#checkCandidateSymlinks(symlinks)
+      : [];
+    const targets = new Map(links.map(({ path, target }) => [path, target]));
     if (!expectation) {
       const entries = await this.#entries(
         this.#config.repository,
@@ -832,12 +835,16 @@ export class LocalGitIntegration {
         throw new GitIntegrationError("invalid-candidate");
       }
     }
-    return changes;
+    return changes.map(({ path, newMode }) => ({
+      path,
+      newMode,
+      target: targets.get(path),
+    }));
   }
 
   async #checkCandidateSymlinks(
     entries: readonly { path: string; oid: string }[],
-  ): Promise<void> {
+  ) {
     // Recheck pinned commits, including candidates produced by older hosts.
     const batch = await this.#run(["cat-file", "--batch"], {
       gitDir: this.#config.repository,
@@ -847,29 +854,37 @@ export class LocalGitIntegration {
       timeout: 60_000,
     });
     let offset = 0;
+    const links: { path: string; target: string | null }[] = [];
     for (const entry of entries) {
       const newline = batch.indexOf(10, offset);
       if (newline < 0) throw new GitIntegrationError("invalid-candidate");
       const header = batch.toString("latin1", offset, newline);
       const match = /^([a-f0-9]{40}) blob (\d+)$/.exec(header);
       const end = newline + 1 + Number(match?.[2]);
+      const bytes = batch.subarray(newline + 1, end);
       if (
         match?.[1] !== entry.oid ||
         batch[end] !== 10 ||
-        !isSafeSymlinkTarget(entry.path, batch.subarray(newline + 1, end))
+        !isSafeSymlinkTarget(entry.path, bytes)
       )
         throw new GitIntegrationError("invalid-candidate");
+      const target = bytes.toString("utf8");
+      links.push({
+        path: entry.path,
+        target: Buffer.from(target).equals(bytes) ? target : null,
+      });
       offset = end + 1;
     }
     if (offset !== batch.length)
       throw new GitIntegrationError("invalid-candidate");
+    return links;
   }
 
-  async changedPaths(base: string, candidate: string): Promise<string[]> {
+  async candidateChanges(base: string, candidate: string) {
     await this.#repository();
-    return (await this.#candidate(base, candidate))
-      .map(({ path }) => path)
-      .sort();
+    return (await this.#candidate(base, candidate)).sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+    );
   }
 
   async diffStat(base: string, candidate: string): Promise<string> {
@@ -877,6 +892,8 @@ export class LocalGitIntegration {
     await this.#candidate(base, candidate);
     return (
       await this.#git([
+        "-c",
+        `attr.tree=${emptyTree}`,
         "diff",
         "--stat",
         "--no-ext-diff",
