@@ -3,6 +3,7 @@ import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, isAbsolute } from "node:path";
 import {
+  canonicalJson,
   ContractError,
   fields,
   identifier,
@@ -25,6 +26,7 @@ const protocolVersions = [
   "2024-11-05",
 ];
 const briefLimit = 20_000;
+const requestMetaLimit = 4 * 1024;
 const mib = 1024 * 1024;
 
 export interface ExecutionRequester {
@@ -240,8 +242,9 @@ async function callTool(
   let code: ToolCode = "ok";
   let run: (() => unknown) | undefined;
   try {
-    const input = fields(params, ["name", "arguments"]);
-    if (typeof input.name !== "string") throw new ContractError();
+    const input = fields(params, ["name", "arguments", "_meta"]);
+    if (typeof input.name !== "string" || !validRequestMeta(input))
+      throw new ContractError();
     if (isTool(input.name)) {
       tool = input.name;
       if (session === "active" && !notification)
@@ -327,6 +330,21 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function validRequestMeta(params: unknown): boolean {
+  if (!isObject(params) || !Object.hasOwn(params, "_meta")) return true;
+  const meta = params._meta;
+  if (!isObject(meta)) return false;
+  try {
+    // Reject oversized wire JSON before canonicalization sorts and checks its keys.
+    if (Buffer.byteLength(JSON.stringify(meta)) > requestMetaLimit)
+      return false;
+    canonicalJson(meta, requestMetaLimit);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function dispatch(
   message: Record<string, unknown>,
   id: RequestId | undefined,
@@ -360,6 +378,11 @@ async function dispatch(
     };
   }
   if (id === undefined) return {};
+  if (
+    (method === "initialize" || method === "ping" || method === "tools/list") &&
+    !validRequestMeta(params)
+  )
+    return { error: rpcError(id, -32602, "Invalid params") };
   switch (method) {
     case "initialize": {
       const version = isObject(params) ? params.protocolVersion : undefined;

@@ -202,6 +202,56 @@ test("negotiates MCP versions, lists scoped tools and pipelines notifications", 
   });
 });
 
+test("accepts MCP request metadata without echoing or auditing it", async () => {
+  const client = await listen();
+  const _meta = { progressToken: 1 };
+  for (const args of [undefined, {}]) {
+    const { result } = await client.request("tools/call", {
+      name: "status",
+      arguments: args,
+      _meta,
+    });
+    assert.deepEqual(result, {
+      content: [
+        { type: "text", text: JSON.stringify(store.getHostApiStatus()) },
+      ],
+    });
+  }
+  assert.deepEqual(
+    (await client.request("tools/list", { _meta })).result,
+    (await client.request("tools/list")).result,
+  );
+  const params = { protocolVersion: "2025-11-25" };
+  assert.deepEqual(
+    (await client.request("initialize", { ...params, _meta })).result,
+    (await client.request("initialize", params)).result,
+  );
+  assert.deepEqual((await client.request("ping", { _meta })).result, {});
+  assert.equal(apiCalls().length, 2);
+  for (const { data } of apiCalls())
+    assert.partialDeepStrictEqual(data, { tool: "status", code: "ok" });
+  const events = store.listEvents({ subjectId: options.sessionId, limit: 100 });
+  assert.ok(!JSON.stringify(events).includes("progressToken"));
+});
+
+test("rejects malformed and oversized MCP request metadata", async () => {
+  const client = await listen();
+  for (const _meta of [null, [], "invalid", { text: "é".repeat(2048) }]) {
+    const { result } = await client.request("tools/call", {
+      name: "status",
+      _meta,
+    });
+    assert.deepEqual(result, {
+      content: [{ type: "text", text: '{"code":"invalid-arguments"}' }],
+      isError: true,
+    });
+    assert.deepEqual((await client.request("tools/list", { _meta })).error, {
+      code: -32602,
+      message: "Invalid params",
+    });
+  }
+});
+
 test("refuses existing paths, invalid configuration and non-Concierge sessions", async () => {
   writeFileSync(options.socketPath, "keep");
   await assert.rejects(HostApiServer.listen(options), /already exists/);
