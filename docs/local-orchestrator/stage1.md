@@ -57,3 +57,33 @@ Host API and operator CLI own caller authentication and role permissions.
 The host supplies the execution ID when it submits an agent's answer.
 Scheduling and budget consumption will use the stored execution and task
 records.
+
+## Operator CLI
+
+Run `bun run src/local-orchestrator/cli.ts [--db <path>] <command>` on the
+trusted host. The default database is
+`<repo root>/.local/local-orchestrator/state.db`. The CLI creates its state
+directory with mode `0700`. The `.local/` directory is never part of actor
+workspaces or the Concierge's read-only snapshot. Keep any custom database
+in a host-controlled directory outside those workspaces and snapshots.
+
+- `status` reports Goal, Task and proposal counts and summarizes pending gates.
+- `proposals [--status <pending|approved|rejected|registered>]` and
+  `show <proposalId>` display content, the full digest, origin, current gate
+  policy and its source, and requested policy loosenings. Under an agent
+  policy, the display flags when a loosening requires human approval or a
+  Task's policy request requires a human answer. Auto-registered Tasks have
+  no gate. Displayed text uses JSON escaping and long fields end with an
+  ellipsis.
+- `approve <proposalId>` and `reject <proposalId>` require a terminal on both
+  stdin and stdout. Review the displayed proposal and type the command
+  followed by the first 12 hex digits of its digest to confirm, for example
+  `approve 0123456789ab`. The store records a human answer bound to the full
+  displayed digest. A changed digest requires a fresh review.
+- `policy show` displays project defaults. `policy set <gate> <human|agent>`
+  requires a terminal on both stdin and stdout and the exact confirmation
+  `set <gate> <value>`. Setting a gate to `agent` displays a warning.
+- `events [--subject <id>] [--limit <n>]` lists recent audit events, newest
+  first. The limit defaults to 50 and accepts values from 1 to 1,000.
+
+The CLI exits with 0 on success, 1 on refusal or failure, and 2 on usage errors.
