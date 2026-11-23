@@ -159,11 +159,11 @@ repository under `.local`. Review the candidate at the approval prompt.
 
 | Live claim                                           | Codex evidence | Claude evidence |
 | ---------------------------------------------------- | -------------- | --------------- |
-| Command outcome, role execution IDs and audit export | Pass (1)       | Pending         |
-| Lifecycle, provider TCP and DNS rows                 | Pass (1)       | Pending         |
-| Audit and trace joins and Worker resource comparison | Partial (1)    | Pending         |
+| Command outcome, role execution IDs and audit export | Pass (1)       | Pass (2)        |
+| Lifecycle, provider TCP and DNS rows                 | Pass (1)       | Pass (2)        |
+| Audit and trace joins and Worker resource comparison | Pass (1)       | Pass (2)        |
 | External termination and abnormal records            | Pending        | Pending         |
-| Evidence review and cleanup                          | Pass (1)       | Pending         |
+| Evidence review and cleanup                          | Pass (1)       | Pass (2)        |
 
 ### Codex live evidence
 
@@ -200,7 +200,7 @@ task. The prompt, diff, reason and answer are in the run's local
   turn and none for the Worker, which has no durable context of its own.
   The Worker used 2.06 s CPU and 90 MB peak memory with a 6.1% startup
   ratio. The Coordinator used 1.96 s CPU and 87 MB with a 9.0% ratio.
-  A Claude run is still needed for the cross-provider comparison.
+  See the Claude evidence below for the cross-provider comparison.
 - No sandboxes remained in the dedicated `MSB_HOME`. The run lock was
   released, and the refresh token stayed in the Keychain as intended.
 - External termination was not exercised live.
@@ -212,3 +212,44 @@ Earlier live attempts on the same day found two problems.
   `subscription_sharing_unsupported_capability`, because subscription
   sharing rejects `tool_search`. `M5_DEBUG_WORKER=1` exposed the error, and
   the derived catalog now disables `supports_search_tool`.
+
+### Claude live evidence
+
+(2) On 2026-11-23, M5 completed live with `M5_ACTORS=all=claude`, model
+`claude-opus-5-5`, gateway egress, and the operator-credential mode.
+The credential came from a Keychain item through `M5_CLAUDE_KEYCHAIN`.
+Task `e64f7e43-be5f-4340-a8e2-8464b33bd915` finished `done` in 70.0 seconds
+with three Coordinator turns, one Worker, one Reviewer, no revisions, no
+retries and one approval. `hello.txt` now reads
+`Good day, and warm greetings to you.`. The coordinating agent answered the
+approval gate as in (1), and the run's local `gate-answers.md` records the
+answer.
+
+| Role         | Execution ID                           | Seconds |
+| ------------ | -------------------------------------- | ------: |
+| Coordinator  | `3817c820-9022-40ca-af70-3c0869ac39d4` |    9.26 |
+| Worker       | `15b53974-0b36-4040-9238-5425cbf08c50` |   17.26 |
+| Coordinator  | `7df3777c-cd46-48ea-a86f-6dcad819b590` |    8.31 |
+| Reviewer     | `cfe14b22-8bfd-4b68-b8b8-150c3438a764` |   11.58 |
+| Coordinator  | `28e4ea16-9dc6-4c5e-9a92-cb934c446c05` |    8.80 |
+| Verification | `45ca30ae-4fe9-47ab-9cbc-45ad26e5d863` |    0.50 |
+
+- The report says `auditExported: true`. Each model-driven role connected
+  only to `api.anthropic.com:443`. Each made four connections: two short
+  ones (about 0.8 KB sent), one that closed with no bytes, and the model
+  request. DNS for `dl-cdn.alpinelinux.org` was denied 40 times in total.
+  The CLI tries to reach that host from the Alpine guest, and the policy
+  refuses it as intended.
+- For the Worker, the audit-to-trace join matched 260 rows by execution ID.
+  For the first Coordinator turn, the durable-context join matched 225 rows.
+- Coordinator usage was reported for all three turns, at 2 input and about
+  30 output tokens each. Prompt caching likely accounts for the low input
+  figures.
+- No sandboxes remained.
+
+Worker comparison, from the two live runs:
+
+| Worker | Seconds | Startup (ms) | Startup ratio | CPU (s) | Peak memory (MB) |
+| ------ | ------: | -----------: | ------------: | ------: | ---------------: |
+| Codex  |   16.78 |         1031 |         0.061 |    2.06 |               90 |
+| Claude |   17.26 |         1281 |         0.074 |    2.88 |              186 |
