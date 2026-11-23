@@ -66,5 +66,6 @@ See [the operator guide](running.md#approve-and-export-a-goal-branch)
 for the checkout option and manual PR steps.
 
 Stage 3 is covered by local Git and SQLite tests with fake actor and
-verification runs. An operator live run of the integrated cycle remains
-to be recorded. Stage 4 adds Researcher and replanning.
+verification runs. The [Stage 2–3 live runs](stage23-live.md#run-9) record
+the operator run through delegated approval, integration, and branch export.
+Stage 4 adds Researcher and replanning.

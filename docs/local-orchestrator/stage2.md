@@ -136,3 +136,5 @@ Local fixtures exercise the queue, real SQLite migration, real Git
 candidate pinning and path checks, optional verification ordering,
 the approval gate and operator CLI. These review fixes were exercised
 with local fixtures. Live guest usage reporting was outside this review.
+See the [Stage 2–3 live runs](stage23-live.md) for the operator run results,
+including live usage reporting.
