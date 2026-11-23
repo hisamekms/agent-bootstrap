@@ -1,10 +1,14 @@
-import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import { GitIntegrationError } from "../git-integration.ts";
 import {
+  analyze,
+  escapeTerminalControls,
+  type AnalysisCommand,
+} from "./analysis.ts";
+import {
   ContractError,
+  contentDigest,
   GATES,
   identifier,
   integer,
@@ -25,6 +29,18 @@ import {
   reconciliationIntegrationHeads,
 } from "./tasks.ts";
 
+import {
+  prepareTargetDirectory,
+  resolveTarget,
+  TargetError,
+} from "./target.ts";
+import {
+  parseVerificationConfig,
+  readVerificationConfig,
+  writeVerificationConfig,
+  type VerificationConfig,
+} from "./verification.ts";
+
 interface CliIo {
   stdin: NodeJS.ReadableStream;
   stdout: { write(text: string): unknown };
@@ -38,25 +54,30 @@ type ProposalDetails = NonNullable<
 >;
 type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
-const defaultRepo = fileURLToPath(new URL("../../", import.meta.url));
 const maxFieldLength = 4000;
-const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--repo <root>] <command>
+const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--target <path>] <command>
+  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] analyze [--audit <file>] [--out <dir>] [--sql <file>]
+  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] denials [--since <iso>] [--limit <1-1000>]
   reconcile
   status
   retry-task <taskId>
   update-goal-base <goalId>
-  export-goal-branch <goalId> [--repo <checkout>]
+  export-goal-branch <goalId> [--target <checkout>]
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId|goalId|taskId>
   approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
+  verification show
+  verification set --profile <name> -- <argv...>
+  verification clear
   policy show
   policy set <gate> <human|agent>
   events [--subject <id>] [--limit <1-1000>]`;
 
 type Command =
   | { kind: "status" | "policy-show" | "reconcile" }
+  | AnalysisCommand
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
   | { kind: "show-execution" | "retry-task" | "update-goal-base"; id: string }
@@ -66,11 +87,66 @@ type Command =
       id: string;
       delegate?: ReturnType<typeof parseHumanDelegate>;
     }
+  | { kind: "verification-show" | "verification-clear" }
+  | { kind: "verification-set"; config: VerificationConfig }
   | { kind: "policy-set"; gate: Gate; value: Policy }
   | { kind: "events"; subjectId?: string; limit: number };
 
 function parseCommand([kind, ...args]: readonly string[]): Command {
   switch (kind) {
+    case "analyze": {
+      const command: Extract<AnalysisCommand, { kind: "analyze" }> = { kind };
+      for (let i = 0; i < args.length; i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (!value || value.startsWith("--") || value.includes("\0"))
+          throw new ContractError();
+        if (flag === "--out" && command.out === undefined) command.out = value;
+        else if (flag === "--sql" && command.sql === undefined)
+          command.sql = value;
+        else if (flag === "--audit" && command.audit === undefined)
+          command.audit = value;
+        else throw new ContractError();
+      }
+      return command;
+    }
+    case "denials": {
+      const command: Extract<AnalysisCommand, { kind: "denials" }> = { kind };
+      for (let i = 0; i < args.length; i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (
+          flag === "--since" &&
+          command.since === undefined &&
+          value !== undefined &&
+          /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(
+            value,
+          )
+        ) {
+          const date = new Date(value);
+          const day = value.slice(0, 10);
+          const midnight = new Date(day);
+          if (
+            !Number.isFinite(date.getTime()) ||
+            !Number.isFinite(midnight.getTime()) ||
+            !midnight.toISOString().startsWith(day)
+          )
+            throw new ContractError();
+          command.since =
+            value.length === 10
+              ? `${value}T00:00:00Z`
+              : value.replace(/(T\d{2}:\d{2})(?=Z|[+-])/, "$1:00");
+        } else if (
+          flag === "--limit" &&
+          command.limit === undefined &&
+          value !== undefined &&
+          /^[0-9]+$/.test(value)
+        ) {
+          command.limit = integer(Number(value), 1, 1000);
+        } else throw new ContractError();
+      }
+      return command;
+    }
     case "status":
     case "reconcile":
       if (args.length === 0) return { kind };
@@ -92,7 +168,7 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
       const checkout = args[2];
       if (
         args.length === 3 &&
-        args[1] === "--repo" &&
+        isTargetFlag(args[1]) &&
         checkout &&
         !checkout.startsWith("--") &&
         !checkout.includes("\0")
@@ -127,6 +203,20 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
         }),
       };
     }
+    case "verification":
+      if (args.length === 1 && args[0] === "show")
+        return { kind: "verification-show" };
+      if (args.length === 1 && args[0] === "clear")
+        return { kind: "verification-clear" };
+      if (args[0] === "set" && args[1] === "--profile" && args[3] === "--")
+        return {
+          kind: "verification-set",
+          config: parseVerificationConfig({
+            profile: args[2],
+            argv: args.slice(4),
+          }),
+        };
+      break;
     case "policy":
       if (args.length === 1 && args[0] === "show")
         return { kind: "policy-show" };
@@ -160,15 +250,6 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     }
   }
   throw new ContractError();
-}
-
-function escapeTerminalControls(text: string): string {
-  return text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
-    character
-      .split("")
-      .map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`)
-      .join(""),
-  );
 }
 
 function boundField(value: string): string {
@@ -248,17 +329,56 @@ function refuse(io: CliIo, message: string): 1 {
 async function execute(
   io: CliIo,
   store: OrchestratorStore,
-  command: Command,
+  command: Exclude<Command, AnalysisCommand>,
   directory: string | undefined,
   repoRoot: string,
 ): Promise<0 | 1> {
   switch (command.kind) {
+    case "verification-show":
+      writeJson(io, readVerificationConfig(directory!));
+      return 0;
+    case "verification-clear":
+    case "verification-set": {
+      const config =
+        command.kind === "verification-set" ? command.config : null;
+      const digest = config === null ? null : contentDigest(config);
+      const previous = readVerificationConfig(directory!);
+      writeJson(io, {
+        target: repoRoot,
+        current: previous,
+        verification: config,
+      });
+      const phrase =
+        digest === null
+          ? "verification clear"
+          : `verification set ${digest.slice(0, 12)}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      const previousDigest = contentDigest(previous);
+      const applied = store.changeVerification(digest, () => {
+        if (
+          contentDigest(readVerificationConfig(directory!)) !== previousDigest
+        )
+          return false;
+        writeVerificationConfig(directory!, config);
+        return true;
+      });
+      if (!applied)
+        return refuse(
+          io,
+          "Verification changed. Review the current configuration.",
+        );
+      return 0;
+    }
     case "update-goal-base": {
       if (directory === undefined)
-        return refuse(io, "update-goal-base with --db requires --repo <root>.");
+        return refuse(
+          io,
+          "update-goal-base with --db requires --target <path>.",
+        );
       const { from, to, apply } = await previewGoalBaseUpdate(
         store,
-        resolve(directory, "../.."),
+        repoRoot,
         directory,
         command.id,
       );
@@ -410,7 +530,7 @@ async function execute(
         if (directory === undefined)
           return refuse(
             io,
-            "Integration proposals with --db also require --repo <root>.",
+            "Integration proposals with --db also require --target <path>.",
           );
         diffStat = await candidateDiffStat(directory, proposal.content);
       }
@@ -471,25 +591,47 @@ async function execute(
   }
 }
 
+function isTargetFlag(flag: string | undefined): boolean {
+  return flag === "--target" || flag === "--repo";
+}
+
 export async function runCli(
   argv: readonly string[],
   io: CliIo,
+  bootstrapRoot?: string,
 ): Promise<0 | 1 | 2> {
   let db: string | undefined;
-  let repo: string | undefined;
+  let targetPath: string | undefined;
+  let allTargets = false;
   let command: Command;
   try {
     let i = 0;
-    while (argv[i] === "--db" || argv[i] === "--repo") {
+    while (
+      argv[i] === "--db" ||
+      argv[i] === "--all-targets" ||
+      isTargetFlag(argv[i])
+    ) {
       const flag = argv[i++];
+      if (flag === "--all-targets" && !allTargets) {
+        allTargets = true;
+        continue;
+      }
       const value = argv[i++];
       if (!value || value.startsWith("--") || value.includes("\0"))
         throw new ContractError();
       if (flag === "--db" && db === undefined) db = value;
-      else if (flag === "--repo" && repo === undefined) repo = value;
+      else if (isTargetFlag(flag) && targetPath === undefined)
+        targetPath = value;
       else throw new ContractError();
     }
     command = parseCommand(argv.slice(i));
+    const analysis = command.kind === "analyze" || command.kind === "denials";
+    if (
+      (allTargets && (targetPath !== undefined || !analysis)) ||
+      (db !== undefined && analysis) ||
+      (allTargets && command.kind === "analyze" && command.audit !== undefined)
+    )
+      throw new ContractError();
   } catch {
     io.stderr.write(`${usage}\n`);
     return 2;
@@ -504,6 +646,8 @@ export async function runCli(
       "retry-task",
       "update-goal-base",
       "export-goal-branch",
+      "verification-set",
+      "verification-clear",
     ].includes(command.kind) &&
     !io.isTTY
   )
@@ -512,14 +656,21 @@ export async function runCli(
   if (
     command.kind === "export-goal-branch" &&
     db !== undefined &&
-    repo === undefined
+    targetPath === undefined
   )
     return refuse(
       io,
-      "With a custom --db, pass --repo for the launcher checkout before the command.",
+      "With a custom --db, pass --target for the launcher target before the command.",
     );
 
+  if (db !== undefined && command.kind.startsWith("verification-"))
+    return refuse(io, "Verification commands use the target's state database.");
+
   try {
+    const target = await resolveTarget(targetPath, bootstrapRoot);
+    if (command.kind === "analyze" || command.kind === "denials")
+      return await analyze(target, allTargets, command, io);
+    const { repoRoot, directory } = target;
     if (command.kind === "policy-set") {
       if (command.value === "agent")
         io.stdout.write(
@@ -529,23 +680,24 @@ export async function runCli(
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
     }
-    const repoRoot = resolve(repo ?? defaultRepo);
-    const directory = join(repoRoot, ".local", "local-orchestrator");
     if (db === undefined)
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      await prepareTargetDirectory(target.bootstrapRoot, directory);
     const store = OrchestratorStore.open(db ?? join(directory, "state.db"));
     try {
       return await execute(
         io,
         store,
         command,
-        db !== undefined && repo === undefined ? undefined : directory,
+        db !== undefined && targetPath === undefined ? undefined : directory,
         repoRoot,
       );
     } finally {
       store.close();
     }
   } catch (error) {
+    if (error instanceof TargetError) return refuse(io, error.message);
+    if (command.kind === "analyze" || command.kind === "denials")
+      return refuse(io, "Local orchestrator analysis export failed.");
     if (
       command.kind === "export-goal-branch" &&
       error instanceof GitIntegrationError
@@ -575,7 +727,7 @@ export async function runCli(
     )
       return refuse(
         io,
-        "Integration is still uncertain. Inspect the private Goal branch and integration journal. With a custom --db, pass --repo for the launcher checkout.",
+        "Integration is still uncertain. Inspect the private Goal branch and integration journal. With a custom --db, pass --target for the launcher target.",
       );
     if (command.kind === "update-goal-base") {
       if (

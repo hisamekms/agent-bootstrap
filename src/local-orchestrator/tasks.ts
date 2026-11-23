@@ -8,6 +8,7 @@ import type { RoleHarness } from "../actors.ts";
 import {
   parseClaudeCodeResult,
   parseClaudeWorkerResult,
+  readClaudeRunMetrics,
 } from "../claude-code.ts";
 import {
   GitIntegrationError,
@@ -47,12 +48,13 @@ type TaskHost = Pick<
   TrustedHost,
   "runWorker" | "runReviewer" | "runVerification"
 >;
-type ActorResult = {
+type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
   outcome?: string;
   invocationId?: string;
   tokens?: number;
   usage?: TokenUsage;
   isError?: boolean;
+  revision?: boolean;
 };
 type CandidateChange = {
   path: string;
@@ -136,7 +138,18 @@ function processExit(child: ReturnType<typeof spawn>) {
 }
 
 /** Resolve the direct local main ref without consulting remote refs. */
-export async function localMainCommit(repoRoot: string): Promise<string> {
+export async function localMainCommit(
+  repoRoot: string,
+  requireWorktreeRoot = false,
+): Promise<string> {
+  if (requireWorktreeRoot) {
+    const { stdout } = await git(repoRoot, [
+      "rev-parse",
+      "--is-inside-work-tree",
+      "--show-prefix",
+    ]);
+    if (stdout !== "true\n\n") throw new Error("Invalid worktree root");
+  }
   const { stdout } = await git(repoRoot, [
     "for-each-ref",
     "--format=%(refname)%00%(symref)%00%(objectname)%00%(objecttype)",
@@ -364,6 +377,7 @@ export function createTaskExecutor(options: {
           if (reviewer.harness === "claude") {
             const result = parseClaudeCodeResult(run.response);
             Object.assign(reviewerResult, reportedUsage(result));
+            Object.assign(reviewerResult, readClaudeRunMetrics(result));
             if (result?.isError) reviewerResult.isError = true;
           }
           return run;
@@ -388,13 +402,27 @@ export function createTaskExecutor(options: {
               onWorkerStderr(bytes: Uint8Array) {
                 const result = parseClaudeWorkerResult(bytes);
                 Object.assign(workerResult, reportedUsage(result));
+                Object.assign(workerResult, readClaudeRunMetrics(result));
                 if (result?.isError) workerResult.isError = true;
               },
             }
           : {}),
         reviewerSandbox: reviewer.sandbox,
         reviewerOutput: (response) => taskReviewerOutput(reviewer, response),
-        ...(verification ? { verification } : { allowUnverified: true }),
+        ...(verification
+          ? {
+              verification: {
+                ...verification,
+                command: {
+                  ...verification.command,
+                  timeoutMs: Math.min(
+                    verification.command.timeoutMs,
+                    timeoutMs,
+                  ),
+                },
+              },
+            }
+          : { allowUnverified: true }),
       },
     );
 
@@ -591,6 +619,10 @@ export async function runTask(
       {
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
+        ...(observed.revision === undefined
+          ? {}
+          : { revision: observed.revision }),
+        ...readClaudeRunMetrics(observed),
         tokens: mode === "verification" ? 0 : (observed.tokens ?? null),
         usage:
           mode === "verification"
@@ -616,6 +648,7 @@ export async function runTask(
         "Executor",
         "task",
         async (runId, observed) => {
+          observed.revision = attempt > 0;
           const pin = await flow.worker(runId, attempt > 0, observed);
           const changes = await flow.changes(pin);
           const changedPaths = changes.map(({ path }) => path);
@@ -650,6 +683,7 @@ export async function runTask(
         code = "session-ended";
         break;
       }
+      let verified = false;
       if (flow.verify) {
         const verify = flow.verify;
         const verification = await execute(
@@ -663,11 +697,12 @@ export async function runTask(
             };
           },
         );
-        if (verification.failure) {
-          code = verification.failure;
+        if (verification.failure || verification.value !== true) {
+          code = verification.failure ?? "verification-failed";
           if (code === "verification-failed") continue;
           break;
         }
+        verified = true;
       }
 
       if (!canContinue()) {
@@ -715,7 +750,7 @@ export async function runTask(
           ...pin,
           changedPaths,
           symlinks,
-          verified: flow.verify !== undefined,
+          verified,
           review: {
             result: "pass",
             ...(review.value.notes ? { notes: review.value.notes } : {}),
@@ -813,7 +848,38 @@ export async function integrateApprovedProposal(
     });
     outcome = await integration.integrate(
       randomUUID(),
-      verified ? undefined : { allowUnverified: true },
+      verified
+        ? {
+            verificationObserver: {
+              begin() {
+                const { id } = store.createExecution({
+                  actor: "Reviewer",
+                  mode: "verification",
+                  taskId: task.id,
+                  requestedBy: { kind: "host" },
+                });
+                store.startExecution(id);
+                return id;
+              },
+              finish(id, passed) {
+                store.finishExecution(id, passed ? "succeeded" : "failed", {
+                  phase: "integration",
+                  ...(passed
+                    ? {}
+                    : {
+                        code:
+                          passed === null
+                            ? "host-error"
+                            : "verification-failed",
+                      }),
+                  tokens: 0,
+                  usage: emptyTokenUsage,
+                  ...readClaudeRunMetrics(null),
+                });
+              },
+            },
+          }
+        : { allowUnverified: true },
     );
     if (outcome === "denied") {
       const last = (await journal.read()).at(-1);

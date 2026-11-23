@@ -78,7 +78,7 @@ function events(telemetry: Telemetry, executionId = randomUUID()) {
   return {
     emit,
     executionId,
-    start(flags = "00") {
+    start(flags = "00", profile: "base" | "bun" = "base") {
       emit("execution.started", {
         context: {
           executionId,
@@ -89,7 +89,7 @@ function events(telemetry: Telemetry, executionId = randomUUID()) {
           },
         },
         role: "Worker",
-        profile: "base",
+        profile,
         agentKind: "codex",
         runtimeKind: "microsandbox",
       });
@@ -130,11 +130,11 @@ for (const outcome of [
     const telemetry = createTelemetry(config, "/unused", { exporters });
     const run = events(telemetry);
     try {
-      run.start();
+      run.start("00", "bun");
       run.emit("sandbox.created", {
         outcome: "succeeded",
         durationMs: 2,
-        profile: "base",
+        profile: "bun",
         runtimeKind: "microsandbox",
       });
       run.emit("process.started", { outcome: "started" });
@@ -167,7 +167,7 @@ for (const outcome of [
         assert.equal(span.attributes["agent.kind"], "codex");
         assert.equal(span.attributes["runtime.kind"], "microsandbox");
         assert.equal(span.attributes.role, "Worker");
-        assert.equal(span.attributes.profile, "base");
+        assert.equal(span.attributes.profile, "bun");
       }
       for (const span of [create, start, process, destroy])
         assert.equal(

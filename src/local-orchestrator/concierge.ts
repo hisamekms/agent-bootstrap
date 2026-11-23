@@ -11,7 +11,7 @@ import {
   readdir,
   rm,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { claudeRoleHarness, guestOf } from "../actors.ts";
@@ -37,6 +37,11 @@ import { ActorRunner } from "./runner.ts";
 import type { OrchestratorStore } from "./store.ts";
 import { createTaskExecutor, localMainCommit } from "./tasks.ts";
 import type { Verification } from "../reviewed-integration.ts";
+import {
+  checkDirectory,
+  prepareTargetDirectory,
+  type resolveTarget,
+} from "./target.ts";
 
 /** macOS limits Unix socket paths to 104 bytes; /private/tmp keeps the Host API
  * socket short there. Other hosts use the OS temporary directory. */
@@ -53,6 +58,7 @@ const gitEnv = {
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_NO_LAZY_FETCH: "1",
+  GIT_ALLOW_PROTOCOL: "",
   GIT_NO_REPLACE_OBJECTS: "1",
   GIT_ATTR_NOSYSTEM: "1",
   GIT_OPTIONAL_LOCKS: "0",
@@ -78,6 +84,7 @@ export interface ConciergeDeps {
     sessionId: string,
     commit?: string,
     goalRepository?: boolean,
+    target?: ConciergeOptions["target"],
   ) => Promise<ConciergeSnapshot>;
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
@@ -89,6 +96,7 @@ export interface ConciergeDeps {
 
 export interface ConciergeOptions {
   readonly repoRoot: string;
+  readonly target?: Awaited<ReturnType<typeof resolveTarget>>;
   readonly model: string;
   readonly mode?: PermissionMode;
   readonly continue?: boolean;
@@ -144,36 +152,6 @@ EOF
   return { argv: ["/bin/sh", "-ec", script], workdir: "/repo" };
 }
 
-async function checkDirectory(path: string): Promise<void> {
-  const parent = dirname(path);
-  if (parent !== path) await checkDirectory(parent);
-  const info = await lstat(path);
-  const mode = info.mode & 0o7777;
-  if (
-    !info.isDirectory() ||
-    (info.uid !== process.getuid?.() && info.uid !== 0) ||
-    ((mode & 0o022) !== 0 && !(info.uid === 0 && mode === 0o1777))
-  )
-    throw new Error("Unsafe Concierge directory");
-}
-
-export async function prepareConciergeDirectory(
-  repoRoot: string,
-): Promise<string> {
-  const root = resolve(repoRoot);
-  await checkDirectory(root);
-  let dir = root;
-  for (const name of [".local", "local-orchestrator"]) {
-    dir = join(dir, name);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await checkDirectory(dir);
-  }
-  const info = await lstat(dir);
-  if (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)
-    throw new Error("Concierge state requires a private directory");
-  return dir;
-}
-
 function exited(child: ReturnType<typeof spawn>): Promise<void> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
@@ -198,9 +176,13 @@ export async function snapshotConciergeRepo(
   sessionId: string,
   commit?: string,
   goalRepository = false,
+  target?: ConciergeOptions["target"],
 ): Promise<ConciergeSnapshot> {
   if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error("Invalid session ID");
-  const root = await prepareConciergeDirectory(repoRoot);
+  const root = await prepareTargetDirectory(
+    target?.bootstrapRoot ?? resolve(repoRoot),
+    target?.directory,
+  );
   const parent = join(root, "snapshots");
   await mkdir(parent, { recursive: true, mode: 0o700 });
   await checkDirectory(parent);
@@ -333,6 +315,7 @@ function missing(error: NodeJS.ErrnoException) {
 /** Provisional Planner context, leaving room for the runner's request.json. */
 export async function conciergeContext(
   snapshot: Pick<ConciergeSnapshot, "dir" | "files">,
+  includeOrchestratorDocs = true,
 ): Promise<SandboxFile[]> {
   const { fileBytes, files, workspaceBytes } = MICROSANDBOX_LIMITS;
   const listing: string[] = [];
@@ -351,7 +334,7 @@ export async function conciergeContext(
     { path: "files.txt", bytes: Buffer.from(listing.join("")) },
   ];
   let remaining = workspaceBytes - fileBytes - context[0]!.bytes.byteLength;
-  const docs = [...tracked]
+  const docs = (includeOrchestratorDocs ? [...tracked] : [])
     .filter((path) =>
       /^docs\/local-orchestrator\/[a-zA-Z0-9._-]+\.md$/.test(path),
     )
@@ -414,7 +397,9 @@ export async function startConcierge(
     tools,
     profile: "base",
   });
-  const stateVolume = conciergeVolumeName(options.repoRoot);
+  const { repoRoot, target } = options;
+  const bootstrapRoot = target?.bootstrapRoot ?? resolve(repoRoot);
+  const stateVolume = target?.volume ?? conciergeVolumeName(repoRoot);
 
   const invocationId = randomUUID();
   const { id: sessionId } = store.startSession("Concierge", invocationId, true);
@@ -437,17 +422,26 @@ export async function startConcierge(
 
   try {
     options.onSession?.(sessionId);
-    const snapshot = await deps.snapshot(options.repoRoot, sessionId);
+    const snapshot = await deps.snapshot(
+      repoRoot,
+      sessionId,
+      undefined,
+      false,
+      target,
+    );
     snapshotDir = snapshot.dir;
     store.recordSessionSnapshot(sessionId, snapshot.commit);
-    const context = await conciergeContext(snapshot);
+    const context = await conciergeContext(snapshot, target?.isDefault);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
     const tasks =
       host.runWorker && host.runVerification
         ? createTaskExecutor({
-            directory: await prepareConciergeDirectory(options.repoRoot),
-            repoRoot: options.repoRoot,
+            directory: await prepareTargetDirectory(
+              bootstrapRoot,
+              target?.directory,
+            ),
+            repoRoot,
             store,
             snapshotCommit: snapshot.commit,
             host: {
@@ -463,7 +457,7 @@ export async function startConcierge(
                   : {
                       ...install,
                       binary: join(
-                        options.repoRoot,
+                        bootstrapRoot,
                         ".local",
                         "claude-code",
                         CLAUDE_CODE.version,
@@ -497,15 +491,16 @@ export async function startConcierge(
       context: async (commit, goalRepository) => {
         if (commit === null || commit === snapshot.commit) return context;
         const pinned = await deps.snapshot(
-          options.repoRoot,
+          repoRoot,
           randomUUID(),
           commit,
           goalRepository,
+          target,
         );
         try {
           if (pinned.commit !== commit)
             throw new Error("Planner snapshot mismatch");
-          return await conciergeContext(pinned);
+          return await conciergeContext(pinned, target?.isDefault);
         } finally {
           await rm(pinned.dir, { recursive: true, force: true });
         }
@@ -595,7 +590,14 @@ export async function startConcierge(
       }
     };
     await cleanup("concierge-end-session-failed", () =>
-      store.endSession(sessionId),
+      store.endSession(sessionId, {
+        mode,
+        status:
+          !failed && outcome === "ok" && exitCode === 0
+            ? "succeeded"
+            : "failed",
+        exitCode,
+      }),
     );
     const closing = cleanup("concierge-close-api-failed", () =>
       server?.close(),

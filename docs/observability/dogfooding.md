@@ -100,6 +100,37 @@ bun test --timeout 60000 $(rg --files test -g '*.test.ts' -g '!egress-gateway.te
 The test command reported 415 passing tests across 35 files. The pinned
 DuckDB schema smoke, `bun spike/obs/duckdb-smoke.ts`, passed all 15 checks.
 
+## Snapshot export and denials
+
+Create a consistent copy of an audit database with SQLite's backup command.
+Use a private working directory and a fresh export destination.
+
+```sh
+sqlite3 /path/to/audit.sqlite '.backup ./audit-backup.sqlite'
+bun src/audit-export.ts ./audit-backup.sqlite ./snapshot-export
+```
+
+The command invokes `exportAudit` on the snapshot. It reads supported audit
+schemas in WAL or rollback journal mode and writes finalized JSONL under
+`snapshot-export/audit/`. To switch the copy to rollback journal mode, run
+`sqlite3 ./audit-backup.sqlite 'PRAGMA journal_mode=DELETE;'` on the copy.
+To combine the snapshot with a local orchestrator
+target's state and telemetry, use `analyze --audit ./audit-backup.sqlite`.
+
+When loading a manual layout, check `input_issues` first. A
+`missing-stream` row gives the expected path when a stream has no
+finalized `YYYY-MM-DD-NNNN.jsonl` rotations. With `orchestrator.sql` loaded,
+it also reports a missing orchestrator checkpoint. An audit-only export
+can therefore show telemetry and orchestrator issues while its audit views
+are available.
+
+Query `denial_summary` for counts by target, DNS or connection kind,
+hostname and reason. Query `denials` for the underlying execution IDs,
+roles, destinations and decision times. Loading `orchestrator.sql` adds
+actor attribution when a matching run is available. For a local
+orchestrator checkout, `denials --since 2026-11-23T00:00:00Z --limit 20`
+prints counts and recent details. See the [CLI examples](../local-orchestrator/analysis.md#denial-reports).
+
 ## Live M5 operator checklist
 
 Run these commands only after the operator approves the provider, credential
@@ -253,3 +284,10 @@ Worker comparison, from the two live runs:
 | ------ | ------: | -----------: | ------------: | ------: | ---------------: |
 | Codex  |   16.78 |         1031 |         0.061 |    2.06 |               90 |
 | Claude |   17.26 |         1281 |         0.074 |    2.88 |              186 |
+
+## Local orchestrator runs
+
+The Concierge launcher exports the host audit at session end and records the
+export outcome in the local orchestrator store. To join runtime facts with
+actor time, usage, Task outcomes and gate decisions for any target checkout,
+use the [local orchestrator DuckDB analysis](../local-orchestrator/analysis.md).

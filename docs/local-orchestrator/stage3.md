@@ -16,8 +16,10 @@ branch must still point to the proposal base. A stale base fails the Task
 with `stale-base`. Use an operator retry to prepare a fresh candidate.
 Integration uses the existing Git compare-and-swap.
 
-A verification suite configured in the launcher runs before review and
-again during M5 integration. New proposals record `verified: false` when
+A host verification suite runs before review and again during M5
+integration. The stock launcher reads the selected target’s private
+`config.json` at startup. Set or clear the command with the operator CLI.
+See [target verification](running.md#configure-verification-for-the-target). New proposals record `verified: false` when
 there is no suite. Those proposals require a human answer even under an
 agent policy. Older proposals with no verification field, and proposals
 with symlink changes or missing symlink evidence, also require a human
@@ -53,7 +55,7 @@ Other heads require operator investigation. Reconciliation performs no Git
 updates or replay.
 
 Run `export-goal-branch <goalId>` in a host terminal to fetch the private
-Goal head into the operator checkout as the same local branch. Review the
+Goal head into the selected target as the same local branch by default. Review the
 destination and the old and new heads and confirm with the displayed
 phrase. The command allows branch creation or a fast-forward and refuses
 to update a branch checked out in any linked worktree. SQLite records
@@ -61,7 +63,8 @@ to update a branch checked out in any linked worktree. SQLite records
 the local branch update. Preview and apply require the private ref to
 match the last audited integration head or the recorded Goal base if no
 integration has completed. A mismatch returns `export-head-mismatch`.
-With a custom `--db`, pass the leading `--repo <launcher-root>`.
+Use the same leading `--target <path>` as the launcher for an external
+repository. With a custom `--db`, pass the leading `--target <path>`.
 See [the operator guide](running.md#approve-and-export-a-goal-branch)
 for the checkout option and manual PR steps.
 

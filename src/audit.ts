@@ -8,6 +8,7 @@ import {
   parseExecutionContext,
 } from "./execution-context.ts";
 import { isConciergeVolumeName } from "./sandbox-runtime.ts";
+import { PROFILE_NAMES, type ProfileName } from "./sandbox-profiles.ts";
 
 type AuditDetail =
   | {
@@ -46,7 +47,7 @@ export type AuditInput = {
     | "Verification"
     | "Concierge";
   /** Schema v4. Only on `sandbox.create` requests, together with `image`. */
-  readonly profile?: "base" | "db" | "browser" | "concierge";
+  readonly profile?: ProfileName;
   /** Schema v4. Lowercase hex SHA-256 digest of the sandbox image. */
   readonly image?: string;
   /** Schema v6. Host-owned channel or session-volume evidence. */
@@ -151,7 +152,7 @@ const roles = [
   "Verification",
   "Concierge",
 ];
-const profiles = ["base", "db", "browser", "concierge"];
+const profiles: readonly string[] = PROFILE_NAMES;
 const imageDigest = /^[0-9a-f]{64}$/;
 const inputKeys = [
   "invocationId",
@@ -518,7 +519,15 @@ const schemaV6 = [
   { name: "audit_events", sql: auditTableV6 },
   ...schemaV5.slice(1),
 ];
-const currentVersion = 6;
+const auditTableV7 = auditTableV6.replace(
+  "'base','db','browser','concierge'",
+  "'base','db','browser','concierge','bun'",
+);
+const schemaV7 = [
+  { name: "audit_events", sql: auditTableV7 },
+  ...schemaV6.slice(1),
+];
+const currentVersion = 7;
 const versionSchemas = {
   1: auditSchema,
   2: schema,
@@ -526,6 +535,7 @@ const versionSchemas = {
   4: schemaV4,
   5: schemaV5,
   6: schemaV6,
+  7: schemaV7,
 };
 
 type AuditVersion = keyof typeof versionSchemas;
@@ -1288,7 +1298,7 @@ export class SqliteAudit implements AuditSink {
         database.exec("PRAGMA journal_mode=WAL");
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of schemaV6) database.exec(entry.sql);
+          for (const entry of schemaV7) database.exec(entry.sql);
           database.exec(
             `PRAGMA application_id=${applicationId}; PRAGMA user_version=${currentVersion}; COMMIT`,
           );
@@ -1309,7 +1319,16 @@ export class SqliteAudit implements AuditSink {
             foundVersion !== 3 &&
             foundVersion !== 4 &&
             foundVersion !== 5 &&
+            foundVersion !== 6 &&
             foundVersion !== currentVersion)
+        )
+          throw new AuditStoreError("invalid-database");
+        // Only an empty store may initialize WAL. Refuse a snapshot before
+        // any schema migration can modify it.
+        if (
+          !this.#readOnly &&
+          record(database.query("PRAGMA journal_mode").get()).journal_mode !==
+            "wal"
         )
           throw new AuditStoreError("invalid-database");
         version = foundVersion;
@@ -1319,7 +1338,7 @@ export class SqliteAudit implements AuditSink {
           "SELECT name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
         )
         .all();
-      const matchesSchema = (expectedSchema: typeof schemaV6) =>
+      const matchesSchema = (expectedSchema: typeof schemaV7) =>
         installed.length === expectedSchema.length &&
         expectedSchema.every((expected) =>
           installed.some((value) => {
@@ -1365,7 +1384,7 @@ export class SqliteAudit implements AuditSink {
       }
       if (
         !this.#readOnly &&
-        (version === 1 || version === 4 || version === 5)
+        (version === 1 || version === 4 || version === 5 || version === 6)
       ) {
         const upgradedVersion = version === 1 ? 2 : currentVersion;
         database.exec("BEGIN IMMEDIATE");
@@ -1385,11 +1404,12 @@ export class SqliteAudit implements AuditSink {
             database.exec(
               "ALTER TABLE audit_events RENAME TO audit_events_previous",
             );
-            database.exec(auditTableV6);
+            database.exec(auditTableV7);
+            const detailColumn = version === 6 ? ", detail" : "";
             database.exec(`
               INSERT INTO audit_events
-                (sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image)
-                SELECT sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image
+                (sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image${detailColumn})
+                SELECT sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image${detailColumn}
                 FROM audit_events_previous;
               INSERT INTO sqlite_sequence (name, seq)
                 SELECT 'audit_events', seq FROM sqlite_sequence
@@ -1413,13 +1433,11 @@ export class SqliteAudit implements AuditSink {
           throw new AuditStoreError("invalid-database");
         }
       }
-      // Change persistent journaling only after recognizing and validating the
-      // database. Unrelated SQLite databases are rejected without this mutation.
-      if (!this.#readOnly) database.exec("PRAGMA journal_mode=WAL");
       if (
-        record(database.query("PRAGMA journal_mode").get()).journal_mode !==
+        !this.#readOnly &&
+        (record(database.query("PRAGMA journal_mode").get()).journal_mode !==
           "wal" ||
-        record(database.query("PRAGMA synchronous").get()).synchronous !== 2
+          record(database.query("PRAGMA synchronous").get()).synchronous !== 2)
       )
         throw new AuditStoreError("invalid-database");
       this.#database = database;
@@ -1519,6 +1537,8 @@ export class SqliteAudit implements AuditSink {
   append(event: AuditInput): void {
     this.#requireWriter();
     const input = parseInput(event);
+    if (this.#version < 7 && input.profile === "bun")
+      throw new AuditStoreError("invalid-event");
     if (
       this.#version < 6 &&
       (input.role === "Concierge" ||

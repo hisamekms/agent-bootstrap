@@ -34,6 +34,17 @@ const task = {
 };
 
 describe("orchestrator contracts", () => {
+  test("Bun Executor tasks fit a goal that grants the bun profile", () => {
+    const bunGoal = validateGoalContent({
+      ...goal,
+      scope: { ...scope, profiles: ["bun"] },
+    });
+    const bunTask = validateTaskContent({ ...task, profile: "bun" });
+    assert.deepEqual(bunGoal.scope.profiles, ["bun"]);
+    assert.equal(bunTask.profile, "bun");
+    assert.deepEqual(fitsScope(bunGoal, bunTask, 0), { ok: true });
+  });
+
   test("rejects malformed goal", () => {
     for (const invalid of [
       undefined,

@@ -689,6 +689,36 @@ export class OrchestratorStore {
     });
   }
 
+  changeVerification(digest: string | null, apply: () => boolean): boolean {
+    if (digest !== null && !/^[a-f0-9]{64}$/.test(digest))
+      throw new ContractError();
+    const data = { changeId: randomUUID(), digest };
+    this.#write((at) => {
+      this.#event(
+        at,
+        "project.verification-change-authorized",
+        "project",
+        "project",
+        data,
+      );
+    });
+    // Commit authorization first, then serialize the comparison, file update
+    // and completion event with other CLI processes using this database.
+    return this.#write((at) => {
+      if (!apply()) return false;
+      this.#event(
+        at,
+        digest === null
+          ? "project.verification-cleared"
+          : "project.verification-set",
+        "project",
+        "project",
+        data,
+      );
+      return true;
+    });
+  }
+
   #newProposal(
     kind: ProposalRow["kind"],
     content: GoalContent | TaskContent | IntegrationContent,
@@ -1885,7 +1915,14 @@ export class OrchestratorStore {
     }
   }
 
-  endSession(sessionId: string): void {
+  endSession(
+    sessionId: string,
+    result?: {
+      mode: string;
+      status: "succeeded" | "failed";
+      exitCode: number | null;
+    },
+  ): void {
     const id = identifier(sessionId);
     this.#write((at) => {
       const row = required(
@@ -1902,7 +1939,23 @@ export class OrchestratorStore {
         at,
         id,
       );
-      this.#event(at, "session.ended", "session", id, {}, { sessionId: id });
+      this.#event(at, "session.ended", "session", id, result ?? {}, {
+        sessionId: id,
+      });
+    });
+  }
+
+  recordSessionAuditExport(sessionId: string, exported: boolean): void {
+    const id = identifier(sessionId);
+    this.#write((at) => {
+      this.#event(
+        at,
+        "session.audit-export",
+        "session",
+        id,
+        { exported },
+        { sessionId: id },
+      );
     });
   }
 

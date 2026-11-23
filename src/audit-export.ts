@@ -194,7 +194,12 @@ function project(rows: AuditExportRecord[], watermark: AuditSequenceWatermark) {
       }
       case "execution_contexts":
         line.action = "execution.context";
-        line.attributes = row.attributes ?? {};
+        line.attributes = {
+          ...row.attributes,
+          ...(row.retryOfExecutionId && {
+            retryOfExecutionId: row.retryOfExecutionId,
+          }),
+        };
         break;
       case "sandbox_bindings":
         line.action = "sandbox.bind";

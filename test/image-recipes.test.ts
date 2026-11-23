@@ -11,6 +11,7 @@ import {
   aptPackages,
   buildNetRules,
   smokeTest,
+  profileFiles,
   profilePackages,
   recipeDigest,
 } from "../src/image-recipes.ts";
@@ -69,14 +70,14 @@ describe("image recipes", () => {
     assert.equal(recipeDigest("db"), first);
   });
 
-  test("db and browser recipe digests match the checked-in profile lock", () => {
+  test("existing recipe digests match the checked-in profile lock", () => {
     const lock = parseProfileLock(
       readFileSync(
         new URL("../images/profiles.lock.json", import.meta.url),
         "utf8",
       ),
     );
-    for (const name of ["db", "browser"]) {
+    for (const name of ["db", "browser", "concierge"]) {
       assert.equal(recipeDigest(name), lock.profiles[name]?.recipeDigest, name);
     }
   });
@@ -168,6 +169,45 @@ describe("image recipes", () => {
       ].join("\n"),
       expected: ["socat-ok", "git-ok"],
     });
+  });
+
+  test("bun pins an offline archive, installs Bun and checks Bun and Git", () => {
+    assert.deepEqual(PROFILE_RECIPES.bun, {
+      base: ALPINE_3_23,
+      features: ["bun", "zstd", "git"],
+      memoryMiB: 2048,
+      cpus: 2,
+    });
+    const [archive] = profileFiles("bun");
+    assert.deepEqual(archive, {
+      name: "bun-linux-aarch64-musl.zip",
+      source: ".local/bun/1.4.4/bun-linux-aarch64-musl.zip",
+      sha256:
+        "57f01b02ac7113c61c935f28f38c2eab849e3c970dab21f8b640a87b1ef65009",
+    });
+    const pin = FEATURES.bun.files[0] as { sha256: string };
+    const original = pin.sha256;
+    const digest = recipeDigest("bun");
+    try {
+      pin.sha256 = "0".repeat(64);
+      assert.notEqual(recipeDigest("bun"), digest);
+    } finally {
+      pin.sha256 = original;
+    }
+    assert.deepEqual(buildNetRules("bun"), []);
+    const script = BUILD_SCRIPT("bun");
+    assert.match(script, /busybox unzip -p .* > \/usr\/local\/bin\/bun/);
+    assert.match(script, /sha256sum -c -\nchmod 0755 \/usr\/local\/bin\/bun/);
+    assert.match(script, /ln -s bun \/usr\/local\/bin\/bunx/);
+    assert.deepEqual(smokeTest("bun"), {
+      script: "bun --version\ngit --version >/dev/null && echo git-ok",
+      expected: ["1.4.4", "git-ok"],
+    });
+    const entry = lockEntry("bun", DIGEST);
+    const lock = parseProfileLock(
+      JSON.stringify({ version: 1, profiles: { bun: entry } }),
+    );
+    assert.equal(profileCatalog(BASE, lock).get("bun").image, entry.image);
   });
 
   test("build script excludes runtime state and resets DNS config", () => {
