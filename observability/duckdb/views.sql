@@ -4,7 +4,7 @@ SET autoinstall_known_extensions = false;
 SET autoload_known_extensions = false;
 SET TimeZone = 'UTC';
 
-CREATE OR REPLACE TEMP MACRO obs_file_pattern(stream) AS (
+CREATE OR REPLACE TEMP MACRO obs_root() AS (
     (CASE
         WHEN getvariable('obs_dir') IS NULL OR getvariable('obs_dir') = ''
             THEN error('Set obs_dir to a local exporter directory')
@@ -12,8 +12,26 @@ CREATE OR REPLACE TEMP MACRO obs_file_pattern(stream) AS (
             THEN error('obs_dir cannot contain glob characters')
         WHEN starts_with(getvariable('obs_dir'), '/') THEN getvariable('obs_dir')
         ELSE './' || getvariable('obs_dir')
-    END) || '/' || stream ||
-    '/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9].jsonl'
+    END)
+);
+
+-- When obs_targets is set, obs_dir is the parent of the selected target slugs.
+CREATE OR REPLACE TEMP MACRO obs_paths(stream, suffix) AS (
+    CASE WHEN getvariable('obs_targets') IS NULL
+        THEN [obs_root() || '/' || stream || suffix]
+        ELSE list_transform(getvariable('obs_targets')::VARCHAR[], lambda slug:
+            obs_root() || '/' ||
+            CASE WHEN NOT regexp_full_match(slug, '[a-z0-9-]+')
+                THEN error('Invalid target slug') ELSE slug END || '/' || stream || suffix)
+    END
+);
+
+CREATE OR REPLACE TEMP MACRO obs_file_patterns(stream, suffix) AS (
+    obs_paths(stream, '/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9].jsonl' || suffix)
+);
+
+CREATE OR REPLACE TEMP MACRO obs_source_target(filename, depth) AS (
+    coalesce(getvariable('obs_target'), string_split(filename, '/')[-depth])
 );
 
 -- DuckDB reads finalized rotations directly. For an interrupted final write,
@@ -21,7 +39,7 @@ CREATE OR REPLACE TEMP MACRO obs_file_pattern(stream) AS (
 CREATE OR REPLACE TEMP MACRO obs_finalized(stream) AS TABLE
 WITH decoded AS (
     SELECT filename, content, try(decode(content)) AS strict_text
-    FROM read_blob(obs_file_pattern(stream))
+    FROM read_blob(obs_file_patterns(stream, ''))
 ), split AS (
     SELECT filename, content, strict_text IS NOT NULL AS valid_utf8,
            coalesce(strict_text, decode(content, 'replace')) AS body
@@ -45,7 +63,7 @@ WHERE valid_prefix;
 
 CREATE OR REPLACE TEMP MACRO obs_stream_issues(stream) AS TABLE
 SELECT stream AS stream, file AS filename, 'partial-file' AS issue
-FROM glob(obs_file_pattern(stream) || '.partial')
+FROM glob(obs_file_patterns(stream, '.partial'))
 UNION ALL
 SELECT stream, filename, 'truncated-last-line'
 FROM obs_finalized(stream) WHERE truncated
@@ -79,7 +97,8 @@ SELECT record ->> 'auditId' AS audit_id,
        record ->> 'reasonCode' AS reason_code,
        record ->> 'traceId' AS trace_id,
        record -> 'attributes' AS attributes,
-       coalesce(try_cast(record ->> 'derived' AS BOOLEAN), false) AS derived
+       coalesce(try_cast(record ->> 'derived' AS BOOLEAN), false) AS derived,
+       obs_source_target(filename, 3) AS source_target
 FROM obs_records('audit')
 WHERE (record ->> 'schemaVersion') = 'agent-bootstrap.audit/v1';
 
@@ -176,7 +195,7 @@ CREATE OR REPLACE TEMP MACRO obs_attribute(attributes, name) AS (
 
 CREATE OR REPLACE TEMP VIEW obs_spans AS
 WITH spans AS (
-    SELECT span, json_extract(span, '$.attributes[*]') AS attrs
+    SELECT filename, span, json_extract(span, '$.attributes[*]') AS attrs
     FROM obs_records('telemetry/traces'),
          unnest(json_extract(record, '$.resourceSpans[*].scopeSpans[*].spans[*]')) AS flat(span)
 )
@@ -197,7 +216,8 @@ SELECT obs_attribute(attrs, 'agent_bootstrap.execution_id') ->> 'stringValue' AS
        obs_attribute(attrs, 'resource.sampling.status') ->> 'stringValue' AS resource_sampling_status,
        try_cast(obs_attribute(attrs, 'sandbox.cpu.time') ->> 'intValue' AS BIGINT) AS cpu_time_ns,
        try_cast(obs_attribute(attrs, 'sandbox.memory.usage') ->> 'intValue' AS BIGINT) AS memory_bytes,
-       try_cast(obs_attribute(attrs, 'sandbox.memory.peak') ->> 'intValue' AS BIGINT) AS peak_memory_bytes
+       try_cast(obs_attribute(attrs, 'sandbox.memory.peak') ->> 'intValue' AS BIGINT) AS peak_memory_bytes,
+       obs_source_target(filename, 4) AS source_target
 FROM spans;
 
 CREATE OR REPLACE TEMP VIEW obs_metric_points AS

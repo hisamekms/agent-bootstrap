@@ -1915,7 +1915,14 @@ export class OrchestratorStore {
     }
   }
 
-  endSession(sessionId: string): void {
+  endSession(
+    sessionId: string,
+    result?: {
+      mode: string;
+      status: "succeeded" | "failed";
+      exitCode: number | null;
+    },
+  ): void {
     const id = identifier(sessionId);
     this.#write((at) => {
       const row = required(
@@ -1932,7 +1939,23 @@ export class OrchestratorStore {
         at,
         id,
       );
-      this.#event(at, "session.ended", "session", id, {}, { sessionId: id });
+      this.#event(at, "session.ended", "session", id, result ?? {}, {
+        sessionId: id,
+      });
+    });
+  }
+
+  recordSessionAuditExport(sessionId: string, exported: boolean): void {
+    const id = identifier(sessionId);
+    this.#write((at) => {
+      this.#event(
+        at,
+        "session.audit-export",
+        "session",
+        id,
+        { exported },
+        { sessionId: id },
+      );
     });
   }
 

@@ -1747,7 +1747,7 @@ function stage3Fixture(
   const scratch = join(root, "candidate");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   let workers = 0;
-  let verifications = 0;
+  const verificationIds: string[] = [];
   const executor = createTaskExecutor({
     repoRoot: f.repoRoot,
     directory: f.directory,
@@ -1787,14 +1787,15 @@ function stage3Fixture(
         };
       },
       async runVerification(_plan, id) {
-        verifications++;
+        verificationIds.push(id!);
         return {
           id: id!,
           outcome: "ok",
           response: Buffer.from(
             JSON.stringify({
               review:
-                verification === "deny-integration" && verifications === 2
+                verification === "deny-integration" &&
+                verificationIds.length === 2
                   ? "revise"
                   : "pass",
             }),
@@ -1813,7 +1814,8 @@ function stage3Fixture(
     taskId,
     work,
     journal,
-    verifications: () => verifications,
+    verificationIds,
+    verifications: () => verificationIds.length,
     async proposal() {
       await work.drain();
       const proposal = store
@@ -1880,6 +1882,17 @@ test("integration verification denial fails the Task before moving the branch", 
   approve(proposal);
   await f.work.drain();
   assert.equal(f.verifications(), 2);
+  assert.partialDeepStrictEqual(store.getExecution(f.verificationIds[1]!), {
+    taskId: f.taskId,
+    mode: "verification",
+    status: "failed",
+    result: {
+      code: "verification-failed",
+      phase: "integration",
+      tokens: 0,
+      costUsd: null,
+    },
+  });
   assert.equal(f.head(), f.base);
   assert.deepEqual(failure(f.taskId), {
     status: "failed",

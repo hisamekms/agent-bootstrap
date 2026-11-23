@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { RoleHarness } from "../actors.ts";
-import { parseClaudeCodeResult } from "../claude-code.ts";
+import {
+  parseClaudeCodeResult,
+  type ClaudeCodeResult,
+} from "../claude-code.ts";
 import type { ExecutionContext } from "../execution-context.ts";
 import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
 import { ROLE_PROFILES } from "../sandbox-profiles.ts";
@@ -20,7 +23,7 @@ import {
 import { rawReviewerAnswer } from "./reviewer-answer.ts";
 import { OrchestratorStoreError, type OrchestratorStore } from "./store.ts";
 import { runTask, type TaskExecutor } from "./tasks.ts";
-import { reportedUsage } from "./token-usage.ts";
+import { reportedUsage, sumRunMetrics } from "./token-usage.ts";
 
 type PlannerCall = (
   plan: ReviewerPlan,
@@ -70,8 +73,6 @@ type Job =
   | { id: string; kind: "approval"; proposalId: string }
   | { id: string; kind: "task" }
   | { id: string; kind: "integration" };
-
-type ReportedUsage = NonNullable<ReturnType<typeof reportedUsage>>;
 
 type Completion = {
   status: "succeeded" | "failed" | "timed-out";
@@ -475,9 +476,9 @@ export class ActorRunner {
     if (store.getExecution(job.id)?.status === "cancelled") return;
     store.startExecution(job.id);
     let attempts = 0;
-    const actorUsage: (ReportedUsage | undefined)[] = [];
-    const recordUsage = (usage?: ReportedUsage) => {
-      actorUsage.push(usage);
+    const results: (ClaudeCodeResult | null)[] = [];
+    const recordResult = (result: ClaudeCodeResult | null) => {
+      results.push(result);
     };
     let completion: Completion = {
       status: "failed",
@@ -491,9 +492,9 @@ export class ActorRunner {
               () => {
                 attempts++;
               },
-              recordUsage,
+              recordResult,
             )
-          : await this.#runApproval(job, recordUsage);
+          : await this.#runApproval(job, recordResult);
     } catch (error) {
       const code =
         error instanceof RunnerError || error instanceof OrchestratorStoreError
@@ -503,17 +504,22 @@ export class ActorRunner {
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {
-        const reported = actorUsage.filter((run) => run !== undefined);
+        const reported = results
+          .map(reportedUsage)
+          .filter((run) => run !== undefined);
         const usage =
           job.kind === "planner"
             ? reported.map((run) => run.usage)
             : reported[0]?.usage;
+        const expected = job.kind === "planner" ? attempts : 1;
         const unavailable =
-          reported.length === 0 ||
-          reported.length !== (job.kind === "planner" ? attempts : 1);
+          reported.length === 0 || reported.length !== expected;
         store.finishExecution(job.id, completion.status, {
           ...completion.result,
-          ...(job.kind === "planner" ? { attempts } : {}),
+          ...(job.kind === "planner"
+            ? { attempts }
+            : { proposalId: job.proposalId }),
+          ...sumRunMetrics(results.length === expected ? results : []),
           tokens:
             reported.length === 0
               ? null
@@ -531,7 +537,7 @@ export class ActorRunner {
   async #runPlanner(
     { id, input }: Extract<Job, { kind: "planner" }>,
     onAttempt: () => void,
-    recordUsage: (usage?: ReportedUsage) => void,
+    recordResult: (result: ClaudeCodeResult | null) => void,
   ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { mode, brief, goalId } = input;
@@ -590,11 +596,11 @@ export class ActorRunner {
             });
       if (run.id !== invocationId)
         return { status: "failed", result: { code: "host-error" } };
-      const usage =
+      recordResult(
         harness.harness === "claude"
-          ? reportedUsage(parseClaudeCodeResult(run.response))
-          : undefined;
-      recordUsage(usage);
+          ? parseClaudeCodeResult(run.response)
+          : null,
+      );
       if (run.outcome === "timed-out")
         return { status: "timed-out", result: { code: "timed-out" } };
       if (run.outcome !== "ok") {
@@ -685,7 +691,7 @@ export class ActorRunner {
 
   async #runApproval(
     { id, proposalId }: Extract<Job, { kind: "approval" }>,
-    recordUsage: (usage?: ReportedUsage) => void,
+    recordResult: (result: ClaudeCodeResult | null) => void,
   ): Promise<Completion> {
     const { store, harness } = this.#deps;
     const { proposal, goalId } = this.#approvalSnapshot(proposalId);
@@ -729,7 +735,7 @@ export class ActorRunner {
       return { status: "failed", result: { code: "host-error" } };
     const result =
       harness.harness === "claude" ? parseClaudeCodeResult(run.response) : null;
-    recordUsage(reportedUsage(result));
+    recordResult(result);
     const timedOut = run.outcome === "timed-out";
     if (run.outcome !== "ok" || result?.isError)
       return {

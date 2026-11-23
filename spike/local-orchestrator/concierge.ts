@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
+import { exportAudit } from "../../src/audit-export.ts";
 import {
   CLAUDE_CODE,
   claudeCodeProvider,
@@ -224,6 +225,7 @@ async function main(args: readonly string[]) {
   const telemetry = createTelemetry(config.telemetry, config.directory);
   let store: OrchestratorStore | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
+  let sessionId: string | undefined;
   let stage = "open state";
   try {
     store = OrchestratorStore.open(join(directory, "state.db"));
@@ -264,7 +266,10 @@ async function main(args: readonly string[]) {
         ...options,
         repoRoot,
         target,
-        onSession: (id) => console.log(`Concierge session ${id}`),
+        onSession: (id) => {
+          sessionId = id;
+          console.log(`Concierge session ${id}`);
+        },
       },
     );
     console.log(
@@ -282,9 +287,30 @@ async function main(args: readonly string[]) {
     credential = "";
     const closed = await Promise.allSettled([
       Promise.resolve().then(() => observed?.close()),
-      Promise.resolve().then(() => store?.close()),
       telemetry.shutdown(),
     ]);
+    try {
+      if (sessionId && observed && store) {
+        let exported = false;
+        try {
+          exportAudit(auditPath, config.directory);
+          exported = true;
+        } catch {
+          console.error("concierge-audit-export-failed");
+        }
+        try {
+          store.recordSessionAuditExport(sessionId, exported);
+        } catch {
+          console.error("concierge-audit-export-evidence-failed");
+        }
+      }
+    } finally {
+      try {
+        store?.close();
+      } catch {
+        closed.push({ status: "rejected", reason: "store-close-failed" });
+      }
+    }
     if (closed.some(({ status }) => status === "rejected")) {
       console.error("concierge-shutdown-failed");
       process.exitCode = 1;

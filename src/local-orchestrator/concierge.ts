@@ -590,7 +590,14 @@ export async function startConcierge(
       }
     };
     await cleanup("concierge-end-session-failed", () =>
-      store.endSession(sessionId),
+      store.endSession(sessionId, {
+        mode,
+        status:
+          !failed && outcome === "ok" && exitCode === 0
+            ? "succeeded"
+            : "failed",
+        exitCode,
+      }),
     );
     const closing = cleanup("concierge-close-api-failed", () =>
       server?.close(),

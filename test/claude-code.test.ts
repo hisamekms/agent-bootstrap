@@ -112,6 +112,8 @@ test("the JSON result is parsed defensively", () => {
         result: "FIXTURE-OK",
         is_error: false,
         total_cost_usd: 0.00006,
+        num_turns: 4,
+        duration_ms: 1234,
         usage: {
           input_tokens: 5,
           output_tokens: 2,
@@ -125,6 +127,8 @@ test("the JSON result is parsed defensively", () => {
     text: "FIXTURE-OK",
     isError: false,
     costUsd: 0.00006,
+    numTurns: 4,
+    durationMs: 1234,
     inputTokens: 5,
     outputTokens: 2,
     cacheReadInputTokens: 3,
@@ -138,6 +142,37 @@ test("the JSON result is parsed defensively", () => {
     parseClaudeCodeResult(
       Buffer.from(JSON.stringify({ result: "x", usage: { input_tokens: -1 } })),
     )?.inputTokens,
+    null,
+  );
+});
+
+test("CLI analysis metrics accept zero and reject invalid or oversized numbers", () => {
+  for (const sample of [
+    { total_cost_usd: -1, num_turns: -1, duration_ms: -1 },
+    { total_cost_usd: "1", num_turns: "1", duration_ms: "1" },
+    { total_cost_usd: 10_001, num_turns: 10_001, duration_ms: 86_400_001 },
+    { total_cost_usd: Infinity, num_turns: 1.5, duration_ms: 100.5 },
+  ]) {
+    const result = parseClaudeCodeResult(
+      Buffer.from(JSON.stringify({ result: "x", ...sample })),
+    );
+    assert.deepEqual(
+      [result?.costUsd, result?.numTurns, result?.durationMs],
+      [null, null, null],
+    );
+  }
+  const result = parseClaudeCodeResult(
+    Buffer.from(
+      '{"result":"x","total_cost_usd":0,"num_turns":0,"duration_ms":0}',
+    ),
+  );
+  assert.deepEqual(
+    [result?.costUsd, result?.numTurns, result?.durationMs],
+    [0, 0, 0],
+  );
+  assert.equal(
+    parseClaudeCodeResult(Buffer.from('{"result":"x","total_cost_usd":1e999}'))
+      ?.costUsd,
     null,
   );
 });

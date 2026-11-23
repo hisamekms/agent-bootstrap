@@ -1,4 +1,23 @@
-import type { parseClaudeCodeResult } from "../claude-code.ts";
+import { readClaudeRunMetrics, type ClaudeCodeResult } from "../claude-code.ts";
+
+export function sumRunMetrics(runs: readonly (ClaudeCodeResult | null)[]) {
+  // A retry with missing metrics makes the corresponding total unavailable.
+  const total = (key: keyof ReturnType<typeof readClaudeRunMetrics>) => {
+    if (!runs.length) return null;
+    let sum = 0;
+    for (const run of runs) {
+      const value = run?.[key];
+      if (value == null) return null;
+      sum += value;
+    }
+    return sum;
+  };
+  return {
+    costUsd: total("costUsd"),
+    numTurns: total("numTurns"),
+    durationMs: total("durationMs"),
+  };
+}
 
 export type TokenUsage = {
   input: number;
@@ -77,7 +96,7 @@ export function compareTokenBudget<
 }
 
 export function reportedUsage(
-  result: ReturnType<typeof parseClaudeCodeResult>,
+  result: ClaudeCodeResult | null,
 ): { tokens: number; usage: TokenUsage } | undefined {
   if (
     result?.inputTokens == null ||

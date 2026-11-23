@@ -74,6 +74,9 @@ function response(id: string, answer: unknown): ReviewerRun {
     response: Buffer.from(
       JSON.stringify({
         result: JSON.stringify(answer),
+        total_cost_usd: 0.125,
+        num_turns: 2,
+        duration_ms: 80,
         usage: {
           input_tokens: 10,
           output_tokens: 5,
@@ -209,6 +212,9 @@ test("Planner keeps the brief and context in files, records usage and submits a 
         },
       ],
       attempts: 1,
+      costUsd: 0.125,
+      numTurns: 2,
+      durationMs: 80,
       tokens: 19,
       usage: [{ input: 10, output: 5, cacheRead: 2, cacheCreation: 3 }],
     },
@@ -577,6 +583,9 @@ test("Planner discards answers over 64 KiB after harness extraction", async () =
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "contract-violation",
     attempts: 2,
+    costUsd: 0.25,
+    numTurns: 4,
+    durationMs: 160,
     maxTokens: null,
     tokens: 38,
     usage: [
@@ -805,6 +814,10 @@ test("Reviewer rechecks policy before recording an in-flight verdict", async () 
   await work.drain();
   assert.deepEqual(store.getExecution(id)?.result, {
     code: "approval-forbidden",
+    proposalId: proposal.id,
+    costUsd: 0.125,
+    numTurns: 2,
+    durationMs: 80,
     maxTokens: null,
     tokens: 19,
     usage: { input: 10, output: 5, cacheRead: 2, cacheCreation: 3 },

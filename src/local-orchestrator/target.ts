@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkPrivateDirectory } from "../private-journal.ts";
@@ -53,9 +53,33 @@ export async function resolveTarget(
     bootstrapRoot,
     repoRoot,
     isDefault,
+    slug,
     directory: isDefault ? baseDirectory : join(baseDirectory, "targets", slug),
     volume: `lo-concierge-${isDefault ? hash.slice(0, 16) : slug}`,
   };
+}
+
+export async function discoverAnalysisTargets(
+  target: Awaited<ReturnType<typeof resolveTarget>>,
+): Promise<readonly { slug: string; directory: string }[]> {
+  const parent = join(target.directory, "targets");
+  const entries = await checkDirectory(parent)
+    .then(() => readdir(parent, { withFileTypes: true }))
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+  return [
+    { slug: target.slug, directory: target.directory },
+    ...entries
+      .filter(
+        (entry) =>
+          entry.isDirectory() &&
+          /^[a-z0-9-]{1,32}-[a-f0-9]{12}$/.test(entry.name),
+      )
+      .map(({ name }) => ({ slug: name, directory: join(parent, name) }))
+      .sort((a, b) => a.slug.localeCompare(b.slug)),
+  ];
 }
 
 export async function checkDirectory(path: string): Promise<void> {

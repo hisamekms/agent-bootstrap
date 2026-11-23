@@ -965,7 +965,13 @@ export class ReviewedIntegration {
 
   async integrate(
     id?: string,
-    options?: { allowUnverified?: true },
+    options?: {
+      allowUnverified?: true;
+      verificationObserver?: {
+        begin(): string;
+        finish(id: string, passed: boolean | null): void;
+      };
+    },
   ): Promise<"completed" | "denied" | "uncertain"> {
     const events = await this.#journal.read();
     const { pin, review } = latestPin(events, await this.#target());
@@ -1009,9 +1015,19 @@ export class ReviewedIntegration {
       !this.#plan.verification &&
       this.#plan.allowUnverified &&
       options?.allowUnverified;
-    if (!skipVerification && !(await this.#verify(pin, diff, append, id))) {
-      await append({ kind: "denied", reason: "verification" });
-      return "denied";
+    if (!skipVerification) {
+      const observer = options?.verificationObserver;
+      const verificationId = observer?.begin() ?? id;
+      let passed: boolean | null = null;
+      try {
+        passed = await this.#verify(pin, diff, append, verificationId);
+      } finally {
+        if (observer) observer.finish(verificationId!, passed);
+      }
+      if (!passed) {
+        await append({ kind: "denied", reason: "verification" });
+        return "denied";
+      }
     }
     await append({ kind: "integration.authorized", ...pin });
     try {

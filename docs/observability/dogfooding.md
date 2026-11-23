@@ -253,3 +253,10 @@ Worker comparison, from the two live runs:
 | ------ | ------: | -----------: | ------------: | ------: | ---------------: |
 | Codex  |   16.78 |         1031 |         0.061 |    2.06 |               90 |
 | Claude |   17.26 |         1281 |         0.074 |    2.88 |              186 |
+
+## Local orchestrator runs
+
+The Concierge launcher exports the host audit at session end and records the
+export outcome in the local orchestrator store. To join runtime facts with
+actor time, usage, Task outcomes and gate decisions for any target checkout,
+use the [local orchestrator DuckDB analysis](../local-orchestrator/analysis.md).

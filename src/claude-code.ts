@@ -317,6 +317,8 @@ export interface ClaudeCodeResult {
   readonly text: string;
   readonly isError: boolean;
   readonly costUsd: number | null;
+  readonly numTurns: number | null;
+  readonly durationMs: number | null;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
   readonly cacheReadInputTokens: number | null;
@@ -332,6 +334,22 @@ export function parseClaudeWorkerResult(
   return start < 0
     ? null
     : parseClaudeCodeResult(stderr.subarray(start + marker.length));
+}
+
+export function readClaudeRunMetrics(value: unknown, attempts: 1 | 2 = 1) {
+  const fields = value as Partial<ClaudeCodeResult> | null;
+  const bounded = (value: unknown, max: number, integer = true) =>
+    typeof value === "number" &&
+    (integer ? Number.isSafeInteger(value) : Number.isFinite(value)) &&
+    value >= 0 &&
+    value <= max * attempts
+      ? value
+      : null;
+  return {
+    costUsd: bounded(fields?.costUsd, 10_000, false),
+    numTurns: bounded(fields?.numTurns, 10_000),
+    durationMs: bounded(fields?.durationMs, 86_400_000),
+  };
 }
 
 /** Parse the CLI's `--output-format json` result. Untrusted guest data. */
@@ -357,11 +375,11 @@ export function parseClaudeCodeResult(
     return {
       text: value.result,
       isError: value.is_error === true,
-      costUsd:
-        typeof value.total_cost_usd === "number" &&
-        Number.isFinite(value.total_cost_usd)
-          ? value.total_cost_usd
-          : null,
+      ...readClaudeRunMetrics({
+        costUsd: value.total_cost_usd,
+        numTurns: value.num_turns,
+        durationMs: value.duration_ms,
+      }),
       inputTokens: count("input_tokens"),
       outputTokens: count("output_tokens"),
       cacheReadInputTokens: count("cache_read_input_tokens"),

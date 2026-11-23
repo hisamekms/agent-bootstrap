@@ -257,3 +257,9 @@ The branch is created or fast-forwarded locally. A divergent branch or
 one checked out in any worktree must be resolved before exporting.
 Review the exported branch, then push it and open a PR to `main`
 from your usual Git workflow.
+
+## Analyze runs
+
+Use `analyze` with the default checkout, the same `--target` argument as the
+launcher, or `--all-targets` to compare projects. See [DuckDB analysis](analysis.md)
+for the private export layout, view definitions and query examples.

@@ -8,6 +8,7 @@ import type { RoleHarness } from "../actors.ts";
 import {
   parseClaudeCodeResult,
   parseClaudeWorkerResult,
+  readClaudeRunMetrics,
 } from "../claude-code.ts";
 import {
   GitIntegrationError,
@@ -47,12 +48,13 @@ type TaskHost = Pick<
   TrustedHost,
   "runWorker" | "runReviewer" | "runVerification"
 >;
-type ActorResult = {
+type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
   outcome?: string;
   invocationId?: string;
   tokens?: number;
   usage?: TokenUsage;
   isError?: boolean;
+  revision?: boolean;
 };
 type CandidateChange = {
   path: string;
@@ -375,6 +377,7 @@ export function createTaskExecutor(options: {
           if (reviewer.harness === "claude") {
             const result = parseClaudeCodeResult(run.response);
             Object.assign(reviewerResult, reportedUsage(result));
+            Object.assign(reviewerResult, readClaudeRunMetrics(result));
             if (result?.isError) reviewerResult.isError = true;
           }
           return run;
@@ -399,6 +402,7 @@ export function createTaskExecutor(options: {
               onWorkerStderr(bytes: Uint8Array) {
                 const result = parseClaudeWorkerResult(bytes);
                 Object.assign(workerResult, reportedUsage(result));
+                Object.assign(workerResult, readClaudeRunMetrics(result));
                 if (result?.isError) workerResult.isError = true;
               },
             }
@@ -615,6 +619,10 @@ export async function runTask(
       {
         ...completion?.result,
         ...(failure ? { code: failure } : {}),
+        ...(observed.revision === undefined
+          ? {}
+          : { revision: observed.revision }),
+        ...readClaudeRunMetrics(observed),
         tokens: mode === "verification" ? 0 : (observed.tokens ?? null),
         usage:
           mode === "verification"
@@ -640,6 +648,7 @@ export async function runTask(
         "Executor",
         "task",
         async (runId, observed) => {
+          observed.revision = attempt > 0;
           const pin = await flow.worker(runId, attempt > 0, observed);
           const changes = await flow.changes(pin);
           const changedPaths = changes.map(({ path }) => path);
@@ -839,7 +848,38 @@ export async function integrateApprovedProposal(
     });
     outcome = await integration.integrate(
       randomUUID(),
-      verified ? undefined : { allowUnverified: true },
+      verified
+        ? {
+            verificationObserver: {
+              begin() {
+                const { id } = store.createExecution({
+                  actor: "Reviewer",
+                  mode: "verification",
+                  taskId: task.id,
+                  requestedBy: { kind: "host" },
+                });
+                store.startExecution(id);
+                return id;
+              },
+              finish(id, passed) {
+                store.finishExecution(id, passed ? "succeeded" : "failed", {
+                  phase: "integration",
+                  ...(passed
+                    ? {}
+                    : {
+                        code:
+                          passed === null
+                            ? "host-error"
+                            : "verification-failed",
+                      }),
+                  tokens: 0,
+                  usage: emptyTokenUsage,
+                  ...readClaudeRunMetrics(null),
+                });
+              },
+            },
+          }
+        : { allowUnverified: true },
     );
     if (outcome === "denied") {
       const last = (await journal.read()).at(-1);

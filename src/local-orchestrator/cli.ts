@@ -2,6 +2,11 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { GitIntegrationError } from "../git-integration.ts";
 import {
+  analyze,
+  escapeTerminalControls,
+  type AnalysisOptions,
+} from "./analysis.ts";
+import {
   ContractError,
   contentDigest,
   GATES,
@@ -51,6 +56,7 @@ type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
 const maxFieldLength = 4000;
 const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--target <path>] <command>
+  bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] analyze [--out <dir>] [--sql <file>]
   reconcile
   status
   retry-task <taskId>
@@ -70,6 +76,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
 
 type Command =
   | { kind: "status" | "policy-show" | "reconcile" }
+  | ({ kind: "analyze" } & AnalysisOptions)
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
   | { kind: "show-execution" | "retry-task" | "update-goal-base"; id: string }
@@ -86,6 +93,20 @@ type Command =
 
 function parseCommand([kind, ...args]: readonly string[]): Command {
   switch (kind) {
+    case "analyze": {
+      const options: AnalysisOptions = {};
+      for (let i = 0; i < args.length; i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (!value || value.startsWith("--") || value.includes("\0"))
+          throw new ContractError();
+        if (flag === "--out" && options.out === undefined) options.out = value;
+        else if (flag === "--sql" && options.sql === undefined)
+          options.sql = value;
+        else throw new ContractError();
+      }
+      return { kind, ...options };
+    }
     case "status":
     case "reconcile":
       if (args.length === 0) return { kind };
@@ -191,15 +212,6 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
   throw new ContractError();
 }
 
-function escapeTerminalControls(text: string): string {
-  return text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
-    character
-      .split("")
-      .map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`)
-      .join(""),
-  );
-}
-
 function boundField(value: string): string {
   // Bound the displayed string even when escaping expands its contents.
   const length = (text: string) =>
@@ -277,7 +289,7 @@ function refuse(io: CliIo, message: string): 1 {
 async function execute(
   io: CliIo,
   store: OrchestratorStore,
-  command: Command,
+  command: Exclude<Command, { kind: "analyze" }>,
   directory: string | undefined,
   repoRoot: string,
 ): Promise<0 | 1> {
@@ -550,11 +562,20 @@ export async function runCli(
 ): Promise<0 | 1 | 2> {
   let db: string | undefined;
   let targetPath: string | undefined;
+  let allTargets = false;
   let command: Command;
   try {
     let i = 0;
-    while (argv[i] === "--db" || isTargetFlag(argv[i])) {
+    while (
+      argv[i] === "--db" ||
+      argv[i] === "--all-targets" ||
+      isTargetFlag(argv[i])
+    ) {
       const flag = argv[i++];
+      if (flag === "--all-targets" && !allTargets) {
+        allTargets = true;
+        continue;
+      }
       const value = argv[i++];
       if (!value || value.startsWith("--") || value.includes("\0"))
         throw new ContractError();
@@ -564,6 +585,12 @@ export async function runCli(
       else throw new ContractError();
     }
     command = parseCommand(argv.slice(i));
+    if (
+      (allTargets &&
+        (targetPath !== undefined || command.kind !== "analyze")) ||
+      (db !== undefined && command.kind === "analyze")
+    )
+      throw new ContractError();
   } catch {
     io.stderr.write(`${usage}\n`);
     return 2;
@@ -600,6 +627,8 @@ export async function runCli(
 
   try {
     const target = await resolveTarget(targetPath, bootstrapRoot);
+    if (command.kind === "analyze")
+      return await analyze(target, allTargets, command, io);
     const { repoRoot, directory } = target;
     if (command.kind === "policy-set") {
       if (command.value === "agent")
@@ -626,6 +655,8 @@ export async function runCli(
     }
   } catch (error) {
     if (error instanceof TargetError) return refuse(io, error.message);
+    if (command.kind === "analyze")
+      return refuse(io, "Local orchestrator analysis export failed.");
     if (
       command.kind === "export-goal-branch" &&
       error instanceof GitIntegrationError
