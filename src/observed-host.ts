@@ -193,7 +193,7 @@ export async function createObservedHost({
   }
 
   try {
-    if (!audit.isV5Writable) throw new Error("Writable v5 audit required");
+    if (!audit.isV5Writable) throw new Error("Writable v6 audit required");
 
     const activeObservers = config.telemetry.enabled ? [...observers] : [];
     const pendingHandles = new Map<string, SandboxHandle | undefined>();
@@ -302,7 +302,7 @@ export async function createObservedHost({
       } catch {
         throw new Error("Egress gateway startup check failed");
       }
-      if (!audit.isV5Writable) throw new Error("Writable v5 audit required");
+      if (!audit.isV5Writable) throw new Error("Writable v6 audit required");
     }
 
     return {

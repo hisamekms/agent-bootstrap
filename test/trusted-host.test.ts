@@ -17,7 +17,10 @@ import type {
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import { HOST_SERVICE_NAME } from "../src/egress-policy.ts";
 import type { RuntimeEvent } from "../src/runtime-events.ts";
-import { SandboxRuntimeError } from "../src/sandbox-runtime.ts";
+import {
+  INTERACTIVE_MAX_LIFETIME_MS,
+  SandboxRuntimeError,
+} from "../src/sandbox-runtime.ts";
 import {
   HostAuditError,
   TrustedHost,
@@ -29,6 +32,7 @@ import { fakeGateway } from "./fake-gateway.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+  concierge: { image: `fixture.invalid/concierge@sha256:${"c".repeat(64)}` },
 });
 
 function fixture(t: { after(fn: () => void): void }) {
@@ -564,7 +568,7 @@ test("Coordinator session failures are audited in order and keep their codes", a
   assert.deepEqual(calls, ["create", "destroy"]);
 });
 
-test("a new audit database uses schema 5 and records provider egress", async (t) => {
+test("a new audit database uses schema 6 and records provider egress", async (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   const id = randomUUID();
@@ -590,7 +594,7 @@ test("a new audit database uses schema 5 and records provider egress", async (t)
       encoding: "utf8",
     },
   );
-  if (version.status === 0) assert.equal(version.stdout.trim(), "5");
+  if (version.status === 0) assert.equal(version.stdout.trim(), "6");
 });
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
@@ -1405,7 +1409,7 @@ test("required host refuses invalid setup, mismatched context and direct host po
         config: requiredConfig,
         gatewayFactory: fake.open,
       }),
-    /Writable v5/,
+    /Writable v6/,
   );
   await assert.rejects(
     host.runWorker({
@@ -1726,4 +1730,508 @@ test("Coordinator session send refuses further guest work after gateway quaranti
     "gateway.close",
     "destroy",
   ]);
+});
+
+const conciergePlan = {
+  sandbox: {
+    profile: "concierge",
+    provider: { host: "api.anthropic.com", secretEnv: "ANTHROPIC_API_KEY" },
+    interactive: {
+      vsock: { hostPath: "/fixture/api.sock", port: 5000 },
+      stateVolume: "lo-session",
+      snapshotDir: "/fixture/repo",
+    },
+  },
+} as const;
+
+test("Concierge creates through the audited provider gateway and records each terminal attach", async (t) => {
+  const id = randomUUID();
+  const results = [7, 0];
+  const { host, calls, db, fake } = observedFixture(t, {
+    async attachTerminal(handle, command) {
+      calls.push("attach");
+      assert.equal(
+        handle.id,
+        db.readExecution(id).sandboxBindings[0]?.sandboxId,
+      );
+      assert.equal(db.read(id).at(-1)?.kind, "operation.allowed");
+      assert.equal(db.read(id).at(-1)?.operation, "sandbox.exec");
+      assert.deepEqual(command.argv, ["claude"]);
+      return { exitCode: results.shift()! };
+    },
+  });
+  let escaped: ((command: { argv: string[] }) => Promise<unknown>) | undefined;
+  assert.deepEqual(
+    await host.runConcierge(conciergePlan, id, async ({ attach }) => {
+      escaped = attach;
+      assert.deepEqual(await attach({ argv: ["claude"] }), { exitCode: 7 });
+      assert.deepEqual(await attach({ argv: ["claude"] }), { exitCode: 0 });
+      return "used";
+    }),
+    { id, outcome: "failed" },
+  );
+  await assert.rejects(escaped!({ argv: ["claude"] }), /unknown-handle/);
+  const { policy, sandboxLabel } = fake.opened!;
+  assert.deepEqual(policy.allow, [
+    { hostname: "api.anthropic.com", port: 443 },
+    { hostname: "platform.claude.com", port: 443 },
+  ]);
+  assert.deepEqual(policy.providerBinding, {
+    hostname: "api.anthropic.com",
+    port: 443,
+  });
+  assert.deepEqual(policy.hostServices, []);
+  for (const qtype of [1, 28]) {
+    assert.equal(
+      policy.decideDns({ qname: "platform.claude.com", qtype }).decision,
+      "allow",
+    );
+  }
+  for (const [hostname, ip, channel] of [
+    ["api.anthropic.com", "8.8.8.8", "provider-egress"],
+    ["platform.claude.com", "8.8.4.4", "egress"],
+  ] as const) {
+    policy.dnsPins.pin(sandboxLabel, hostname, ip, 60);
+    assert.deepEqual(
+      policy.decideConnect({ sandbox: sandboxLabel, ip, port: 443 }),
+      {
+        decision: "allow",
+        reasonCode: "allowlisted-host",
+        hostname,
+        channel,
+        upstream: { ip, port: 443 },
+      },
+    );
+  }
+  assert.equal(
+    policy.decideDns({ qname: "other.example", qtype: 1 }).reasonCode,
+    "dns-not-allowlisted",
+  );
+  for (const [ip, port] of [
+    ["1.1.1.1", 443],
+    ["8.8.4.4", 444],
+  ] as const) {
+    assert.equal(
+      policy.decideConnect({ sandbox: sandboxLabel, ip, port }).decision,
+      "deny",
+    );
+  }
+  assert.deepEqual(
+    db.readExecution(id).processResults.map(({ exitCode }) => exitCode),
+    [7, 0],
+  );
+  const trace = db.read(id);
+  assert.ok(trace.every(({ role }) => role === "Concierge"));
+  const request = trace.find(({ operation }) => operation === "sandbox.create");
+  assert.equal(request?.profile, "concierge");
+  assert.deepEqual(request?.detail, {
+    socketPath: "/fixture/api.sock",
+    vsockPort: 5000,
+    volumeName: "lo-session",
+    snapshotDir: "/fixture/repo",
+  });
+  assert.deepEqual(
+    trace
+      .filter(({ operation }) => operation === "sandbox.exec")
+      .map(({ kind, outcome }) => [kind, outcome]),
+    [
+      ["operation.requested", undefined],
+      ["operation.allowed", undefined],
+      ["operation.finished", "failed"],
+      ["operation.requested", undefined],
+      ["operation.allowed", undefined],
+      ["operation.finished", "ok"],
+    ],
+  );
+  assert.deepEqual(
+    calls.filter((call) =>
+      ["create", "attach", "gateway.close", "destroy"].includes(call),
+    ),
+    ["create", "attach", "attach", "gateway.close", "destroy"],
+  );
+});
+
+test("other roles keep Anthropic API-only gateway policies", async (t) => {
+  const { host, fake } = observedFixture(t);
+  const sandbox = { provider: conciergePlan.sandbox.provider };
+  const command = plan.command;
+  for (const run of [
+    () => host.runWorker({ ...plan, sandbox }),
+    () => host.runPlanner({ sandbox, command }),
+    () => host.runReviewer({ sandbox, command }),
+    () =>
+      host.runCoordinator({
+        sandbox: {
+          ...sandbox,
+          readOnlyFiles: [{ path: "control.json", bytes: Buffer.from("{}") }],
+        },
+        command,
+      }),
+  ]) {
+    const { id, outcome } = await run();
+    assert.equal(outcome, "ok");
+    assert.equal(fake.opened?.executionId, id);
+    assert.deepEqual(fake.opened?.policy.allow, [
+      { hostname: "api.anthropic.com", port: 443 },
+    ]);
+    assert.equal(
+      fake.opened?.policy.decideDns({ qname: "platform.claude.com", qtype: 1 })
+        .reasonCode,
+      "dns-not-allowlisted",
+    );
+  }
+});
+
+test("Concierge refuses unsupported hosts, other profiles, other providers and host services before create", async (t) => {
+  const use = async () => assert.fail("unexpected callback");
+  const unsupported = observedFixture(t);
+  await assert.rejects(
+    unsupported.host.runConcierge(conciergePlan, randomUUID(), use),
+    /audited interactive/,
+  );
+  const { host, calls, runtime, db } = observedFixture(t, {
+    async attachTerminal() {
+      assert.fail("unexpected attach");
+    },
+  });
+  const unaudited = new TrustedHost(db, runtime, profiles);
+  await assert.rejects(
+    unaudited.runConcierge(conciergePlan, randomUUID(), use),
+    /audited interactive/,
+  );
+  for (const sandbox of [
+    { ...conciergePlan.sandbox, profile: "base" as const },
+    { ...conciergePlan.sandbox, provider },
+    {
+      ...conciergePlan.sandbox,
+      provider: { ...conciergePlan.sandbox.provider, port: 444 },
+    },
+    { ...conciergePlan.sandbox, hostTcpPort: 8080 },
+    {
+      ...conciergePlan.sandbox,
+      maxLifetimeMs: INTERACTIVE_MAX_LIFETIME_MS + 1,
+    },
+  ])
+    await assert.rejects(
+      host.runConcierge({ sandbox }, randomUUID(), use),
+      /audited interactive/,
+    );
+  await assert.rejects(
+    host.runConcierge(conciergePlan, randomUUID(), use, undefined, {
+      hostServices: [
+        {
+          hostname: HOST_SERVICE_NAME,
+          port: 8080,
+          ip: "192.0.2.1",
+          loopbackPort: 8080,
+        },
+      ],
+    }),
+    /audited interactive/,
+  );
+  await assert.rejects(
+    host.runWorker({ ...plan, sandbox: { profile: "concierge" } }),
+    /profile not allowed/,
+  );
+  await assert.rejects(
+    host.runWorker({
+      ...plan,
+      sandbox: { interactive: conciergePlan.sandbox.interactive },
+    }),
+    /Only Concierge/,
+  );
+  assert.deepEqual(calls, []);
+  assert.deepEqual(unsupported.calls, []);
+});
+
+test("Concierge cannot resume guest work after a mandatory terminal audit failure", async (t) => {
+  for (const label of [
+    "operation.requested sandbox.exec",
+    "operation.allowed sandbox.exec",
+    "process_results",
+    "operation.finished sandbox.exec",
+  ]) {
+    const id = randomUUID();
+    const { host, calls, db } = observedFixture(
+      t,
+      {
+        async attachTerminal() {
+          calls.push("attach");
+          return { exitCode: 0 };
+        },
+      },
+      label,
+    );
+    await assert.rejects(
+      host.runConcierge(conciergePlan, id, async ({ attach }) => {
+        await assert.rejects(attach({ argv: ["claude"] }), HostAuditError);
+        await assert.rejects(
+          async () => attach({ argv: ["claude"] }),
+          HostAuditError,
+        );
+      }),
+      HostAuditError,
+    );
+    assert.equal(
+      calls.filter((call) => call === "attach").length,
+      label.startsWith("operation.") && !label.includes("finished") ? 0 : 1,
+    );
+    assert.equal(
+      db.read(id).some(({ operation }) => operation === "sandbox.destroy"),
+      false,
+    );
+    assert.deepEqual(calls.slice(-2), ["gateway.close", "destroy"]);
+  }
+});
+
+test("Concierge closes the gateway and destroys a sandbox when audit fails during an attach", async (t) => {
+  const id = randomUUID();
+  let stop: (result: { exitCode: null }) => void = () =>
+    assert.fail("no attach");
+  const { host, calls, db, fake } = observedFixture(t, {
+    async attachTerminal() {
+      calls.push("attach");
+      return new Promise((resolve) => {
+        stop = resolve;
+        fake.quarantine();
+      });
+    },
+    async destroy() {
+      calls.push("destroy");
+      stop({ exitCode: null });
+    },
+  });
+  await assert.rejects(
+    host.runConcierge(conciergePlan, id, ({ attach }) =>
+      attach({ argv: ["claude"] }),
+    ),
+    HostAuditError,
+  );
+  assert.deepEqual(calls.slice(-3), ["attach", "gateway.close", "destroy"]);
+  assert.deepEqual(db.readExecution(id).processResults, []);
+});
+
+test("an idle Concierge callback cannot retain the VM and gateway past its lifetime", async (t) => {
+  const id = randomUUID();
+  const { host, calls, db } = observedFixture(t, {
+    async attachTerminal() {
+      assert.fail("unexpected attach");
+    },
+  });
+  let attachAfterExpiry: (() => Promise<unknown>) | undefined;
+  const result = await host.runConcierge(
+    {
+      sandbox: { ...conciergePlan.sandbox, maxLifetimeMs: 30 },
+    },
+    id,
+    ({ attach }) => {
+      attachAfterExpiry = () => attach({ argv: ["claude"] });
+      return new Promise(() => {});
+    },
+  );
+  assert.deepEqual(result, { id, outcome: "timed-out" });
+  await assert.rejects(attachAfterExpiry!(), /unknown-handle/);
+  assert.equal(db.read(id).at(-1)?.outcome, "timed-out");
+  assert.ok(calls.indexOf("gateway.close") < calls.indexOf("destroy"));
+});
+
+test("Concierge tears down at the host deadline when the adapter never settles an attach", async (t) => {
+  const id = randomUUID();
+  const { host, calls, db } = observedFixture(t, {
+    async attachTerminal() {
+      calls.push("attach");
+      return new Promise(() => {});
+    },
+  });
+  const result = await host.runConcierge(
+    { sandbox: { ...conciergePlan.sandbox, maxLifetimeMs: 100 } },
+    id,
+    ({ attach }) => attach({ argv: ["claude"] }),
+  );
+  assert.deepEqual(result, { id, outcome: "timed-out" });
+  assert.ok(calls.includes("attach"));
+  assert.ok(calls.indexOf("gateway.close") < calls.indexOf("destroy"));
+  assert.equal(
+    db
+      .read(id)
+      .find(
+        ({ kind, operation }) =>
+          kind === "operation.finished" && operation === "sandbox.exec",
+      )?.outcome,
+    "timed-out",
+  );
+});
+
+test("Concierge reports the worst attach outcome while preserving each attach result", async (t) => {
+  const id = randomUUID();
+  let attaches = 0;
+  const { host, db } = observedFixture(t, {
+    async attachTerminal(_handle, command) {
+      assert.deepEqual(command.env, {
+        TERM: "é".repeat(512),
+        ["LO_" + "X".repeat(40)]: "fixture",
+      });
+      switch (++attaches) {
+        case 1:
+          return { exitCode: 1 };
+        case 2:
+          throw new SandboxRuntimeError("timed-out");
+        case 3:
+          return { exitCode: null };
+        default:
+          return { exitCode: 0 };
+      }
+    },
+  });
+  const result = await host.runConcierge(
+    conciergePlan,
+    id,
+    async ({ attach }) => {
+      await assert.rejects(
+        attach({ argv: ["claude"], env: { PATH: "/bin" } }),
+        /invalid-input/,
+      );
+      const command = {
+        argv: ["claude"],
+        env: { TERM: "é".repeat(512), ["LO_" + "X".repeat(40)]: "fixture" },
+      };
+      await attach(command);
+      await assert.rejects(attach(command), /timed-out/);
+      await attach(command);
+      await attach(command);
+    },
+  );
+  assert.deepEqual(result, { id, outcome: "timed-out" });
+  assert.deepEqual(
+    db
+      .read(id)
+      .filter(
+        ({ kind, operation }) =>
+          kind === "operation.finished" && operation === "sandbox.exec",
+      )
+      .map(({ outcome }) => outcome),
+    ["failed", "timed-out", "failed", "ok"],
+  );
+});
+
+test("Concierge volume operations durably record authorization, reuse and failure", async (t) => {
+  const volumeName = "lo-session";
+  let creates = 0;
+  const { host, db, runtime } = observedFixture(t, {
+    async createVolume(name) {
+      const last = db.readSince({}).at(-1);
+      assert.equal(
+        last?.table === "audit_events" && last.kind,
+        "operation.allowed",
+      );
+      assert.equal(
+        last?.table === "audit_events" && last.operation,
+        "volume.create",
+      );
+      assert.equal(name, volumeName);
+      return { reused: ++creates > 1 };
+    },
+    async removeVolume(name) {
+      const last = db.readSince({}).at(-1);
+      assert.equal(
+        last?.table === "audit_events" && last.kind,
+        "operation.allowed",
+      );
+      assert.equal(
+        last?.table === "audit_events" && last.operation,
+        "volume.remove",
+      );
+      assert.equal(name, volumeName);
+      throw new SandboxRuntimeError("backend-failure");
+    },
+  });
+  await assert.rejects(host.prepareConciergeVolume("outside"), /invalid-input/);
+  await assert.rejects(
+    host.removeConciergeVolume("lo-../outside"),
+    /invalid-input/,
+  );
+  await assert.rejects(
+    new TrustedHost(db, runtime, profiles).prepareConciergeVolume(volumeName),
+    /unsupported/,
+  );
+  assert.deepEqual(db.readSince({}), []);
+  assert.deepEqual(await host.prepareConciergeVolume(volumeName), {
+    reused: false,
+  });
+  assert.deepEqual(await host.prepareConciergeVolume(volumeName), {
+    reused: true,
+  });
+  await assert.rejects(
+    host.removeConciergeVolume(volumeName),
+    /backend-failure/,
+  );
+  const rows = db.readSince({}).filter((row) => row.table === "audit_events");
+  for (const [i, operation] of [
+    "volume.create",
+    "volume.create",
+    "volume.remove",
+  ].entries()) {
+    const group = rows.slice(3 * i, 3 * (i + 1));
+    assert.equal(
+      new Set(group.map(({ invocationId }) => invocationId)).size,
+      1,
+    );
+    assert.deepEqual(
+      group.map(({ kind, role, operation: action, outcome, detail }) => [
+        kind,
+        role,
+        action,
+        outcome,
+        detail,
+      ]),
+      [
+        [
+          "operation.requested",
+          "Concierge",
+          operation,
+          undefined,
+          { volumeName },
+        ],
+        [
+          "operation.allowed",
+          "Concierge",
+          operation,
+          undefined,
+          { volumeName },
+        ],
+        [
+          "operation.finished",
+          "Concierge",
+          operation,
+          i === 2 ? "failed" : "ok",
+          i === 2 ? { volumeName } : { volumeName, reused: i === 1 },
+        ],
+      ],
+    );
+  }
+  assert.equal(rows.length, 9);
+});
+
+test("Concierge volume operations refuse side effects without durable request and authorization", async (t) => {
+  for (const operation of ["volume.create", "volume.remove"]) {
+    for (const kind of ["operation.requested", "operation.allowed"]) {
+      const { host } = observedFixture(
+        t,
+        {
+          async createVolume() {
+            assert.fail("unexpected create");
+          },
+          async removeVolume() {
+            assert.fail("unexpected remove");
+          },
+        },
+        `${kind} ${operation}`,
+      );
+      const result =
+        operation === "volume.create"
+          ? host.prepareConciergeVolume("lo-session")
+          : host.removeConciergeVolume("lo-session");
+      await assert.rejects(result, HostAuditError);
+    }
+  }
 });

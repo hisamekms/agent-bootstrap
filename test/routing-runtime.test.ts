@@ -120,3 +120,82 @@ test("bound creation routes by provider and retains ownership by handle", async 
     "openai:destroy",
   ]);
 });
+
+test("interactive terminals follow the handle and volume operations follow the Concierge backend", async () => {
+  const calls: string[] = [];
+  const volumeBackend = (name: string) => ({
+    ...fake(name, calls),
+    async createVolume(volume: string) {
+      calls.push(`${name}:create-volume:${volume}`);
+      return { reused: true };
+    },
+    async removeVolume(volume: string) {
+      calls.push(`${name}:remove-volume:${volume}`);
+    },
+  });
+  const runtime = new RoutingSandboxRuntime([
+    { provider: openai, runtime: volumeBackend("openai") },
+    {
+      provider: anthropic,
+      runtime: {
+        ...volumeBackend("anthropic"),
+        async attachTerminal(handle, command) {
+          calls.push(`${handle.id}:attach:${command.argv[0]}`);
+          return { exitCode: 0 };
+        },
+      },
+    },
+  ]);
+  const interactive = {
+    vsock: { hostPath: "/fixture/socket", port: 5000 },
+    stateVolume: "lo-session",
+    snapshotDir: "/fixture/repo",
+  };
+  await assert.rejects(
+    runtime.create({ provider: openai, profile: "concierge", interactive }),
+    /unsupported/,
+  );
+  assert.deepEqual(await runtime.createVolume(interactive.stateVolume), {
+    reused: true,
+  });
+  const handle = await runtime.create({
+    provider: anthropic,
+    profile: "concierge",
+    interactive,
+  });
+  assert.deepEqual(await runtime.attachTerminal(handle, { argv: ["claude"] }), {
+    exitCode: 0,
+  });
+  await runtime.destroy(handle);
+  await runtime.removeVolume(interactive.stateVolume);
+  assert.deepEqual(calls, [
+    "anthropic:create-volume:lo-session",
+    "anthropic:create",
+    "anthropic:attach:claude",
+    "anthropic:destroy",
+    "anthropic:remove-volume:lo-session",
+  ]);
+});
+
+test("volume operations refuse a Concierge backend without volume support", async () => {
+  const calls: string[] = [];
+  const runtime = new RoutingSandboxRuntime([
+    { provider: anthropic, runtime: fake("anthropic", calls) },
+    {
+      provider: openai,
+      runtime: {
+        ...fake("openai", calls),
+        async createVolume() {
+          calls.push("wrong create");
+          return { reused: false };
+        },
+        async removeVolume() {
+          calls.push("wrong remove");
+        },
+      },
+    },
+  ]);
+  await assert.rejects(runtime.createVolume("lo-session"), /unsupported/);
+  await assert.rejects(runtime.removeVolume("lo-session"), /unsupported/);
+  assert.deepEqual(calls, []);
+});
