@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   chmod,
   lstat,
@@ -36,6 +37,12 @@ import { ActorRunner } from "./runner.ts";
 import type { OrchestratorStore } from "./store.ts";
 import { createTaskExecutor, localMainCommit } from "./tasks.ts";
 import type { Verification } from "../reviewed-integration.ts";
+
+/** macOS limits Unix socket paths to 104 bytes; /private/tmp keeps the Host API
+ * socket short there. Other hosts use the OS temporary directory. */
+function socketRoot(): string {
+  return existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+}
 
 const PORT = 5000;
 const modes = ["default", "acceptEdits", "plan", "auto"] as const;
@@ -434,7 +441,7 @@ export async function startConcierge(
     snapshotDir = snapshot.dir;
     store.recordSessionSnapshot(sessionId, snapshot.commit);
     const context = await conciergeContext(snapshot);
-    socketDir = await mkdtemp("/private/tmp/lo-");
+    socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
     const tasks =
       host.runWorker && host.runVerification
