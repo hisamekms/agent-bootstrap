@@ -281,6 +281,16 @@ own disks and do not back the mount.
 Afterwards, every host file kept its modification time and size, and the
 host's before and after directory check passed on every run.
 
+### V9.2 result, 2026-11-24
+
+The policy smoke ran on the host against a registered project:
+
+- **Setup.** `claude.auth: "external"`, and one `ro` mount for Planner, Executor and Reviewer, with its configuration-directory variable set.
+- **Passing checks.** Reviewer file tools and shell, Executor file tools, shell and symlink access, read-only directory metadata, and no memory entries all passed.
+- **Skipped check.** The Reviewer symlink probe was skipped by design, because the review snapshot accepts regular files only.
+- **Repeat runs.** Two of three runs passed every check. One failed with `invalid-answer`, because the model's answer did not match the strict answer format.
+- **Fixed on the way.** The first live run found that macOS mounts the volume root as `0755`. Attach now sets the root to `0700` through a checked file descriptor.
+
 ## Consequences
 
 - Benign tool writes cannot stop a run, because nothing inspects mount

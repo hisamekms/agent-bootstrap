@@ -106,7 +106,13 @@ export function createClaudePolicy(
     },
     async beginMount(mount, holder, ensureAudit, deadline) {
       const definition = config.volumes?.[mount.volume];
-      if (!definition) throw new VolumeError("config-invalid");
+      if (!definition)
+        throw new VolumeError(
+          "config-invalid",
+          `Mount "${mount.name}"`,
+          "The mount's volume is undefined.",
+          "Define the volume or update the mount declaration, then restart the launcher.",
+        );
       const changed = (): never =>
         invalid(
           `mounts.${mount.name}`,
@@ -174,7 +180,10 @@ export function createClaudePolicy(
         };
         ensureOwnership();
       }
-      const volume = new Volume(definition, state);
+      const volume = new Volume(definition, state, undefined, {
+        volume: mount.volume,
+        mount: mount.name,
+      });
       const lease = await volume.acquire(
         mount.dir,
         mount.mode ?? "ro",

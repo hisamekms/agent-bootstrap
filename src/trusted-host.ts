@@ -17,7 +17,7 @@ import {
 } from "./local-orchestrator/claude-errors.ts";
 import type { Config, EgressActor, MountDeclaration } from "./config/layers.ts";
 import { ConfigError } from "./config/messages.ts";
-import { VolumeError, MountBusy } from "./volumes/volume.ts";
+import { VolumeError } from "./volumes/volume.ts";
 import { readFileSync } from "node:fs";
 import type { CredentialScanner } from "./local-orchestrator/credential-scan.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -228,7 +228,7 @@ export interface ClaudeHostPolicy {
         deadline: number,
       ) => Promise<MountLease>)
     | undefined;
-  note(message: string): void;
+  note(message: string, volumeError?: VolumeError): void;
 }
 
 export interface TrustedHostOptions {
@@ -1183,6 +1183,7 @@ export class TrustedHost {
     let orphanedSandbox = false;
     let code: ClaudeFailureCode | undefined;
     let leaseNext: string | undefined;
+    let reportedVolumeCode: ClaudeFailureCode | undefined;
     const leases: MountLease[] = [];
     const finishLeases = (quarantine: boolean) => {
       for (const lease of leases.splice(0).reverse()) {
@@ -1195,9 +1196,15 @@ export class TrustedHost {
       }
     };
     const report = (error: unknown) => {
-      if (error instanceof MountBusy || error instanceof ConfigError)
+      reportedVolumeCode = undefined;
+      if (error instanceof VolumeError) {
+        note(`${error.message}\nnext: ${error.next}`, error);
+        reportedVolumeCode = error.code;
+      }
+      if (error instanceof ConfigError) {
         leaseNext = error.next;
-      if (error instanceof ConfigError) note(error.message);
+        note(error.message);
+      }
       if (code !== "credential-leak")
         code =
           error instanceof ClaudeRunError || error instanceof VolumeError
@@ -1205,9 +1212,9 @@ export class TrustedHost {
             : "config-invalid";
       outcome = "failed";
     };
-    const note = (message: string) => {
+    const note = (message: string, volumeError?: VolumeError) => {
       try {
-        this.#claude?.note(message);
+        this.#claude?.note(message, volumeError);
       } catch {}
     };
     try {
@@ -1300,12 +1307,8 @@ export class TrustedHost {
               } catch (error) {
                 if (
                   error instanceof HostAuditError ||
-                  error instanceof ConfigError
-                )
-                  throw error;
-                if (
-                  error instanceof VolumeError &&
-                  error.code === "volume-detached"
+                  error instanceof ConfigError ||
+                  error instanceof VolumeError
                 )
                   throw error;
                 throw new ConfigError(
@@ -1845,7 +1848,8 @@ export class TrustedHost {
         (orphanedSandbox || (!!handle && !sandboxDestroyed));
       finishLeases(quarantine);
       if (quarantine) report(new ClaudeRunError("volume-detached"));
-      if (code) note(`next: ${leaseNext ?? claudeNext(code)}`);
+      if (code && code !== reportedVolumeCode)
+        note(`next: ${leaseNext ?? claudeNext(code)}`);
       await append({
         kind: "invocation.finished",
         outcome,

@@ -310,15 +310,18 @@ async function checkMounts(
   let memory = false;
   const hasMemory = (entries: Awaited<ReturnType<typeof directoryMetadata>>) =>
     entries.some(({ name }) => name.split("/").at(-1) === "memory");
-  const mounts = Object.values(effective.config.mounts ?? {});
-  const volumeFor = (name: string) =>
-    new Volume(effective.config.volumes![name]!, state);
+  const mounts = Object.entries(effective.config.mounts ?? {});
+  const volumeFor = (mount: string, volume: string) =>
+    new Volume(effective.config.volumes![volume]!, state, undefined, {
+      mount,
+      volume,
+    });
   try {
-    for (const mount of mounts) {
+    for (const [name, mount] of mounts) {
       if (mount.mode === "rw") continue;
       const key = `${mount.volume}/${mount.dir}`;
       if (readers.has(key)) continue;
-      const volume = volumeFor(mount.volume);
+      const volume = volumeFor(name, mount.volume);
       const lease = await volume.acquire(
         mount.dir,
         "ro",
@@ -340,9 +343,9 @@ async function checkMounts(
       unchanged &&= JSON.stringify(before) === JSON.stringify(after);
       memory ||= hasMemory(after);
     }
-    for (const mount of mounts) {
+    for (const [name, mount] of mounts) {
       if (mount.mode !== "rw") continue;
-      const volume = volumeFor(mount.volume);
+      const volume = volumeFor(name, mount.volume);
       const lease = await volume.acquire(
         mount.dir,
         "ro",
@@ -361,8 +364,8 @@ async function checkMounts(
     const released = await Promise.allSettled(
       [...readers.values()].map(async (lease) => lease.release()),
     );
-    if (released.some(({ status }) => status === "rejected"))
-      throw new VolumeError("volume-detached");
+    for (const result of released)
+      if (result.status === "rejected") throw result.reason;
   }
   return [
     unchanged
@@ -464,7 +467,12 @@ async function open(
     auditPath: join(directory, `audit-${effective.auth}.sqlite`),
     msb: { home, binary, stagingRoot: join(directory, "sandboxes") },
     profiles,
-    claude: createClaudePolicy(effective, state, () => {}, project),
+    claude: {
+      ...createClaudePolicy(effective, state, () => {}, project),
+      note(message, volumeError) {
+        if (volumeError) console.error(message);
+      },
+    },
     ...(effective.gatewayHosts ? { gatewayHosts: effective.gatewayHosts } : {}),
     ...(key && provider
       ? {
@@ -583,11 +591,15 @@ async function main() {
 if (import.meta.main) {
   try {
     await main();
-  } catch {
-    console.error(
-      "Could not start the Claude policy smoke or write its report.",
-    );
-    console.error(usage);
+  } catch (error) {
+    if (error instanceof VolumeError) {
+      console.error(`${error.message}\nnext: ${error.next}`);
+    } else {
+      console.error(
+        "Could not start the Claude policy smoke or write its report.",
+      );
+      console.error(usage);
+    }
     process.exitCode = 1;
   }
 }

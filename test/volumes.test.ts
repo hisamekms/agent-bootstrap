@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  fstatSync,
   lstatSync,
   readFileSync,
+  mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
@@ -52,6 +55,9 @@ function fixture(t: TestContext) {
   } as const;
   let attachment = "";
   let detachFailure = false;
+  let attachedDevice: number | undefined;
+  let attachFault: "symlink" | "owner" | "device" | undefined;
+  const symlinkTarget = join(root, "symlink-target");
   const events: { command: string; args: string[]; input?: Buffer }[] = [];
   const command: VolumeCommand = (file, args, input) => {
     const [command] = args as [string];
@@ -69,7 +75,12 @@ function fixture(t: TestContext) {
               ? [
                   {
                     "image-path": definition.image,
-                    "system-entities": [{ "mount-point": attachment }],
+                    "system-entities": [
+                      {
+                        "mount-point": attachment,
+                        "dev-entry": "/dev/disk99s1",
+                      },
+                    ],
                   },
                 ]
               : [],
@@ -80,8 +91,16 @@ function fixture(t: TestContext) {
       writeFileSync(definition.image, "", { mode: 0o600 });
     if (command === "isencrypted")
       return { status: 0, stdout: Buffer.from("encrypted: YES\n") };
-    if (command === "attach")
+    if (command === "attach") {
       attachment = args[args.indexOf("-mountpoint") + 1]!;
+      chmodSync(attachment, 0o755);
+      attachedDevice = lstatSync(attachment).dev;
+      if (attachFault === "symlink") {
+        rmSync(attachment, { recursive: true });
+        mkdirSync(symlinkTarget, { mode: 0o755 });
+        symlinkSync(symlinkTarget, attachment);
+      }
+    }
     if (command === "detach") {
       if (detachFailure) return { status: 1, stdout: Buffer.alloc(0) };
       attachment = "";
@@ -96,7 +115,29 @@ function fixture(t: TestContext) {
     root,
     env,
     definition,
-    command,
+    volume: () =>
+      new Volume(definition, userStateDirectory(env), command, {
+        volume: "private",
+        mount: "example",
+        mountIo: {
+          deviceNumber(path) {
+            assert.equal(path, "/dev/disk99s1");
+            return attachedDevice;
+          },
+          rootStat(fd) {
+            const info = fstatSync(fd);
+            return {
+              dev: info.dev + Number(attachFault === "device"),
+              uid: info.uid + Number(attachFault === "owner"),
+              isDirectory: () => info.isDirectory(),
+            };
+          },
+        },
+      }),
+    setAttachFault: (fault: typeof attachFault) => {
+      attachFault = fault;
+    },
+    symlinkTarget,
     events,
     failDetach: () => {
       detachFailure = true;
@@ -114,11 +155,18 @@ const mount = {
 const audit = () => {};
 
 test("encrypted image initialization and independent directory leases keep passphrases off argv", async (t) => {
-  const { definition, env, command, events } = fixture(t);
-  const state = userStateDirectory(env);
-  const first = new Volume(definition, state, command);
-  const second = new Volume(definition, state, command);
+  const { volume, events } = fixture(t);
+  const first = volume();
+  const second = volume();
   first.init();
+  assert.equal(lstatSync(first.mount).mode & 0o7777, 0o700);
+  assert.deepEqual(first.status(), { mounted: false, active: 0, stale: false });
+  assert.deepEqual(
+    events
+      .filter(({ command }) => command === "attach" || command === "detach")
+      .map(({ command }) => command),
+    ["attach", "detach"],
+  );
   const create = events.find(({ command }) => command === "create")!;
   assert.ok(create.args.includes("APFS") && create.args.includes("AES-256"));
   assert.ok(create.args.includes("-stdinpass"));
@@ -132,6 +180,7 @@ test("encrypted image initialization and independent directory leases keep passp
   );
 
   const initial = await first.acquire("parent", "ro", "Executor", audit);
+  assert.equal(lstatSync(first.mount).mode & 0o7777, 0o700);
   initial.prepare();
   initial.ready();
   const overlap = await second.acquire("parent", "ro", "Reviewer", audit);
@@ -154,18 +203,33 @@ test("encrypted image initialization and independent directory leases keep passp
   overlap.release();
   separate.release();
   assert.deepEqual(first.status(), { mounted: false, active: 0, stale: false });
-  assert.equal(events.filter(({ command }) => command === "attach").length, 1);
+  assert.equal(events.filter(({ command }) => command === "attach").length, 2);
 
   const writer = await first.acquire("parent", "rw", "operator shell", audit);
   await assert.rejects(
     second.acquire("parent", "ro", "Reviewer", audit, performance.now()),
     (error: MountBusy) =>
-      error.code === "mount-busy" && /operator shell/.test(error.next),
+      error.code === "mount-busy" &&
+      /Mount "example".*busy/.test(error.message) &&
+      /operator shell/.test(error.next),
   );
   const path = first.directory("parent", true);
   assert.equal(lstatSync(path).mode & 0o7777, 0o700);
   symlinkSync(path, join(first.mount, "alias"));
-  assert.throws(() => first.directory("alias"), { code: "config-invalid" });
+  assert.throws(() => first.directory("alias"), {
+    code: "config-invalid",
+    message: /Mount "example" directory.*symbolic link/,
+    next: /Replace the link/,
+  });
+  for (const entry of [path, first.mount]) {
+    chmodSync(entry, 0o755);
+    assert.throws(() => first.directory("parent"), {
+      code: "config-invalid",
+      message: /Mount "example".*mode 0700/,
+      next: /chmod 700/,
+    });
+    chmodSync(entry, 0o700);
+  }
   writer.quarantine();
   assert.equal(first.status().stale, true);
   assert.throws(() => first.detach(), { code: "volume-detached" });
@@ -173,9 +237,50 @@ test("encrypted image initialization and independent directory leases keep passp
   assert.deepEqual(first.status(), { mounted: false, active: 0, stale: false });
 });
 
+for (const [fault, code, message] of [
+  ["symlink", "config-invalid", /Mount "example" root.*symbolic link/],
+  ["owner", "config-invalid", /Mount "example" root.*not owned/],
+  ["device", "volume-detached", /Mount "example".*expected mounted device/],
+] as const) {
+  test(`attach refuses a mounted root with a ${fault} mismatch`, (t) => {
+    const {
+      volume: makeVolume,
+      setAttachFault,
+      symlinkTarget,
+      events,
+    } = fixture(t);
+    const volume = makeVolume();
+    volume.init();
+    setAttachFault(fault);
+    assert.throws(() => volume.attach(), { code, message });
+    const untouched = fault === "symlink" ? symlinkTarget : volume.mount;
+    assert.equal(lstatSync(untouched).mode & 0o7777, 0o755);
+    assert.deepEqual(events.at(-1)?.args, ["detach", "/dev/disk99s1"]);
+    assert.deepEqual(volume.status(), {
+      mounted: false,
+      active: 0,
+      stale: false,
+    });
+  });
+}
+
+test("failed attach cleanup keeps the validation code and gives recovery steps", (t) => {
+  const { volume: makeVolume, setAttachFault, failDetach } = fixture(t);
+  const volume = makeVolume();
+  volume.init();
+  setAttachFault("owner");
+  failDetach();
+  assert.throws(() => volume.attach(), {
+    code: "config-invalid",
+    message: /not owned.*could not detach/,
+    next: /volume status private.*volume detach private --force/,
+  });
+  assert.deepEqual(volume.status(), { mounted: true, active: 0, stale: true });
+});
+
 test("manual volume attachment is consumed by the next lease and failed detach is recoverable", async (t) => {
-  const { definition, env, command, failDetach } = fixture(t);
-  const volume = new Volume(definition, userStateDirectory(env), command);
+  const { volume: makeVolume, failDetach } = fixture(t);
+  const volume = makeVolume();
   volume.init();
   volume.attach();
   assert.deepEqual(volume.status(), { mounted: true, active: 1, stale: false });
@@ -309,7 +414,7 @@ test("managed settings keep mounts outside file-tool scopes and remove shell too
 });
 
 test("migration converts mounts and actor egress once and refuses active attachments or leases", async (t) => {
-  const { root, env, definition, command } = fixture(t);
+  const { root, env, definition, volume: makeVolume } = fixture(t);
   const repo = initConfigRepo(join(root, "migration"));
   const project = addProject(repo, undefined, env);
   const second = addProject(
@@ -338,7 +443,7 @@ test("migration converts mounts and actor egress once and refuses active attachm
       }),
     /must be detached/,
   );
-  const volume = new Volume(definition, userStateDirectory(env), command);
+  const volume = makeVolume();
   volume.init();
   const lease = await volume.acquire("shared", "ro", "Executor", audit);
   assert.throws(
@@ -404,6 +509,39 @@ test("migration converts mounts and actor egress once and refuses active attachm
   assert.deepEqual(
     files.map((path) => readFileSync(path, "utf8")),
     snapshot,
+  );
+});
+
+test("volume CLI reports a named fault without exposing configuration values", async (t) => {
+  const { root, env, definition } = fixture(t);
+  writePrivateConfig(userConfigPath(env), configRoot(env), {
+    version: 1,
+    volumes: { private: definition },
+  });
+  const state = userStateDirectory(env);
+  mkdirSync(state, { recursive: true, mode: 0o700 });
+  chmodSync(state, 0o755);
+  const output: string[] = [];
+  const io: BootstrapIo = {
+    stdin: process.stdin,
+    isTTY: false,
+    conciergeTTY: false,
+    stdout: { write: (text) => output.push(text) },
+    stderr: { write: (text) => output.push(text) },
+    async prompt() {
+      return "";
+    },
+  };
+  const result = await runBootstrap(["volume", "status", "private"], root, io, {
+    ...systemHost,
+    env,
+  });
+  assert.equal(result, 1);
+  const message = output.join("");
+  assert.match(message, /Volume "private".*state directory is unsafe/);
+  assert.match(message, /\nnext: .*mode 0700/);
+  assert.ok(
+    !message.includes(root) && !message.includes(definition.keychainService),
   );
 });
 
@@ -813,8 +951,8 @@ test("config validation and doctor reject mounts for a non-Claude harness", asyn
 });
 
 test("a waiting lease checks mount ownership when it can acquire the lock", async (t) => {
-  const { definition, env, command, events } = fixture(t);
-  const volume = new Volume(definition, userStateDirectory(env), command);
+  const { volume: makeVolume, events } = fixture(t);
+  const volume = makeVolume();
   volume.init();
   const writer = await volume.acquire("shared", "rw", "operator shell", audit);
   let ownershipChecks = 0;
@@ -835,7 +973,7 @@ test("a waiting lease checks mount ownership when it can acquire the lock", asyn
   writer.release();
   await rejected;
   assert.equal(ownershipChecks, 1);
-  assert.equal(events.filter(({ command }) => command === "attach").length, 1);
+  assert.equal(events.filter(({ command }) => command === "attach").length, 2);
   assert.deepEqual(volume.status(), {
     mounted: false,
     active: 0,

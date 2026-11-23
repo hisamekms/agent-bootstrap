@@ -10,7 +10,7 @@ import {
   validService,
   type ClaudeAuthMode,
 } from "../local-orchestrator/claude-config.ts";
-import { Volume } from "../volumes/volume.ts";
+import { Volume, VolumeError } from "../volumes/volume.ts";
 import { loadConfig, missing, privatePath } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
 import {
@@ -636,7 +636,12 @@ export async function doctor(
       )) {
         try {
           const image = await stat(definition.image).catch(() => undefined);
-          const volume = new Volume(definition, userStateDirectory(host.env));
+          const volume = new Volume(
+            definition,
+            userStateDirectory(host.env),
+            undefined,
+            { volume: name },
+          );
           const status = volume.status();
           add(
             check(
@@ -651,20 +656,26 @@ export async function doctor(
                     : "The image is missing.",
               status.stale
                 ? [
-                    "Confirm no VM is running, then use agent-bootstrap volume detach --force.",
+                    `Confirm no VM is running, then use agent-bootstrap volume detach ${name} --force.`,
                   ]
                 : image?.isFile()
                   ? []
-                  : ["Run agent-bootstrap volume init for this volume."],
+                  : [`Run agent-bootstrap volume init ${name}.`],
             ),
           );
-        } catch {
+        } catch (error) {
           add(
             check(
               `volumes.${name}`,
               "wrong",
-              "Volume status could not be checked.",
-              ["Run agent-bootstrap volume status for this volume."],
+              error instanceof VolumeError
+                ? error.message
+                : "Volume status could not be checked.",
+              [
+                error instanceof VolumeError
+                  ? error.next
+                  : `Run agent-bootstrap volume status ${name}.`,
+              ],
             ),
           );
         }

@@ -4,15 +4,24 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
+  fchmodSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   realpathSync,
+  statSync,
+  type Stats,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { userInfo } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
-import { privatePath, type VolumeDefinition } from "../config/layers.ts";
+import {
+  privatePath,
+  projectName,
+  type VolumeDefinition,
+} from "../config/layers.ts";
+import { ConfigError } from "../config/messages.ts";
 import { validKeychainService } from "../credentials.ts";
 
 type Binding = string | number | null;
@@ -29,9 +38,21 @@ const { Database } = require("bun:sqlite") as {
 
 export class VolumeError extends Error {
   readonly code: "config-invalid" | "volume-detached" | "mount-busy";
-  constructor(code: VolumeError["code"]) {
-    super(code);
+  readonly next: string;
+  readonly subject: string;
+  readonly reason: string;
+
+  constructor(
+    code: VolumeError["code"],
+    subject: string,
+    reason: string,
+    next: string,
+  ) {
+    super(`${subject}: ${reason}`);
     this.code = code;
+    this.next = next;
+    this.subject = subject;
+    this.reason = reason;
   }
 }
 
@@ -40,15 +61,20 @@ export type LeaseHolder =
   "operator shell" | "Concierge" | "Planner" | "Executor" | "Reviewer";
 
 export class MountBusy extends VolumeError {
-  readonly next: string;
-  constructor(holder?: LeaseHolder) {
-    super("mount-busy");
-    this.next =
+  constructor(subject: string, holder?: LeaseHolder) {
+    super(
+      "mount-busy",
+      subject,
+      "The mount is busy.",
       holder === "operator shell"
         ? "Wait for the operator shell to exit, then retry."
-        : holder
+        : holder === "Concierge" ||
+            holder === "Planner" ||
+            holder === "Executor" ||
+            holder === "Reviewer"
           ? `Wait for the ${holder} run to finish, then retry.`
-          : "Wait for the volume operation to finish, then retry.";
+          : "Wait for the volume operation to finish, then retry.",
+    );
   }
 }
 
@@ -75,29 +101,40 @@ const systemCommand: VolumeCommand = (file, args, input) =>
     maxBuffer: 1024 * 1024,
   });
 
-export function privateDirectory(path: string) {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  const info = lstatSync(path);
-  if (
-    !info.isDirectory() ||
-    info.uid !== process.getuid?.() ||
-    (info.mode & 0o7777) !== 0o700 ||
-    realpathSync(path) !== path
-  )
-    throw new VolumeError("config-invalid");
+export function privateDirectory(
+  path: string,
+  subject = "Private state directory",
+) {
+  if (!lstatSync(path, { throwIfNoEntry: false }))
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  if (checkMountDirectory(path, subject) !== path)
+    throw new VolumeError(
+      "config-invalid",
+      subject,
+      "A parent directory is a symbolic link.",
+      "Use a state directory with no symbolic links and retry.",
+    );
 }
 
 const sha256 = (data: string | Buffer) =>
   createHash("sha256").update(data).digest("hex");
 type VolumeState = { mounted: boolean; stale: boolean; active: number };
+type DiskEntity = { "mount-point"?: string; "dev-entry"?: string };
 type DiskImage = {
   "image-path"?: string;
-  "system-entities"?: { "mount-point"?: string }[];
+  "system-entities"?: DiskEntity[];
 };
 
 function diskImages(run: VolumeCommand): DiskImage[] {
+  const unavailable = () =>
+    new VolumeError(
+      "volume-detached",
+      "Volume attachments",
+      "macOS could not report the disk image attachments.",
+      "Check Disk Utility for disk image errors, then retry.",
+    );
   const result = run(disk, ["info", "-plist"]);
-  if (result.status !== 0) throw new VolumeError("volume-detached");
+  if (result.status !== 0) throw unavailable();
   // DiskImages may include aliases and timestamps, which JSON cannot represent.
   const plist = result.stdout
     .toString()
@@ -107,12 +144,14 @@ function diskImages(run: VolumeCommand): DiskImage[] {
     ["-convert", "json", "-o", "-", "-"],
     Buffer.from(plist),
   );
-  if (json.status !== 0) throw new VolumeError("volume-detached");
-  const { images } = JSON.parse(json.stdout.toString()) as {
-    images: DiskImage[];
-  };
-  if (!Array.isArray(images)) throw new VolumeError("volume-detached");
-  return images;
+  if (json.status !== 0) throw unavailable();
+  try {
+    const { images } = JSON.parse(json.stdout.toString()) as {
+      images: DiskImage[];
+    };
+    if (Array.isArray(images)) return images;
+  } catch {}
+  throw unavailable();
 }
 
 export function assertDetachedImages(
@@ -129,7 +168,12 @@ export function assertDetachedImages(
           paths.includes(realpathSyncIfPresent(image["image-path"]))),
     )
   )
-    throw new VolumeError("volume-detached");
+    throw new VolumeError(
+      "volume-detached",
+      "Volume migration",
+      "A volume is still attached.",
+      "Detach all volumes involved in the migration and retry.",
+    );
 }
 
 function realpathSyncIfPresent(path: string) {
@@ -141,52 +185,122 @@ function realpathSyncIfPresent(path: string) {
   }
 }
 
+type MountIdentity = Pick<Stats, "dev" | "uid" | "isDirectory">;
+interface VolumeMountIo {
+  deviceNumber(path: string): number | undefined;
+  rootStat(fd: number): MountIdentity;
+}
+
+const systemMountIo: VolumeMountIo = {
+  deviceNumber(path) {
+    const info = statSync(path, { throwIfNoEntry: false });
+    return info?.isBlockDevice() ? info.rdev : undefined;
+  },
+  rootStat: fstatSync,
+};
+
 export class Volume {
   readonly #config: VolumeDefinition;
   readonly #run: VolumeCommand;
   readonly #root: string;
   readonly #state: string;
   readonly #account: string;
+  readonly #volumeName: string | undefined;
+  readonly #subject: string;
+  readonly #mountIo: VolumeMountIo;
   readonly mount: string;
 
   constructor(
     config: VolumeDefinition,
     state: string,
     run = systemCommand,
-    account = userInfo().username,
+    options: { volume?: string; mount?: string; mountIo?: VolumeMountIo } = {},
   ) {
+    const account = userInfo().username;
+    this.#mountIo = options.mountIo ?? systemMountIo;
     this.#config = { ...config };
     this.#state = state;
     this.#run = run;
     this.#account = account;
+    this.#volumeName =
+      options.volume && projectName.test(options.volume)
+        ? options.volume
+        : undefined;
+    this.#subject =
+      options.mount && projectName.test(options.mount)
+        ? `Mount "${options.mount}"`
+        : this.#volumeName
+          ? `Volume "${this.#volumeName}"`
+          : "Volume";
     if (
       !validKeychainService(account) ||
       !validKeychainService(config.keychainService)
     )
-      throw new VolumeError("config-invalid");
+      throw this.#error(
+        "config-invalid",
+        "The Keychain account or service name is invalid.",
+        "Check the volume's Keychain configuration.",
+      );
     this.#root = join(state, "volumes", sha256(config.image).slice(0, 24));
     this.mount = join(this.#root, "volume");
-    if (/[\0:=,\r\n]/.test(this.mount)) throw new VolumeError("config-invalid");
+    if (/[\0:=,\r\n]/.test(this.mount))
+      throw this.#error(
+        "config-invalid",
+        "The state location contains characters unsupported by the mount backend.",
+        "Choose a different state directory and retry.",
+      );
+  }
+
+  #error(code: VolumeError["code"], reason: string, next: string) {
+    return new VolumeError(code, this.#subject, reason, next);
+  }
+
+  #recoverAttachment() {
+    const name = this.#volumeName ?? "<volume>";
+    return `Run agent-bootstrap volume status ${name}. If state is stale, confirm no VM is running before using agent-bootstrap volume detach ${name} --force.`;
+  }
+
+  #detached(reason: string) {
+    return this.#error("volume-detached", reason, this.#recoverAttachment());
   }
 
   #locked<T>(effect: (db: Connection) => T, busyTimeout = 45_000): T {
-    privatePath(this.#root, this.#state, true);
+    try {
+      privatePath(this.#root, this.#state, true);
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      throw this.#error(
+        "config-invalid",
+        "The volume state directory is unsafe.",
+        "Check that the state directories are user-owned, have mode 0700, and contain no symbolic links.",
+      );
+    }
     const lock = join(this.#root, "lock.sqlite");
-    closeSync(
-      openSync(
-        lock,
-        constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
-        0o600,
-      ),
-    );
-    const info = lstatSync(lock);
+    const unsafeLock = () =>
+      this.#error(
+        "config-invalid",
+        "The volume lock could not be opened as a private file owned by the current user.",
+        "Check the volume state directory and restore a regular lock file with mode 0600, no symbolic link, and no additional hard links.",
+      );
+    try {
+      closeSync(
+        openSync(
+          lock,
+          constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+          0o600,
+        ),
+      );
+    } catch {
+      throw unsafeLock();
+    }
+    const info = lstatSync(lock, { throwIfNoEntry: false });
     if (
-      !info.isFile() ||
+      !info?.isFile() ||
       info.nlink !== 1 ||
       info.uid !== process.getuid?.() ||
       (info.mode & 0o7777) !== 0o600
     )
-      throw new VolumeError("config-invalid");
+      throw unsafeLock();
     const db = new Database(lock, { strict: true });
     try {
       db.run(`PRAGMA busy_timeout = ${busyTimeout}`);
@@ -203,14 +317,25 @@ export class Volume {
     }
   }
 
-  #mounted(): boolean {
-    const images = diskImages(this.#run);
-    let mounted = false;
+  #mounted(): DiskEntity | undefined {
+    let images: DiskImage[];
+    try {
+      images = diskImages(this.#run);
+    } catch (error) {
+      if (!(error instanceof VolumeError)) throw error;
+      throw this.#error(
+        error.code,
+        "macOS could not report the disk image attachments.",
+        error.next,
+      );
+    }
+    let mounted: DiskEntity | undefined;
     for (const image of images) {
       const entities = image["system-entities"] ?? [];
-      const matchesMount = entities.some(
+      const entity = entities.find(
         (entity) => entity["mount-point"] === this.mount,
       );
+      const matchesMount = entity !== undefined;
       const imagePath = image["image-path"];
       const matchesImage =
         imagePath === this.#config.image ||
@@ -218,8 +343,10 @@ export class Volume {
           imagePath !== undefined &&
           realpathSyncIfPresent(imagePath) === this.#config.image);
       if (matchesMount !== matchesImage)
-        throw new VolumeError("volume-detached");
-      mounted ||= matchesMount;
+        throw this.#detached(
+          "The image and its expected mount point do not match the reported attachment.",
+        );
+      mounted ??= entity;
     }
     return mounted;
   }
@@ -248,7 +375,7 @@ export class Volume {
 
   status(): VolumeState {
     return this.#locked((db) => {
-      const mounted = this.#mounted();
+      const mounted = this.#mounted() !== undefined;
       const { dead, active, quarantined } = this.#leases(db);
       const expectedMounted = active > 0;
       return {
@@ -268,14 +395,22 @@ export class Volume {
       info.uid !== process.getuid?.() ||
       realpathSync(image) !== image
     )
-      throw new VolumeError("volume-detached");
+      throw this.#error(
+        "volume-detached",
+        "The image is missing or is not a private, user-owned image file.",
+        `Check the image file or initialize a new volume with agent-bootstrap volume init ${this.#volumeName ?? "<volume>"}.`,
+      );
     const encrypted = this.#run(disk, ["isencrypted", image]);
     if (
       encrypted.status !== 0 ||
       !/^encrypted:\s*YES\s*$/im.test(encrypted.stdout.toString())
     )
-      throw new VolumeError("config-invalid");
-    privateDirectory(this.mount);
+      throw this.#error(
+        "config-invalid",
+        "The disk image could not be verified as encrypted.",
+        "Configure a user-owned encrypted APFS image and retry.",
+      );
+    privateDirectory(this.mount, `${this.#subject} mount point`);
     const key = this.#run(security, [
       "find-generic-password",
       "-a",
@@ -298,7 +433,11 @@ export class Volume {
         passphrase.includes(10) ||
         passphrase.includes(13)
       )
-        throw new VolumeError("volume-detached");
+        throw this.#error(
+          "volume-detached",
+          "The volume passphrase could not be read from Keychain.",
+          "Unlock the login Keychain and check the volume's Keychain item.",
+        );
       input = Buffer.concat([passphrase, Buffer.from([0])]);
       const result = this.#run(
         disk,
@@ -314,26 +453,94 @@ export class Volume {
         ],
         input,
       );
-      if (result.status !== 0 || !this.#mounted())
-        throw new VolumeError("volume-detached");
+      if (result.status !== 0)
+        throw this.#detached(
+          "macOS could not attach the encrypted disk image.",
+        );
+      const entity = this.#mounted();
+      if (!entity) throw this.#detached("The disk image is detached.");
+      const device = entity["dev-entry"];
+      if (!device || !/^\/dev\/disk[0-9]+(?:s[0-9]+)*$/.test(device))
+        throw this.#detached("macOS did not identify the mounted device.");
+      try {
+        this.#privatizeRoot(device);
+      } catch (error) {
+        // Detach by device so a replaced mount path cannot redirect cleanup.
+        const cleanup = this.#run(disk, ["detach", device]);
+        if (cleanup.status !== 0 && error instanceof VolumeError)
+          throw new VolumeError(
+            error.code,
+            error.subject,
+            `${error.reason} macOS could not detach the image after this failure.`,
+            this.#recoverAttachment(),
+          );
+        throw error;
+      }
     } finally {
       key.stdout.fill(0);
       input?.fill(0);
     }
   }
 
+  #privatizeRoot(device: string) {
+    const subject = `${this.#subject} root`;
+    const permissions =
+      "Check the mounted root on the host. Restore ownership to the current user and run chmod 700 on the root directory.";
+    let fd: number | undefined;
+    try {
+      fd = openSync(
+        this.mount,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const info = this.#mountIo.rootStat(fd);
+      if (!info.isDirectory())
+        throw new VolumeError(
+          "config-invalid",
+          subject,
+          "The root is not a directory.",
+          "Restore the volume mount point as a directory and retry.",
+        );
+      if (info.uid !== process.getuid?.())
+        throw new VolumeError(
+          "config-invalid",
+          subject,
+          "The directory is not owned by the current user.",
+          permissions,
+        );
+      if (info.dev !== this.#mountIo.deviceNumber(device))
+        throw this.#detached("The root is not on the expected mounted device.");
+      fchmodSync(fd, 0o700);
+    } catch (error) {
+      if (error instanceof VolumeError) throw error;
+      // Diagnose a refused open without following or changing a link.
+      if (fd === undefined)
+        checkDirectoryIdentity(
+          lstatSync(this.mount, { throwIfNoEntry: false }),
+          subject,
+        );
+      throw new VolumeError(
+        "config-invalid",
+        subject,
+        "The directory could not be opened or made private.",
+        permissions,
+      );
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
+
   #detach() {
     if (this.#run(disk, ["detach", this.mount]).status !== 0)
-      throw new VolumeError("volume-detached");
+      throw this.#detached("macOS could not detach the disk image.");
   }
 
   attach() {
     this.#locked((db) => {
       const { dead, active, quarantined, pending } = this.#leases(db);
-      const mounted = this.#mounted();
+      const mounted = this.#mounted() !== undefined;
       const expectedMounted = active > 0;
       if (dead.length || quarantined || pending || mounted !== expectedMounted)
-        throw new VolumeError("volume-detached");
+        throw this.#detached("The volume has a stale attachment or lease.");
       if (!mounted) this.#attach();
       db.run("INSERT OR IGNORE INTO lease (id, pid) VALUES ('manual', 0)");
     });
@@ -351,11 +558,17 @@ export class Volume {
           )
           .all()
           .filter(({ id }) => !dead.some((lease) => lease.id === id)).length;
-      const mounted = this.#mounted();
+      const mounted = this.#mounted() !== undefined;
       const expectedMounted = active > 0;
       const stale = dead.length || quarantined || mounted !== expectedMounted;
-      if (liveRuns || (stale && !force))
-        throw new VolumeError("volume-detached");
+      if (liveRuns)
+        throw this.#error(
+          "volume-detached",
+          "A run still holds a volume lease.",
+          "Wait for active runs and operator shells to exit before detaching.",
+        );
+      if (stale && !force)
+        throw this.#detached("The volume has a stale attachment or lease.");
       if (mounted) this.#detach();
       db.run("DELETE FROM lease");
     });
@@ -374,7 +587,7 @@ export class Volume {
     let holderWaitingOn: LeaseHolder | undefined;
     let waited = false;
     const timeout = () => {
-      throw new MountBusy(holderWaitingOn);
+      throw new MountBusy(this.#subject, holderWaitingOn);
     };
     for (;;) {
       ensureAudit();
@@ -384,7 +597,9 @@ export class Volume {
           (db) => {
             const { dead, active, quarantined } = this.#leases(db);
             if (dead.length || quarantined)
-              throw new VolumeError("volume-detached");
+              throw this.#detached(
+                "The volume has a stale attachment or lease.",
+              );
             const conflict = db
               .query<{ holder: LeaseHolder }>(
                 "SELECT holder FROM lease WHERE dir = ? AND (mode = 'rw' OR ? = 'rw' OR id LIKE 'pending-%') LIMIT 1",
@@ -392,10 +607,12 @@ export class Volume {
               .get(dir, mode);
             if (conflict) return conflict;
             if (waited && performance.now() >= deadline) timeout();
-            const mounted = this.#mounted();
+            const mounted = this.#mounted() !== undefined;
             const expectedMounted = active > 0;
             if (mounted !== expectedMounted)
-              throw new VolumeError("volume-detached");
+              throw this.#detached(
+                "The volume has a stale attachment or lease.",
+              );
             ensureOwnership?.();
             ensureAudit();
             if (!mounted) this.#attach();
@@ -453,7 +670,10 @@ export class Volume {
             return true;
           }
         });
-        if (detachFailed) throw new VolumeError("volume-detached");
+        if (detachFailed)
+          throw this.#detached(
+            "macOS could not detach the disk image after the last lease ended.",
+          );
       },
       quarantine: () =>
         this.#locked((db) => {
@@ -470,14 +690,24 @@ export class Volume {
     const { image, keychainService } = this.#config;
     const uid = process.getuid?.();
     const gid = process.getgid?.();
-    this.#locked(() => {
+    this.#locked((db) => {
+      const leases = this.#leases(db);
+      if (leases.active || leases.dead.length)
+        throw this.#detached("The volume already has a lease.");
+      if (this.#mounted())
+        throw this.#detached("The disk image is already attached.");
       if (
         uid === undefined ||
         gid === undefined ||
         lstatSync(image, { throwIfNoEntry: false }) ||
+        !lstatSync(dirname(image), { throwIfNoEntry: false })?.isDirectory() ||
         realpathSync(dirname(image)) !== dirname(image)
       )
-        throw new VolumeError("config-invalid");
+        throw this.#error(
+          "config-invalid",
+          "The image already exists or its parent is unavailable.",
+          "Choose an unused image location in an existing directory.",
+        );
       const probe = this.#run(security, [
         "find-generic-password",
         "-a",
@@ -485,7 +715,12 @@ export class Volume {
         "-s",
         keychainService,
       ]);
-      if (probe.status !== 44) throw new VolumeError("config-invalid");
+      if (probe.status !== 44)
+        throw this.#error(
+          "config-invalid",
+          "The Keychain item already exists or Keychain could not be checked.",
+          "Unlock the login Keychain and choose an unused volume Keychain item.",
+        );
       const passphrase = randomBytes(32).toString("hex");
       const command = Buffer.from(
         `add-generic-password -a ${this.#account} -s ${keychainService} -w ${passphrase}\n`,
@@ -493,7 +728,11 @@ export class Volume {
       const input = Buffer.from(passphrase + "\0");
       try {
         if (this.#run(security, ["-i"], command).status !== 0)
-          throw new VolumeError("config-invalid");
+          throw this.#error(
+            "config-invalid",
+            "The passphrase could not be saved in Keychain.",
+            "Unlock the login Keychain and retry.",
+          );
         // The create command has no credential in its argv.
         if (
           this.#run(
@@ -530,34 +769,73 @@ export class Volume {
               "-s",
               keychainService,
             ]);
-          throw new VolumeError("config-invalid");
+          throw this.#error(
+            "config-invalid",
+            "macOS could not create the encrypted APFS image.",
+            "Check available disk space and directory permissions, then retry.",
+          );
         }
       } finally {
         input.fill(0);
         command.fill(0);
       }
+      this.#attach();
+      this.#detach();
     });
   }
 
   directory(dir: string, create = false): string {
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(dir))
-      throw new VolumeError("config-invalid");
-    if (!this.#mounted()) throw new VolumeError("volume-detached");
-    checkMountDirectory(this.mount);
+      throw this.#error(
+        "config-invalid",
+        "The mount directory name is invalid.",
+        "Check the mount directory declaration and retry.",
+      );
+    if (!this.#mounted()) throw this.#detached("The disk image is detached.");
+    checkMountDirectory(this.mount, `${this.#subject} root`);
     const path = join(this.mount, dir);
     if (create && !lstatSync(path, { throwIfNoEntry: false }))
       mkdirSync(path, { mode: 0o700 });
-    return checkMountDirectory(path);
+    return checkMountDirectory(path, `${this.#subject} directory`);
   }
 }
 
-export function checkMountDirectory(path: string) {
-  const info = lstatSync(path, { throwIfNoEntry: false });
-  if (
-    !info?.isDirectory() ||
-    info.uid !== process.getuid?.() ||
-    (info.mode & 0o7777) !== 0o700
-  )
-    throw new VolumeError("config-invalid");
+function checkDirectoryIdentity(info: Stats | undefined, subject: string) {
+  if (info?.isSymbolicLink())
+    throw new VolumeError(
+      "config-invalid",
+      subject,
+      "The directory is a symbolic link.",
+      "Replace the link with a real directory and retry.",
+    );
+  if (!info?.isDirectory())
+    throw new VolumeError(
+      "config-invalid",
+      subject,
+      "The directory is missing or is not a directory.",
+      "Create a directory with mode 0700 at the configured location and retry.",
+    );
+  if (info.uid !== process.getuid?.())
+    throw new VolumeError(
+      "config-invalid",
+      subject,
+      "The directory is not owned by the current user.",
+      "Restore ownership of the directory to the current user on the host and retry.",
+    );
+  return info;
+}
+
+export function checkMountDirectory(path: string, subject = "Mount directory") {
+  const info = checkDirectoryIdentity(
+    lstatSync(path, { throwIfNoEntry: false }),
+    subject,
+  );
+  if ((info.mode & 0o7777) !== 0o700)
+    throw new VolumeError(
+      "config-invalid",
+      subject,
+      "The directory must have mode 0700.",
+      "Run chmod 700 on the directory on the host, then retry.",
+    );
   return realpathSync(path);
 }

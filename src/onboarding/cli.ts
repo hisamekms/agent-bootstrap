@@ -34,7 +34,7 @@ import {
   ClaudeRunError,
   claudeNext,
 } from "../local-orchestrator/claude-errors.ts";
-import { VolumeError, MountBusy, Volume } from "../volumes/volume.ts";
+import { VolumeError, Volume } from "../volumes/volume.ts";
 import { resolveTarget } from "../local-orchestrator/target.ts";
 import { parseConciergeArgs } from "../local-orchestrator/concierge.ts";
 import {
@@ -456,13 +456,18 @@ export async function runBootstrap(
           "The selected volume is undefined.",
           "Define the volume in the user config.",
         );
-      const volume = new Volume(definition, userStateDirectory(host.env));
+      const volume = new Volume(
+        definition,
+        userStateDirectory(host.env),
+        undefined,
+        { volume: name },
+      );
       if (action === "status") {
         const status = volume.status();
         print(status);
         if (status.stale)
           hint(
-            "Run agent-bootstrap doctor and confirm no VM is running before using volume detach --force.",
+            `Run agent-bootstrap doctor and confirm no VM is running before using agent-bootstrap volume detach ${name} --force.`,
           );
         return 0;
       }
@@ -586,12 +591,9 @@ export async function runBootstrap(
         error.message,
         "Review the private Claude config.json and run agent-bootstrap doctor.",
       );
-    if (error instanceof ClaudeRunError || error instanceof VolumeError)
-      return fail(
-        1,
-        error.code,
-        error instanceof MountBusy ? error.next : claudeNext(error.code),
-      );
+    if (error instanceof VolumeError) return fail(1, error.message, error.next);
+    if (error instanceof ClaudeRunError)
+      return fail(1, error.code, claudeNext(error.code));
     if (error instanceof SetupError)
       return fail(error.code, error.message, error.next);
     return fail(

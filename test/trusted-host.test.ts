@@ -1,3 +1,4 @@
+import { VolumeError } from "../src/volumes/volume.ts";
 import { claudeCodeCommand } from "../src/claude-code.ts";
 import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { createClaudePolicy } from "../src/local-orchestrator/claude-policy.ts";
@@ -2409,6 +2410,57 @@ test("mount authorization commits before the host acquires a lease", async (t) =
     host.runPlanner({ sandbox: { claude: true }, command: plan.command }),
     HostAuditError,
   );
+});
+
+test("mount validation reports operator guidance and keeps the audit code", async (t) => {
+  const notes: string[] = [];
+  let sandboxCreated = false;
+  const { host, db } = observedFixture(
+    t,
+    {
+      async createBound() {
+        sandboxCreated = true;
+        throw new Error("Unexpected sandbox creation");
+      },
+    },
+    undefined,
+    {
+      claude: {
+        managedSettings: () => new URL(import.meta.url).pathname,
+        note: (message) => notes.push(message),
+        mounts: { fixture: plannerMount },
+        async beginMount() {
+          return {
+            directory() {
+              throw new VolumeError(
+                "config-invalid",
+                'Mount "fixture" directory',
+                "The directory must have mode 0700.",
+                "Run chmod 700 on the directory on the host, then retry.",
+              );
+            },
+            prepare() {},
+            ready() {},
+            finish() {},
+            quarantine() {},
+          };
+        },
+      },
+    },
+  );
+  const result = await host.runPlanner({
+    sandbox: { claude: true },
+    command: plan.command,
+  });
+  assert.equal(sandboxCreated, false);
+  assert.equal(result.outcome, "failed");
+  assert.equal(result.code, "config-invalid");
+  assert.deepEqual(db.read(result.id).at(-1)?.detail, {
+    code: "config-invalid",
+  });
+  assert.deepEqual(notes, [
+    'Mount "fixture" directory: The directory must have mode 0700.\nnext: Run chmod 700 on the directory on the host, then retry.',
+  ]);
 });
 
 test("a partial create that survives cleanup quarantines the mount lease", async (t) => {
