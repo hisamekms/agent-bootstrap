@@ -1,10 +1,9 @@
-import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
 import { GitIntegrationError } from "../git-integration.ts";
 import {
   ContractError,
+  contentDigest,
   GATES,
   identifier,
   integer,
@@ -25,6 +24,18 @@ import {
   reconciliationIntegrationHeads,
 } from "./tasks.ts";
 
+import {
+  prepareTargetDirectory,
+  resolveTarget,
+  TargetError,
+} from "./target.ts";
+import {
+  parseVerificationConfig,
+  readVerificationConfig,
+  writeVerificationConfig,
+  type VerificationConfig,
+} from "./verification.ts";
+
 interface CliIo {
   stdin: NodeJS.ReadableStream;
   stdout: { write(text: string): unknown };
@@ -38,19 +49,21 @@ type ProposalDetails = NonNullable<
 >;
 type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
-const defaultRepo = fileURLToPath(new URL("../../", import.meta.url));
 const maxFieldLength = 4000;
-const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--repo <root>] <command>
+const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--target <path>] <command>
   reconcile
   status
   retry-task <taskId>
   update-goal-base <goalId>
-  export-goal-branch <goalId> [--repo <checkout>]
+  export-goal-branch <goalId> [--target <checkout>]
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId|goalId|taskId>
   approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
+  verification show
+  verification set --profile <name> -- <argv...>
+  verification clear
   policy show
   policy set <gate> <human|agent>
   events [--subject <id>] [--limit <1-1000>]`;
@@ -66,6 +79,8 @@ type Command =
       id: string;
       delegate?: ReturnType<typeof parseHumanDelegate>;
     }
+  | { kind: "verification-show" | "verification-clear" }
+  | { kind: "verification-set"; config: VerificationConfig }
   | { kind: "policy-set"; gate: Gate; value: Policy }
   | { kind: "events"; subjectId?: string; limit: number };
 
@@ -92,7 +107,7 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
       const checkout = args[2];
       if (
         args.length === 3 &&
-        args[1] === "--repo" &&
+        isTargetFlag(args[1]) &&
         checkout &&
         !checkout.startsWith("--") &&
         !checkout.includes("\0")
@@ -127,6 +142,20 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
         }),
       };
     }
+    case "verification":
+      if (args.length === 1 && args[0] === "show")
+        return { kind: "verification-show" };
+      if (args.length === 1 && args[0] === "clear")
+        return { kind: "verification-clear" };
+      if (args[0] === "set" && args[1] === "--profile" && args[3] === "--")
+        return {
+          kind: "verification-set",
+          config: parseVerificationConfig({
+            profile: args[2],
+            argv: args.slice(4),
+          }),
+        };
+      break;
     case "policy":
       if (args.length === 1 && args[0] === "show")
         return { kind: "policy-show" };
@@ -253,12 +282,51 @@ async function execute(
   repoRoot: string,
 ): Promise<0 | 1> {
   switch (command.kind) {
+    case "verification-show":
+      writeJson(io, readVerificationConfig(directory!));
+      return 0;
+    case "verification-clear":
+    case "verification-set": {
+      const config =
+        command.kind === "verification-set" ? command.config : null;
+      const digest = config === null ? null : contentDigest(config);
+      const previous = readVerificationConfig(directory!);
+      writeJson(io, {
+        target: repoRoot,
+        current: previous,
+        verification: config,
+      });
+      const phrase =
+        digest === null
+          ? "verification clear"
+          : `verification set ${digest.slice(0, 12)}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      const previousDigest = contentDigest(previous);
+      const applied = store.changeVerification(digest, () => {
+        if (
+          contentDigest(readVerificationConfig(directory!)) !== previousDigest
+        )
+          return false;
+        writeVerificationConfig(directory!, config);
+        return true;
+      });
+      if (!applied)
+        return refuse(
+          io,
+          "Verification changed. Review the current configuration.",
+        );
+      return 0;
+    }
     case "update-goal-base": {
       if (directory === undefined)
-        return refuse(io, "update-goal-base with --db requires --repo <root>.");
+        return refuse(
+          io,
+          "update-goal-base with --db requires --target <path>.",
+        );
       const { from, to, apply } = await previewGoalBaseUpdate(
         store,
-        resolve(directory, "../.."),
+        repoRoot,
         directory,
         command.id,
       );
@@ -410,7 +478,7 @@ async function execute(
         if (directory === undefined)
           return refuse(
             io,
-            "Integration proposals with --db also require --repo <root>.",
+            "Integration proposals with --db also require --target <path>.",
           );
         diffStat = await candidateDiffStat(directory, proposal.content);
       }
@@ -471,22 +539,28 @@ async function execute(
   }
 }
 
+function isTargetFlag(flag: string | undefined): boolean {
+  return flag === "--target" || flag === "--repo";
+}
+
 export async function runCli(
   argv: readonly string[],
   io: CliIo,
+  bootstrapRoot?: string,
 ): Promise<0 | 1 | 2> {
   let db: string | undefined;
-  let repo: string | undefined;
+  let targetPath: string | undefined;
   let command: Command;
   try {
     let i = 0;
-    while (argv[i] === "--db" || argv[i] === "--repo") {
+    while (argv[i] === "--db" || isTargetFlag(argv[i])) {
       const flag = argv[i++];
       const value = argv[i++];
       if (!value || value.startsWith("--") || value.includes("\0"))
         throw new ContractError();
       if (flag === "--db" && db === undefined) db = value;
-      else if (flag === "--repo" && repo === undefined) repo = value;
+      else if (isTargetFlag(flag) && targetPath === undefined)
+        targetPath = value;
       else throw new ContractError();
     }
     command = parseCommand(argv.slice(i));
@@ -504,6 +578,8 @@ export async function runCli(
       "retry-task",
       "update-goal-base",
       "export-goal-branch",
+      "verification-set",
+      "verification-clear",
     ].includes(command.kind) &&
     !io.isTTY
   )
@@ -512,14 +588,19 @@ export async function runCli(
   if (
     command.kind === "export-goal-branch" &&
     db !== undefined &&
-    repo === undefined
+    targetPath === undefined
   )
     return refuse(
       io,
-      "With a custom --db, pass --repo for the launcher checkout before the command.",
+      "With a custom --db, pass --target for the launcher target before the command.",
     );
 
+  if (db !== undefined && command.kind.startsWith("verification-"))
+    return refuse(io, "Verification commands use the target's state database.");
+
   try {
+    const target = await resolveTarget(targetPath, bootstrapRoot);
+    const { repoRoot, directory } = target;
     if (command.kind === "policy-set") {
       if (command.value === "agent")
         io.stdout.write(
@@ -529,23 +610,22 @@ export async function runCli(
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
     }
-    const repoRoot = resolve(repo ?? defaultRepo);
-    const directory = join(repoRoot, ".local", "local-orchestrator");
     if (db === undefined)
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      await prepareTargetDirectory(target.bootstrapRoot, directory);
     const store = OrchestratorStore.open(db ?? join(directory, "state.db"));
     try {
       return await execute(
         io,
         store,
         command,
-        db !== undefined && repo === undefined ? undefined : directory,
+        db !== undefined && targetPath === undefined ? undefined : directory,
         repoRoot,
       );
     } finally {
       store.close();
     }
   } catch (error) {
+    if (error instanceof TargetError) return refuse(io, error.message);
     if (
       command.kind === "export-goal-branch" &&
       error instanceof GitIntegrationError
@@ -575,7 +655,7 @@ export async function runCli(
     )
       return refuse(
         io,
-        "Integration is still uncertain. Inspect the private Goal branch and integration journal. With a custom --db, pass --repo for the launcher checkout.",
+        "Integration is still uncertain. Inspect the private Goal branch and integration journal. With a custom --db, pass --target for the launcher target.",
       );
     if (command.kind === "update-goal-base") {
       if (

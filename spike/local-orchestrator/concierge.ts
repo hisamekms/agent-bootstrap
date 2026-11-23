@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   CLAUDE_CODE,
@@ -13,7 +12,6 @@ import { ALPINE_3_23 } from "../../src/image-recipes.ts";
 import {
   conciergeCommand,
   parseConciergeMode,
-  prepareConciergeDirectory,
   snapshotConciergeRepo,
   startConcierge,
 } from "../../src/local-orchestrator/concierge.ts";
@@ -21,6 +19,15 @@ import {
   OrchestratorStore,
   OrchestratorStoreError,
 } from "../../src/local-orchestrator/store.ts";
+import {
+  bootstrapCheckout,
+  prepareTargetDirectory,
+  resolveTarget,
+} from "../../src/local-orchestrator/target.ts";
+import {
+  configuredVerification,
+  readVerificationConfig,
+} from "../../src/local-orchestrator/verification.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
 import { createObservedHost } from "../../src/observed-host.ts";
 import {
@@ -31,22 +38,27 @@ import {
 import { createTelemetry } from "../../src/telemetry.ts";
 
 const usage =
-  "Usage: bun run spike/local-orchestrator/concierge.ts --run [--continue] [--mode <m>]";
+  "Usage: bun run spike/local-orchestrator/concierge.ts --run [--continue] [--mode <m>] [--target <path>]";
 const operatorCli = "bun run src/local-orchestrator/cli.ts status";
 const runFile = promisify(execFile);
 
 function parseArgs(args: readonly string[]) {
   let run = false;
   let resume = false;
+  let target: string | undefined;
   let mode: ReturnType<typeof parseConciergeMode> | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--run" && !run) run = true;
     else if (args[i] === "--continue" && !resume) resume = true;
     else if (args[i] === "--mode" && mode === undefined)
       mode = parseConciergeMode(args[++i]);
-    else throw new Error(usage);
+    else if (args[i] === "--target" && target === undefined) {
+      target = args[++i];
+      if (!target || target.startsWith("--") || target.includes("\0"))
+        throw new Error(usage);
+    } else throw new Error(usage);
   }
-  return { run, mode: mode ?? "auto", continue: resume };
+  return { run, mode: mode ?? "auto", continue: resume, target };
 }
 
 function operatorAuth(value: string | undefined): ClaudeCodeAuth {
@@ -120,6 +132,12 @@ async function main(args: readonly string[]) {
     console.log(
       `Dry run. The launcher would open the audited Concierge VM in ${flags.mode} mode${flags.continue ? " and resume the last conversation" : ""}, expose the Host API over vsock, and queue Planner runs.`,
     );
+    if (flags.target !== undefined) {
+      const target = await resolveTarget(flags.target);
+      console.log(
+        JSON.stringify({ target: target.repoRoot, state: target.directory }),
+      );
+    }
     console.log(usage);
     return;
   }
@@ -149,10 +167,9 @@ async function main(args: readonly string[]) {
   const options = { model, mode: flags.mode, continue: flags.continue };
   conciergeCommand(options, auth);
 
-  const repoRoot = await realpath(
-    fileURLToPath(new URL("../../", import.meta.url)),
-  );
-  const local = join(repoRoot, ".local");
+  const target = await resolveTarget(flags.target ?? bootstrapCheckout);
+  const { bootstrapRoot, directory, repoRoot } = target;
+  const local = join(bootstrapRoot, ".local");
   const install = {
     binary:
       LO_CLAUDE_BINARY ??
@@ -175,12 +192,24 @@ async function main(args: readonly string[]) {
   const binary = await microsandboxBinary();
   const profiles = profileCatalog(
     ALPINE_3_23.reference,
-    parseProfileLock(await readFile(join(repoRoot, PROFILE_LOCK_PATH), "utf8")),
+    parseProfileLock(
+      await readFile(join(bootstrapRoot, PROFILE_LOCK_PATH), "utf8"),
+    ),
   );
   if (!profiles.has("concierge"))
     throw new Error("The profile lock must include the Concierge image");
 
-  const directory = await prepareConciergeDirectory(repoRoot);
+  await prepareTargetDirectory(bootstrapRoot, directory);
+  let verificationConfig: ReturnType<typeof readVerificationConfig>;
+  try {
+    verificationConfig = readVerificationConfig(directory);
+  } catch {
+    throw new Error("Invalid target verification configuration");
+  }
+  if (verificationConfig && !profiles.has(verificationConfig.profile))
+    throw new Error(
+      "The profile lock must include the configured Verification profile",
+    );
   const auditPath = join(directory, "audit.sqlite");
   const msb = { binary, home, stagingRoot: join(directory, "sandboxes") };
   const config = parseObservabilityConfig(
@@ -200,7 +229,9 @@ async function main(args: readonly string[]) {
     store = OrchestratorStore.open(join(directory, "state.db"));
     console.log(`Audit database ${JSON.stringify(auditPath)}`);
     console.log(
-      `Inspect proposals and approvals from another host terminal with ${operatorCli}`,
+      target.isDefault
+        ? `Inspect proposals and approvals from another host terminal with ${operatorCli}`
+        : "Inspect proposals and approvals with the operator CLI and the same --target argument.",
     );
     stage = "open audited host";
     observed = await createObservedHost({
@@ -225,10 +256,14 @@ async function main(args: readonly string[]) {
         snapshot: snapshotConciergeRepo,
         install,
         auth,
+        ...(verificationConfig
+          ? { verification: configuredVerification(verificationConfig) }
+          : {}),
       },
       {
         ...options,
         repoRoot,
+        target,
         onSession: (id) => console.log(`Concierge session ${id}`),
       },
     );

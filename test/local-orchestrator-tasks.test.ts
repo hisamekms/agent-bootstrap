@@ -36,6 +36,11 @@ import {
   OrchestratorStoreError,
 } from "../src/local-orchestrator/store.ts";
 import {
+  prepareTargetDirectory,
+  resolveTarget,
+} from "../src/local-orchestrator/target.ts";
+import { configuredVerification } from "../src/local-orchestrator/verification.ts";
+import {
   createTaskExecutor,
   type TaskExecutor,
   type TaskFlow,
@@ -587,6 +592,7 @@ function goalBaseFixture(recordBase = true, policies?: PolicySet) {
           return prompt(question);
         },
       },
+      repoRoot,
     );
     return { code, stdout, stderr, questions };
   }
@@ -884,8 +890,9 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   ]);
   git(["update-ref", "refs/heads/main", advancedMain, base]);
 
-  const directory = join(repoRoot, ".local", "local-orchestrator");
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const target = await resolveTarget(repoRoot, root);
+  const { directory } = target;
+  await prepareTargetDirectory(target.bootstrapRoot, directory);
   const scratch = join(root, "scratch");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   writeFileSync(join(scratch, "docs", "a.md"), "after\n");
@@ -893,7 +900,10 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   symlinkSync("../README.md", link);
   const attack = "`printf INJECTED` $(printf INJECTED) ' \"";
   const goalId = goal();
-  const taskId = task(goalId, { description: attack });
+  const taskId = task(goalId, {
+    description: attack,
+    budgets: { ...budgets, maxExecutionMs: 125_000 },
+  });
   const calls: string[] = [];
   const invocationIds: string[] = [];
   const executor = createTaskExecutor({
@@ -909,10 +919,13 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         reportWorkerUsage: true,
       }),
     reviewer: harness,
-    verification: { command: { argv: ["/bin/true"], timeoutMs: 1 } },
+    verification: configuredVerification({
+      profile: "base",
+      argv: ["test", "-f", "docs/passed"],
+    }),
     host: {
       async runWorker(plan, id, _context, options) {
-        assert.equal(plan.command.timeoutMs, 240_000);
+        assert.equal(plan.command.timeoutMs, 125_000);
         assert.match(
           plan.command.argv[2]!,
           /head -c 65537 \/tmp\/claude-out\.json >&2/,
@@ -956,6 +969,10 @@ test("real Git composes tree mode, path rejection, verification, review and oper
               : /outside the Task/,
           );
         }
+        if (calls.at(-1) === "verification") {
+          assert.deepEqual(store.pendingIntegrations(goalId), []);
+          writeFileSync(join(scratch, "docs", "passed"), "");
+        }
         calls.push("worker");
         return {
           id: id!,
@@ -978,20 +995,26 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         calls.push("verification");
         invocationIds.push(id!);
         assert.ok(plan.sandbox.repository);
-        const review =
-          calls.filter((call) => call === "verification").length === 1
-            ? "revise"
-            : "pass";
+        assert.equal(plan.sandbox.profile, "base");
+        assert.equal(plan.command.timeoutMs, 125_000);
+        const [binary, ...args] = plan.command.argv;
+        const { tree } = plan.sandbox.repository;
+        const workspace = mkdtempSync(join(root, "verify-"));
+        const unpacked = spawnSync("/usr/bin/tar", ["-xf", tree], {
+          cwd: workspace,
+        });
+        assert.equal(unpacked.status, 0, String(unpacked.stderr));
+        const response = command(binary!, workspace, args);
         return {
           id: id!,
           outcome: "ok",
-          response: Buffer.from(JSON.stringify({ review })),
+          response: Buffer.from(response),
         };
       },
       async runReviewer(plan, id) {
         calls.push("review");
         invocationIds.push(id!);
-        assert.equal(plan.command.timeoutMs, 240_000);
+        assert.equal(plan.command.timeoutMs, 125_000);
         const [instructions, data, noteLimit, contract] =
           plan.command.argv[4]!.split("\n");
         assert.match(
@@ -1050,8 +1073,9 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   assert.partialDeepStrictEqual(proposal.content, {
     base,
     taskId,
-    changedPaths: ["docs/a.md", "docs/link"],
+    changedPaths: ["docs/a.md", "docs/link", "docs/passed"],
     symlinks: ["docs/link"],
+    verified: true,
     review: { notes: "Looks good" },
   });
   assert.equal(git(["rev-parse", "main"]), advancedMain);
@@ -1124,25 +1148,42 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   assert.equal(await runCli(["--db", filename, "show", proposal.id], io), 1);
   assert.equal(
     await runCli(
-      ["--db", filename, "--repo", repoRoot, "show", proposal.id],
+      ["--db", filename, "--target", repoRoot, "show", proposal.id],
       io,
+      root,
     ),
     0,
   );
   assert.deepEqual(JSON.parse(output).content.changedPaths, [
     "docs/a.md",
     "docs/link",
+    "docs/passed",
   ]);
   assert.match(JSON.parse(output).diffStat, /docs\/a\.md/);
   assert.equal(
     await runCli(
-      ["--db", filename, "--repo", repoRoot, "approve", proposal.id],
+      ["--db", filename, "--target", repoRoot, "approve", proposal.id],
       io,
+      root,
     ),
     0,
   );
   assert.equal(store.getProposal(proposal.id)?.status, "approved");
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+
+  assert.equal(
+    await runCli(
+      ["--db", filename, "--target", repoRoot, "export-goal-branch", goalId],
+      {
+        ...io,
+        prompt: () => `export-goal-branch ${goalId} ${base.slice(0, 12)}`,
+      },
+      root,
+    ),
+    0,
+  );
+  assert.equal(git(["rev-parse", goalBranch(goalId)]), base);
+  assert.equal(existsSync(join(repoRoot, ".local")), false);
 
   command("/usr/bin/git", join(directory, "repository.git"), [
     "update-ref",
@@ -1160,6 +1201,7 @@ test("real Git composes tree mode, path rejection, verification, review and oper
     randomUUID(),
     base,
     true,
+    target,
   );
   assert.equal(pinned.commit, base);
   assert.equal(
@@ -2170,7 +2212,7 @@ test("export refuses an unaudited private head before and after confirmation", a
   assert.equal(missingRepo.code, 1);
   assert.match(
     missingRepo.stderr.join(""),
-    /custom --db, pass --repo for the launcher checkout/,
+    /custom --db, pass --target for the launcher target/,
   );
   assert.deepEqual(missingRepo.questions, []);
   assert.equal(existsSync(unusedDb), false);

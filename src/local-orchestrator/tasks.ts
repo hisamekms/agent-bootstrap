@@ -136,7 +136,18 @@ function processExit(child: ReturnType<typeof spawn>) {
 }
 
 /** Resolve the direct local main ref without consulting remote refs. */
-export async function localMainCommit(repoRoot: string): Promise<string> {
+export async function localMainCommit(
+  repoRoot: string,
+  requireWorktreeRoot = false,
+): Promise<string> {
+  if (requireWorktreeRoot) {
+    const { stdout } = await git(repoRoot, [
+      "rev-parse",
+      "--is-inside-work-tree",
+      "--show-prefix",
+    ]);
+    if (stdout !== "true\n\n") throw new Error("Invalid worktree root");
+  }
   const { stdout } = await git(repoRoot, [
     "for-each-ref",
     "--format=%(refname)%00%(symref)%00%(objectname)%00%(objecttype)",
@@ -394,7 +405,20 @@ export function createTaskExecutor(options: {
           : {}),
         reviewerSandbox: reviewer.sandbox,
         reviewerOutput: (response) => taskReviewerOutput(reviewer, response),
-        ...(verification ? { verification } : { allowUnverified: true }),
+        ...(verification
+          ? {
+              verification: {
+                ...verification,
+                command: {
+                  ...verification.command,
+                  timeoutMs: Math.min(
+                    verification.command.timeoutMs,
+                    timeoutMs,
+                  ),
+                },
+              },
+            }
+          : { allowUnverified: true }),
       },
     );
 
@@ -650,6 +674,7 @@ export async function runTask(
         code = "session-ended";
         break;
       }
+      let verified = false;
       if (flow.verify) {
         const verify = flow.verify;
         const verification = await execute(
@@ -663,11 +688,12 @@ export async function runTask(
             };
           },
         );
-        if (verification.failure) {
-          code = verification.failure;
+        if (verification.failure || verification.value !== true) {
+          code = verification.failure ?? "verification-failed";
           if (code === "verification-failed") continue;
           break;
         }
+        verified = true;
       }
 
       if (!canContinue()) {
@@ -715,7 +741,7 @@ export async function runTask(
           ...pin,
           changedPaths,
           symlinks,
-          verified: flow.verify !== undefined,
+          verified,
           review: {
             result: "pass",
             ...(review.value.notes ? { notes: review.value.notes } : {}),

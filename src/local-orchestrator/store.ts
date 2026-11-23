@@ -689,6 +689,36 @@ export class OrchestratorStore {
     });
   }
 
+  changeVerification(digest: string | null, apply: () => boolean): boolean {
+    if (digest !== null && !/^[a-f0-9]{64}$/.test(digest))
+      throw new ContractError();
+    const data = { changeId: randomUUID(), digest };
+    this.#write((at) => {
+      this.#event(
+        at,
+        "project.verification-change-authorized",
+        "project",
+        "project",
+        data,
+      );
+    });
+    // Commit authorization first, then serialize the comparison, file update
+    // and completion event with other CLI processes using this database.
+    return this.#write((at) => {
+      if (!apply()) return false;
+      this.#event(
+        at,
+        digest === null
+          ? "project.verification-cleared"
+          : "project.verification-set",
+        "project",
+        "project",
+        data,
+      );
+      return true;
+    });
+  }
+
   #newProposal(
     kind: ProposalRow["kind"],
     content: GoalContent | TaskContent | IntegrationContent,

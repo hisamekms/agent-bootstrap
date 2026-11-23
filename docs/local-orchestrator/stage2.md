@@ -53,7 +53,7 @@ verdicts retain the first 4 KiB of available raw answer text on a UTF-8
 boundary in the execution result.
 
 Host callers can provide a verification suite to `startConcierge`. The
-stock launcher explicitly opts into review without a suite. Each Worker,
+stock launcher reads the selected target’s [verification configuration](running.md#configure-verification-for-the-target). Each Worker,
 verification and Reviewer run uses its SQLite execution ID as the
 TrustedHost invocation ID. SQLite records the verification suite under
 actor `Reviewer` in mode `verification`. TrustedHost uses its own
@@ -111,7 +111,7 @@ effective policy comes from the Task, then Goal, then project defaults.
 A proposal with symlink changes requires a human answer, as does a
 legacy proposal without recorded symlink evidence. The operator CLI
 shows the pinned candidate's diff stat using the empty Git attribute
-tree. Use `--repo` to identify the launcher's repository when specifying
+tree. Use `--target` to identify the launcher’s target when specifying
 a custom `--db`.
 
 For an eligible agent gate, the host gives the pinned diff to a dedicated

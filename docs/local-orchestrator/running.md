@@ -41,13 +41,13 @@ bun run spike/local-orchestrator/concierge.ts
 bun run spike/local-orchestrator/concierge.ts --run
 ```
 
-Run one Concierge per checkout. Launchers in the same checkout share the
-conversation volume. The launcher prints its session ID and audit database
+Run one Concierge per target. Launchers for the same target in the same
+agent-bootstrap checkout share the conversation volume. The launcher prints its session ID and audit database
 path. Exit Claude Code to end the session and remove temporary files. If
 the launcher process is terminated abruptly, its session record and
 temporary files can remain until host-side cleanup, and the backend
 lifetime still applies. To continue the latest conversation, use the same
-checkout and `MSB_HOME`.
+target and `MSB_HOME` from the same agent-bootstrap checkout.
 
 ```sh
 bun run spike/local-orchestrator/concierge.ts --run --continue
@@ -56,6 +56,58 @@ bun run spike/local-orchestrator/concierge.ts --run --continue
 The default Claude Code permission mode is `auto`. If Claude Code reports
 that it cannot start in that mode, rerun with `--mode default`. The launcher
 also accepts `--mode acceptEdits` and `--mode plan`.
+
+## Work on another repository
+
+Run the launcher and operator CLI from agent-bootstrap. Use the same
+leading `--target` for operator commands to select the target's state.
+The target must be a local SHA-1 Git worktree root outside `.local/` with
+a local `main` commit. Relative paths resolve from the operator's current
+working directory. The launcher pins the target's local `main` for the
+Concierge snapshot and seeds new Goals from that commit. Planner context
+includes the target's `AGENTS.md`, `README.md`, and tracked file listing.
+For agent-bootstrap, Planner context also includes its local-orchestrator
+docs.
+
+```sh
+target="$HOME/ghq/github.com/hisamekms/dagq-lite"
+bun run spike/local-orchestrator/concierge.ts --run --target "$target"
+bun run src/local-orchestrator/cli.ts --target "$target" status
+```
+
+Each external target uses
+`.local/local-orchestrator/targets/<slug>/` in agent-bootstrap for
+`state.db`, `audit.sqlite`, `repository.git`, `integrations/`,
+`worktrees/`, `snapshots/`, and runtime observability files. The slug
+uses the target's basename and an abbreviated SHA-256 hash of its
+canonical path. Its conversation volume is `lo-concierge-<slug>`.
+The agent-bootstrap target keeps its existing paths directly in
+`.local/local-orchestrator/` and its existing conversation volume name.
+
+### Configure verification for the target
+
+Preload the pinned Bun profile image and include it in the agent-bootstrap
+profile lock. Configure the command before starting the launcher.
+
+```sh
+bun run src/local-orchestrator/cli.ts --target "$target" verification set --profile bun -- bun test
+bun run src/local-orchestrator/cli.ts --target "$target" verification show
+bun run src/local-orchestrator/cli.ts --target "$target" verification clear
+```
+
+`set` and `clear` require a host terminal and the exact confirmation phrase
+shown in the prompt. The CLI records changes in the target's state database
+and stores the configuration in its private `config.json`. `show` prints
+`null` when verification is unset. The launcher reads the configuration at
+startup. Keep it in place until existing integration proposals are
+resolved, so integration can recheck each candidate with the same command.
+
+The credential-free Verification sandbox runs the fixed argv in the pinned
+candidate workspace. Its timeout is bounded by the Task's execution time
+budget and the runtime limit. A nonzero exit uses the Task's revision
+budget. A passing command allows review to proceed and the resulting
+proposal records `verified: true`. Verification runs again at integration.
+Without a suite, a human must answer the integration gate.
 
 ## Troubleshooting
 
@@ -108,8 +160,8 @@ private Goal branch and integration journal. It records success when the ref
 is at the authorized candidate, or fails the Task with
 `integration-interrupted` when the ref is still at the approved base. If the
 ref points elsewhere, inspect it and its journal before continuing. With a
-custom `--db`, pass `--repo <root>` before `reconcile` so it can locate the
-launcher's private repository.
+custom `--db`, pass `--target <path>` before `reconcile` so it can locate the
+target's private repository.
 
 ## Diagnose and retry a failed Task
 
@@ -143,8 +195,8 @@ bun run src/local-orchestrator/cli.ts update-goal-base <goalId>
 
 Use the full Goal ID. Review the two commit IDs, then type
 `update-goal-base <goalId> <first 12 hex of new base>` at the prompt. With
-a custom `--db <path>`, also pass `--repo <root>` for the checkout the
-launcher used. The command uses that checkout's local `main` and performs
+a custom `--db <path>`, also pass `--target <path>` for the repository the
+launcher targeted. The command uses that repository's local `main` and performs
 no network fetch.
 
 The Goal branch must still point to its recorded base. A running,
@@ -171,21 +223,19 @@ bun run src/local-orchestrator/cli.ts show <proposalId>
 bun run src/local-orchestrator/cli.ts approve <proposalId>
 ```
 
-With a custom `--db <path>`, also supply `--repo <root>` when
+With a custom `--db <path>`, also supply `--target <path>` when
 showing, approving or rejecting an integration proposal. Use the same
-checkout root the launcher used so the CLI can find its pinned candidate.
+target path the launcher used so the CLI can find its pinned candidate.
 
-State stays in `.local/local-orchestrator/state.db`. The runtime audit is
-in `.local/local-orchestrator/audit.sqlite` and OTLP files are under
-`.local/local-orchestrator/observability/`. Treat those records and the
-persistent Claude conversation volume as sensitive.
+Treat the target state, audit, observability files, and persistent Claude
+conversation volume as sensitive.
 
 ## Approve and export a Goal branch
 
 Use `show <proposalId>` to inspect the pinned integration diff stat. Run
 `approve <proposalId>` and type `approve <first 12 hex of proposal digest>`.
-Use a host terminal. The stock launcher has no verification suite, so a
-human answer is required even when the Goal allows agent approval. The
+Use a host terminal. If verification is unset, a human answer is required
+even when the Goal allows agent approval. The
 running launcher polls for decisions, and approved proposals can also be
 picked up on its next launch. Use `show <taskId>` to check for
 `succeeded` and `events --subject <taskId>` to see the integrated head.
@@ -193,15 +243,15 @@ picked up on its next launch. Use `show <taskId>` to check for
 When the Goal branch is ready for handoff, run:
 
 ```sh
-bun run src/local-orchestrator/cli.ts export-goal-branch <goalId> [--repo <checkout>]
+bun run src/local-orchestrator/cli.ts [--target <path>] export-goal-branch <goalId> [--target <checkout>]
 ```
 
 Type `export-goal-branch <goalId> <first 12 hex of new head>` as shown.
-The trailing `--repo` selects a destination checkout. By default, the
-launcher checkout is also the destination. To locate a launcher in a
-different checkout, use the leading `--repo <launcher-root>` before the
-command. If you set a custom database path, supply both the leading
-`--db <path>` and `--repo <launcher-root>`.
+The leading `--target` selects the repository and its host-side state. The
+export writes the branch into that repository by default. A trailing
+`--target` selects a different destination checkout. The CLI accepts
+`--repo` as an alias in either position. If you set a custom database path,
+supply both the leading `--db <path>` and `--target <path>`.
 
 The branch is created or fast-forwarded locally. A divergent branch or
 one checked out in any worktree must be resolved before exporting.
