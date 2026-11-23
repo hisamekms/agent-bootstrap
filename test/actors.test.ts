@@ -277,6 +277,7 @@ test("the derived catalog switches one model to ordinary tools and is pinned", (
         tool_mode: "code_mode_only",
         experimental_supported_tools: ["clock"],
         multi_agent_version: "v2",
+        supports_search_tool: true,
         text: 'a "}{" b \\ c',
       },
     ],
@@ -293,6 +294,7 @@ test("the derived catalog switches one model to ordinary tools and is pinned", (
         tool_mode: null,
         experimental_supported_tools: [],
         multi_agent_version: null,
+        supports_search_tool: false,
       },
     ],
   });

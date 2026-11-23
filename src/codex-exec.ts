@@ -298,8 +298,9 @@ export function codexCoordinatorCommand(
 /**
  * Extract the model catalog embedded in the pinned Codex binary and switch
  * one model to ordinary tools: no code mode (which fails closed without a
- * code-mode host in the guest), no experimental tools and no multi-agent
- * tools. The result is checked against `expectedSha256`.
+ * code-mode host in the guest), no experimental or multi-agent tools, and no
+ * `tool_search` (rejected by subscription sharing). The result is checked
+ * against `expectedSha256`.
  */
 export function deriveCodexCatalog(
   binary: Uint8Array,
@@ -339,6 +340,7 @@ export function deriveCodexCatalog(
       tool_mode: string | null;
       experimental_supported_tools: string[];
       multi_agent_version: string | null;
+      supports_search_tool: boolean;
     }[];
   };
   const entry = catalog.models.find((item) => item.slug === model);
@@ -346,6 +348,7 @@ export function deriveCodexCatalog(
   entry.tool_mode = null;
   entry.experimental_supported_tools = [];
   entry.multi_agent_version = null;
+  entry.supports_search_tool = false;
   const text = JSON.stringify(catalog);
   if (createHash("sha256").update(text).digest("hex") !== expectedSha256)
     throw new Error("Derived Codex catalog changed");

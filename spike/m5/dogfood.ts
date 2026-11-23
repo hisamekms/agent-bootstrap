@@ -100,7 +100,7 @@ const alpineImage =
   "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd";
 const codexModel = "gpt-6.2-sol";
 const codexCatalogDigest =
-  "9a6ef910866167ed194b1374ff346256fa813fb46d768b9683d1ce61d60419b9";
+  "bc2eb145cf3f32a265102474d0c5f51a190dac97cf47b59c4dfa1c9ef0a30625";
 const codexSecretEnv = "AGENT_BOOTSTRAP_SUBSCRIPTION_TOKEN";
 const claudeFixtureHost = "m5-anthropic.agent-bootstrap.internal";
 const claudeFixtureIp = "192.0.2.11";

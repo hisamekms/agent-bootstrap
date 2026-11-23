@@ -632,6 +632,9 @@ code-mode Worker therefore could not edit files. With `gpt-5.5` and
 - **Worker** saw `exec_command`, `write_stdin`, `request_user_input`,
   `apply_patch`, `view_image`, the goal tools and `tool_search`.
 
+Subscription sharing rejects `tool_search`, so the derived catalog sets
+`supports_search_tool` to `false`.
+
 A live provider may serve a different catalog, so the live run records
 what it actually saw.
 
