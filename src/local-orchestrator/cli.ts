@@ -8,8 +8,6 @@ import {
   identifier,
   integer,
   oneOf,
-  requestedLoosening,
-  resolvePolicy,
   type Gate,
   type Policy,
 } from "./model.ts";
@@ -23,8 +21,10 @@ interface CliIo {
   prompt(question: string): string | undefined | Promise<string | undefined>;
 }
 
-type Proposal = NonNullable<ReturnType<OrchestratorStore["getProposal"]>>;
-type ProposalStatus = Proposal["status"];
+type ProposalDetails = NonNullable<
+  ReturnType<OrchestratorStore["getProposalDetails"]>
+>;
+type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
 const defaultDb = fileURLToPath(
   new URL("../../.local/local-orchestrator/state.db", import.meta.url),
@@ -144,67 +144,36 @@ function projectDefaults(store: OrchestratorStore): Record<Gate, Policy> {
   };
 }
 
-function proposalPolicy(
-  store: OrchestratorStore,
-  proposal: Proposal,
-  defaults: Record<Gate, Policy>,
-) {
-  if (proposal.status === "registered")
-    return {
-      gate: null,
-      effectivePolicy: null,
-      policySource: null,
-      loosening: [],
-    };
-
-  const requested = proposal.content.policies ?? {};
-  if (proposal.kind === "goal") {
-    const gate = "goal-registration";
-    const layers = { defaults };
-    const loosening = requestedLoosening(layers, requested);
-    const { policy, source } = resolvePolicy(
-      gate,
-      loosening.includes(gate) ? layers : { ...layers, request: requested },
-    );
-    return {
-      gate,
-      effectivePolicy: policy,
-      policySource: source,
-      loosening,
-      ...(policy === "agent" &&
-        loosening.length > 0 && { humanApprovalRequired: true }),
-    };
-  }
-
-  const gate = "task-registration";
-  const goal = store.getGoal(proposal.content.goalId);
-  if (!goal) throw new OrchestratorStoreError("not-found");
-  const layers = { defaults, goal: goal.content.policies ?? {} };
-  const { policy, source } = resolvePolicy(gate, layers);
-  const loosening = requestedLoosening(layers, requested);
+function proposalPolicy({
+  gate,
+  policy,
+  source,
+  loosening,
+  humanApprovalRequired,
+  humanAnswerRequired,
+}: ProposalDetails) {
   return {
     gate,
     effectivePolicy: policy,
     policySource: source,
     loosening,
-    ...(policy === "agent" &&
-      loosening.length > 0 && { humanApprovalRequired: true }),
-    ...(policy === "agent" &&
-      requested[gate] === "human" && { humanAnswerRequired: true }),
+    humanApprovalRequired,
+    humanAnswerRequired,
   };
 }
 
-function proposalDetails(
-  store: OrchestratorStore,
-  proposal: Proposal,
-  defaults: Record<Gate, Policy>,
-) {
-  const { source: origin, ...record } = proposal;
-  return {
-    ...record,
-    origin,
-    ...proposalPolicy(store, proposal, defaults),
-  };
+function displayProposal({
+  policy: effectivePolicy,
+  source: policySource,
+  ...proposal
+}: ProposalDetails) {
+  return { ...proposal, effectivePolicy, policySource };
+}
+
+function requireProposalDetails(store: OrchestratorStore, id: string) {
+  const proposal = store.getProposalDetails(id);
+  if (!proposal) throw new OrchestratorStoreError("not-found");
+  return proposal;
 }
 
 function refuse(io: CliIo, message: string): 1 {
@@ -221,14 +190,13 @@ async function execute(
     case "status": {
       const proposals = store.listProposals();
       const goals = store.listGoals();
-      const defaults = projectDefaults(store);
       const pending = proposals
         .filter(({ status }) => status === "pending")
         .map((proposal) => ({
           id: proposal.id,
           kind: proposal.kind,
           title: proposal.content.title,
-          ...proposalPolicy(store, proposal, defaults),
+          ...proposalPolicy(requireProposalDetails(store, proposal.id)),
         }));
       writeJson(io, {
         counts: {
@@ -245,22 +213,23 @@ async function execute(
       return 0;
     }
     case "proposals": {
-      const defaults = projectDefaults(store);
       const proposals = store.listProposals(
         command.status === undefined ? {} : { status: command.status },
       );
       writeJson(
         io,
-        proposals.map((proposal) => proposalDetails(store, proposal, defaults)),
+        proposals.map(({ id }) =>
+          displayProposal(requireProposalDetails(store, id)),
+        ),
       );
       return 0;
     }
     case "show":
     case "approve":
     case "reject": {
-      const proposal = store.getProposal(command.id);
+      const proposal = store.getProposalDetails(command.id);
       if (!proposal) return refuse(io, "Proposal was not found.");
-      writeJson(io, proposalDetails(store, proposal, projectDefaults(store)));
+      writeJson(io, displayProposal(proposal));
       if (command.kind === "show") return 0;
       if (proposal.status !== "pending")
         return refuse(io, "Proposal is no longer pending.");

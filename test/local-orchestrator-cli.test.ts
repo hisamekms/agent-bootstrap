@@ -169,6 +169,35 @@ test("proposal display identifies human requirements under an inherited agent po
   });
 });
 
+test("show matches store details after the project policy changes", async () => {
+  const { id, digest } = store.proposeGoal(goal, origin);
+  store.decide(id, {
+    digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  store.setProjectDefaults(
+    { "goal-registration": "agent" },
+    { kind: "operator" },
+  );
+
+  const details = store.getProposalDetails(id);
+  assert.ok(details);
+  const {
+    policy: effectivePolicy,
+    source: policySource,
+    ...proposal
+  } = details;
+  assert.equal(effectivePolicy, "human");
+  const shown = await cli(["show", id]);
+  assert.equal(shown.code, 0);
+  assert.deepEqual(JSON.parse(shown.stdout), {
+    ...proposal,
+    effectivePolicy,
+    policySource,
+  });
+});
+
 test("a TTY approval shows the proposal first and records a human answer bound to its digest", async () => {
   const { id, digest } = store.proposeGoal(goal, origin);
   const phrase = `approve ${digest.slice(0, 12)}`;

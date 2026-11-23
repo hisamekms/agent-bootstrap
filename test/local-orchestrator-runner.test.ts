@@ -551,20 +551,50 @@ test("Reviewer refuses human policy, including pending content tightening an age
   );
 });
 
-test("Reviewer reports store refusal and leaves Concierge proposals pending", async () => {
+test("Reviewer cannot queue an approval for a goal that loosens integration policy", async () => {
+  enableGoalAgentApproval();
+  const proposal = store.proposeGoal(
+    { ...goal, policies: { integration: "agent" } },
+    plannerOrigin,
+  );
+  assert.equal(proposal.policy, "agent");
+  assert.deepEqual(proposal.loosening, ["integration"]);
+
+  await assert.rejects(runner().requestApproval(proposal.id), {
+    code: "approval-forbidden",
+  });
+  assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
+});
+
+test("Reviewer refuses to queue an approval for Concierge proposals", async () => {
   enableGoalAgentApproval();
   const proposal = store.proposeGoal(goal, {
     ...plannerOrigin,
     actor: "Concierge",
   });
-  const work = runner();
-  const id = await work.requestApproval(proposal.id);
-  await work.drain();
-  assert.partialDeepStrictEqual(store.getExecution(id), {
-    status: "failed",
-    result: { code: "approval-forbidden" },
+  await assert.rejects(runner().requestApproval(proposal.id), {
+    code: "approval-forbidden",
   });
+  assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
+});
+
+test("Reviewer cannot queue an approval for a task with missing dependencies", async () => {
+  const goalId = registerGoal({
+    ...goal,
+    policies: { "task-registration": "agent" },
+  });
+  const proposal = store.proposeTask(
+    { ...task, goalId, dependsOn: ["missing-task"] },
+    plannerOrigin,
+  );
+  assert.equal(proposal.status, "pending");
+  assert.deepEqual(proposal.reasons, ["dependsOn"]);
+
+  await assert.rejects(runner().requestApproval(proposal.id), {
+    code: "task-constraints",
+  });
+  assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
 });
 
 test("Runner refuses responses attributed to a different host invocation", async () => {

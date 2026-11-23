@@ -237,6 +237,22 @@ test("allows an eligible reviewer and refuses the producer and Concierge origins
   );
 });
 
+test("an eligible Reviewer can reject a goal that loosens integration policy", () => {
+  store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+  const { id, digest } = store.proposeGoal(
+    { ...goal, policies: { integration: "agent" } },
+    operator,
+  );
+  assert.deepEqual(
+    store.decide(id, {
+      digest,
+      decision: "reject",
+      answerer: startReviewer(),
+    }),
+    { status: "rejected" },
+  );
+});
+
 test("rejects fabricated, non-Reviewer, non-approval, queued and finished executions", () => {
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
   const proposal = store.proposeGoal(goal, operator);

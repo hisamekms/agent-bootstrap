@@ -344,23 +344,10 @@ export class ActorRunner {
   }
 
   #approvalSnapshot(proposalId: string) {
-    const { store } = this.#deps;
-    const proposal = store.getProposal(proposalId);
-    if (!proposal) throw new OrchestratorStoreError("not-found");
-    if (proposal.status !== "pending")
-      throw new OrchestratorStoreError("invalid-transition");
-    const gate =
-      proposal.kind === "goal" ? "goal-registration" : "task-registration";
+    const proposal = this.#deps.store.getProposalForAgentApproval(proposalId);
     const goalId =
       proposal.kind === "task" ? proposal.content.goalId : undefined;
-    const { policy } = store.effectivePolicy(
-      gate,
-      goalId === undefined ? {} : { goalId },
-    );
-    // The public policy query includes registered layers. Pending content can tighten the gate.
-    if (policy !== "agent" || proposal.content.policies?.[gate] === "human")
-      throw new OrchestratorStoreError("approval-forbidden");
-    return { proposal, gate, policy, goalId };
+    return { proposal, goalId };
   }
 
   #plan(
@@ -554,16 +541,15 @@ export class ActorRunner {
     proposalId,
   }: Extract<Job, { kind: "approval" }>): Promise<Completion> {
     const { store, harness } = this.#deps;
-    const { proposal, gate, policy, goalId } =
-      this.#approvalSnapshot(proposalId);
+    const { proposal, goalId } = this.#approvalSnapshot(proposalId);
     const files = [
       jsonFile("proposal.json", {
         id: proposal.id,
         kind: proposal.kind,
         content: proposal.content,
         digest: proposal.digest,
-        gate,
-        policy,
+        gate: proposal.gate,
+        policy: proposal.policy,
       }),
     ];
     if (goalId !== undefined) {

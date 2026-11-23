@@ -260,6 +260,41 @@ function proposalRecord({
     : freeze({ ...row, kind, source, content: validateTaskContent(raw) });
 }
 
+function proposalAnswerRequirements(
+  proposal: ReturnType<typeof proposalRecord>,
+  policy: ApprovalPolicy["policy"] | null,
+  loosening: readonly Gate[],
+) {
+  return {
+    ...(policy === "agent" &&
+      loosening.length > 0 && { humanApprovalRequired: true }),
+    ...(policy === "agent" &&
+      proposal.kind === "task" &&
+      proposal.content.policies?.["task-registration"] === "human" && {
+        humanAnswerRequired: true,
+      }),
+  };
+}
+
+function permitsAgentAnswer(
+  origin: Origin,
+  {
+    policy,
+    humanApprovalRequired,
+    humanAnswerRequired,
+  }: ReturnType<typeof proposalAnswerRequirements> & {
+    policy: ApprovalPolicy["policy"] | null;
+  },
+  decision: Decision,
+): boolean {
+  return (
+    policy === "agent" &&
+    !humanAnswerRequired &&
+    !(decision === "approve" && humanApprovalRequired) &&
+    !(origin.kind === "actor" && origin.actor === "Concierge")
+  );
+}
+
 function goalRecord({ contentJson, ...row }: GoalRow) {
   return freeze({
     ...row,
@@ -611,6 +646,16 @@ export class OrchestratorStore {
     return task.dependsOn.every((id) => query.get(id, task.goalId) !== null);
   }
 
+  #taskApprovalError(task: TaskContent, goal: ReturnType<typeof goalRecord>) {
+    if (goal.status !== "active") return "goal-inactive";
+    if (
+      taskLimitReasons(goal.content, task, this.#taskCount(task.goalId))
+        .length !== 0 ||
+      !this.#hasDependencies(task)
+    )
+      return "task-constraints";
+  }
+
   #registerTask(row: ProposalRow, task: TaskContent, at: string): string {
     const id = randomUUID();
     this.#run(
@@ -709,13 +754,15 @@ export class OrchestratorStore {
       const origin = proposal.source;
       if (answerer.kind === "agent") {
         const execution = this.#execution(answerer.executionId);
+        const requirements = proposalAnswerRequirements(
+          proposal,
+          policy,
+          loosening,
+        );
         if (
-          policy === "human" ||
-          task?.policies?.["task-registration"] === "human" ||
-          (decision === "approve" && loosening.length > 0) ||
+          !permitsAgentAnswer(origin, { policy, ...requirements }, decision) ||
           (origin.kind === "actor" &&
-            (origin.actor === "Concierge" ||
-              origin.executionId === answerer.executionId)) ||
+            origin.executionId === answerer.executionId) ||
           execution?.actor !== "Reviewer" ||
           execution.mode !== "approval" ||
           execution.status !== "running" ||
@@ -726,14 +773,8 @@ export class OrchestratorStore {
       }
 
       if (decision === "approve" && task) {
-        if (goal?.status !== "active")
-          throw new OrchestratorStoreError("goal-inactive");
-        if (
-          taskLimitReasons(goal.content, task, this.#taskCount(task.goalId))
-            .length !== 0 ||
-          !this.#hasDependencies(task)
-        )
-          throw new OrchestratorStoreError("task-constraints");
+        const error = this.#taskApprovalError(task, goal!);
+        if (error) throw new OrchestratorStoreError(error);
       }
       const status = decision === "approve" ? "approved" : "rejected";
       const approvalId = randomUUID();
@@ -1021,13 +1062,43 @@ export class OrchestratorStore {
           "SELECT gate, policy, policy_source AS source FROM approvals WHERE proposal_id = ?",
         )
         .get(id);
+      const policy = { ...this.#proposalGate(proposal), ...decision };
       return freeze({
         ...proposal,
-        ...this.#proposalGate(proposal),
-        ...decision,
+        ...policy,
+        ...proposalAnswerRequirements(
+          proposal,
+          policy.policy,
+          policy.loosening,
+        ),
         origin: proposal.source,
       });
     });
+  }
+
+  /** Read and check the same proposal snapshot before scheduling a Reviewer. */
+  getProposalForAgentApproval(proposalId: string) {
+    const id = identifier(proposalId);
+    return this.#read(() =>
+      this.#db
+        .transaction(() => {
+          const proposal = required(this.getProposalDetails(id));
+          if (proposal.status !== "pending")
+            throw new OrchestratorStoreError("invalid-transition");
+          if (contentDigest(proposal.content) !== proposal.digest)
+            throw new OrchestratorStoreError("stale-digest");
+          if (!permitsAgentAnswer(proposal.origin, proposal, "approve"))
+            throw new OrchestratorStoreError("approval-forbidden");
+          if (proposal.kind === "task") {
+            const task = proposal.content;
+            const goal = goalRecord(required(this.#goal(task.goalId)));
+            const error = this.#taskApprovalError(task, goal);
+            if (error) throw new OrchestratorStoreError(error);
+          }
+          return proposal;
+        })
+        .deferred(),
+    );
   }
 
   getHostApiStatus() {
