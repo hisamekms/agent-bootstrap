@@ -1,4 +1,9 @@
-import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
+import {
+  CLAUDE_MANAGED_PATH,
+  CLAUDE_MANAGED_STAGING,
+  SECRET_FILE_TOOL_COUNT,
+} from "./claude-code.ts";
+import { SECRET_FILE_PORT } from "./secret-file.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, lstatSync, realpathSync } from "node:fs";
@@ -16,6 +21,11 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CredentialProvider } from "./credentials.ts";
+import { workerGitConfig } from "./git-integration.ts";
+import {
+  checkSecretWorkspaceArchive,
+  SECRET_WORKSPACE_MAX_BYTES,
+} from "./workspace-tree.ts";
 import { boundedLines } from "./lines.ts";
 import {
   METRICS_OUTPUT_BYTES,
@@ -95,7 +105,7 @@ export const MICROSANDBOX_LIMITS = {
   sessionStopMs: 5000,
   gitDirBytes: 2 * 1024 * 1024 * 1024,
   gitDirEntries: 200_000,
-  treeBytes: 1024 * 1024 * 1024,
+  treeBytes: SECRET_WORKSPACE_MAX_BYTES,
   collectedTreeBytes: 512 * 1024 * 1024,
   treeStepTimeoutMs: 120_000,
 } as const;
@@ -201,8 +211,15 @@ async function sha256File(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
-  if (tools.length > MICROSANDBOX_LIMITS.tools) invalid();
+function checkTools(
+  tools: readonly SandboxTool[],
+  secretFile = false,
+): SandboxTool[] {
+  if (
+    tools.length >
+    (secretFile ? SECRET_FILE_TOOL_COUNT : MICROSANDBOX_LIMITS.tools)
+  )
+    invalid();
   const guests = new Set<string>();
   return tools.map((tool) => {
     if (
@@ -211,6 +228,7 @@ function checkTools(tools: readonly SandboxTool[]): SandboxTool[] {
       /[\0:\r\n]/.test(tool.hostPath) ||
       typeof tool.guestPath !== "string" ||
       !/^\/tmp\/[a-zA-Z0-9._-]{1,64}$/.test(tool.guestPath) ||
+      (secretFile && tool.guestPath === CLAUDE_MANAGED_STAGING) ||
       tool.guestPath.split("/").some((part) => part === "." || part === "..") ||
       guests.has(tool.guestPath) ||
       typeof tool.sha256 !== "string" ||
@@ -329,10 +347,11 @@ function mountArgs(spec: SandboxSpec): string[] {
   if (spec.claudeManagedSettings !== undefined) {
     if (spec.claude !== true || !isMountHostPath(spec.claudeManagedSettings))
       invalid();
-    args.push(
-      "--mount-file",
-      `${spec.claudeManagedSettings}:${CLAUDE_MANAGED_PATH}:ro`,
-    );
+    if (!spec.claudeSecretSocket)
+      args.push(
+        "--mount-file",
+        `${spec.claudeManagedSettings}:${CLAUDE_MANAGED_PATH}:ro`,
+      );
   }
   const paths = new Set<string>();
   for (const mount of spec.mounts ?? []) {
@@ -352,6 +371,42 @@ function mountArgs(spec: SandboxSpec): string[] {
     );
   }
   return args;
+}
+
+function secretFileArgs(spec: SandboxSpec): string[] {
+  const path = spec.claudeSecretSocket;
+  if (path === undefined) return [];
+  if (
+    !isMountHostPath(path) ||
+    Buffer.byteLength(path) >= 100 ||
+    !spec.claudeManagedSettings ||
+    !/^[a-f0-9]{64}$/.test(spec.claudeManagedSettingsDigest ?? "") ||
+    (spec.profile ?? "base") !== "base" ||
+    !spec.egressGateway ||
+    spec.provider ||
+    spec.interactive ||
+    spec.debugMounts ||
+    spec.mounts?.length
+  )
+    invalid();
+  return ["--vsock", `${path}:${SECRET_FILE_PORT}`];
+}
+
+function checkSecretSocket(path: string) {
+  const parent = dirname(path);
+  const directory = lstatSync(parent, { throwIfNoEntry: false });
+  const socket = lstatSync(path, { throwIfNoEntry: false });
+  const uid = process.getuid?.();
+  if (
+    !directory?.isDirectory() ||
+    directory.uid !== uid ||
+    (directory.mode & 0o7777) !== 0o700 ||
+    realpathSync(parent) !== parent ||
+    !socket?.isSocket() ||
+    socket.uid !== uid ||
+    (socket.mode & 0o7777) !== 0o600
+  )
+    invalid();
 }
 
 function isMountHostPath(path: string) {
@@ -689,6 +744,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       ...this.#network(spec).args,
       ...interactiveArgs(spec),
       ...mountArgs(spec),
+      ...secretFileArgs(spec),
       ...debugArgs(spec),
     ]);
   }
@@ -701,6 +757,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     interactive?: InteractiveSpec,
     managed?: string,
     mounts?: SandboxSpec["mounts"],
+    secretSocket?: string,
   ): Promise<void> {
     const create = async (env: Record<string, string>) => {
       if (gateway) {
@@ -724,6 +781,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       const args = buildArgs();
       if (interactive) checkInteractivePaths(interactive);
       if (managed) checkClaudeManagedSettings(managed);
+      if (secretSocket) checkSecretSocket(secretSocket);
       for (const { hostPath } of mounts ?? []) {
         for (const path of [dirname(hostPath), hostPath]) {
           const info = lstatSync(path, { throwIfNoEntry: false });
@@ -823,6 +881,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
         : undefined;
     const managed = spec.claudeManagedSettings;
+    const secretSocket = spec.claudeSecretSocket;
     const mounts = spec.mounts?.map((mount) => ({ ...mount }));
     const channels = [
       ...interactiveArgs(interactive ? { ...spec, interactive } : spec),
@@ -831,6 +890,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(mounts ? { mounts } : {}),
         ...(managed ? { claudeManagedSettings: managed } : {}),
       }),
+      ...secretFileArgs(spec),
       ...debugArgs(spec),
     ];
     boundedInteger(
@@ -839,7 +899,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ? MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs
         : MICROSANDBOX_LIMITS.maxLifetimeMs,
     );
-    const tools = checkTools(spec.tools ?? []);
+    const tools = checkTools(spec.tools ?? [], secretSocket !== undefined);
     const { args: networkArgs, gateway, provider } = this.#network(spec);
     const netRuleDigest = digestNetworkArgs([...networkArgs, ...channels]);
     if (
@@ -861,6 +921,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       return files.map(({ path, bytes }) => {
         relativePath(path);
         if (
+          (secretSocket &&
+            path.split("/").some((part) => part.toLowerCase() === ".git")) ||
           !(bytes instanceof Uint8Array) ||
           bytes.byteLength > MICROSANDBOX_LIMITS.fileBytes ||
           paths.has(path)
@@ -930,21 +992,53 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         }
       }
       let stagedTree: string | undefined;
+      let stagedManaged: string | undefined;
+      if (secretSocket && managed) {
+        checkClaudeManagedSettings(managed);
+        stagedManaged = join(directory, "claude-managed-settings.json");
+        await copyFile(managed, stagedManaged);
+        if (
+          (await sha256File(stagedManaged)) !== spec.claudeManagedSettingsDigest
+        )
+          invalid();
+      }
       if (repository) {
         // Copy, then re-check the copy, so the bytes handed to the backend
         // are the bytes that were checked.
-        await cp(repository.gitDir, join(workspace, ".git"), {
+        const gitDir = join(workspace, ".git");
+        await cp(repository.gitDir, gitDir, {
           recursive: true,
           verbatimSymlinks: true,
           errorOnExist: true,
           force: false,
         });
-        await plainTreeBytes(join(workspace, ".git"));
+        await plainTreeBytes(gitDir);
+        if (secretSocket) {
+          const path = join(gitDir, "config");
+          const info = await lstat(path);
+          if (!info.isFile() || info.size > 4096) invalid();
+          const candidates = [
+            workerGitConfig("cone"),
+            workerGitConfig("patterns"),
+          ];
+          const original = await readFile(path);
+          const trusted = candidates.find((candidate) =>
+            original.equals(Buffer.from(candidate)),
+          );
+          await writeFile(path, trusted ?? workerGitConfig());
+        }
         stagedTree = join(directory, "tree.tar");
         await copyFile(repository.tree, stagedTree);
         const info = await lstat(stagedTree);
         if (!info.isFile() || info.size > MICROSANDBOX_LIMITS.treeBytes)
           invalid();
+        if (secretSocket) {
+          try {
+            await checkSecretWorkspaceArchive(stagedTree);
+          } catch {
+            invalid();
+          }
+        }
       }
       const current: State = {
         id: sandboxId,
@@ -980,7 +1074,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         ...(profile.cpus !== undefined ? ["--cpus", String(profile.cpus)] : []),
         "--copy-dir",
         `${workspace}:/workspace`,
-        ...(readOnly.length ? ["--mount-dir", `${review}:/review:ro`] : []),
+        ...(readOnly.length
+          ? secretSocket
+            ? ["--copy-dir", `${review}:/review`]
+            : ["--mount-dir", `${review}:/review:ro`]
+          : []),
+        ...(stagedManaged
+          ? ["--copy-file", `${stagedManaged}:${CLAUDE_MANAGED_STAGING}`]
+          : []),
         ...tools.flatMap((tool, index) => [
           "--copy-file",
           `${staged[index]}:${tool.guestPath}`,
@@ -996,6 +1097,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         interactive,
         managed,
         mounts,
+        secretSocket,
       );
       if (stagedTree) {
         const extracted = await this.#execute(

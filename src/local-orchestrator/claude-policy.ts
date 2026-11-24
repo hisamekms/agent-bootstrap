@@ -23,6 +23,7 @@ import type { ClaudeHostPolicy } from "../trusted-host.ts";
 import type { ClaudeActor, EffectiveClaudeConfig } from "./claude-config.ts";
 import { VolumeError, Volume, privateDirectory } from "../volumes/volume.ts";
 
+import { SECRET_TOOL_DIRS } from "../secret-file.ts";
 import { createCredentialScanner } from "./credential-scan.ts";
 
 export const orchestratorMcp = {
@@ -35,8 +36,12 @@ export function managedClaudeSettings(
   actor: ClaudeActor,
   shell = false,
   mounts: readonly string[] = [],
+  auth?: "secret-file",
 ) {
   const concierge = actor === "Concierge";
+  const secretFile = auth === "secret-file";
+  const toolDirs = Object.values(SECRET_TOOL_DIRS);
+  const gitPaths = ["/workspace/.git/config", "/workspace/.git/hooks"];
   const scope = actor === "Executor" ? "/workspace" : "/review";
   const fileTools = ["Read", "Glob", "Grep", "Edit", "Write"];
   const allow = concierge
@@ -54,19 +59,56 @@ export function managedClaudeSettings(
       ? [{ serverCommand: [orchestratorMcp.command, ...orchestratorMcp.args] }]
       : [],
     allowManagedPermissionRulesOnly: true,
+    ...(secretFile
+      ? {
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            network: { allowManagedDomainsOnly: true, allowedDomains: [] },
+            filesystem: {
+              // The CLI talks to sandboxed commands through its temporary directory.
+              denyRead: [
+                "/run/secrets",
+                "/etc/claude-code",
+                SECRET_TOOL_DIRS.home,
+                SECRET_TOOL_DIRS.config,
+              ],
+              allowWrite: [SECRET_TOOL_DIRS.tmp],
+              denyWrite: gitPaths,
+            },
+          },
+        }
+      : {}),
     permissions: {
       disableBypassPermissionsMode: "disable",
       allow,
       deny: [
-        ...["/etc/claude-code", ...mounts].flatMap((path) =>
+        ...[
+          "/etc/claude-code",
+          ...(secretFile
+            ? ["/run/secrets", "/proc", "/sys", "/dev", ...toolDirs]
+            : []),
+          ...mounts,
+        ].flatMap((path) =>
           fileTools.flatMap((tool) => [
             `${tool}(/${path})`,
             `${tool}(/${path}/**)`,
           ]),
         ),
+        ...(secretFile
+          ? gitPaths.flatMap((path) =>
+              ["Write", "Edit"].flatMap((tool) => [
+                `${tool}(/${path})`,
+                `${tool}(/${path}/**)`,
+              ]),
+            )
+          : []),
         ...(concierge || mounts.length
           ? ["Bash", "WebFetch", "WebSearch", "Agent", "Skill"]
-          : []),
+          : secretFile
+            ? ["WebFetch", "WebSearch", "Agent", "Skill"]
+            : []),
       ],
     },
   };
@@ -86,11 +128,11 @@ export function createClaudePolicy(
     egress: config.egress,
     scan: createCredentialScanner(effective, state, note),
     errors: effective.errors,
-    managedSettings(actor, shell, mounts) {
+    managedSettings(actor, shell, mounts, auth) {
       const dir = join(state, "claude-policy");
       privateDirectory(dir);
       const content = JSON.stringify(
-        managedClaudeSettings(actor, shell, mounts),
+        managedClaudeSettings(actor, shell, mounts, auth),
       );
       const digest = createHash("sha256").update(content).digest("hex");
       const path = join(dir, `managed-${digest}.json`);

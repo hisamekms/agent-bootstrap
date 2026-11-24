@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { win32 } from "node:path";
 import { readTar } from "./oci-image.ts";
 
@@ -179,6 +181,48 @@ export function isSafeSymlinkTarget(path: string, bytes: Uint8Array): boolean {
     }
   }
   return true;
+}
+
+export function checkSecretWorkspace(tar: Uint8Array, maxBytes: number): void {
+  for (const entry of readTar(tar, maxBytes, true)) {
+    if (
+      (entry.type === "symlink" &&
+        !isSafeSymlinkTarget(entry.path, enc.encode(entry.linkname))) ||
+      !["file", "directory", "symlink", "hardlink"].includes(entry.type) ||
+      entry.path.split("/").some((part) => part.toLowerCase() === ".git")
+    )
+      fail("Unsafe secret-run workspace entry");
+  }
+}
+
+export const SECRET_WORKSPACE_MAX_BYTES = 1024 ** 3;
+
+export async function checkSecretWorkspaceArchive(path: string): Promise<void> {
+  const archive = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const info = await archive.stat();
+    if (!info.isFile() || info.size > SECRET_WORKSPACE_MAX_BYTES)
+      fail("Invalid workspace archive");
+    const bytes = Buffer.alloc(info.size);
+    for (let offset = 0; offset < bytes.length;) {
+      const { bytesRead } = await archive.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
+      if (!bytesRead) fail("Workspace archive changed");
+      offset += bytesRead;
+    }
+    if ((await archive.stat()).size !== info.size)
+      fail("Workspace archive changed");
+    checkSecretWorkspace(bytes, SECRET_WORKSPACE_MAX_BYTES);
+  } finally {
+    await archive.close();
+  }
 }
 
 export function checkTreeCollisions(paths: Iterable<string>): void {

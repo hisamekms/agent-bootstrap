@@ -63,6 +63,31 @@ const oidPattern = /^[a-f0-9]{40}$/;
 const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 type FileExpectation = { readonly path: string };
 
+export function workerGitConfig(sparse?: "cone" | "patterns"): string {
+  return [
+    "[core]",
+    "\trepositoryformatversion = 0",
+    "\tfilemode = true",
+    "\tbare = false",
+    "\thooksPath = /dev/null",
+    "\tautocrlf = false",
+    ...(sparse
+      ? [
+          "\tsparseCheckout = true",
+          `\tsparseCheckoutCone = ${sparse === "cone"}`,
+        ]
+      : []),
+    "[index]",
+    "\tsparse = false",
+    "[user]",
+    '\tname = "Agent Bootstrap Worker"',
+    '\temail = "worker@agent-bootstrap.invalid"',
+    "[commit]",
+    "\tgpgsign = false",
+    "",
+  ].join("\n");
+}
+
 function oid(value: unknown): string {
   if (typeof value !== "string" || !oidPattern.test(value))
     throw new GitIntegrationError("invalid-object");
@@ -1463,28 +1488,7 @@ export class LocalGitIntegration {
         );
       await writeFile(
         join(gitDir, "config"),
-        [
-          "[core]",
-          "\trepositoryformatversion = 0",
-          "\tfilemode = true",
-          "\tbare = false",
-          "\thooksPath = /dev/null",
-          "\tautocrlf = false",
-          ...(sparse
-            ? [
-                "\tsparseCheckout = true",
-                `\tsparseCheckoutCone = ${cone ? "true" : "false"}`,
-              ]
-            : []),
-          "[index]",
-          "\tsparse = false",
-          "[user]",
-          '\tname = "Agent Bootstrap Worker"',
-          '\temail = "worker@agent-bootstrap.invalid"',
-          "[commit]",
-          "\tgpgsign = false",
-          "",
-        ].join("\n"),
+        workerGitConfig(sparse ? (cone ? "cone" : "patterns") : undefined),
         { mode: 0o600 },
       );
       await this.#tar(gitDir, directory, tree, selected);

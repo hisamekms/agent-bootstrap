@@ -168,6 +168,12 @@ function project(rows: AuditExportRecord[], watermark: AuditSequenceWatermark) {
           line.attributes = { profile: row.profile, image: row.image };
         }
         if (row.detail) line.attributes = { ...line.attributes, ...row.detail };
+        if (row.detail && "event" in row.detail) {
+          line.action = row.detail.event;
+          line.phase =
+            row.detail.event === "secret.served" ? "intent" : "outcome";
+          break;
+        }
         if (row.operation) {
           const key = `${id}/${row.operation}`;
           const open = operations.get(key) ?? [];
