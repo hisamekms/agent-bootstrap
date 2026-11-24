@@ -16,6 +16,7 @@ import {
 import { ALPINE_3_23 } from "../../src/image-recipes.ts";
 import {
   loadClaudeConfig,
+  resolveClaudeModel,
   userStateDirectory,
   validService,
   type EffectiveClaudeConfig,
@@ -453,7 +454,7 @@ async function open(
     auth,
     tools,
     profile: "base",
-    model: effective.model ?? "claude-opus-5-5",
+    model: resolveClaudeModel(effective),
     shell: true,
     reportWorkerUsage: true,
     maxTurns: 50,

@@ -47,6 +47,8 @@ export interface RunnerDeps {
     id: string,
   ) => Promise<ReviewerRun>;
   readonly harness: RoleHarness;
+  readonly plannerHarness?: RoleHarness;
+  readonly executorRequiresBase?: boolean;
   /** Model configured for the Reviewer in the harness. */
   readonly model: string;
   /** Host-selected files with paths relative to the repository root. */
@@ -141,14 +143,16 @@ const goalContract = {
     "Return exactly one goal. Keys marked ? are optional, without the ? in the answer. Use only the specified keys.",
 };
 
-function taskContract(maxTasks: number) {
+function taskContract(maxTasks: number, executorRequiresBase = false) {
   return {
     answer: {
       tasks: [
         {
           ...commonContract,
           actor: "Executor | Researcher",
-          profile: ROLE_PROFILES.Worker.join(" | "),
+          profile: executorRequiresBase
+            ? `Executor requires base. Researcher may use ${ROLE_PROFILES.Worker.join(" | ")}.`
+            : ROLE_PROFILES.Worker.join(" | "),
           paths:
             "1..64 distinct repository-relative paths for Executor, empty for Researcher",
           dependsOn:
@@ -461,10 +465,11 @@ export class ActorRunner {
     readOnlyFiles: readonly SandboxFile[],
     taskTimeoutMs: number = MICROSANDBOX_LIMITS.commandTimeoutMs,
   ): ReviewerPlan {
-    const { harness } = this.#deps;
+    const { harness, plannerHarness } = this.#deps;
+    const selected = role === "Planner" ? (plannerHarness ?? harness) : harness;
     return {
-      sandbox: { ...harness.sandbox, readOnlyFiles, maxLifetimeMs: 300_000 },
-      command: harness.command({
+      sandbox: { ...selected.sandbox, readOnlyFiles, maxLifetimeMs: 300_000 },
+      command: selected.command({
         role,
         prompt: role === "Planner" ? PLANNER_PROMPT : APPROVAL_PROMPT,
         timeoutMs:
@@ -595,7 +600,9 @@ export class ActorRunner {
             }
           : {}),
         contract:
-          mode === "goal-design" ? goalContract : taskContract(maxTasks),
+          mode === "goal-design"
+            ? goalContract
+            : taskContract(maxTasks, this.#deps.executorRequiresBase),
       }),
       ...context.map(({ path, bytes }) => ({ path: `repo/${path}`, bytes })),
     ]);
@@ -645,6 +652,20 @@ export class ActorRunner {
         if (!(error instanceof ContractError)) throw error;
         code = "contract-violation";
         continue;
+      }
+      if (this.#deps.executorRequiresBase && "tasks" in drafts) {
+        const index = drafts.tasks.findIndex(
+          ({ content }) =>
+            content.actor === "Executor" && content.profile !== "base",
+        );
+        if (index !== -1)
+          return {
+            status: "failed",
+            result: {
+              code: "task-constraints",
+              next: `Task ${index + 1} assigns a non-base profile to an Executor with a secret grant. Choose the base profile and retry.`,
+            },
+          };
       }
       if (store.getExecution(id)?.status !== "running")
         return { status: "failed", result: { code: "invalid-transition" } };

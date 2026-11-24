@@ -30,6 +30,13 @@ import { type Host } from "../src/onboarding/prerequisites.ts";
 import { applySetup, setupPlan } from "../src/onboarding/setup.ts";
 import { ALPINE_3_23 } from "../src/image-recipes.ts";
 import { MISE_MSB } from "../src/mise-tools.ts";
+import {
+  userStateDirectory,
+  writePrivateConfig,
+  configRoot,
+  userConfigPath,
+} from "../src/config/layers.ts";
+import { recordSecretTestPass } from "../src/local-orchestrator/secret-test-record.ts";
 
 const checkout = fileURLToPath(new URL("..", import.meta.url));
 const lockFile = "images/profiles.lock.json";
@@ -147,6 +154,7 @@ const topics = [
   "troubleshoot",
   "safety",
   "volume",
+  "secrets",
 ];
 
 describe("agent-bootstrap", () => {
@@ -168,6 +176,7 @@ describe("agent-bootstrap", () => {
       "config",
       "migrate",
       "volume",
+      "secrets",
       "status",
       "proposals",
       "show",
@@ -212,6 +221,30 @@ describe("agent-bootstrap", () => {
       run.stdout.toString(),
       await readFile(join(checkout, "docs/agent-guide.md"), "utf8"),
     );
+  });
+
+  test("secrets test rejects invalid arguments and absent grants before host commands", async () => {
+    const root = await fixture();
+    const { host, calls } = fakeHost(root);
+    for (const args of [
+      ["secrets"],
+      ["secrets", "test", "../TOOL_TOKEN"],
+      ["secrets", "test", "TOOL_TOKEN", "--claude-auth", "external"],
+      ["secrets", "test", "TOOL_TOKEN", "unexpected"],
+    ]) {
+      assert.equal((await invoke(args, root, host)).code, 2);
+    }
+    const result = await invoke(
+      ["secrets", "test", "TOOL_TOKEN", "--json"],
+      root,
+      host,
+    );
+    assert.equal(result.code, 1);
+    assert.match(
+      JSON.parse(result.stdout).error,
+      /requires an effective secret grant/,
+    );
+    assert.deepEqual(calls, []);
   });
 
   test("the linked command ignores settings from the target working directory's .env", async () => {
@@ -343,6 +376,54 @@ describe("agent-bootstrap", () => {
     }
   });
 
+  test("doctor reports secret grants and pinned passes without showing the source", async () => {
+    const root = await fixture();
+    const { host, calls } = fakeHost(root);
+    const target = initConfigRepo(join(root, "target"));
+    addProject(target, undefined, host.env);
+    const config = {
+      version: 1,
+      claude: { auth: "external" },
+      secrets: { tool: { keychainService: "fixture-private-service" } },
+      secretEnv: {
+        TOOL_TOKEN: { secret: "tool", actors: ["Planner", "Reviewer"] },
+      },
+    };
+    const path = userConfigPath(host.env);
+    const configDir = configRoot(host.env);
+    writePrivateConfig(path, configDir, config);
+    const run = () =>
+      invoke(["doctor", "--target", target, "--json"], root, host);
+    const grant = (out: string) =>
+      JSON.parse(out).find(
+        ({ id }: { id: string }) => id === "secretEnv.TOOL_TOKEN",
+      );
+    const before = await run();
+    const missing = grant(before.stdout);
+    assert.equal(missing.status, "missing");
+    assert.match(missing.detail, /Planner, Reviewer.*Self-test/);
+    assert.match(missing.fix[0], /secrets test TOOL_TOKEN/);
+    recordSecretTestPass(userStateDirectory(host.env), "TOOL_TOKEN");
+    const after = await run();
+    assert.equal(grant(after.stdout).status, "ok");
+    assert.doesNotMatch(
+      before.stdout + after.stdout,
+      /fixture-private-service/,
+    );
+    assert.ok(!calls.some(({ file }) => file === "/usr/bin/security"));
+
+    writePrivateConfig(path, configDir, {
+      ...config,
+      egress: { Planner: ["extra.example:443"] },
+    });
+    const rejected = await run();
+    assert.match(rejected.stdout, /cannot receive added egress/);
+    assert.doesNotMatch(
+      rejected.stdout,
+      /extra\.example|fixture-private-service/,
+    );
+  });
+
   test("concierge returns prerequisite exit and does not launch", async () => {
     const root = await fixture();
     const { host } = fakeHost(root);
@@ -376,6 +457,20 @@ describe("agent-bootstrap", () => {
           /^[a-f0-9]{64}$/.test(sha256) && url.startsWith("https:"),
       ),
       true,
+    );
+    writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
+      version: 1,
+      claude: { auth: "external" },
+      secrets: { fixture: { keychainService: "fixture-private-service" } },
+      secretEnv: { TOOL_TOKEN: { secret: "fixture", actors: ["Executor"] } },
+    });
+    const withGrant = await invoke(["setup", "--json"], root, host);
+    assert.equal(withGrant.code, 0);
+    assert.deepEqual(
+      JSON.parse(withGrant.stdout).artifacts.map(
+        ({ path }: { path: string }) => path,
+      ),
+      artifacts(defaultProfiles, undefined, true).map(({ path }) => path),
     );
     assert.deepEqual(
       plan.images.profiles.map(({ name }: { name: string }) => name),

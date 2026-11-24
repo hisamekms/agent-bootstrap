@@ -31,8 +31,17 @@ import type {
   ProcessResultInput,
   ResourceEventInput,
   SandboxBindingInput,
+  SecretLeakSink,
 } from "./audit.ts";
 import type { EgressGatewayOptions } from "./egress-gateway.ts";
+import {
+  SECRET_FILE_DEADLINE_MS,
+  type SecretFileDelivery,
+} from "./secret-file.ts";
+import {
+  checkSecretWorkspaceArchive,
+  workspaceFiles,
+} from "./workspace-tree.ts";
 import {
   DEBUG_SHELL_LIFETIME_MS,
   isDebugMount,
@@ -166,6 +175,7 @@ export interface VerificationPlan {
 
 export interface HostObservabilityAudit extends AuditSink {
   readonly isV5Writable: boolean;
+  onV5Unwritable?(listener: () => void): () => void;
   appendExecutionContext(context: ExecutionContext): void | Promise<void>;
   appendSandboxBinding(binding: SandboxBindingInput): void | Promise<void>;
   appendProcessResult(result: ProcessResultInput): void | Promise<void>;
@@ -210,7 +220,7 @@ export interface MountLease {
 }
 
 export interface ClaudeHostPolicy {
-  readonly auth?: "api-key" | "external" | undefined;
+  readonly auth?: "api-key" | "external" | "secret-file" | undefined;
   readonly mounts?: Config["mounts"];
   readonly egress?: Config["egress"];
   readonly scan?: CredentialScanner | undefined;
@@ -219,6 +229,7 @@ export interface ClaudeHostPolicy {
     actor: ClaudeActor,
     shell?: boolean,
     mountPaths?: readonly string[],
+    auth?: "secret-file",
   ): string;
   beginMount?:
     | ((
@@ -243,6 +254,9 @@ export interface TrustedHostOptions {
 
 export interface TrustedHostRunOptions {
   readonly hostServices?: readonly HostService[];
+  readonly secretFile?: SecretFileDelivery;
+  /** Host authorization for delivery based on the self-test record or probe. */
+  readonly secretTest?: "passed" | "running";
   /** Host-owned inspection of the changed files in a collected tree. */
   readonly inspectWorkerTree?: (tree: Uint8Array) => Promise<void>;
   /** Best-effort host callback for the last 66 KiB of Worker stderr. */
@@ -907,6 +921,11 @@ export class TrustedHost {
       },
       context: validated,
       options,
+    }).finally(async () => {
+      if (options?.secretFile) {
+        options.secretFile.clearScreen();
+        await options.secretFile.close();
+      }
     });
     return {
       id: invocationId,
@@ -934,7 +953,12 @@ export class TrustedHost {
     };
     if ("debugMounts" in sandbox && input.debugEgress === undefined)
       throw new Error("Debug mounts require the operator sandbox shell");
-    if ("mounts" in sandbox || "claudeManagedSettings" in sandbox)
+    if (
+      "mounts" in sandbox ||
+      "claudeManagedSettings" in sandbox ||
+      "claudeManagedSettingsDigest" in sandbox ||
+      "claudeSecretSocket" in sandbox
+    )
       throw new Error("Mounts are assigned by the trusted host");
 
     const claude =
@@ -960,7 +984,44 @@ export class TrustedHost {
         "The actor's adapter cannot enforce mount restrictions.",
         "Remove the actor from the mount or select the Claude adapter, then retry.",
       );
-    const auth = claude?.auth ?? "api-key";
+    const configuredAuth = claude?.auth ?? "api-key";
+    const secretFile = options?.secretFile;
+    const secretVariable =
+      "command" in input ? input.command.claudeSecretVariable : undefined;
+    const secretProbe = "command" in input && input.command.secretFileProbe;
+    if (
+      (secretFile ||
+        secretVariable !== undefined ||
+        secretProbe ||
+        options?.secretTest) &&
+      (secretProbe
+        ? options?.secretTest !== "running" || role !== "Worker" || !secretFile
+        : options?.secretTest !== "passed")
+    )
+      throw new ConfigError(
+        "secretEnv",
+        "A current secret self-test pass is required for delivery.",
+        "Run agent-bootstrap secrets test for the granted variable with the same target.",
+      );
+    const auth =
+      configuredAuth === "external" && secretFile && secretVariable
+        ? "secret-file"
+        : configuredAuth;
+    if (
+      (auth === "secret-file" || secretFile || secretVariable !== undefined) &&
+      (auth !== "secret-file" ||
+        !secretFile ||
+        secretFile.variable !== secretVariable ||
+        (role !== "Worker" && role !== "Reviewer" && role !== "Planner") ||
+        !("plan" in input) ||
+        !audit ||
+        sandbox.provider ||
+        (sandbox.profile !== undefined && sandbox.profile !== "base") ||
+        mounted.length ||
+        options?.hostServices?.length ||
+        input.debugEgress)
+    )
+      throw new Error("Invalid audited secret-file run");
     if (claude && auth === "external" && sandbox.provider)
       throw new Error("External mode requires plain audited egress");
     const addedHosts =
@@ -971,9 +1032,13 @@ export class TrustedHost {
               shellMount ? "shell" : (actor as EgressActor)
             ] ?? []
           ).map((endpoint) => endpoint.slice(0, -4));
+    if (auth === "secret-file" && addedHosts.length)
+      throw new Error("Secret-file runs cannot use added egress");
     const plainHosts = [
       ...new Set([
-        ...(claude && auth === "external" ? ["api.anthropic.com"] : []),
+        ...(claude && (auth === "external" || auth === "secret-file")
+          ? ["api.anthropic.com"]
+          : []),
         ...addedHosts,
       ]),
     ];
@@ -1072,6 +1137,8 @@ export class TrustedHost {
     let executionStarted = false;
     let executionFinished = false;
     let auditFailed = false;
+    let secretLeak: SecretLeakSink | undefined;
+    let deliveryDeadline: ReturnType<typeof setTimeout> | undefined;
     const startedAt = performance.now();
     const traceparent = context?.traceContext?.traceparent.split("-");
     const traceFields = {
@@ -1108,7 +1175,7 @@ export class TrustedHost {
 
     const auditUnavailable = () =>
       auditFailed ||
-      (gateway !== undefined && gateway.quarantined !== false) ||
+      (gateway !== undefined && gateway.quarantined !== false && !secretLeak) ||
       (audit !== undefined && audit.isV5Writable !== true);
     const ensureAudit = () => {
       if (auditUnavailable()) throw new HostAuditError(id);
@@ -1127,6 +1194,44 @@ export class TrustedHost {
       this.#disabled
         ? Promise.resolve()
         : write(() => this.#audit.append({ ...event, invocationId: id, role }));
+    const screen = async (
+      sink: SecretLeakSink,
+      ...data: (string | Uint8Array)[]
+    ) => {
+      if (!secretFile || !data.some(secretFile.matches)) return;
+      if (!secretLeak) {
+        secretLeak = sink;
+        await append({
+          kind: "operation.requested",
+          operation: "sandbox.exec",
+          detail: {
+            event: "secret-leak-suspected",
+            variable: secretFile.variable,
+            sink,
+          },
+        });
+      }
+      throw new ClaudeRunError("credential-leak");
+    };
+    const screenError = (error: unknown) =>
+      screen(
+        "journal-error",
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "",
+      );
+    const closeDelivery = async () => {
+      clearTimeout(deliveryDeadline);
+      if (!secretFile) return;
+      try {
+        await secretFile.close();
+      } catch {
+        throw new HostAuditError(id);
+      }
+      if (secretFile.auditFailed) throw new HostAuditError(id);
+    };
     const authorize = async (operation: Operation, allowed = true) => {
       const interactive = sandbox.interactive;
       await append({
@@ -1230,6 +1335,7 @@ export class TrustedHost {
             actor,
             shell,
             mounted.map(({ path }) => path),
+            auth === "secret-file" ? auth : undefined,
           );
           settingsDigest = createHash("sha256")
             .update(readFileSync(managed))
@@ -1263,6 +1369,20 @@ export class TrustedHost {
           context,
         });
 
+      if (!failure && secretFile && sandbox.repository) {
+        try {
+          await checkSecretWorkspaceArchive(sandbox.repository.tree);
+        } catch {
+          const error = new ConfigError(
+            "secretEnv",
+            "The workspace archive is unsafe for a secret grant.",
+            "Remove absolute or escaping symlinks from the repository and retry.",
+          );
+          report(error);
+          failure = { error };
+        }
+      }
+
       if (!failure && (managed || mounted.length)) {
         if (mounted.length) {
           await authorize("sandbox.create");
@@ -1270,6 +1390,10 @@ export class TrustedHost {
         }
         try {
           if (managed) sandbox.claudeManagedSettings = managed;
+          if (secretFile && settingsDigest) {
+            sandbox.claudeSecretSocket = secretFile.hostPath;
+            sandbox.claudeManagedSettingsDigest = settingsDigest;
+          }
           const files = sandbox.readOnlyFiles ?? [];
           if (files.length)
             await claude?.scan?.(
@@ -1336,16 +1460,74 @@ export class TrustedHost {
             executionId: id,
             sandboxLabel: sandboxId,
             policy,
-            audit: required.audit,
+            audit: secretFile
+              ? {
+                  get isV5Writable() {
+                    return required.audit.isV5Writable;
+                  },
+                  ...(required.audit.onV5Unwritable
+                    ? {
+                        onV5Unwritable: required.audit.onV5Unwritable.bind(
+                          required.audit,
+                        ),
+                      }
+                    : {}),
+                  appendNetwork: async (event) => {
+                    await screen(
+                      "network-audit",
+                      event.hostname ?? "",
+                      event.destinationIp ?? "",
+                    );
+                    await required.audit.appendNetwork(event);
+                  },
+                  appendDnsQuery: async (event) => {
+                    await screen(
+                      "network-audit",
+                      event.qname,
+                      ...event.answerIps,
+                    );
+                    await required.audit.appendDnsQuery(event);
+                  },
+                  appendNetworkFinished: (event) =>
+                    required.audit.appendNetworkFinished(event),
+                  appendResourceEvent: (event) =>
+                    required.audit.appendResourceEvent(event),
+                }
+              : required.audit,
             ...(this.#observers.length
               ? {
                   observer: {
-                    observe: (event: RuntimeEvent) =>
-                      this.#notify((observer) =>
-                        observer.observe(
-                          structuredClone({ ...event, ...traceFields }),
-                        ),
-                      ),
+                    observe: (event: RuntimeEvent) => {
+                      const deliver = () =>
+                        this.#notify((observer) =>
+                          observer.observe(
+                            structuredClone({ ...event, ...traceFields }),
+                          ),
+                        );
+                      // These are the guest-derived strings in gateway events.
+                      const payload = event.payload;
+                      const data = [
+                        "hostname",
+                        "destinationIp",
+                        "qname",
+                        "answerIps",
+                      ].flatMap((key) => {
+                        const field = (payload as Record<string, unknown>)[key];
+                        return typeof field === "string"
+                          ? [field]
+                          : Array.isArray(field)
+                            ? field.filter(
+                                (item): item is string =>
+                                  typeof item === "string",
+                              )
+                            : [];
+                      });
+                      if (secretFile && data.some(secretFile.matches)) {
+                        void screen("runtime-event", ...data).catch(() => {});
+                        return;
+                      }
+                      deliver();
+                    },
                   },
                 }
               : {}),
@@ -1619,6 +1801,32 @@ export class TrustedHost {
         const processStarted = performance.now();
         const dispatchedAt = new Date().toISOString();
         ensureAudit();
+        if (secretFile) {
+          secretFile.authorize({
+            beforeSend: () =>
+              append({
+                kind: "operation.requested",
+                operation: "sandbox.exec",
+                detail: {
+                  event: "secret.served",
+                  variable: secretFile.variable,
+                },
+              }),
+            afterSend: (delivery) =>
+              append({
+                kind: "operation.requested",
+                operation: "sandbox.exec",
+                detail: {
+                  event: "secret.delivery",
+                  variable: secretFile.variable,
+                  delivery,
+                },
+              }),
+          });
+          deliveryDeadline = setTimeout(() => {
+            void secretFile.close().catch(() => {});
+          }, SECRET_FILE_DEADLINE_MS);
+        }
         // The gateway and shared audit expose health through getters.
         const auditAbort =
           audit && !("open" in input) ? new AbortController() : undefined;
@@ -1630,7 +1838,7 @@ export class TrustedHost {
         const monitor =
           auditAbort &&
           setInterval(() => {
-            if (auditUnavailable()) auditAbort.abort();
+            if (auditUnavailable() || secretLeak) auditAbort.abort();
           }, AUDIT_HEALTH_POLL_MS);
         const process = await this.#runProcess(
           input,
@@ -1638,7 +1846,12 @@ export class TrustedHost {
           command,
           ensureAudit,
           () => emit("process.started", { outcome: "started" }, operationId),
-        ).finally(() => clearInterval(monitor));
+        ).finally(async () => {
+          clearInterval(monitor);
+          await closeDelivery();
+        });
+        // Drain network observations before releasing any guest output.
+        if (secretFile) await closeGateway();
         ensureAudit();
         const durationMs = performance.now() - processStarted;
         const { exit, kind } = process;
@@ -1670,6 +1883,27 @@ export class TrustedHost {
               kind,
             }),
           );
+        if (secretFile) {
+          try {
+            if (secretLeak) throw new ClaudeRunError("credential-leak");
+            if (failure) await screenError(failure.error);
+            if (result) {
+              await screen("guest-output", result.stdout, result.stderr);
+              await screen(
+                "result-envelope",
+                parseClaudeCodeResult(result.stdout)?.text ?? "",
+                parseClaudeWorkerResult(result.stderr)?.text ?? "",
+                claudeWorkerMessage(result.stderr) ?? "",
+              );
+            }
+            if (outcome === "ok" && !secretFile.acknowledged)
+              outcome = "failed";
+          } catch (error) {
+            if (error instanceof HostAuditError) throw error;
+            report(error);
+            result = undefined;
+          }
+        }
         await finish("sandbox.exec", outcome);
         emit(
           "process.exited",
@@ -1702,7 +1936,8 @@ export class TrustedHost {
           }
         }
 
-        if (role === "Worker" && result && input.options?.onWorkerStderr) {
+        const publishWorkerStderr = (result: ExecResult) => {
+          if (role !== "Worker" || !input.options?.onWorkerStderr) return;
           try {
             const delivery = input.options.onWorkerStderr(
               new Uint8Array(result.stderr.subarray(-66 * 1024)),
@@ -1712,7 +1947,8 @@ export class TrustedHost {
           } catch {
             // Worker diagnostics are best effort.
           }
-        }
+        };
+        if (!secretFile && result) publishWorkerStderr(result);
 
         if (sandbox.claude && result && result.status === "exited") {
           const parsed =
@@ -1754,6 +1990,19 @@ export class TrustedHost {
                 claude && role === "Worker"
                   ? (claudeWorkerMessage(result.stderr) ?? collected.message)
                   : collected.message;
+              if (secretFile) {
+                await screen(
+                  "collection",
+                  message ?? "",
+                  collected.message ?? "",
+                  ...files.flatMap(({ path, bytes }) => [path, bytes]),
+                );
+                if (tree) {
+                  await screen("collection", tree);
+                  for (const [path, file] of workspaceFiles(tree))
+                    await screen("collection", path, file.bytes);
+                }
+              }
               if (claude?.scan)
                 await claude.scan(
                   message ?? "",
@@ -1777,7 +2026,17 @@ export class TrustedHost {
               };
             } catch (error) {
               if (error instanceof HostAuditError) throw error;
-              if (error instanceof ClaudeRunError) report(error);
+              let failure = error;
+              if (secretFile && !(error instanceof ClaudeRunError)) {
+                try {
+                  await screenError(error);
+                } catch (screeningError) {
+                  if (screeningError instanceof HostAuditError)
+                    throw screeningError;
+                  failure = screeningError;
+                }
+              }
+              if (failure instanceof ClaudeRunError) report(failure);
               else outcome = "failed";
             }
             await finish("sandbox.collect", outcome);
@@ -1789,6 +2048,8 @@ export class TrustedHost {
             outcome = "denied";
           }
         }
+        if (secretFile?.acknowledged && !secretLeak && result)
+          publishWorkerStderr(result);
       }
 
       // Stop egress and drain its audit writes before authorizing VM removal.

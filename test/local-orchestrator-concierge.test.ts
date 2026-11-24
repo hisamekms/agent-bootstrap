@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { ALPINE_3_23 } from "../src/image-recipes.ts";
 import {
   claudeCodeProvider,
   claudeCodeTools,
@@ -116,6 +117,8 @@ for (const failure of [undefined, ...failures]) {
         };
         const deps: ConciergeDeps = {
           store,
+          config: { version: 1 },
+          baseImage: ALPINE_3_23.reference,
           auth,
           install,
           async snapshot(root, session) {
@@ -270,6 +273,8 @@ test("Concierge drains a single active Planner and cancels queued work on exit",
     const result = await startConcierge(
       {
         store,
+        config: { version: 1 },
+        baseImage: ALPINE_3_23.reference,
         auth,
         install,
         snapshot: async () => ({
@@ -347,6 +352,8 @@ test("Concierge refuses further Planner work after a failed execution audit writ
     };
     const deps: ConciergeDeps = {
       store,
+      config: { version: 1 },
+      baseImage: ALPINE_3_23.reference,
       auth,
       install,
       snapshot: async () => ({

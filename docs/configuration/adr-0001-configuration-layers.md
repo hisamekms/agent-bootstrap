@@ -99,14 +99,15 @@ Version 1 allows only these keys:
   Executor and Reviewer. `shell`, Verification and Coordinator cannot
   appear (C8).
 
-Anything that refers to the machine, such as volumes or mounts, cannot
-appear in a declaration.
+The declaration cannot contain volume definitions, mounts, secret sources
+(`secrets`), or actor secret grants (`secretEnv`).
 
 ### C4. Approval and drift
 
 `agent-bootstrap project approve <name>` does the following:
 
-1. Reads and validates the declaration at local `main` (C3).
+1. Reads and validates the declaration at local `main` (C3) and checks
+   the proposed effective configuration against operator grants.
 2. Shows the changed configuration keys and egress destination counts.
    Configuration values stay out of the preview. Egress added for an
    actor that has a mount is highlighted. The operator can inspect the
@@ -114,9 +115,10 @@ appear in a declaration.
 3. Reads the confirmation from `/dev/tty`. The operator types the
    project name. The command fails when stdin or stdout is not a
    terminal. There is no `--yes`.
-4. Writes `approved.json`. It contains the validated value parsed from
-   the blob that was read, together with the commit and blob object IDs.
-   The command never reads the declaration again after confirmation.
+4. Rechecks the operator grants and writes `approved.json`. It contains
+   the validated value parsed from the blob that was read, together with
+   the commit and blob object IDs. The command never reads the
+   declaration again after confirmation.
 
 The drift check compares the blob object ID at local `main` with the
 approved blob object ID.
@@ -143,10 +145,40 @@ Re-approval replaces only `approved.json`. It never touches `local.json`.
 
 ### C5. Local permissions
 
-`local.json` takes every key the user config takes, except volume
-definitions. Volumes are machine-wide and are defined only in the user
-config. `local.json` can refer to them. `agent-bootstrap config edit
-[--project <name>]` opens the right file in `$EDITOR`.
+`local.json` takes every key the user config takes, except volume and
+secret source definitions. These are machine-wide and are defined only in
+the user config. `local.json` can refer to them. `agent-bootstrap config
+edit [--project <name>]` opens the right file in `$EDITOR`.
+
+The user config defines Keychain sources by name.
+
+```json
+{
+  "version": 1,
+  "secrets": {
+    "tool": { "keychainService": "agent-bootstrap.tool" }
+  }
+}
+```
+
+The operator grants a source to actors in the user config or in a project's
+`local.json`.
+
+```json
+{
+  "version": 1,
+  "claude": { "auth": "external" },
+  "secretEnv": {
+    "TOOL_TOKEN": { "secret": "tool", "actors": ["Executor"] }
+  }
+}
+```
+
+The variable name must be a safe credential variable. The adapter reserves
+`ANTHROPIC_API_KEY` for header substitution. Planner, Executor and Reviewer
+can each receive one variable per run on the Claude adapter with the base
+Alpine profile. Each grant requires effective `claude.auth` of `external`.
+Keep the secret value in Keychain.
 
 ### C6. Merging
 
@@ -155,8 +187,8 @@ config. `local.json` can refer to them. `agent-bootstrap config edit
 - **Single values** follow this order: local, then approved, then user.
   Version 1 has these single values: `claude.auth`, `claude.model` and
   `verification`.
-- **Named entries**, such as mounts, are never merged. The same name in
-  two layers is an error.
+- **Named entries**, such as mounts and `secretEnv` grants, are never
+  merged. The same name in two layers is an error.
 - **Negation.** No layer can remove a grant from a lower layer in
   version 1.
 
@@ -196,6 +228,7 @@ Some rules hold whatever any layer says:
 
 - Verification never receives added egress.
 - The mount rules in the volumes ADR also apply.
+- An actor with a secret grant cannot receive a mount or added egress.
 
 These protect agent-bootstrap's own guarantees, such as offline
 verification. They do not encode any one deployment's choices.

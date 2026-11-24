@@ -12,6 +12,7 @@ export interface ProfileLockEntry {
 
 export interface ProfileLock {
   readonly version: 1;
+  readonly base?: string;
   readonly profiles: Readonly<Record<string, ProfileLockEntry>>;
 }
 
@@ -74,8 +75,20 @@ function checkPackages(
 export function parseProfileLock(text: string): ProfileLock {
   const root: unknown = JSON.parse(text);
   if (!isRecord(root)) throw new Error("Profile lock is not an object");
-  exactKeys(root, ["version", "profiles"]);
+  exactKeys(
+    root,
+    Object.hasOwn(root, "base")
+      ? ["version", "profiles", "base"]
+      : ["version", "profiles"],
+  );
   if (root["version"] !== 1) throw new Error("Unsupported profile lock");
+  const base = root["base"];
+  if (
+    Object.hasOwn(root, "base") &&
+    (typeof base !== "string" ||
+      !/^docker\.io\/library\/alpine@sha256:[0-9a-f]{64}$/.test(base))
+  )
+    throw new Error("Bad base image reference");
   const profiles = root["profiles"];
   if (!isRecord(profiles)) throw new Error("Profile lock has no profiles");
   const out: Record<string, ProfileLockEntry> = {};
@@ -115,7 +128,11 @@ export function parseProfileLock(text: string): ProfileLock {
       ...(hasPackages ? { packages: entry["packages"] as string[] } : {}),
     };
   }
-  return { version: 1, profiles: out };
+  return {
+    version: 1,
+    ...(typeof base === "string" ? { base } : {}),
+    profiles: out,
+  };
 }
 
 export function profileCatalog(
@@ -124,7 +141,7 @@ export function profileCatalog(
 ): ProfileCatalog {
   const profiles: Partial<
     Record<ProfileName, { image: string; memoryMiB?: number; cpus?: number }>
-  > = { base: { image: baseImage } };
+  > = { base: { image: lock?.base ?? baseImage } };
   for (const [name, e] of Object.entries(lock?.profiles ?? {}))
     profiles[name as ProfileName] = {
       image: e.image,

@@ -36,12 +36,25 @@ import {
   type SandboxFile,
   type TerminalCommand,
 } from "../sandbox-runtime.ts";
-import type { TrustedHost } from "../trusted-host.ts";
-import { parseClaudeAuthMode, type ClaudeAuthMode } from "./claude-config.ts";
-import { orchestratorMcp } from "./claude-policy.ts";
+import type {
+  ReviewerPlan,
+  TrustedHost,
+  TrustedHostRunOptions,
+  WorkerPlan,
+} from "../trusted-host.ts";
+import type { ExecutionContext } from "../execution-context.ts";
+import type { Config, SecretActor } from "../config/layers.ts";
+import { ConfigError } from "../config/messages.ts";
+import {
+  parseClaudeAuthMode,
+  userStateDirectory,
+  type ClaudeAuthMode,
+} from "./claude-config.ts";
+import { orchestratorMcp, SECRET_EXECUTOR_SHELL } from "./claude-policy.ts";
 import { HostApiServer } from "./host-api.ts";
 import { gitCommit } from "./model.ts";
 import { ActorRunner } from "./runner.ts";
+import { secretVariable, withActorSecret } from "./secret-launch.ts";
 import type { OrchestratorStore } from "./store.ts";
 import { createTaskExecutor, localMainCommit } from "./tasks.ts";
 import type { Verification } from "../reviewed-integration.ts";
@@ -97,6 +110,9 @@ export interface ConciergeDeps {
   ) => Promise<ConciergeSnapshot>;
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
+  readonly config: Config;
+  readonly baseImage: string;
+  readonly note?: (message: string) => void;
   readonly verification?: Verification;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
@@ -427,6 +443,62 @@ export async function startConcierge(
   const { repoRoot } = options;
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
+  const { config, baseImage } = deps;
+  const secretHarness = (actor: SecretActor) => {
+    const variable = secretVariable(config, actor);
+    if (!variable) return;
+    if (auth.mode !== "external")
+      throw new ConfigError(
+        `secretEnv.${variable}`,
+        "Secret grants require claude.auth to be external.",
+        "Select external mode or remove the grant and retry.",
+      );
+    const secretAuth = { mode: "secret-file", variable } as const;
+    return claudeRoleHarness({
+      auth: secretAuth,
+      model: options.model,
+      profile: "base",
+      shell: actor === "Executor" && SECRET_EXECUTOR_SHELL,
+      reportWorkerUsage: actor === "Executor",
+      tools: claudeCodeTools(install, "alpine", secretAuth),
+    });
+  };
+  const planner = secretHarness("Planner");
+  const reviewer = secretHarness("Reviewer") ?? harness;
+  const executor = secretHarness("Executor");
+  function runActor<P extends WorkerPlan | ReviewerPlan, T>(
+    run: (
+      plan: P,
+      id?: string,
+      context?: ExecutionContext,
+      options?: TrustedHostRunOptions,
+    ) => Promise<T>,
+  ) {
+    return async (
+      plan: P,
+      id?: string,
+      context?: ExecutionContext,
+      runOptions?: TrustedHostRunOptions,
+    ): Promise<T> => {
+      const variable = plan.command.claudeSecretVariable;
+      if (!variable) return run(plan, id, context, runOptions);
+      try {
+        return await withActorSecret(
+          config,
+          userStateDirectory(env),
+          variable,
+          baseImage,
+          (secret) => run(plan, id, context, { ...runOptions, ...secret }),
+        );
+      } catch (error) {
+        if (error instanceof ConfigError)
+          deps.note?.(`${error.message}\nnext: ${error.next}`);
+        throw error;
+      }
+    };
+  }
+  const runPlanner = runActor(host.runPlanner.bind(host));
+  const runReviewer = runActor(host.runReviewer.bind(host));
   if (auth.mode === "external" && !deps.scan)
     throw new Error("Credential screening is required");
   if (deps.scan) {
@@ -483,11 +555,23 @@ export async function startConcierge(
             store,
             snapshotCommit: snapshot.commit,
             host: {
-              runWorker: host.runWorker.bind(host),
-              runReviewer: host.runReviewer.bind(host),
+              runWorker: runActor(host.runWorker.bind(host)),
+              runReviewer,
               runVerification: host.runVerification.bind(host),
             },
             worker(profile) {
+              if (executor) {
+                if (profile !== "base") {
+                  const error = new ConfigError(
+                    "secretEnv",
+                    "The Executor's secret grant requires the base profile.",
+                    "Choose the base profile for this task or remove the grant.",
+                  );
+                  deps.note?.(`${error.message}\nnext: ${error.next}`);
+                  throw error;
+                }
+                return executor;
+              }
               const guest = guestOf(profile);
               const workerInstall =
                 guest === "alpine"
@@ -511,7 +595,7 @@ export async function startConcierge(
                 tools: claudeCodeTools(workerInstall, guest),
               });
             },
-            reviewer: harness,
+            reviewer,
             ...(deps.verification ? { verification: deps.verification } : {}),
           })
         : undefined;
@@ -522,10 +606,12 @@ export async function startConcierge(
       ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
       runPlanner: (...args) => {
         if (stopping) throw new Error("Concierge session ended");
-        return host.runPlanner(...args);
+        return runPlanner(...args);
       },
-      runReviewer: (...args) => host.runReviewer(...args),
-      harness,
+      runReviewer,
+      harness: reviewer,
+      ...(planner ? { plannerHarness: planner } : {}),
+      ...(executor ? { executorRequiresBase: true } : {}),
       model: options.model,
       context: async (commit, goalRepository) => {
         if (commit === null || commit === snapshot.commit) return context;

@@ -24,6 +24,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
+import { runSecretTest } from "../local-orchestrator/secret-test.ts";
+import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
   ClaudeConfigError,
   parseClaudeAuthMode,
@@ -175,6 +177,41 @@ export async function runBootstrap(
           `agent-bootstrap — Audited, sandboxed coding agents\n\nagent-bootstrap help <topic>\nTopics: ${Object.keys(helpTopics).join(", ")}\n\nRun agent-bootstrap help --agent for the full manual or agent-bootstrap help --json for the command schema.\nnext: agent-bootstrap help start\n`,
         );
       return 0;
+    }
+
+    if (command === "secrets") {
+      let options: ReturnType<typeof claudeOptions>;
+      try {
+        options = claudeOptions(rest);
+      } catch {
+        return usage();
+      }
+      const { target, override, remaining } = options;
+      const [action, variable, ...extra] = remaining;
+      if (
+        action !== "test" ||
+        !isSafeCredentialVariable(variable) ||
+        override !== undefined ||
+        extra.length
+      )
+        return usage();
+      try {
+        const report = await runSecretTest(root, host, variable, target);
+        print(report);
+        if (!report.pass)
+          hint(
+            "Review the failed checks and run agent-bootstrap help secrets.",
+          );
+        return report.pass ? 0 : 1;
+      } catch (error) {
+        if (error instanceof ConfigError || error instanceof ClaudeConfigError)
+          throw error;
+        return fail(
+          1,
+          "The secret self-test stopped before a complete report was available.",
+          "Check the pinned VM prerequisites and the configured Keychain item, then retry.",
+        );
+      }
     }
 
     if (command === "project") {
@@ -342,9 +379,18 @@ export async function runBootstrap(
     }
 
     if (command === "setup") {
+      const options = (() => {
+        try {
+          return claudeOptions(rest);
+        } catch {
+          return undefined;
+        }
+      })();
       if (
-        rest.length !== new Set(rest).size ||
-        rest.some(
+        !options ||
+        options.override !== undefined ||
+        options.remaining.length !== new Set(options.remaining).size ||
+        options.remaining.some(
           (arg) => !["--allow-network", "--yes", "--profiles"].includes(arg),
         )
       )
@@ -356,7 +402,9 @@ export async function runBootstrap(
         root,
         rest.includes("--profiles"),
         host.env,
-      ).catch(() => {
+        options.target,
+      ).catch((error: unknown) => {
+        if (error instanceof ConfigError) throw error;
         throw new SetupError(
           "The setup plan could not load the required profile lock.",
           "Restore the checked-in lock and matching recipes.",
@@ -383,7 +431,7 @@ export async function runBootstrap(
           );
       }
       if (!allowNetwork) {
-        const next = `Review the plan, then run agent-bootstrap setup --allow-network${rest.includes("--profiles") ? " --profiles" : ""} when authorized.`;
+        const next = `Review the plan, then run agent-bootstrap setup --allow-network${rest.includes("--profiles") ? " --profiles" : ""}${options.target ? " with the same target" : ""} when authorized.`;
         print({ mode: "plan", ...plan, next });
         if (!json) hint(next);
         return 0;

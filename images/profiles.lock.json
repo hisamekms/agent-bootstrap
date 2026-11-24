@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "base": "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd",
   "profiles": {
     "db": {
       "image": "localhost/agent-bootstrap/db@sha256:3b967b44aa4ec181966a57aac94af81dae8205d3eda55ba950391e960ea46748",

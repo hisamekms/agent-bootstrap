@@ -20,7 +20,7 @@ import {
   configRoot,
   declarationBounds,
   layerFix,
-  loadConfig,
+  mergeConfig,
   missing,
   oid,
   parseConfig,
@@ -32,6 +32,7 @@ import {
   projectName,
   projectsRoot,
   readApproved,
+  readLayer,
   readPrivateConfig,
   record,
   syncDirectory,
@@ -452,10 +453,19 @@ export async function approveProject(
   const approveFix = layerFix("approved", {
     path: join(directory, "approved.json"),
   });
-  const current = loadConfig(env, directory);
   // An absent declaration requests removal of every prior grant.
   const next: Config = shown.config ?? { version: 1 };
-  const old = current.approved?.config;
+  const approvedBefore = readApproved(directory, env);
+  const validateApproval = () =>
+    mergeConfig(
+      readLayer("user", undefined, env),
+      next,
+      readLayer("local", directory, env),
+      env,
+      directory,
+    ).config;
+  const proposed = validateApproval();
+  const old = approvedBefore?.config;
   io.write(`Declaration at main (${shown.commit.slice(0, 7)})\n`);
   const { added, removed } = changes(old, next);
   for (const entry of removed) io.write(`- ${entry}\n`);
@@ -468,7 +478,7 @@ export async function approveProject(
         destinations(old)[actor as keyof NonNullable<Config["egress"]>],
         after,
       ).length &&
-      Object.values(current.config.mounts ?? {}).some((mount) =>
+      Object.values(proposed.mounts ?? {}).some((mount) =>
         mount.actors.includes(actor),
       )
     )
@@ -481,13 +491,14 @@ export async function approveProject(
   if (
     requireProject(name, env).identity !== project.identity ||
     escapedJson(readApproved(directory, env) ?? null) !==
-      escapedJson(current.approved ?? null)
+      escapedJson(approvedBefore ?? null)
   )
     invalid(
       "approval",
       "The registration or approved copy changed during review.",
       approveFix,
     );
+  validateApproval();
   const path = join(directory, "approved.json");
   if (shown.blob) {
     const approved: ApprovedConfig = {

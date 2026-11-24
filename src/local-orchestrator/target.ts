@@ -130,6 +130,26 @@ export async function discoverAnalysisTargets(
   }));
 }
 
+/** User configuration can be used before registering the default checkout. */
+export async function resolveConfigTarget(
+  path: string | undefined,
+  checkout: string,
+  env: NodeJS.ProcessEnv,
+) {
+  if (path !== undefined) return resolveTarget(path, checkout, env);
+  const projects = listProjects(env);
+  if (!projects.length) return;
+  let identity: string;
+  try {
+    ({ identity } = repository(checkout));
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+    return;
+  }
+  if (projects.some((project) => project.identity === identity))
+    return resolveTarget(undefined, checkout, env);
+}
+
 export async function checkDirectory(path: string): Promise<void> {
   checkAncestors(path);
 }

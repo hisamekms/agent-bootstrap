@@ -189,6 +189,10 @@ export interface SandboxSpec {
   /** The host assigns and validates paths for Claude runs. */
   readonly claude?: true;
   readonly claudeManagedSettings?: string;
+  /** Expected digest of the staged managed policy for a secret run. */
+  readonly claudeManagedSettingsDigest?: string;
+  /** Trusted host's one-shot Unix socket, exposed to this guest via vsock. */
+  readonly claudeSecretSocket?: string;
   readonly mounts?: readonly SandboxMount[];
   readonly maxLifetimeMs?: number;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
@@ -224,6 +228,8 @@ export interface SandboxCommand {
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly claudeShell?: true;
+  readonly claudeSecretVariable?: string;
+  readonly secretFileProbe?: true;
 }
 
 export interface ExecResult {

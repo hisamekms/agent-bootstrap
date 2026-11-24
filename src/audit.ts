@@ -14,7 +14,10 @@ import {
   type ExecutionContext,
   parseExecutionContext,
 } from "./execution-context.ts";
-import { isConciergeVolumeName } from "./sandbox-runtime.ts";
+import {
+  isConciergeVolumeName,
+  isSafeCredentialVariable,
+} from "./sandbox-runtime.ts";
 import { PROFILE_NAMES, type ProfileName } from "./sandbox-profiles.ts";
 
 interface AuditMount {
@@ -39,6 +42,16 @@ function auditMounts(value: unknown): AuditMount[] {
   });
 }
 
+export const SECRET_LEAK_SINKS = [
+  "guest-output",
+  "result-envelope",
+  "journal-error",
+  "runtime-event",
+  "network-audit",
+  "collection",
+] as const;
+export type SecretLeakSink = (typeof SECRET_LEAK_SINKS)[number];
+
 type AuditDetail =
   | {
       readonly socketPath: string;
@@ -51,12 +64,23 @@ type AuditDetail =
   | { readonly plainHosts: readonly string[] }
   | { readonly mounts: readonly AuditMount[] }
   | {
-      readonly authMode: "api-key" | "external";
+      readonly authMode: "api-key" | "external" | "secret-file";
       readonly settingsDigest: string;
       readonly managedPath: typeof CLAUDE_MANAGED_PATH;
       readonly mounts?: readonly AuditMount[];
     }
-  | { readonly code: ClaudeFailureCode };
+  | { readonly code: ClaudeFailureCode }
+  | { readonly event: "secret.served"; readonly variable: string }
+  | {
+      readonly event: "secret.delivery";
+      readonly variable: string;
+      readonly delivery: "acknowledged" | "unknown";
+    }
+  | {
+      readonly event: "secret-leak-suspected";
+      readonly variable: string;
+      readonly sink: SecretLeakSink;
+    };
 
 export type AuditInput = {
   readonly invocationId: string;
@@ -718,6 +742,35 @@ function parseAuditDetail(
     role === "Worker" ||
     role === "Planner" ||
     role === "Reviewer";
+  if (
+    present &&
+    (role === "Worker" || role === "Reviewer" || role === "Planner") &&
+    kind === "operation.requested" &&
+    operation === "sandbox.exec"
+  ) {
+    const { event, variable, delivery, sink } = dataFields(value, [
+      "event",
+      "variable",
+      "delivery",
+      "sink",
+    ]);
+    if (!isSafeCredentialVariable(variable)) return invalidEvent();
+    if (
+      event === "secret.served" &&
+      delivery === undefined &&
+      sink === undefined
+    )
+      return { event, variable };
+    if (
+      event === "secret.delivery" &&
+      (delivery === "acknowledged" || delivery === "unknown") &&
+      sink === undefined
+    )
+      return { event, variable, delivery };
+    if (event === "secret-leak-suspected" && delivery === undefined)
+      return { event, variable, sink: enumField(sink, SECRET_LEAK_SINKS) };
+    return invalidEvent();
+  }
   if (present && claudeRole && kind === "invocation.started") {
     if (
       stored &&
@@ -755,7 +808,9 @@ function parseAuditDetail(
       ["authMode", "settingsDigest", "managedPath", "mounts"],
     );
     if (
-      (authMode !== "api-key" && authMode !== "external") ||
+      (authMode !== "api-key" &&
+        authMode !== "external" &&
+        authMode !== "secret-file") ||
       typeof settingsDigest !== "string" ||
       !/^[a-f0-9]{64}$/.test(settingsDigest) ||
       managedPath !== CLAUDE_MANAGED_PATH

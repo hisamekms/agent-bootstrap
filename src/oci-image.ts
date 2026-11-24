@@ -145,6 +145,7 @@ function normalizePath(raw: string): string {
 function parseTar(
   tar: Uint8Array,
   maxBytes: number = MAX_INPUT_BYTES,
+  workspace = false,
 ): TarEntry[] {
   if (tar.length > maxBytes) fail("tar: input too large");
   const entries: TarEntry[] = [];
@@ -154,7 +155,11 @@ function parseTar(
   let pax: Map<string, string> | undefined;
   while (pos + BLOCK <= tar.length) {
     const header = tar.subarray(pos, pos + BLOCK);
-    if (isZeroBlock(header)) break;
+    if (isZeroBlock(header)) {
+      if (workspace && tar.subarray(pos).some((byte) => byte !== 0))
+        fail("tar: data after workspace archive");
+      break;
+    }
     if (parseNumber(header, 148, 8) !== checksumOf(header)) {
       fail("tar: bad header checksum");
     }
@@ -162,6 +167,8 @@ function parseTar(
     const flag = header[156] === 0 ? "0" : String.fromCharCode(header[156]!);
     const paxSize = pax?.get("size");
     if (paxSize !== undefined && flag !== "x" && flag !== "g") {
+      if (workspace && strictInt(paxSize) !== size)
+        fail("tar: ambiguous workspace entry size");
       size = strictInt(paxSize);
     }
     const start = pos + BLOCK;
@@ -182,7 +189,8 @@ function parseTar(
       continue;
     }
     if (flag === "g") {
-      parsePax(data); // validated, otherwise ignored
+      if (parsePax(data).size && workspace)
+        fail("tar: global workspace metadata");
       continue;
     }
 
@@ -194,9 +202,11 @@ function parseTar(
     let name = dec.decode(cstr(header, 0, 100));
     const prefix = dec.decode(cstr(header, 345, 155));
     if (prefix !== "") name = `${prefix}/${name}`;
-    let linkname = dec.decode(cstr(header, 157, 100));
+    const headerLink = dec.decode(cstr(header, 157, 100));
+    if (workspace && (name.startsWith("/") || headerLink.startsWith("/")))
+      fail("tar: absolute workspace entry name");
     name = pax?.get("path") ?? longName ?? name;
-    linkname = pax?.get("linkpath") ?? longLink ?? linkname;
+    const linkname = pax?.get("linkpath") ?? longLink ?? headerLink;
     const uid = pax?.has("uid")
       ? strictInt(pax.get("uid"))
       : parseNumber(header, 108, 8);
@@ -205,6 +215,10 @@ function parseTar(
       : parseNumber(header, 116, 8);
     longName = longLink = pax = undefined;
 
+    if (workspace && (name.startsWith("/") || linkname.startsWith("/")))
+      fail("tar: absolute workspace entry name");
+    if (workspace && headerLink && headerLink !== linkname)
+      fail("tar: ambiguous workspace link target");
     const path = normalizePath(name);
     if (path === "") {
       // Root directory entry: not representable, dropped.
@@ -353,8 +367,9 @@ function byPath(a: TarEntry, b: TarEntry): number {
 function validateTar(
   tar: Uint8Array,
   maxBytes: number,
+  workspace = false,
 ): { entries: TarEntry[]; byName: Map<string, TarEntry> } {
-  const entries = parseTar(tar, maxBytes);
+  const entries = parseTar(tar, maxBytes, workspace);
   const byName = new Map<string, TarEntry>();
   for (const e of entries) {
     if (byName.has(e.path)) fail("tar: duplicate path");
@@ -376,7 +391,8 @@ function validateTar(
   for (const e of entries) {
     const parts = e.path.split("/");
     for (let i = 1; i < parts.length; i++) {
-      if (byName.get(parts.slice(0, i).join("/"))?.type !== "5") {
+      const ancestor = byName.get(parts.slice(0, i).join("/"));
+      if (ancestor?.type !== "5" && (!workspace || ancestor)) {
         fail("tar: entry parent is not a directory entry");
       }
     }
@@ -406,15 +422,16 @@ const VIEW_TYPES = {
 /**
  * Strictly read a tar: the same validation as normalizeLayer (ancestors must
  * be explicit directories, hardlink targets must be regular files, no
- * duplicates, no "..", size and entry caps). Returns frozen entry views in
- * archive order.
+ * duplicates, no "..", size and entry caps). Workspace archives can omit
+ * directory records. Returns frozen entry views in archive order.
  */
 export function readTar(
   tar: Uint8Array,
   maxBytes: number = MAX_INPUT_BYTES,
+  workspace = false,
 ): readonly TarEntryView[] {
   return Object.freeze(
-    validateTar(tar, maxBytes).entries.map((e) =>
+    validateTar(tar, maxBytes, workspace).entries.map((e) =>
       Object.freeze({
         path: e.path,
         type: VIEW_TYPES[e.type],

@@ -28,6 +28,7 @@ import {
 import { listProjects } from "./projects.ts";
 import { localActorHarnesses, type LocalActorHarnesses } from "../actors.ts";
 import { CLAUDE_MOUNT_ENV } from "../claude-code.ts";
+import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
   CLAUDE_ACTORS,
   validClaudeHostname,
@@ -64,6 +65,15 @@ export interface MountDeclaration {
   mode?: "ro" | "rw";
   env?: string;
 }
+export interface SecretDefinition {
+  readonly keychainService: string;
+}
+const secretActors = ["Planner", "Executor", "Reviewer"] as const;
+export type SecretActor = (typeof secretActors)[number];
+export interface SecretEnvGrant {
+  readonly secret: string;
+  readonly actors: readonly SecretActor[];
+}
 export interface Config {
   version: 1;
   verification?: VerificationConfig;
@@ -72,6 +82,8 @@ export interface Config {
   egress?: Partial<Record<EgressActor, readonly string[]>>;
   mounts?: Record<string, MountDeclaration>;
   volumes?: Record<string, VolumeDefinition>;
+  secrets?: Record<string, SecretDefinition>;
+  secretEnv?: Record<string, SecretEnvGrant>;
 }
 
 export interface ApprovedConfig {
@@ -446,10 +458,10 @@ export function parseConfig(
 ): Config {
   const key = "$";
   const keys = ["version", "verification", "profiles", "egress"];
-  if (layer !== "approved") keys.push("claude", "mounts");
-  if (layer === "user") keys.push("volumes");
+  if (layer !== "approved") keys.push("claude", "mounts", "secretEnv");
+  if (layer === "user") keys.push("volumes", "secrets");
   const raw = record(value, key, next);
-  for (const field of ["claude", "mounts", "volumes"])
+  for (const field of ["claude", "mounts", "volumes", "secrets", "secretEnv"])
     if (Object.hasOwn(raw, field) && !keys.includes(field))
       invalid(field, "This key is disallowed in this layer.", next);
   record(raw, key, next, keys);
@@ -646,6 +658,53 @@ export function parseConfig(
       }
     }
   }
+  if ("secrets" in raw) {
+    for (const [name, value] of Object.entries(
+      record(raw.secrets, "secrets", next),
+    )) {
+      if (!projectName.test(name))
+        invalid("secrets", "Expected a valid entry name.", next);
+      const path = `secrets.${name}`;
+      const entry = record(value, path, next, ["keychainService"]);
+      if (!validService(entry.keychainService))
+        invalid(
+          `${path}.keychainService`,
+          "Expected a valid Keychain service name.",
+          next,
+        );
+    }
+  }
+  if ("secretEnv" in raw) {
+    for (const [variable, value] of Object.entries(
+      record(raw.secretEnv, "secretEnv", next),
+    )) {
+      if (!isSafeCredentialVariable(variable))
+        invalid("secretEnv", "Expected a safe credential variable name.", next);
+      const path = `secretEnv.${variable}`;
+      if (variable === "ANTHROPIC_API_KEY")
+        invalid(
+          path,
+          "The adapter reserves this variable for header substitution.",
+          next,
+        );
+      const entry = record(value, path, next, ["secret", "actors"]);
+      if (typeof entry.secret !== "string" || !projectName.test(entry.secret))
+        invalid(`${path}.secret`, "Expected a valid secret source name.", next);
+      if (
+        !Array.isArray(entry.actors) ||
+        !entry.actors.length ||
+        new Set(entry.actors).size !== entry.actors.length ||
+        !entry.actors.every((actor) =>
+          secretActors.some((name) => name === actor),
+        )
+      )
+        invalid(
+          `${path}.actors`,
+          "Expected a nonempty list of distinct Planner, Executor or Reviewer actors.",
+          next,
+        );
+    }
+  }
   return raw as unknown as Config;
 }
 
@@ -730,7 +789,7 @@ export function mergeConfig(
         origins.push(layer);
       }
     }
-    for (const key of ["mounts", "volumes"] as const) {
+    for (const key of ["mounts", "volumes", "secrets", "secretEnv"] as const) {
       for (const [name, entry] of Object.entries(current[key] ?? {})) {
         const path = `${key}.${name}`;
         if (Object.hasOwn(sources, path))
@@ -833,7 +892,85 @@ export function mergeConfig(
         );
     }
   }
+  validateSecretGrants(config, sources, harnesses, env, directory);
   return { config, sources };
+}
+
+function validateSecretGrants(
+  config: Config,
+  sources: Record<string, Layer | Layer[]>,
+  harnesses: LocalActorHarnesses,
+  env: NodeJS.ProcessEnv,
+  directory?: string,
+) {
+  const grantedActors = new Set<SecretActor>();
+  const mountedActors = new Set(
+    Object.values(config.mounts ?? {}).flatMap((mount) => mount.actors),
+  );
+  for (const [variable, grant] of Object.entries(config.secretEnv ?? {})) {
+    const path = `secretEnv.${variable}`;
+    const fix = layerFile(sources[path] as Layer, env, directory);
+    if (!Object.hasOwn(config.secrets ?? {}, grant.secret))
+      invalid(`${path}.secret`, "The referenced secret source is undefined.", {
+        ...fix,
+        next: "Use agent-bootstrap config edit to define the source in the user configuration, or correct the grant.",
+      });
+    if (config.claude?.auth !== "external") {
+      const authFix = layerFile(
+        (sources["claude.auth"] ?? sources[path]) as Layer,
+        env,
+        directory,
+      );
+      invalid(
+        "claude.auth",
+        "Secret grants require claude.auth set to external.",
+        {
+          ...authFix,
+          next: `Set claude.auth to external or remove the grant. ${authFix.next}`,
+        },
+      );
+    }
+    for (const actor of grant.actors) {
+      const actorPath = `${path}.actors`;
+      if (grantedActors.has(actor))
+        invalid(
+          actorPath,
+          `${actor} can receive one secret variable per run.`,
+          fix,
+        );
+      if (harnesses[actor] !== "claude")
+        invalid(
+          actorPath,
+          `${actor} must use the Claude adapter for secret grants.`,
+          fix,
+        );
+      const role = actor === "Executor" ? "Worker" : actor;
+      const profile = config.profiles?.[role] ?? "base";
+      if (profile !== "base") {
+        const profilePath = `profiles.${role}`;
+        invalid(
+          profilePath,
+          `${actor} requires the base Alpine profile for secret grants.`,
+          layerFile(sources[profilePath] as Layer, env, directory),
+        );
+      }
+      if (mountedActors.has(actor))
+        invalid(
+          actorPath,
+          `${actor} has a mount and cannot receive a secret grant.`,
+          fix,
+        );
+      if (config.egress?.[actor]?.length) {
+        const egressPath = `egress.${actor}`;
+        invalid(
+          egressPath,
+          `${actor} cannot receive added egress with a secret grant.`,
+          layerFile((sources[egressPath] as Layer[])[0]!, env, directory),
+        );
+      }
+      grantedActors.add(actor);
+    }
+  }
 }
 
 export function conflictingClaims(

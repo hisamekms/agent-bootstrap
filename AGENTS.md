@@ -22,6 +22,7 @@
 - `src/contracts.ts` owns agent contracts. `src/sandbox-runtime.ts` owns the
   provider-neutral sandbox port, `src/microsandbox.ts` owns the first adapter,
   and `src/credentials.ts` defines the trusted-host credential boundary.
+  `src/secret-file.ts` owns one-shot secret delivery and screening.
   `src/model-coordinator.ts` owns the provider-neutral Coordinator model port,
   and `src/codex-app-server.ts` owns its first adapter.
   `src/task-trace.ts` joins one task's journal with the host audit.

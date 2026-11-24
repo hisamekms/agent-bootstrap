@@ -74,6 +74,16 @@ A project can request verification, profiles, and egress in
 the diff. Doctor shows the effective settings and their sources. Use
 `agent-bootstrap config edit --project <name>` for operator overrides.
 
+For a secret grant, configure the source and actor grants, then run the
+self-test before starting a task with the grant. Choose the `base` profile
+for an Executor with a grant. See the
+[secret configuration](configuration/adr-0001-configuration-layers.md#c5-local-permissions).
+
+```sh
+agent-bootstrap secrets test TOOL_TOKEN --target "$target"
+agent-bootstrap doctor --target "$target"
+```
+
 ## 2. Create Goals and run Tasks
 
 Use the root of a local SHA-1 Git worktree with a current local `main`. You

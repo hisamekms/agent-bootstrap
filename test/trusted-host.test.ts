@@ -39,6 +39,10 @@ import {
   type TrustedHostOptions,
 } from "../src/trusted-host.ts";
 import { fakeGateway } from "./fake-gateway.ts";
+import {
+  createSecretScreen,
+  type SecretFileDelivery,
+} from "../src/secret-file.ts";
 
 const profiles = new ProfileCatalog({
   base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
@@ -1155,6 +1159,323 @@ function observedFixture(
       return binding;
     },
   };
+}
+
+function secretRunFixture(t: { after(fn: () => void): void }) {
+  const settings = fixture(t) + ".settings";
+  writeFileSync(settings, "{}");
+  const value = Buffer.from("fixture-secret-abcdefghijklmnopqrstuvwxyz");
+  const screen = createSecretScreen(value);
+  const history: string[] = [];
+  let delivery: Parameters<SecretFileDelivery["authorize"]>[0] | undefined;
+  let acknowledged = false;
+  const channel: SecretFileDelivery = {
+    variable: "TOOL_TOKEN",
+    hostPath: "/fixture/socket",
+    auditFailed: false,
+    get acknowledged() {
+      return acknowledged;
+    },
+    matches: screen.matches,
+    clearScreen: screen.close,
+    authorize(audit) {
+      delivery = audit;
+      history.push("armed");
+    },
+    async close() {
+      history.push("closed");
+    },
+  };
+  return {
+    channel,
+    value,
+    fragment: value.subarray(17, 33),
+    history,
+    async deliver() {
+      assert.ok(delivery);
+      await delivery.beforeSend();
+      history.push("delivered");
+      await delivery.afterSend("acknowledged");
+      acknowledged = true;
+    },
+    plan: {
+      sandbox: { claude: true as const },
+      command: { ...plan.command, claudeSecretVariable: channel.variable },
+      collectPaths: ["fixture.txt"],
+    },
+    policy: {
+      auth: "secret-file" as const,
+      managedSettings: () => settings,
+      note() {},
+    },
+  };
+}
+
+test("secret host refuses delivery without a current pass and limits the bypass to a probe", async (t) => {
+  const secret = secretRunFixture(t);
+  const observed = observedFixture(t, {}, undefined, { claude: secret.policy });
+  for (const secretTest of [undefined, "running"] as const)
+    await assert.rejects(
+      observed.host.runWorker(secret.plan, undefined, undefined, {
+        secretFile: secret.channel,
+        ...(secretTest ? { secretTest } : {}),
+      }),
+      /current secret self-test pass/,
+    );
+  assert.deepEqual(observed.calls, []);
+  assert.ok(!secret.history.includes("armed"));
+
+  const probe = {
+    ...secret.plan,
+    command: { ...secret.plan.command, secretFileProbe: true as const },
+  };
+  await assert.rejects(
+    observed.host.runWorker(probe, undefined, undefined, {
+      secretFile: secret.channel,
+      secretTest: "passed",
+    }),
+    /current secret self-test pass/,
+  );
+  await observed.host.runWorker(probe, undefined, undefined, {
+    secretFile: secret.channel,
+    secretTest: "running",
+  });
+  assert.ok(secret.history.includes("armed"));
+});
+
+test("secret host audits delivery and closes the channel before collection, with egress limited to the model endpoint", async (t) => {
+  const secret = secretRunFixture(t);
+  const id = randomUUID();
+  const observed = observedFixture(
+    t,
+    {
+      async exec() {
+        await secret.deliver();
+        const records = observed.db
+          .readExecution(id)
+          .auditEvents.flatMap(({ detail }) =>
+            detail && "event" in detail ? [detail.event] : [],
+          );
+        assert.deepEqual(records, ["secret.served", "secret.delivery"]);
+        return {
+          status: "exited",
+          exitCode: 0,
+          stdout: Buffer.from('{"tool":"collect"}'),
+          stderr: Buffer.from("fixture stderr"),
+        };
+      },
+      async collect() {
+        assert.deepEqual(secret.history, ["armed", "delivered", "closed"]);
+        secret.history.push("collected");
+        return { files: [] };
+      },
+    },
+    undefined,
+    {
+      claude: { ...secret.policy, auth: "external" },
+    },
+  );
+  const run = await observed.host.runWorker(secret.plan, id, undefined, {
+    secretFile: secret.channel,
+    secretTest: "passed",
+    onWorkerStderr() {
+      secret.history.push("published");
+    },
+  });
+  assert.equal(run.outcome, "ok");
+  assert.deepEqual(observed.fake.opened?.policy.allow, [
+    { hostname: "api.anthropic.com", port: 443 },
+  ]);
+  assert.deepEqual(secret.history, [
+    "armed",
+    "delivered",
+    "closed",
+    "collected",
+    "published",
+    "closed",
+  ]);
+});
+
+test("secret host rejects added egress before arming", async (t) => {
+  const secret = secretRunFixture(t);
+  const observed = observedFixture(t, {}, undefined, {
+    claude: {
+      ...secret.policy,
+      egress: { Executor: ["extra.example:443"] },
+    },
+  });
+  await assert.rejects(
+    observed.host.runWorker(secret.plan, undefined, undefined, {
+      secretFile: secret.channel,
+      secretTest: "passed",
+    }),
+    /cannot use added egress/,
+  );
+  assert.deepEqual(observed.calls, []);
+  assert.deepEqual(secret.history, ["closed"]);
+});
+
+test("secret host rejects mount grants before arming", async (t) => {
+  const secret = secretRunFixture(t);
+  const observed = observedFixture(t, {}, undefined, {
+    claude: {
+      ...secret.policy,
+      mounts: { fixture: { ...plannerMount, actors: ["Executor"] } },
+    },
+  });
+  await assert.rejects(
+    observed.host.runWorker(secret.plan, undefined, undefined, {
+      secretFile: secret.channel,
+      secretTest: "passed",
+    }),
+    /Invalid audited secret-file run/,
+  );
+  assert.deepEqual(observed.calls, []);
+  assert.deepEqual(secret.history, ["closed"]);
+});
+
+test("secret host refuses success when delivery was never acknowledged", async (t) => {
+  const secret = secretRunFixture(t);
+  const observed = observedFixture(t, {}, undefined, { claude: secret.policy });
+  const run = await observed.host.runWorker(secret.plan, undefined, undefined, {
+    secretFile: secret.channel,
+    secretTest: "passed",
+  });
+  assert.equal(run.outcome, "failed");
+  assert.equal(run.artifacts, undefined);
+  assert.ok(!observed.calls.includes("collect"));
+});
+
+test("secret host screens guest network metadata before the gateway audit stores it", async (t) => {
+  const secret = secretRunFixture(t);
+  const id = randomUUID();
+  const observed = observedFixture(
+    t,
+    {
+      async exec() {
+        await secret.deliver();
+        const opened = observed.fake.opened!;
+        await assert.rejects(async () =>
+          opened.audit.appendDnsQuery({
+            invocationId: id,
+            sandboxId: opened.sandboxLabel,
+            queryId: randomUUID(),
+            protocol: "udp",
+            qname: secret.fragment.toString() + ".example",
+            qtype: 1,
+            decision: "deny",
+            policyId: opened.policy.policyId,
+            reasonCode: "dns-not-allowlisted",
+            answerIps: [],
+          }),
+        );
+        return {
+          status: "exited",
+          exitCode: 0,
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.alloc(0),
+        };
+      },
+    },
+    undefined,
+    { claude: secret.policy },
+  );
+  const run = await observed.host.runWorker(secret.plan, id, undefined, {
+    secretFile: secret.channel,
+    secretTest: "passed",
+  });
+  assert.equal(run.code, "credential-leak");
+  const execution = observed.db.readExecution(id);
+  assert.equal(execution.networkEvents.length, 0);
+  assert.ok(
+    execution.auditEvents.some(
+      ({ detail }) =>
+        detail &&
+        "event" in detail &&
+        detail.event === "secret-leak-suspected" &&
+        detail.sink === "network-audit",
+    ),
+  );
+});
+
+for (const sink of [
+  "guest-output",
+  "result-envelope",
+  "journal-error",
+  "collection",
+] as const) {
+  test(
+    "secret host discards matching " +
+      sink +
+      " and records only the variable and sink",
+    async (t) => {
+      const secret = secretRunFixture(t);
+      const observed = observedFixture(
+        t,
+        {
+          async exec() {
+            await secret.deliver();
+            if (sink === "journal-error")
+              throw new Error(secret.fragment.toString());
+            const envelope =
+              '\nagent-bootstrap-claude-result {"result":"' +
+              Array.from(
+                secret.fragment,
+                (byte) => "\\u00" + byte.toString(16).padStart(2, "0"),
+              ).join("") +
+              '"}';
+            return {
+              status: "exited",
+              exitCode: 0,
+              stdout: Buffer.from('{"tool":"collect"}'),
+              stderr:
+                sink === "guest-output"
+                  ? secret.fragment
+                  : Buffer.from(
+                      sink === "result-envelope" ? envelope : "safe stderr",
+                    ),
+            };
+          },
+          async collect() {
+            assert.equal(sink, "collection");
+            return { files: [{ path: "fixture.txt", bytes: secret.fragment }] };
+          },
+        },
+        undefined,
+        { claude: secret.policy },
+      );
+      let published = false;
+      const run = await observed.host.runWorker(
+        secret.plan,
+        undefined,
+        undefined,
+        {
+          secretFile: secret.channel,
+          secretTest: "passed",
+          onWorkerStderr() {
+            published = true;
+          },
+        },
+      );
+      assert.equal(published, false);
+      assert.deepEqual(
+        { outcome: run.outcome, code: run.code, artifacts: run.artifacts },
+        { outcome: "failed", code: "credential-leak", artifacts: undefined },
+      );
+      const evidence = observed.db.readExecution(run.id).auditEvents;
+      assert.ok(
+        evidence.some(
+          ({ detail }) =>
+            detail &&
+            "event" in detail &&
+            detail.event === "secret-leak-suspected" &&
+            detail.variable === secret.channel.variable &&
+            detail.sink === sink,
+        ),
+      );
+      assert.ok(!JSON.stringify(evidence).includes(secret.fragment.toString()));
+    },
+  );
 }
 
 test("required host durably binds the actual sandbox before create and audits the result", async (t) => {

@@ -49,6 +49,7 @@ import { resolveTarget } from "../src/local-orchestrator/target.ts";
 import { runBootstrap, type BootstrapIo } from "../src/onboarding/cli.ts";
 import { systemHost } from "../src/onboarding/prerequisites.ts";
 import { isConciergeVolumeName } from "../src/sandbox-runtime.ts";
+import { localActorHarnesses } from "../src/actors.ts";
 import { configEnv, fixtureGit, initConfigRepo } from "./config-fixture.ts";
 
 function fixture(t: { after(cleanup: () => void): void }) {
@@ -405,6 +406,227 @@ test("C5/C6/C8: merge sources, union grants and enforce actor and layer constrai
       parseConfig({ version: 1, profiles: { Reviewer: "bun" } }, "approved"),
     /profiles.Reviewer/,
   );
+});
+
+const secretEnv = { TOOL_TOKEN: { secret: "tool", actors: ["Executor"] } };
+const secrets = { tool: { keychainService: "agent-bootstrap.tool" } };
+
+test("secret sources and grants accept only operator layers, safe names and supported actors", (t) => {
+  const { repo, env } = fixture(t);
+  const project = addProject(repo, undefined, env);
+  for (const [key, value] of Object.entries({ secrets, secretEnv })) {
+    commitDeclaration(repo, JSON.stringify({ version: 1, [key]: value }));
+    assert.throws(() => readDeclaration(project), new RegExp(key));
+  }
+  assert.throws(
+    () => parseConfig({ version: 1, secrets }, "local"),
+    /secrets.*disallowed/,
+  );
+  assert.throws(
+    () =>
+      parseConfig(
+        { version: 1, secrets: { tool: { keychainService: "private value" } } },
+        "user",
+      ),
+    (error: ConfigError) => {
+      assert.match(error.message, /secrets\.tool\.keychainService/);
+      assert.doesNotMatch(error.message, /private value/);
+      return true;
+    },
+  );
+  for (const [variable, reason] of [
+    ["PATH", /safe credential variable/],
+    ["GIT_CONFIG_KEY", /safe credential variable/],
+    ["ANTHROPIC_API_KEY", /header substitution/],
+  ] as const)
+    assert.throws(
+      () =>
+        parseConfig(
+          { version: 1, secretEnv: { [variable]: secretEnv.TOOL_TOKEN } },
+          "user",
+        ),
+      reason,
+    );
+  for (const actors of [
+    [],
+    ["Planner", "Planner"],
+    ["Concierge"],
+    ["Researcher"],
+    ["Verification"],
+    ["Coordinator"],
+    ["Worker"],
+  ])
+    assert.throws(
+      () =>
+        parseConfig(
+          { version: 1, secretEnv: { TOOL_TOKEN: { secret: "tool", actors } } },
+          "user",
+        ),
+      /secretEnv\.TOOL_TOKEN\.actors.*distinct/,
+    );
+});
+
+test("effective secret grants check names, sources, adapter, profile, auth, mounts and egress", (t) => {
+  const { repo, env } = fixture(t);
+  const { name } = addProject(repo, undefined, env);
+  const directory = projectConfigDirectory(name, env);
+  const user = {
+    version: 1,
+    secrets,
+    claude: { auth: "external" },
+    volumes: {
+      tools: {
+        image: "/volume.sparseimage",
+        keychainService: "volume-service",
+        attach: "while-running",
+      },
+    },
+    secretEnv: { PLAN_TOKEN: { secret: "tool", actors: ["Planner"] } },
+  };
+  writePrivateConfig(userConfigPath(env), configRoot(env), user);
+  const localPath = join(directory, "local.json");
+  const local = (settings: object) =>
+    writePrivateConfig(localPath, configRoot(env), { version: 1, ...settings });
+  local({
+    secretEnv,
+    mounts: {
+      tools: {
+        volume: "tools",
+        dir: "tool",
+        path: "/mnt/tool",
+        actors: ["Reviewer"],
+      },
+    },
+    egress: { Reviewer: ["fixture.example:443"], Executor: [] },
+  });
+  const merged = loadConfig(env, directory);
+  assert.deepEqual(merged.config.secrets, secrets);
+  assert.deepEqual(merged.config.secretEnv, {
+    ...user.secretEnv,
+    ...secretEnv,
+  });
+  assert.equal(merged.sources["secrets.tool"], "user");
+  assert.equal(merged.sources["secretEnv.PLAN_TOKEN"], "user");
+  assert.equal(merged.sources["secretEnv.TOOL_TOKEN"], "local");
+  assert.throws(
+    () =>
+      loadConfig(env, directory, { ...localActorHarnesses, Executor: "codex" }),
+    /secretEnv\.TOOL_TOKEN\.actors.*Claude adapter/,
+  );
+  for (const [settings, expected] of [
+    [{ claude: { auth: "api-key" } }, /require claude.auth set to external/],
+    [{ profiles: { Worker: "browser" } }, /profiles\.Worker.*base Alpine/],
+    [{ profiles: { Worker: "db" } }, /profiles\.Worker.*base Alpine/],
+    [
+      {
+        mounts: {
+          tools: {
+            volume: "tools",
+            dir: "tool",
+            path: "/mnt/tool",
+            actors: ["Executor"],
+          },
+        },
+      },
+      /Executor has a mount/,
+    ],
+    [
+      { egress: { Executor: ["fixture.example:443"] } },
+      /egress\.Executor.*added egress/,
+    ],
+    [
+      {
+        secretEnv: { TOOL_TOKEN: { secret: "missing", actors: ["Executor"] } },
+      },
+      /secretEnv\.TOOL_TOKEN\.secret.*undefined/,
+    ],
+    [
+      { secretEnv: { PLAN_TOKEN: secretEnv.TOOL_TOKEN } },
+      /secretEnv\.PLAN_TOKEN.*more than one layer/,
+    ],
+    [
+      { secretEnv: { TOOL_TOKEN: { secret: "tool", actors: ["Planner"] } } },
+      /Planner can receive one secret variable/,
+    ],
+  ] as const) {
+    local({ secretEnv, ...settings });
+    assert.throws(() => loadConfig(env, directory), expected);
+  }
+  writePrivateConfig(userConfigPath(env), configRoot(env), {
+    version: 1,
+    secrets,
+  });
+  local({ secretEnv });
+  assert.throws(
+    () => loadConfig(env, directory),
+    /require claude.auth set to external/,
+  );
+  local({ secretEnv, claude: { auth: "external" } });
+  assert.deepEqual(loadConfig(env, directory).config.secretEnv, secretEnv);
+});
+
+test("approval rejects conflicting egress before saving and can remove an existing conflict", async (t) => {
+  const { repo, env } = fixture(t);
+  const { name } = addProject(repo, undefined, env);
+  const directory = projectConfigDirectory(name, env);
+  writePrivateConfig(userConfigPath(env), configRoot(env), {
+    version: 1,
+    secrets,
+  });
+  const addGrant = () =>
+    writePrivateConfig(join(directory, "local.json"), configRoot(env), {
+      version: 1,
+      claude: { auth: "external" },
+      secretEnv,
+    });
+  commitDeclaration(
+    repo,
+    JSON.stringify({
+      version: 1,
+      egress: { Executor: ["fixture.example:443"] },
+    }),
+  );
+  await assert.rejects(
+    approveProject(name, env, {
+      isTTY: true,
+      write() {},
+      async confirm() {
+        addGrant();
+        return name;
+      },
+    }),
+    /egress\.Executor.*added egress/,
+  );
+  assert.equal(loadConfig(env, directory).approved, undefined);
+  await assert.rejects(
+    approveProject(name, env, {
+      isTTY: true,
+      write() {
+        assert.fail("incompatible approval should fail before preview");
+      },
+      async confirm() {
+        return name;
+      },
+    }),
+    /egress\.Executor.*added egress/,
+  );
+  assert.equal(loadConfig(env, directory).approved, undefined);
+
+  rmSync(join(directory, "local.json"));
+  const approval = {
+    isTTY: true,
+    write() {},
+    confirm: async () => name,
+  };
+  await approveProject(name, env, approval);
+  addGrant();
+  assert.throws(
+    () => loadConfig(env, directory),
+    /egress\.Executor.*added egress/,
+  );
+  commitDeclaration(repo, JSON.stringify({ version: 1 }));
+  await approveProject(name, env, approval);
+  assert.deepEqual(loadConfig(env, directory).config.secretEnv, secretEnv);
 });
 
 test("exclusive config creation publishes a private file with one link and preserves it on EEXIST", (t) => {
