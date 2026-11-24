@@ -58,9 +58,12 @@ The capture runner is fixed product code. Each capture batch runs in a
 **new** Verification VM with the `browser` profile, without network,
 mounts or model. A batch is either one push target (base or candidate),
 an Executor pre-run (U7), or one pull call (U5). A batch never mixes
-base and candidate. The VM is destroyed after the batch. The PoC measured
-a VM boot of 0.36 s, so a fresh VM costs little and leaves no application
-state behind.
+base and candidate. The VM is destroyed after the batch, so no
+application state carries over. The cost is measurable: the PoC took
+0.36 s to boot and 3.3 s from boot to the first capture. A review with
+two push batches and six pull calls therefore spends about 25 s or more
+on batch start-up. The host runs at most one capture VM at a time per
+Task, and limits capture VMs host-wide. Extra batches wait in a queue.
 
 Inside the VM:
 
@@ -70,6 +73,9 @@ Inside the VM:
   declaration sets. That user cannot signal or trace the runner or the
   browser, and cannot reach the runner's output directory or its
   channel to the host.
+- The runner and the browser run as a second unprivileged user, never as
+  root. Chromium runs with its own sandbox enabled, so a renderer exploit
+  does not land in the runner directly.
 - The runner starts the application, waits until it is ready, and
   replays **steps**. Steps are data, never code:
   - `goto` with a path that starts with `/`
@@ -100,21 +106,41 @@ Evidence scenes assert nothing. A scene fails only when it cannot be
 captured, so evidence scenes add no tests to maintain. Behavioural
 end-to-end tests stay an ordinary project decision.
 
-This ADR amends configuration-layers C3. The project declaration gains a
-top-level key, `evidence`, so v1 declarations may hold `verification`,
-`profiles`, `egress` and `evidence`. `verification` keeps only `profile`
-and `argv`. Evidence requires a `verification.profile` of `browser`.
-Under C6, `evidence` merges as a single value: a project's `local.json`
-replaces the approved value as a whole. Approval follows C4.
+This ADR amends three sections of the configuration-layers ADR:
+
+- **C3.** The project declaration gains a top-level key, `evidence`.
+  v1 declarations may hold `verification`, `profiles`, `egress` and
+  `evidence`. `verification` keeps only `profile` and `argv`.
+- **C5.** A project's `local.json` may also hold `evidence`. The user
+  config may not.
+- **C6.** `evidence` joins the single values. A project's `local.json`
+  replaces the approved value as a whole.
+
+Validation runs on the merged result. When `evidence` is set, the merged
+`verification.profile` must be `browser`, so a local override cannot
+leave evidence on a profile without a browser. Approval and drift follow
+C4: a changed `evidence` in the declaration is not used until it is
+approved, and until then the approved value stays in effect.
+
+`evidence.app.env` holds only names that match `^[A-Z][A-Z0-9_]{0,63}$`.
+It may not hold `PATH`, `HOME`, `NODE_OPTIONS`, `NODE_PATH`, or names that
+start with `LD_` or `DYLD_`. Values are bounded in length, screened for
+credentials, and may not hold absolute host paths.
+
+Route captures are named `route-<slug>-<viewport>`. The slug is the path
+lowercased, with each run of characters outside `[a-z0-9]` replaced by
+`-` and the ends trimmed. `/` becomes `root`. Two routes with the same
+slug are a validation error. `triggers` name either a declared scene or a
+route capture by this name.
 
 ```json
 "evidence": {
   "app": { "argv": ["node", "server.mjs"], "port": 4173, "readyPath": "/", "env": {} },
   "routes": ["/", "/members"],
   "viewports": ["desktop", "mobile"],
-  "triggers": [{ "paths": ["src/ui/**"], "scenes": ["route:/members"] }],
+  "triggers": [{ "paths": ["src/ui/**"], "scenes": ["route-members-mobile"] }],
   "scenes": { "edit-dialog": [{ "goto": "/" }, { "click": { "role": "button", "name": "Edit" } }, { "screenshot": { "viewport": "desktop" } }] },
-  "limits": { "images": 20 }
+  "limits": { "triggers": 6, "planner": 4, "executor": 4, "pull": 6, "images": 20 }
 }
 ```
 
@@ -129,12 +155,15 @@ The scenes captured for a candidate are the union of the following
 sources. Each source has its own quota, so one source cannot use up
 another's:
 
-| Source                                 | Quota                                                              |
-| -------------------------------------- | ------------------------------------------------------------------ |
-| `triggers` (derived by the host)       | Reserved. Exceeding it fails the run as a configuration error      |
-| Planner (from the acceptance criteria) | Reserved. Exceeding it fails planning                              |
-| Executor proposals                     | Separate. Extra proposals are refused and reported to the Executor |
-| Reviewer pulls (U5)                    | The pull budget                                                    |
+| Source                                 | Quota                                                                       |
+| -------------------------------------- | --------------------------------------------------------------------------- |
+| `triggers` (derived by the host)       | `limits.triggers`. Exceeding it fails the run as a configuration error      |
+| Planner (from the acceptance criteria) | `limits.planner`. Exceeding it fails planning                               |
+| Executor proposals                     | `limits.executor`. Extra proposals are refused and reported to the Executor |
+| Reviewer pulls (U5)                    | `limits.pull` calls and the pull time budget                                |
+
+`limits.images` caps the images of one push target. Every quota has a
+host maximum, and the declaration can only lower it.
 
 Every entry must name a declared scene or route, or carry steps that pass
 validation. No source can lower another's quota or remove its scenes.
@@ -177,7 +206,9 @@ auth mode supports pull, including the default API-key mode.
   The result labels the pairs as untrusted page data.
 - **Screening.** The host runs the credential screening used for Reviewer
   output over every request and every result, including `fill` values
-  and hints. A match fails the call with a code and stores nothing.
+  and hints. Requests are screened before `evidence.authorized` is
+  written, and a match starts no VM. Results are screened before they are
+  stored, and a match stores nothing. Both fail the call with a code.
   `fill` values are bounded in length, recorded in the audit, and can
   reappear in images.
 - **Budget.** A review has a maximum number of calls and a maximum total
@@ -208,10 +239,13 @@ sees the same evidence as the model.
 ### U7. Short feedback loops
 
 - **Executor pre-run.** The Executor can ask the host, through a host
-  service, to capture its working tree. The host runs the batch in a
-  Verification VM, as for pull, and returns the images and result codes.
+  service, to capture its working tree. The host collects the working
+  tree with the existing workspace collection and checks it as it checks
+  a candidate. The host computes the tree id, then runs the batch in a
+  Verification VM, as for pull. Requests and results get the U5 screening
+  and the U6 audit order. The host returns the images and result codes.
   These images are not evidence, and they never reach the Reviewer.
-  Pre-runs have their own budget.
+  Pre-runs have their own budget and share the capture VM queue.
 - **Capture failures go back directly.** When a push batch cannot capture
   a scene, the host returns the scene, the step index and the result code
   to the Executor without running a Reviewer.
@@ -220,7 +254,9 @@ sees the same evidence as the model.
 - **Cache.** Fresh batches make captures reusable. A capture is keyed by
   tree id, steps digest, viewport, runner digest, image digest and the
   digest of the `evidence.app` declaration. Base captures are reused
-  across revisions.
+  across revisions. Only push and pull captures enter this cache. Pre-run
+  images are stored apart and are never reused as evidence, even for the
+  same tree.
 
 ### U8. Answers cite evidence
 
