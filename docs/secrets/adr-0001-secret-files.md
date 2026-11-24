@@ -114,6 +114,10 @@ vsock.
   arming it, whichever is first. It zeroes its buffer on close. Zeroing
   is best effort in a garbage-collected runtime.
 - The value is at most 4 KiB and contains no NUL byte.
+- The frame is the length as 8 ASCII digits, then the value. The guest
+  reads exactly that many bytes and answers with one byte, `A`. Only
+  then does either side close. The vsock relay does not carry a
+  half-close, so the protocol never depends on one.
 - Every host process running as the operator's user is inside the trust
   boundary. The socket's mode keeps out other users only.
 
@@ -158,7 +162,10 @@ command it runs must be contained. For Claude this means:
   - `sandbox.network.allowManagedDomainsOnly` with no allowed domains, so
     sandboxed commands have no network
   - `sandbox.filesystem.denyRead` for `/run/secrets`, `/etc/claude-code`,
-    and the tool's configuration, home and temporary directories
+    and the tool's configuration and home directories
+  - `sandbox.filesystem.allowWrite` for the tool's temporary directory.
+    The CLI passes state to sandboxed commands through it, so sandboxed
+    commands can read and write it. Nothing secret is placed there.
 - **Subprocess scrub.** The launcher sets
   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`. Subprocesses lose the variables
   that S2 proved. On Linux, Bash runs in its own PID namespace, so it
@@ -267,8 +274,9 @@ accepted.
    its uid and whether its environment holds the variable. It then
    writes a hostile `core.fsmonitor`, pager and hooks into `.git/config`.
    Nothing runs.
-5. **Tool directories.** Bash and the file tools cannot read the tool's
-   configuration, home or temporary directories.
+5. **Tool directories.** Bash cannot read the tool's configuration or
+   home directory. The file tools cannot read any of the three tool
+   directories.
 6. **Vsock.** After delivery, a connection from Bash to the secret port
    is refused. So is a connection to the orchestrator port.
 7. **Core files.** A crash of the CLI writes no core file.
@@ -308,10 +316,11 @@ accepted.
 
 ## Evidence
 
-PoC on branch `poc/secret-file`, 2026-11-24: one Worker on the pinned
-CLI 2.1.330 in the Alpine base guest, with Bash, egress only to the model
-API host through the audited gateway. It covers check 1 and part of 9 in
-S10.
+### PoC 1, 2026-11-24
+
+One Worker on the pinned CLI 2.1.330 in the Alpine base guest, with
+Bash, and egress only to the model API host through the audited gateway.
+It covers check 1 and part of check 9 in S10.
 
 | Measure                               | Result                                                                   |
 | ------------------------------------- | ------------------------------------------------------------------------ |
@@ -320,20 +329,50 @@ S10.
 | Destinations contacted                | Model API host only                                                      |
 | Bash user                             | uid 1000                                                                 |
 | Variable visible to Bash              | No                                                                       |
-| `/proc` entries visible to Bash       | 5, none with the variable in `environ`                                   |
+| `/proc` entries visible to Bash       | 5                                                                        |
 | `/run/secrets` from Bash              | Empty                                                                    |
 | Managed settings readable from Bash   | No                                                                       |
 | Value or 16-char prefix in any output | No (stdout, stderr, result, files, audit SQLite and JSONL, gateway logs) |
 | Wall time, one Worker                 | About 24 s                                                               |
 | Two Workers at once                   | Both passed, about 17 s each                                             |
 
-The PoC wrote the delivery audit event after the run. S3 requires it
-before the first byte.
-
 The model refused to run a probe that dumped environments and secret
 files, even when the prompt explained the test. The PoC therefore used a
 self-test script that prints only yes/no answers and counts. Model
 refusal is not counted as a control.
 
-Sample size: 2 single runs and 1 concurrent run, after the probe was
-fixed. Checks 2 to 8 in S10 were not run.
+PoC 1 also reported no `environ` with the variable. That probe used
+`grep -z`, which the guest's BusyBox does not support, so the result
+carried no information. PoC 2 replaced it.
+
+### PoC 2, 2026-11-24
+
+The same setup with S3 to S7 applied, a root-side process observer, and
+the file-tool probes. File-tool results come from the CLI's
+`permission_denials`, not from the model's answer.
+
+| S10 check               | Worker                                                                                                                                    | Reviewer              |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| 1. Scrub                | Variable not in Bash env. 5 `/proc` entries, none with the variable                                                                       | n/a (no Bash)         |
+| 2. Symlinks, file tools | Read, Grep and Glob through links to `/proc/self`, `/proc/1`, `/run/secrets` and `/proc`: all denied                                      | Same, all denied      |
+| 3. Repository symlinks  | Absolute and escaping links fail before any VM is created                                                                                 | Same check            |
+| 4. Helpers              | Only the CLI process (uid 1000) holds the variable. git ran as uid 1000 without it. Hostile hooks did not run. `.git/config` not writable | Only the CLI holds it |
+| 5. Tool directories     | Bash: configuration and home unreadable. File tools: denied                                                                               | File tools: denied    |
+| 6. Vsock                | Secret and orchestrator ports: no connection from Bash                                                                                    | n/a                   |
+| 7. Core files           | `ulimit -c` 0 (soft and hard). A crash as uid 1000 left no core file                                                                      | Same                  |
+| 8. Network              | Bash: no TCP to the model host or a public IP, no DNS                                                                                     | n/a                   |
+| 9. Concurrency          | Two Workers at once: both passed every check, about 31 s and 38 s                                                                         | —                     |
+| Delivery                | Audited before the first byte, then acknowledged                                                                                          | Same                  |
+| Screening               | No match of the value or any 16-byte window in any sink                                                                                   | Same                  |
+
+PoC 2 found two problems that shaped S3 and S5:
+
+- The vsock relay closes the whole connection when the host half-closes.
+  The first framing lost the guest's acknowledgement. S3 now uses a
+  length-prefixed frame.
+- The CLI writes state for sandboxed commands in its temporary
+  directory. With that directory denied, every Bash command failed. S5
+  now lets sandboxed commands write it.
+
+Sample size: 3 Worker runs, 1 Reviewer run and 1 concurrent run with all
+checks passing, after the fixes above.
