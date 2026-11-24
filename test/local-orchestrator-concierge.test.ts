@@ -1,3 +1,6 @@
+import { addProject } from "../src/config/projects.ts";
+import { resolveTarget } from "../src/local-orchestrator/target.ts";
+import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -22,7 +25,6 @@ import {
 import {
   conciergeCommand,
   conciergeContext,
-  conciergeVolumeName,
   parseConciergeMode,
   snapshotConciergeRepo,
   startConcierge,
@@ -44,7 +46,11 @@ const install = {
 const model = "claude-model.1";
 
 async function fixture<T>(
-  run: (root: string, store: OrchestratorStore) => Promise<T>,
+  run: (
+    root: string,
+    store: OrchestratorStore,
+    target: Awaited<ReturnType<typeof resolveTarget>>,
+  ) => Promise<T>,
 ) {
   // macOS keeps the socket path short under /private/tmp; Linux CI has /tmp.
   const root = await mkdtemp(
@@ -53,7 +59,10 @@ async function fixture<T>(
   try {
     const store = OrchestratorStore.open(join(root, "state.db"));
     try {
-      return await run(root, store);
+      const repo = initConfigRepo(join(root, "repo"));
+      const env = configEnv(root);
+      addProject(repo, undefined, env);
+      return await run(repo, store, await resolveTarget(repo, repo, env));
     } finally {
       store.close();
     }
@@ -81,7 +90,7 @@ for (const failure of [undefined, ...failures]) {
       ? `Concierge cleans up after ${failure} failure`
       : "Concierge starts and cleans up in order with an exact interactive plan",
     async () => {
-      await fixture(async (repoRoot, store) => {
+      await fixture(async (repoRoot, store, target) => {
         const log: string[] = [];
         const step = (name: string) => {
           log.push(name);
@@ -148,7 +157,7 @@ for (const failure of [undefined, ...failures]) {
           },
           host: {
             async prepareConciergeVolume(name) {
-              assert.equal(name, conciergeVolumeName(repoRoot));
+              assert.equal(name, target.volume);
               step("volume");
               return { reused: true };
             },
@@ -164,7 +173,7 @@ for (const failure of [undefined, ...failures]) {
                   maxLifetimeMs: 28_800_000,
                   interactive: {
                     vsock: { hostPath: join(socketDir!, "h.sock"), port: 5000 },
-                    stateVolume: conciergeVolumeName(repoRoot),
+                    stateVolume: target.volume,
                     snapshotDir,
                   },
                 },
@@ -188,6 +197,7 @@ for (const failure of [undefined, ...failures]) {
         };
         const started = startConcierge(deps, {
           repoRoot,
+          target,
           model,
           onSession(id) {
             sessionId = id;
@@ -251,7 +261,7 @@ for (const failure of [undefined, ...failures]) {
 }
 
 test("Concierge drains a single active Planner and cancels queued work on exit", async () => {
-  await fixture(async (repoRoot, store) => {
+  await fixture(async (repoRoot, store, target) => {
     let requester: ExecutionRequester;
     let firstId: string;
     let secondId: string;
@@ -317,7 +327,7 @@ test("Concierge drains a single active Planner and cancels queued work on exit",
           },
         },
       },
-      { repoRoot, model, mode: "plan" },
+      { repoRoot, target, model, mode: "plan" },
     );
     assert.equal(result.outcome, "failed");
     assert.equal(result.exitCode, 17);
@@ -327,7 +337,7 @@ test("Concierge drains a single active Planner and cancels queued work on exit",
 });
 
 test("Concierge refuses further Planner work after a failed execution audit write", async () => {
-  await fixture(async (repoRoot, store) => {
+  await fixture(async (repoRoot, store, target) => {
     let api: Parameters<NonNullable<ConciergeDeps["listen"]>>[0];
     let plannerCalls = 0;
     const failed = Promise.withResolvers<void>();
@@ -383,7 +393,7 @@ test("Concierge refuses further Planner work after a failed execution audit writ
       },
     };
     await assert.rejects(
-      startConcierge(deps, { repoRoot, model }),
+      startConcierge(deps, { repoRoot, target, model }),
       /concierge-drain-failed/,
     );
     assert.equal(plannerCalls, 0);
@@ -430,19 +440,10 @@ test("Concierge guest command admits only validated options and uses a fixed rel
       variable: "NAME;touch",
     } as ClaudeCodeAuth),
   );
-  assert.equal(
-    conciergeVolumeName("/repo/./one"),
-    conciergeVolumeName("/repo/one"),
-  );
-  assert.notEqual(
-    conciergeVolumeName("/repo/one"),
-    conciergeVolumeName("/repo/two"),
-  );
-  assert.match(conciergeVolumeName("/repo/one"), /^lo-concierge-[0-9a-f]{16}$/);
 });
 
 test("snapshot uses committed local main, skips .local, and keeps directories private", async () => {
-  await fixture(async (repoRoot) => {
+  await fixture(async (repoRoot, _store, projectTarget) => {
     const git = (...args: string[]) =>
       execFileSync("/usr/bin/git", args, {
         cwd: repoRoot,
@@ -508,7 +509,13 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
     await writeFile(join(repoRoot, "AGENTS.md"), "worktree version");
     await writeFile(join(repoRoot, "untracked.txt"), "untracked");
 
-    const snapshot = await snapshotConciergeRepo(repoRoot, randomUUID());
+    const snapshot = await snapshotConciergeRepo(
+      repoRoot,
+      randomUUID(),
+      undefined,
+      false,
+      projectTarget,
+    );
     assert.equal(
       await readFile(join(snapshot.dir, "AGENTS.md"), "utf8"),
       "committed",
@@ -546,6 +553,8 @@ test("snapshot uses committed local main, skips .local, and keeps directories pr
           repoRoot,
           randomUUID(),
           git("rev-parse", "HEAD").trim(),
+          false,
+          projectTarget,
         ),
         {
           code: "unsafe-input-symlink",

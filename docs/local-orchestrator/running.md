@@ -30,14 +30,16 @@ Update local `main` before starting a session, for example after merging
 PRs. The launcher pins local `main` for the Concierge snapshot and new
 Goal planning, regardless of the branch checked out at launch.
 
-From the repository root, preview the launch with the first command. The
-second command starts an audited session with egress to
+Register the bootstrap checkout once. From the repository root, preview
+the launch with the direct launcher command. The linked command starts an
+audited session with egress to
 `api.anthropic.com:443` and `platform.claude.com:443`. The platform host
 supports Claude Code's startup connectivity check. The gateway relays its
 traffic without API key substitution. This is the default API-key policy.
 Repository context and conversation content can reach the provider.
 
 ```sh
+agent-bootstrap project add .
 bun run spike/local-orchestrator/concierge.ts
 agent-bootstrap concierge
 ```
@@ -66,8 +68,8 @@ also accepts `--mode acceptEdits` and `--mode plan`.
 
 Run the launcher and operator CLI from agent-bootstrap. Use the same
 leading `--target` for operator commands to select the target's state.
-The target must be a local SHA-1 Git worktree root outside `.local/` with
-a local `main` commit. Relative paths resolve from the operator's current
+The target must be a registered local SHA-1 Git worktree root with a
+local `main` commit. Relative paths resolve from the operator's current
 working directory. The launcher pins the target's local `main` for the
 Concierge snapshot and seeds new Goals from that commit. Planner context
 includes the target's `AGENTS.md`, `README.md`, and tracked file listing.
@@ -76,18 +78,15 @@ docs.
 
 ```sh
 target="$HOME/ghq/github.com/hisamekms/dagq-lite"
+agent-bootstrap project add "$target"
 agent-bootstrap concierge --target "$target"
 agent-bootstrap --target "$target" status
 ```
 
-Each external target uses
-`.local/local-orchestrator/targets/<slug>/` in agent-bootstrap for
-`state.db`, `audit.sqlite`, `repository.git`, `integrations/`,
-`worktrees/`, `snapshots/`, and runtime observability files. The slug
-uses the target's basename and an abbreviated SHA-256 hash of its
-canonical path. Its conversation volume is `lo-concierge-<slug>`.
-The agent-bootstrap target keeps its existing paths directly in
-`.local/local-orchestrator/` and its existing conversation volume name.
+Each project uses `${XDG_STATE_HOME:-~/.local/state}/agent-bootstrap/projects/<name>/`
+for `state.db`, `audit.sqlite`, Git integration and observability data.
+Its conversation volume is `lo-concierge-<name>`. Register the bootstrap
+checkout with `agent-bootstrap project add .` to use it as the default target.
 
 ### Configure verification for the target
 
@@ -102,7 +101,8 @@ agent-bootstrap --target "$target" verification clear
 
 `set` and `clear` require a host terminal and the exact confirmation phrase
 shown in the prompt. The CLI records changes in the target's state database
-and stores the verification configuration in its private `config.json`.
+and stores the verification configuration in its private `local.json`. Clearing the local value reveals any approved
+or user verification command.
 The optional `claude` section shares that file. `show` prints
 `null` when verification is unset. The launcher reads the configuration at
 startup. Keep it in place until existing integration proposals are

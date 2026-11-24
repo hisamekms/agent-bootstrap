@@ -1,3 +1,5 @@
+import { addProject } from "../src/config/projects.ts";
+import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -107,15 +109,23 @@ test("exports a non-WAL backup without accepting it as a writable audit", async 
       throw new Error("unexpected analysis prompt");
     },
   };
+  const env = configEnv(root);
+  const repo = initConfigRepo(join(root, "repo"));
+  addProject(repo, undefined, env);
   assert.equal(
-    await runCli(["analyze", "--audit", snapshot, "--out", out], io, root),
+    await runCli(["analyze", "--audit", snapshot, "--out", out], io, repo, env),
     0,
     stderr,
   );
   const target = fs.readdirSync(out).find((name) => name !== "load.sql")!;
   assert.equal(lines(join(out, target, "audit"))[0]?.executionId, invocationId);
   assert.equal(
-    await runCli(["--all-targets", "analyze", "--audit", snapshot], io, root),
+    await runCli(
+      ["--all-targets", "analyze", "--audit", snapshot],
+      io,
+      repo,
+      env,
+    ),
     2,
   );
   assert.throws(

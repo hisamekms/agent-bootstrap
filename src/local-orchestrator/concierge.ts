@@ -3,7 +3,7 @@ import {
   type CredentialScanner,
 } from "./credential-scan.ts";
 import { execFile, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
@@ -53,7 +53,7 @@ import type { Verification } from "../reviewed-integration.ts";
 import {
   checkDirectory,
   prepareTargetDirectory,
-  type resolveTarget,
+  resolveTarget,
 } from "./target.ts";
 
 /** macOS limits Unix socket paths to 104 bytes; /private/tmp keeps the Host API
@@ -121,14 +121,6 @@ export interface ConciergeOptions {
 export function parseConciergeMode(value: unknown): PermissionMode {
   for (const mode of modes) if (value === mode) return mode;
   throw new Error("Concierge mode must be default, acceptEdits, plan, or auto");
-}
-
-export function conciergeVolumeName(repoRoot: string): string {
-  const slug = createHash("sha256")
-    .update(resolve(repoRoot))
-    .digest("hex")
-    .slice(0, 16);
-  return `lo-concierge-${slug}`;
 }
 
 export function conciergeCommand(
@@ -213,9 +205,11 @@ export async function snapshotConciergeRepo(
   target?: ConciergeOptions["target"],
 ): Promise<ConciergeSnapshot> {
   if (!/^[a-f0-9-]{36}$/.test(sessionId)) throw new Error("Invalid session ID");
+  target ??= await resolveTarget(repoRoot, repoRoot);
   const root = await prepareTargetDirectory(
-    target?.bootstrapRoot ?? resolve(repoRoot),
-    target?.directory,
+    target.bootstrapRoot,
+    target.directory,
+    target.env,
   );
   const parent = join(root, "snapshots");
   await mkdir(parent, { recursive: true, mode: 0o700 });
@@ -449,13 +443,13 @@ export async function startConcierge(
     tools,
     profile: "base",
   });
-  const { repoRoot, target } = options;
-  const bootstrapRoot = target?.bootstrapRoot ?? resolve(repoRoot);
-  const stateVolume = target?.volume ?? conciergeVolumeName(repoRoot);
+  const { repoRoot } = options;
+  const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
+  const { bootstrapRoot, volume: stateVolume, env } = target;
   if (auth.mode === "config-dir") {
     if (!deps.scan) throw new Error("Credential screening is required");
     requireCredentialScan(
-      await prepareTargetDirectory(bootstrapRoot, target?.directory),
+      await prepareTargetDirectory(bootstrapRoot, target.directory, env),
     );
   }
 
@@ -499,7 +493,8 @@ export async function startConcierge(
         ? createTaskExecutor({
             directory: await prepareTargetDirectory(
               bootstrapRoot,
-              target?.directory,
+              target.directory,
+              env,
             ),
             repoRoot,
             ...(scan ? { scan } : {}),

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import {
   loadClaudeConfig,
-  readPrivateConfig,
+  readLegacyPrivateFile,
   userStateDirectory,
   type ClaudeDirectoryConfig,
   type ClaudeAuthMode,
@@ -104,7 +104,7 @@ const markerName = "credential-screen.json";
 
 function targetRequiresScan(directory: string | undefined): boolean {
   if (!directory) return false;
-  const marker = readPrivateConfig(join(directory, markerName), 1024, true);
+  const marker = readLegacyPrivateFile(join(directory, markerName), 1024, true);
   if (marker && typeof marker === "object" && !Array.isArray(marker)) {
     const entries = Object.entries(marker);
     if (!entries.length) return false;
@@ -138,8 +138,11 @@ export function configuredCredentialScanner(
   note: (message: string) => void,
   env = process.env,
   override?: ClaudeAuthMode,
+  configurationDirectory?: string,
+  effective?: ReturnType<typeof loadClaudeConfig>,
 ): CredentialScanner | undefined {
-  const config = loadClaudeConfig(env, directory, override);
+  const config =
+    effective ?? loadClaudeConfig(env, configurationDirectory, override);
   if (config.configDir || targetRequiresScan(directory))
     return createCredentialScanner(
       config.configDir ?? config,

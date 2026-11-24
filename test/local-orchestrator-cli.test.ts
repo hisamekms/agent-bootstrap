@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import {
   contentDigest,
 } from "../src/local-orchestrator/model.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
+import { configEnv } from "./config-fixture.ts";
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   Database: new (filename: string) => {
@@ -54,7 +55,7 @@ let filename: string;
 let store: OrchestratorStore;
 
 beforeEach(() => {
-  folder = mkdtempSync(join(tmpdir(), "local-orchestrator-cli-"));
+  folder = mkdtempSync(join(realpathSync(tmpdir()), "local-orchestrator-cli-"));
   filename = join(folder, "state.db");
   store = OrchestratorStore.open(filename);
 });
@@ -77,16 +78,21 @@ async function cli(
   let stdout = "";
   let stderr = "";
   const questions: string[] = [];
-  const code = await runCli(["--db", filename, ...args], {
-    stdin: process.stdin,
-    stdout: { write: (text) => (stdout += text) },
-    stderr: { write: (text) => (stderr += text) },
-    isTTY,
-    prompt(question) {
-      questions.push(question);
-      return answer?.(question, stdout);
+  const code = await runCli(
+    ["--db", filename, ...args],
+    {
+      stdin: process.stdin,
+      stdout: { write: (text) => (stdout += text) },
+      stderr: { write: (text) => (stderr += text) },
+      isTTY,
+      prompt(question) {
+        questions.push(question);
+        return answer?.(question, stdout);
+      },
     },
-  });
+    folder,
+    configEnv(folder),
+  );
   return { code, stdout, stderr, questions };
 }
 

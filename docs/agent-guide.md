@@ -49,9 +49,7 @@ mise --no-config --no-env --no-hooks install microsandbox@0.7.16
 agent-bootstrap setup --json
 agent-bootstrap setup --allow-network
 agent-bootstrap setup --allow-network --profiles
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"
-mkdir -p "$config_dir"
-(umask 077; set -C; printf '%s\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")
+agent-bootstrap config edit
 security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 ```
 
@@ -185,9 +183,10 @@ Use SQL and export destinations authorized by the operator.
 Select a repository and configure a pinned candidate verification command.
 
 **Prerequisites**  
-A SHA-1 Git worktree root with local main, outside .local, and a locked, installed verification profile.
+A registered SHA-1 Git worktree root with local main and a locked, installed verification profile.
 
 ```sh
+agent-bootstrap project add /path/to/project
 agent-bootstrap doctor --target /path/to/project
 agent-bootstrap --target /path/to/project verification set --profile bun -- bun test
 agent-bootstrap --target /path/to/project verification show --json
@@ -196,13 +195,41 @@ agent-bootstrap --target /path/to/project update-goal-base "$goal_id"
 ```
 
 **Expected output**  
-Verification show returns its configuration or null. Set and clear require confirmation. Base updates require an eligible, untouched Goal and preview both commits.
+Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Base updates require an eligible, untouched Goal and preview both commits.
 
 **Next action**  
 Launch with the same target. Keep verification configured until its integration proposals are resolved.
 
 **Human involvement**  
 The operator confirms verification changes and eligible base updates from a host TTY. The operator updates local main, pushes branches, and opens pull requests.
+
+## configuration
+
+Register projects, review repository requests, and edit operator settings.
+
+**Prerequisites**  
+A Git worktree root and an operator terminal for project approval.
+
+```sh
+agent-bootstrap project add /path/to/project --name dagq-lite
+agent-bootstrap project list
+agent-bootstrap project show dagq-lite
+agent-bootstrap project approve dagq-lite
+agent-bootstrap config edit --project dagq-lite
+agent-bootstrap doctor --target /path/to/project
+agent-bootstrap project move dagq-lite /path/to/project
+agent-bootstrap project remove dagq-lite
+agent-bootstrap migrate
+```
+
+**Expected output**  
+Doctor shows effective settings and their sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.
+
+**Next action**  
+Use config edit for user settings. For legacy external targets, pass the original worktree paths to migrate.
+
+**Human involvement**  
+Read the approval diff and type the project name to accept the full declaration at local main.
 
 ## troubleshoot
 
@@ -296,10 +323,13 @@ The operator signs in from the Claude Code CLI.
 ## Command reference
 
 - `agent-bootstrap help [topic] [--json] | help --agent` → { topics, commands, exitCodes }
-- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman }. Exit 3 also returns the array. The next action goes to stderr.
+- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman } with effective settings and sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap setup [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
 - `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
 - `agent-bootstrap sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]` → A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.
+- `agent-bootstrap project add <path> [--name <name>] | project list | project show <name> | project move <name> <path> | project remove <name> | project approve <name>` → Project record, list of records, or a confirmation object.
+- `agent-bootstrap config edit [--project <name>]` → { edited: true } after the editor exits and file validation succeeds.
+- `agent-bootstrap migrate [<original-target-path>...]` → { projects, orphanedVolumes } with migrated project names and legacy Concierge volume names left for operator review.
 - `agent-bootstrap credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]` → { mounted, active, stale } for status or { status } after a completed action.
 - `agent-bootstrap login --group <name> [--target <path>] [--claude-auth <mode>] [--json]` → { status } after a successful interactive session. Transcript goes to stderr in JSON mode.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }

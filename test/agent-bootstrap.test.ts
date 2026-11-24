@@ -1,3 +1,5 @@
+import { addProject } from "../src/config/projects.ts";
+import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -63,6 +65,7 @@ function fakeHost(root: string) {
     arch: "arm64",
     bun: "1.4.4",
     env: {
+      ...configEnv(temporary.includes(root) ? root : "/nonexistent"),
       MSB_HOME: root,
       USER: "operator",
       LO_CLAUDE_KEYCHAIN: "claude-test",
@@ -140,6 +143,7 @@ const topics = [
   "audit",
   "performance",
   "targets",
+  "configuration",
   "troubleshoot",
   "safety",
   "credentials",
@@ -161,6 +165,9 @@ describe("agent-bootstrap", () => {
       "setup",
       "concierge",
       "sandbox",
+      "project",
+      "config",
+      "migrate",
       "credentials",
       "login",
       "status",
@@ -221,6 +228,7 @@ describe("agent-bootstrap", () => {
       cwd: root,
       env: {
         PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+        ...configEnv(root),
         LO_CLAUDE_BINARY: join(root, "absent-claude"),
       },
     });
@@ -274,13 +282,15 @@ describe("agent-bootstrap", () => {
   test("doctor exposes every check status and probes Keychain metadata only", async () => {
     const root = await fixture();
     const { host, calls, images } = fakeHost(root);
+    const target = initConfigRepo(join(root, "target"));
+    addProject(target, undefined, host.env);
     host.bun = "1.2.0";
     host.env.MSB_HOME = "/tmp";
     // /tmp resolves within the limit on macOS and Linux, unlike mkdtemp under macOS TMPDIR.
     const lock = JSON.parse(await readFile(join(root, lockFile), "utf8"));
     images.set(lock.profiles.bun.image, "sha256:" + "f".repeat(64));
     const result = await invoke(
-      ["doctor", "--target", root, "--json"],
+      ["doctor", "--target", target, "--json"],
       root,
       host,
     );
@@ -299,7 +309,8 @@ describe("agent-bootstrap", () => {
       microsandbox: "ok",
       "msb-home": "ok",
       dependencies: "ok",
-      target: "wrong",
+      target: "ok",
+      "effective-configuration": "ok",
       verification: "skipped",
       "artifact:.local/claude-code/2.1.330/linux-arm64-musl/claude": "missing",
       "image:base": "ok",
@@ -313,14 +324,10 @@ describe("agent-bootstrap", () => {
       duckdb: "ok",
     });
     for (const check of checks)
-      assert.deepEqual(Object.keys(check), [
-        "id",
-        "status",
-        "detail",
-        "fix",
-        "needsNetwork",
-        "needsHuman",
-      ]);
+      assert.deepEqual(
+        Object.keys(check).filter((key) => key !== "effective"),
+        ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
+      );
     assert.equal(result.stderr, "next: mise install bun@1.4.4\n");
     const security = calls.filter(({ file }) => file === "/usr/bin/security");
     assert.deepEqual(

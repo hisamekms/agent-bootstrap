@@ -33,20 +33,29 @@ Debian snapshot recipe over HTTP with signed, hash-pinned release metadata.
 An explicitly authorized operator agent can use
 `--allow-network --yes`.
 
-API-key mode is the default. Create the private configuration file and
-provision the API key from an operator terminal.
+API-key mode is the default. Run `agent-bootstrap config edit` with
+`EDITOR` set and enter the following settings.
+
+```json
+{
+  "version": 1,
+  "claude": { "apiKey": { "keychainService": "agent-bootstrap-claude" } }
+}
+```
+
+Provision the API key in Keychain and register the target from an operator
+terminal.
 
 ```sh
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"
-mkdir -p "$config_dir"
-(umask 077; set -C; printf '%s\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")
 security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 target=/path/to/project
+agent-bootstrap project add "$target"
 agent-bootstrap doctor --target "$target"
 ```
 
-Enter your Anthropic API key at the Keychain prompt. If the file already
-exists, edit it in place and keep mode `0600`. The linked command ignores the
+Enter your API key at the Keychain prompt. Keep existing configuration files
+at mode `0600` and add `"version": 1` if upgrading from an unversioned
+user config. The linked command ignores the
 current directory's `.env`. For persistent Claude Code configuration
 directories per actor group, kept on an encrypted volume and signed in
 with the CLI's own `/login`, see [Claude Code authentication](claude-code-auth.md).
@@ -55,10 +64,22 @@ without reading the password. When required checks pass, doctor exits 0.
 Exit 3 means a required check needs attention. DuckDB is optional and uses
 `mise --no-config --no-env --no-hooks install duckdb@1.5.6`.
 
+Worktrees share their project's name and state. When moving a registered
+repository, run `agent-bootstrap project move <name> <path>`. If the
+previous installation has legacy state, run `agent-bootstrap migrate` with
+the original paths of any external targets before launching. Stop any
+active runs and release active leases first.
+
+A project can request verification, profiles, and egress in
+`.agent-bootstrap/project.json` committed to local `main`. Run
+`agent-bootstrap project approve <name>` and type the name after reviewing
+the diff. Doctor shows the effective settings and their sources. Use
+`agent-bootstrap config edit --project <name>` for operator overrides.
+
 ## 2. Create Goals and run Tasks
 
 Use the root of a local SHA-1 Git worktree with a current local `main`. You
-can set a tracked verification command before launch. For a Bun project,
+can set a local verification command before launch. For a Bun project,
 confirm `verification set` at the host prompt.
 
 ```sh

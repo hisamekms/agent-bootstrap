@@ -1,3 +1,6 @@
+import { projectStateDirectory } from "../src/config/layers.ts";
+import { addProject } from "../src/config/projects.ts";
+import { configEnv } from "./config-fixture.ts";
 import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -545,14 +548,17 @@ function command(
 
 function goalBaseFixture(recordBase = true, policies?: PolicySet) {
   const repoRoot = join(root, "source");
-  const directory = join(repoRoot, ".local", "local-orchestrator");
+  const env = configEnv(root);
+  const directory = projectStateDirectory("source", env);
   const bare = join(directory, "repository.git");
-  mkdirSync(bare, { recursive: true, mode: 0o700 });
+  mkdirSync(repoRoot);
   const git = (args: string[]) =>
     String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
   const bareGit = (args: string[]) => git([`--git-dir=${bare}`, ...args]);
   git(["init", "--template=", "--initial-branch=main"]);
   git(["commit", "--allow-empty", "-m", "old main"]);
+  addProject(repoRoot, undefined, env);
+  mkdirSync(bare, { recursive: true, mode: 0o700 });
   const base = git(["rev-parse", "HEAD"]);
   const goalId = goal(policies);
   const ref = `refs/heads/${goalBranch(goalId)}`;
@@ -595,7 +601,8 @@ function goalBaseFixture(recordBase = true, policies?: PolicySet) {
           return prompt(question);
         },
       },
-      repoRoot,
+      root,
+      env,
     );
     return { code, stdout, stderr, questions };
   }
@@ -893,9 +900,11 @@ test("real Git composes tree mode, path rejection, verification, review and oper
   ]);
   git(["update-ref", "refs/heads/main", advancedMain, base]);
 
-  const target = await resolveTarget(repoRoot, root);
+  const env = configEnv(root);
+  addProject(repoRoot, undefined, env);
+  const target = await resolveTarget(repoRoot, root, env);
   const { directory } = target;
-  await prepareTargetDirectory(target.bootstrapRoot, directory);
+  await prepareTargetDirectory(target.bootstrapRoot, directory, env);
   const scratch = join(root, "scratch");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   writeFileSync(join(scratch, "docs", "a.md"), "after\n");
@@ -1139,21 +1148,31 @@ test("real Git composes tree mode, path rejection, verification, review and oper
     isTTY: true,
     prompt: () => `approve ${proposal.digest.slice(0, 12)}`,
   };
-  assert.equal(await runCli(["--db", filename, "show", goalId], io), 0);
+  assert.equal(
+    await runCli(["--db", filename, "show", goalId], io, root, env),
+    0,
+  );
   assert.equal(JSON.parse(output).baseCommit, base);
   output = "";
-  assert.equal(await runCli(["--db", filename, "show", taskId], io), 0);
+  assert.equal(
+    await runCli(["--db", filename, "show", taskId], io, root, env),
+    0,
+  );
   assert.partialDeepStrictEqual(JSON.parse(output), {
     budgetTokens: 31,
     totalTokens: 31,
   });
   output = "";
-  assert.equal(await runCli(["--db", filename, "show", proposal.id], io), 1);
+  assert.equal(
+    await runCli(["--db", filename, "show", proposal.id], io, root, env),
+    1,
+  );
   assert.equal(
     await runCli(
       ["--db", filename, "--target", repoRoot, "show", proposal.id],
       io,
       root,
+      env,
     ),
     0,
   );
@@ -1168,6 +1187,7 @@ test("real Git composes tree mode, path rejection, verification, review and oper
       ["--db", filename, "--target", repoRoot, "approve", proposal.id],
       io,
       root,
+      env,
     ),
     0,
   );
@@ -1182,6 +1202,7 @@ test("real Git composes tree mode, path rejection, verification, review and oper
         prompt: () => `export-goal-branch ${goalId} ${base.slice(0, 12)}`,
       },
       root,
+      env,
     ),
     0,
   );
@@ -2279,9 +2300,11 @@ test("credential text in candidate content, commit messages, or review answers f
   writeFileSync(join(repoRoot, "docs", "file"), "before\n");
   git(["add", "."]);
   git(["commit", "-m", "initial"]);
-  const target = await resolveTarget(repoRoot, root);
+  const env = configEnv(root);
+  addProject(repoRoot, undefined, env);
+  const target = await resolveTarget(repoRoot, root, env);
   const { directory } = target;
-  await prepareTargetDirectory(target.bootstrapRoot, directory);
+  await prepareTargetDirectory(target.bootstrapRoot, directory, env);
   const scratch = join(root, "scratch");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   const secret = "sk-ant-6XX4TbRwxwZyOuIuFZzWa5vP6KJ";

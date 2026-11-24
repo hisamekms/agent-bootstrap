@@ -1,4 +1,26 @@
-import { spawn } from "node:child_process";
+import {
+  configRoot,
+  projectConfigDirectory,
+  privatePath,
+  hasEditableConfig,
+  readLayer,
+  userConfigPath,
+  writePrivateConfig,
+} from "../config/layers.ts";
+import { ConfigError, invalid } from "../config/messages.ts";
+import { migrate } from "../config/migrate.ts";
+import {
+  addProject,
+  approveProject,
+  escapedJson,
+  listProjects,
+  moveProject,
+  projectMissing,
+  removeProject,
+  requireProject,
+} from "../config/projects.ts";
+import { spawn, spawnSync } from "node:child_process";
+import { closeSync, openSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
 import {
@@ -14,7 +36,7 @@ import {
   ClaudeRunError,
   CredentialsVolume,
 } from "../local-orchestrator/credentials-volume.ts";
-import { checkDirectory, resolveTarget } from "../local-orchestrator/target.ts";
+import { hasLegacyState, resolveTarget } from "../local-orchestrator/target.ts";
 import { parseConciergeArgs } from "../local-orchestrator/concierge.ts";
 import {
   exitCodes,
@@ -42,6 +64,8 @@ type Exit = keyof typeof exitCodes;
 
 export interface BootstrapIo extends CliIo {
   conciergeTTY: boolean;
+  approvalTTY?: boolean;
+  confirmProject?(question: string): Promise<string | undefined>;
   launch?(root: string, args: string[], json: boolean): Promise<boolean>;
 }
 
@@ -106,8 +130,7 @@ export async function runBootstrap(
   host: Host = systemHost,
 ): Promise<Exit> {
   const { args, json } = includeJson(argv);
-  const print = (value: unknown) =>
-    io.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  const print = (value: unknown) => io.stdout.write(`${escapedJson(value)}\n`);
   const hint = (next: string) => io.stderr.write(`next: ${next}\n`);
   const fail = (code: Exclude<Exit, 0>, error: string, next: string) => {
     if (json) print({ error, next });
@@ -158,6 +181,102 @@ export async function runBootstrap(
       return 0;
     }
 
+    if (command === "project") {
+      const [action, name, option, value, ...extra] = rest;
+      const arg = (value: string | undefined): value is string =>
+        !!value && !value.startsWith("-") && !value.includes("\0");
+      if (
+        action === "add" &&
+        arg(name) &&
+        !extra.length &&
+        (option === undefined || (option === "--name" && arg(value)))
+      ) {
+        print(addProject(name, value, host.env));
+      } else if (action === "list" && rest.length === 1) {
+        print(
+          listProjects(host.env).map((project) => ({
+            ...project,
+            missing: projectMissing(project),
+          })),
+        );
+      } else if (action === "show" && arg(name) && rest.length === 2) {
+        const project = requireProject(name, host.env);
+        print({ ...project, missing: projectMissing(project) });
+      } else if (
+        action === "move" &&
+        arg(name) &&
+        arg(option) &&
+        rest.length === 3
+      ) {
+        print(moveProject(name, option, host.env));
+      } else if (action === "remove" && arg(name) && rest.length === 2) {
+        removeProject(name, host.env);
+        print({ removed: true });
+      } else if (action === "approve" && arg(name) && rest.length === 2) {
+        await approveProject(name, host.env, {
+          isTTY: io.approvalTTY ?? io.isTTY,
+          write: (text) => (json ? io.stderr : io.stdout).write(text),
+          confirm: async (question) =>
+            io.confirmProject?.(question) ?? io.prompt(question),
+        });
+        print({ approved: true });
+      } else return usage();
+      return 0;
+    }
+
+    if (command === "config") {
+      if (
+        rest[0] !== "edit" ||
+        (rest.length !== 1 &&
+          (rest.length !== 3 || rest[1] !== "--project" || !rest[2]))
+      )
+        return usage();
+      const editor = host.env.EDITOR;
+      if (!editor)
+        invalid(
+          "editor",
+          "Set EDITOR to choose a configuration editor.",
+          "Set EDITOR and run agent-bootstrap config edit.",
+        );
+      const name = rest[2];
+      if (name) requireProject(name, host.env);
+      const directory = name
+        ? projectConfigDirectory(name, host.env)
+        : undefined;
+      const path = directory
+        ? join(directory, "local.json")
+        : userConfigPath(host.env);
+      const layer = directory ? "local" : "user";
+      // Permit editing invalid JSON while preserving the file safety checks.
+      if (!hasEditableConfig(path, configRoot(host.env), layer))
+        writePrivateConfig(path, configRoot(host.env), { version: 1 }, true);
+      const result = spawnSync(
+        "/bin/sh",
+        ["-c", editor + ' "$1"', "editor", path],
+        { stdio: "inherit", env: host.env },
+      );
+      if (result.status !== 0)
+        invalid(
+          "editor",
+          "The editor did not complete successfully.",
+          "Check EDITOR and retry.",
+        );
+      readLayer(layer, directory, host.env, true);
+      if (json) print({ edited: true });
+      return 0;
+    }
+
+    if (command === "migrate") {
+      if (
+        rest.some(
+          (path) => !path || path.startsWith("-") || path.includes("\0"),
+        )
+      )
+        return usage();
+      print(migrate(root, rest, host.env));
+      return 0;
+    }
+
     if (command === "doctor") {
       let path: string | undefined;
       let override: ClaudeAuthMode | undefined;
@@ -178,10 +297,12 @@ export async function runBootstrap(
       else {
         const width = Math.max(...checks.map(({ id }) => id.length));
         io.stdout.write(`${"CHECK".padEnd(width)}  STATUS   DETAIL\n`);
-        for (const { id, status, detail, fix } of checks)
+        for (const { id, status, detail, fix, effective } of checks) {
           io.stdout.write(
-            `${id.padEnd(width)}  ${status.padEnd(7)}  ${detail}${fix.length ? ` Fix: ${fix.join(" && ")}` : ""}\n`,
+            `${id.padEnd(width)}  ${status.padEnd(7)}  ${detail}${fix.length ? ` next: ${fix.join(" && ")}` : ""}\n`,
           );
+          if (effective) io.stdout.write(escapedJson(effective) + "\n");
+        }
       }
       hint(next);
       return first ? 3 : 0;
@@ -324,13 +445,21 @@ export async function runBootstrap(
         return usage();
       }
 
-      const target = await resolveTarget(path, root);
-      await checkDirectory(target.directory).catch(
-        (error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        },
+      // The user-owned volume can be released to unblock migration.
+      const recovering =
+        command === "credentials" &&
+        action === "detach" &&
+        extra[0] === "--force" &&
+        path === undefined &&
+        (await hasLegacyState(root));
+      const target = recovering
+        ? undefined
+        : await resolveTarget(path, root, host.env);
+      const effective = loadClaudeConfig(
+        host.env,
+        target?.configDirectory,
+        override,
       );
-      const effective = loadClaudeConfig(host.env, target.directory, override);
       for (const warning of effective.warnings) io.stderr.write(warning + "\n");
       const config = effective.configDir;
       if (!config || (group && !Object.hasOwn(config.groups, group)))
@@ -357,10 +486,9 @@ export async function runBootstrap(
         return 0;
       }
 
-      const volume = new CredentialsVolume(
-        config,
-        userStateDirectory(host.env),
-      );
+      const state = userStateDirectory(host.env);
+      if (recovering) privatePath(join(state, "credentials"), state);
+      const volume = new CredentialsVolume(config, state);
       if (action === "status") {
         const status = volume.status();
         print(status);
@@ -464,10 +592,13 @@ export async function runBootstrap(
         }),
       },
       root,
+      host.env,
     );
     if (code === 2) return usage();
     if (code === 1) {
       if (json && report) io.stderr.write(report);
+      const [detail, action] = error.split("\nnext: ");
+      if (action) return fail(1, detail!, action);
       return fail(
         1,
         !isReport && error ? error : "Local orchestrator command failed.",
@@ -491,6 +622,7 @@ export async function runBootstrap(
     hint(output.next);
     return 0;
   } catch (error) {
+    if (error instanceof ConfigError) return fail(1, error.message, error.next);
     if (error instanceof ClaudeConfigError)
       return fail(
         1,
@@ -517,6 +649,26 @@ export function terminalIo(json: boolean): BootstrapIo {
     isTTY:
       process.stdin.isTTY === true &&
       (json ? process.stderr : process.stdout).isTTY === true,
+    approvalTTY: process.stdin.isTTY === true && process.stdout.isTTY === true,
+    async confirmProject(question) {
+      let fd: number | undefined;
+      try {
+        fd = openSync("/dev/tty", "r+");
+        writeFileSync(fd, question);
+        const byte = Buffer.alloc(1);
+        let answer = "";
+        for (;;) {
+          if (readSync(fd, byte) !== 1) return undefined;
+          if (byte[0] === 10) return answer;
+          if (answer.length > 48) return undefined;
+          answer += byte.toString("latin1");
+        }
+      } catch {
+        return undefined;
+      } finally {
+        if (fd !== undefined) closeSync(fd);
+      }
+    },
     conciergeTTY:
       process.stdin.isTTY === true &&
       process.stderr.isTTY === true &&

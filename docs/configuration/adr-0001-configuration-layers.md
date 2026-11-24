@@ -54,15 +54,15 @@ repository can therefore only cause a drift warning (C4).
   `^[a-z][a-z0-9-]{0,47}$`. An existing name is an error.
 - **Identity.** It is the real path of `git rev-parse --git-common-dir`.
   All worktrees of a repository share it. `projects/<name>/project.json`
-  records the identity.
+  records the identity and a randomly generated project ID.
 - **Lookup.** `--target <path>` resolves the common directory and finds the
   project that records it. A target that is not registered is an error
   with `next: agent-bootstrap project add <path>`. The CLI never registers
   a project implicitly.
 - **Moving.** If the recorded directory no longer exists, `doctor` reports
   the project as missing. `project move <name> <path>` updates the
-  identity after checking that the new path is a Git repository. A moved
-  repository never becomes a new project silently.
+  identity after checking that the new path is a Git repository. The
+  project ID and its Concierge volume name stay the same.
 - **Other commands.** `project list`, `project show <name>` and
   `project remove <name>` exist. Removal keeps the state directory, and
   the operator deletes it by hand.
@@ -76,7 +76,8 @@ The agent-bootstrap checkout is registered like any other project.
 The declaration is read from Git objects, never from the working tree,
 with plumbing commands only:
 
-1. Resolve `refs/heads/main^{commit}` once, to an object ID.
+1. Find the exact `refs/heads/main` with `git for-each-ref`. Require a
+   direct commit reference and use its object ID.
 2. Check with `git ls-tree` that `.agent-bootstrap` is a tree and that
    `project.json` is a blob with mode `100644`. A symlink or a submodule
    is rejected.
@@ -210,6 +211,9 @@ following:
    default target. The project is named after its repository.
 2. Moves state into the XDG state directory.
 3. Moves each target `config.json` into `local.json`.
+4. Lists the legacy Concierge volume names for operator review and cleanup.
+   New Concierge volume names incorporate the project name and its stored
+   random ID.
 
 Migration refuses to run while a lease or a run is active. It writes new
 files atomically and removes old locations last, so it can be rerun

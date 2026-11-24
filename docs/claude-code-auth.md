@@ -9,21 +9,24 @@
 
 Use a private `${XDG_CONFIG_HOME:-~/.config}/agent-bootstrap/config.json`
 owned by the current user, with mode `0600`. The CLI refuses symlinks.
-Store the Keychain service name in the file and enter the API key at the prompt.
+Run `agent-bootstrap config edit` with `EDITOR` set to store the Keychain
+service name.
+
+```json
+{
+  "version": 1,
+  "claude": { "apiKey": { "keychainService": "agent-bootstrap-claude" } }
+}
+```
 
 ```sh
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-bootstrap"
-mkdir -p "$config_dir"
-(umask 077; set -C; printf '%s\n' '{"claude":{"apiKey":{"keychainService":"agent-bootstrap-claude"}}}' > "$config_dir/config.json")
 security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
 agent-bootstrap doctor
 ```
 
-Edit an existing file in place and preserve its permissions. An optional
-`claude` section in the target state directory's `config.json` overrides
-user settings per key. Target files must be user-owned with no group or
-other permission bits. The target file can coexist with the target's verification
-settings. The invocation's `--claude-auth` flag takes precedence over
+An optional `claude` section in the project's `local.json` overrides user
+settings per key. Use `agent-bootstrap config edit --project <name>` to
+open it. The same file can hold local verification settings. The invocation's `--claude-auth` flag takes precedence over
 both files. Doctor reports the mode and its source. The legacy
 `LO_CLAUDE_AUTH` and `LO_CLAUDE_KEYCHAIN` environment variables are a
 deprecated fallback for API-key mode.

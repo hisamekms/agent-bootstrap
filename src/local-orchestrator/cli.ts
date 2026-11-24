@@ -1,3 +1,5 @@
+import { loadConfig, mergeConfig } from "../config/layers.ts";
+import { ConfigError } from "../config/messages.ts";
 import {
   configuredCredentialScanner,
   recordedCredentialScanner,
@@ -38,7 +40,8 @@ import {
 import {
   prepareTargetDirectory,
   resolveTarget,
-  TargetError,
+  bootstrapCheckout,
+  rejectLegacyState,
 } from "./target.ts";
 import {
   parseVerificationConfig,
@@ -341,6 +344,8 @@ async function execute(
   directory: string | undefined,
   repoRoot: string,
   scan?: CredentialScanner,
+  configDirectory?: string,
+  env = process.env,
 ): Promise<0 | 1> {
   const writeCheckedJson = async (value: unknown) => {
     await scan?.(JSON.stringify(value));
@@ -348,32 +353,47 @@ async function execute(
   };
   switch (command.kind) {
     case "verification-show":
-      await writeCheckedJson(readVerificationConfig(directory!));
+      await writeCheckedJson(readVerificationConfig(configDirectory!, env));
       return 0;
     case "verification-clear":
     case "verification-set": {
       const config =
         command.kind === "verification-set" ? command.config : null;
+      const preview = () => {
+        const layers = loadConfig(env, configDirectory);
+        const { verification: localVerification, ...local } = layers.local;
+        return {
+          current: layers.config.verification ?? null,
+          local: localVerification ?? null,
+          verification:
+            config ??
+            mergeConfig(
+              layers.user,
+              layers.approved?.config,
+              local,
+              env,
+              configDirectory,
+            ).config.verification ??
+            null,
+        };
+      };
+      const previous = preview();
       const digest = config === null ? null : contentDigest(config);
-      const previous = readVerificationConfig(directory!);
       await writeCheckedJson({
         target: repoRoot,
-        current: previous,
-        verification: config,
+        current: previous.current,
+        verification: previous.verification,
       });
       const phrase =
-        digest === null
+        config === null
           ? "verification clear"
-          : `verification set ${digest.slice(0, 12)}`;
+          : `verification set ${contentDigest(config).slice(0, 12)}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       const previousDigest = contentDigest(previous);
       const applied = store.changeVerification(digest, () => {
-        if (
-          contentDigest(readVerificationConfig(directory!)) !== previousDigest
-        )
-          return false;
-        writeVerificationConfig(directory!, config);
+        if (contentDigest(preview()) !== previousDigest) return false;
+        writeVerificationConfig(configDirectory!, config, env);
         return true;
       });
       if (!applied)
@@ -624,7 +644,8 @@ function isTargetFlag(flag: string | undefined): boolean {
 export async function runCli(
   argv: readonly string[],
   io: CliIo,
-  bootstrapRoot?: string,
+  bootstrapRoot = bootstrapCheckout,
+  env = process.env,
 ): Promise<0 | 1 | 2> {
   let db: string | undefined;
   let targetPath: string | undefined;
@@ -693,10 +714,15 @@ export async function runCli(
     return refuse(io, "Verification commands use the target's state database.");
 
   try {
-    const target = await resolveTarget(targetPath, bootstrapRoot);
+    const custom = db !== undefined && targetPath === undefined;
+    if (custom) await rejectLegacyState(bootstrapRoot);
+    const target = custom
+      ? undefined
+      : await resolveTarget(targetPath, bootstrapRoot, env);
     if (command.kind === "analyze" || command.kind === "denials")
-      return await analyze(target, allTargets, command, io);
-    const { repoRoot, directory } = target;
+      return await analyze(target!, allTargets, command, io);
+    const repoRoot = target?.repoRoot ?? bootstrapRoot;
+    const directory = target?.directory;
     if (command.kind === "policy-set") {
       if (command.value === "agent")
         io.stdout.write(
@@ -707,11 +733,17 @@ export async function runCli(
         return refuse(io, "Confirmation did not match. Operation cancelled.");
     }
     if (db === undefined)
-      await prepareTargetDirectory(target.bootstrapRoot, directory);
-    const store = OrchestratorStore.open(db ?? join(directory, "state.db"));
+      await prepareTargetDirectory(bootstrapRoot, directory, env);
+    const store = OrchestratorStore.open(db ?? join(directory!, "state.db"));
     try {
       const note = (message: string) => io.stderr.write(message + "\n");
-      const targetScan = configuredCredentialScanner(directory, note);
+      const targetScan = configuredCredentialScanner(
+        directory,
+        note,
+        env,
+        undefined,
+        target?.configDirectory,
+      );
       const dbScan =
         db && dirname(resolve(db)) !== directory
           ? recordedCredentialScanner(dirname(resolve(db)), note)
@@ -730,13 +762,16 @@ export async function runCli(
         db !== undefined && targetPath === undefined ? undefined : directory,
         repoRoot,
         scan,
+        target?.configDirectory,
+        env,
       );
     } finally {
       store.close();
     }
   } catch (error) {
     if (error instanceof ClaudeRunError) return refuse(io, error.code);
-    if (error instanceof TargetError) return refuse(io, error.message);
+    if (error instanceof ConfigError)
+      return refuse(io, `${error.message}\nnext: ${error.next}`);
     if (command.kind === "analyze" || command.kind === "denials")
       return refuse(io, "Local orchestrator analysis export failed.");
     if (

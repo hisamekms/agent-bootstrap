@@ -1,3 +1,5 @@
+import { addProject, removeProject } from "../src/config/projects.ts";
+import { configEnv } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -6,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   realpath,
+  readFile,
   rm,
   stat,
   symlink,
@@ -18,7 +21,6 @@ import { test } from "node:test";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import {
   conciergeContext,
-  conciergeVolumeName,
   snapshotConciergeRepo,
 } from "../src/local-orchestrator/concierge.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
@@ -85,60 +87,69 @@ async function cli(
       prompt: (question) => answer?.(question),
     },
     bootstrap,
+    configEnv(join(bootstrap, "..")),
   );
   return { code, stdout, stderr };
 }
 
-test("validates worktree roots and isolates canonical targets with the same basename", () =>
+test("registered worktree paths resolve to private state and named volumes", () =>
   fixture(async (root) => {
-    const bootstrap = await repo(join(root, ".local", "bootstrap"));
+    const bootstrap = await repo(join(root, "bootstrap"));
     const one = await repo(join(root, "one", "dagq-lite"));
     const two = await repo(join(root, "two", "dagq-lite"));
+    const env = configEnv(root);
+    await assert.rejects(
+      resolveTarget(undefined, bootstrap, env),
+      /not registered/,
+    );
+    addProject(bootstrap, undefined, env);
+    addProject(one, undefined, env);
+    addProject(two, "other", env);
     const alias = join(root, "alias");
     await symlink(one, alias);
-    const defaultTarget = await resolveTarget(undefined, bootstrap);
-    assert.deepEqual(await resolveTarget(bootstrap, bootstrap), defaultTarget);
+    const defaultTarget = await resolveTarget(undefined, bootstrap, env);
     assert.equal(
       defaultTarget.directory,
-      join(bootstrap, ".local/local-orchestrator"),
+      join(env.XDG_STATE_HOME!, "agent-bootstrap/projects/bootstrap"),
     );
-    assert.equal(defaultTarget.volume, conciergeVolumeName(bootstrap));
-    const first = await resolveTarget(one, bootstrap);
-    assert.deepEqual(await resolveTarget(alias, bootstrap), first);
-    assert.equal(first.repoRoot, one);
-    assert.match(first.directory, /\/targets\/dagq-lite-[a-f0-9]{12}$/);
-    assert.equal(
-      first.volume,
-      `lo-concierge-${first.directory.split("/").at(-1)}`,
-    );
+    assert.match(defaultTarget.volume, /^lo-concierge-bootstrap-[a-f0-9]{12}$/);
+    const first = await resolveTarget(one, bootstrap, env);
+    assert.deepEqual(await resolveTarget(alias, bootstrap, env), first);
+    assert.match(first.volume, /^lo-concierge-dagq-lite-[a-f0-9]{12}$/);
     assert.notEqual(
-      (await resolveTarget(two, bootstrap)).directory,
+      (await resolveTarget(two, bootstrap, env)).directory,
       first.directory,
     );
+    removeProject("dagq-lite", env);
+    removeProject("other", env);
+    addProject(two, "dagq-lite", env);
+    assert.notEqual(
+      (await resolveTarget(two, bootstrap, env)).volume,
+      first.volume,
+    );
 
+    const localPath = join(root, ".LOCAL");
+    await mkdir(localPath);
+    const localRepo = await repo(join(localPath, "inside"));
+    const outsideAlias = join(root, "outside-alias");
+    await symlink(localRepo, outsideAlias);
+    const insideAlias = join(localPath, "inside-alias");
+    await symlink(two, insideAlias);
+    addProject(localRepo, undefined, env);
+    for (const path of [localRepo, outsideAlias, insideAlias])
+      await assert.rejects(
+        resolveTarget(path, bootstrap, env),
+        /must be outside \.local/,
+      );
     const nested = join(one, "sub");
     await mkdir(nested);
-    const inside = await repo(join(bootstrap, ".local", "inside"));
-    const insideAlias = join(root, "inside-alias");
-    await symlink(inside, insideAlias);
     const bare = join(root, "bare.git");
     git(one, "clone", "--bare", "--", one, bare);
-    for (const path of [
-      nested,
-      bare,
-      await repo(join(root, "no-main"), "work"),
-      root,
-    ])
+    for (const path of [nested, bare, root, join(root, "missing")])
       await assert.rejects(
-        resolveTarget(path, bootstrap),
-        /Git worktree root with a local main/,
+        resolveTarget(path, bootstrap, env),
+        /Git worktree root/,
       );
-    for (const path of [inside, insideAlias])
-      await assert.rejects(resolveTarget(path, bootstrap), /outside .local/);
-    await assert.rejects(
-      resolveTarget(join(root, "missing"), bootstrap),
-      /inaccessible/,
-    );
   }));
 
 test("external snapshots pin local main and limit Planner context to the target's root docs and listing", () =>
@@ -158,7 +169,9 @@ test("external snapshots pin local main and limit Planner context to the target'
     git(target, "switch", "-c", "work");
     await writeFile(join(target, "README.md"), "uncommitted");
 
-    const resolved = await resolveTarget(target, bootstrap);
+    const env = configEnv(root);
+    addProject(target, undefined, env);
+    const resolved = await resolveTarget(target, bootstrap, env);
     const snapshot = await snapshotConciergeRepo(
       target,
       randomUUID(),
@@ -188,6 +201,10 @@ test("verification CLI scopes audited config to each target and requires a typed
     const bootstrap = await repo(join(root, "bootstrap"));
     const one = await repo(join(root, "one"));
     const two = await repo(join(root, "two"));
+    const env = configEnv(root);
+    addProject(bootstrap, undefined, env);
+    addProject(one, undefined, env);
+    addProject(two, "other", env);
     const set = [
       "--target",
       one,
@@ -222,8 +239,12 @@ test("verification CLI scopes audited config to each target and requires a typed
       null,
     );
     assert.equal(JSON.parse((await cli(bootstrap, show)).stdout), null);
-    const { directory } = await resolveTarget(one, bootstrap);
-    const path = join(directory, "config.json");
+    const { directory, configDirectory } = await resolveTarget(
+      one,
+      bootstrap,
+      env,
+    );
+    const path = join(configDirectory, "local.json");
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     const clear = ["--target", one, "verification", "clear"];
     assert.match((await cli(bootstrap, clear)).stderr, /requires a terminal/);
@@ -233,7 +254,7 @@ test("verification CLI scopes audited config to each target and requires a typed
     );
     assert.equal(existsSync(path), true);
     assert.equal((await cli(bootstrap, clear, accept)).code, 0);
-    assert.equal(existsSync(path), false);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { version: 1 });
     const store = OrchestratorStore.open(join(directory, "state.db"));
     try {
       assert.deepEqual(
@@ -281,7 +302,7 @@ test("verification CLI scopes audited config to each target and requires a typed
       db.close();
     }
     assert.equal((await cli(bootstrap, set, accept)).code, 1);
-    assert.equal(existsSync(path), false);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { version: 1 });
   }));
 
 test("verification validates argv bounds and produces only the fixed verdict", () => {

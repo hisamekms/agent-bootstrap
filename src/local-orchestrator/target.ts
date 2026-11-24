@@ -1,117 +1,146 @@
-import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkPrivateDirectory } from "../private-journal.ts";
+import {
+  checkDirectory as checkAncestors,
+  missing,
+  privatePath,
+  projectConfigDirectory,
+  projectStateDirectory,
+  userStateDirectory,
+} from "../config/layers.ts";
+import { ConfigError } from "../config/messages.ts";
+import {
+  assertExternalPaths,
+  listProjects,
+  projectMissing,
+  repository,
+} from "../config/projects.ts";
 import { localMainCommit } from "./tasks.ts";
 
 export const bootstrapCheckout = fileURLToPath(
   new URL("../../", import.meta.url),
 );
+export const legacyStateDirectory = (checkout: string) =>
+  join(checkout, ".local", "local-orchestrator");
+export class TargetError extends ConfigError {}
 
-export class TargetError extends Error {}
+export async function hasLegacyState(checkout: string) {
+  try {
+    await lstat(legacyStateDirectory(checkout));
+  } catch (error) {
+    if (missing(error)) return false;
+    throw error;
+  }
+  return true;
+}
+
+export async function rejectLegacyState(checkout: string) {
+  if (!(await hasLegacyState(checkout))) return;
+  throw new TargetError(
+    "state",
+    "Legacy local orchestrator state requires migration.",
+    "agent-bootstrap migrate",
+  );
+}
 
 export async function resolveTarget(
   path?: string,
   checkout = bootstrapCheckout,
+  env = process.env,
 ) {
   const bootstrapRoot = await realpath(checkout);
+  await rejectLegacyState(bootstrapRoot);
+  const projects = listProjects(env);
+  // Detect a moved repository addressed by its previous path.
   const requested = resolve(path ?? bootstrapRoot);
-  const repoRoot = await realpath(requested).catch(() => {
-    throw new TargetError("Target path is inaccessible.");
-  });
+  let found: ReturnType<typeof repository>;
+  try {
+    found = repository(requested);
+    assertExternalPaths(found, env);
+  } catch (error) {
+    const missingProject = projects.some(
+      (project) =>
+        dirname(project.identity) === resolve(requested) &&
+        projectMissing(project),
+    );
+    if (missingProject)
+      throw new TargetError(
+        "project.identity",
+        "The registered Git directory is missing.",
+        "Run agent-bootstrap project move <name> <path>.",
+      );
+    throw error;
+  }
+  const { repoRoot } = found;
   const isDefault = repoRoot === bootstrapRoot;
-  // The bootstrap checkout can itself be a linked worktree under .local.
+  // The bootstrap checkout may itself be a linked worktree under .local.
   if (
     !isDefault &&
     [requested, repoRoot].some((entry) =>
       entry.split(sep).some((part) => part.toLowerCase() === ".local"),
     )
   )
-    throw new TargetError("Target repositories must be outside .local.");
-  if (path !== undefined) {
-    const base = await localMainCommit(repoRoot, true).catch(() => {
-      throw new TargetError(
-        "Target must be a Git worktree root with a local main commit.",
-      );
-    });
-    if (base.length !== 40)
-      throw new TargetError(
-        "Target integration requires a SHA-1 Git repository.",
-      );
+    throw new TargetError(
+      "target",
+      "Target repositories must be outside .local.",
+      "Choose a worktree outside .local.",
+    );
+  const project = projects.find(({ identity }) => identity === found.identity);
+  if (!project)
+    throw new TargetError(
+      "project.identity",
+      "The target is not registered.",
+      "agent-bootstrap project add <path>",
+    );
+  const base = await localMainCommit(repoRoot, true).catch(() => undefined);
+  if (base?.length !== 40)
+    throw new TargetError(
+      "target",
+      "Target integration requires a local SHA-1 main commit.",
+      "Create or restore local main and run agent-bootstrap doctor.",
+    );
+  const directory = projectStateDirectory(project.name, env);
+  try {
+    privatePath(directory, userStateDirectory(env));
+  } catch (error) {
+    if (!missing(error)) throw error;
   }
-  const hash = createHash("sha256").update(repoRoot).digest("hex");
-  const name =
-    basename(repoRoot)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .slice(0, 32)
-      .replace(/^-|-$/g, "") || "repository";
-  const slug = `${name}-${hash.slice(0, 12)}`;
-  const baseDirectory = join(bootstrapRoot, ".local", "local-orchestrator");
   return {
     bootstrapRoot,
     repoRoot,
     isDefault,
-    slug,
-    directory: isDefault ? baseDirectory : join(baseDirectory, "targets", slug),
-    volume: `lo-concierge-${isDefault ? hash.slice(0, 16) : slug}`,
+    slug: project.name,
+    project,
+    env,
+    configDirectory: projectConfigDirectory(project.name, env),
+    directory,
+    // Concierge volume names are limited to 66 characters.
+    volume: `lo-concierge-${project.name.slice(0, 40)}-${project.id}`,
   };
 }
 
 export async function discoverAnalysisTargets(
   target: Awaited<ReturnType<typeof resolveTarget>>,
-): Promise<readonly { slug: string; directory: string }[]> {
-  const parent = join(target.directory, "targets");
-  const entries = await checkDirectory(parent)
-    .then(() => readdir(parent, { withFileTypes: true }))
-    .catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return [];
-      throw error;
-    });
-  return [
-    { slug: target.slug, directory: target.directory },
-    ...entries
-      .filter(
-        (entry) =>
-          entry.isDirectory() &&
-          /^[a-z0-9-]{1,32}-[a-f0-9]{12}$/.test(entry.name),
-      )
-      .map(({ name }) => ({ slug: name, directory: join(parent, name) }))
-      .sort((a, b) => a.slug.localeCompare(b.slug)),
-  ];
+) {
+  return listProjects(target.env).map(({ name }) => ({
+    slug: name,
+    directory: projectStateDirectory(name, target.env),
+    configDirectory: projectConfigDirectory(name, target.env),
+  }));
 }
 
 export async function checkDirectory(path: string): Promise<void> {
-  const parent = dirname(path);
-  if (parent !== path) await checkDirectory(parent);
-  const info = await lstat(path);
-  const mode = info.mode & 0o7777;
-  if (
-    !info.isDirectory() ||
-    (info.uid !== process.getuid?.() && info.uid !== 0) ||
-    ((mode & 0o022) !== 0 && !(info.uid === 0 && mode === 0o1777))
-  )
-    throw new Error("Unsafe local orchestrator directory");
+  checkAncestors(path);
 }
 
 export async function prepareTargetDirectory(
-  bootstrapRoot: string,
-  directory = join(bootstrapRoot, ".local", "local-orchestrator"),
+  checkout: string,
+  directory?: string,
+  env = process.env,
 ): Promise<string> {
-  const subpath = relative(bootstrapRoot, directory);
-  const statePath = join(".local", "local-orchestrator");
-  if (subpath !== statePath && !subpath.startsWith(statePath + sep))
-    throw new Error("Unsafe local orchestrator directory");
-  await checkDirectory(bootstrapRoot);
-  let dir = bootstrapRoot;
-  for (const name of subpath.split(sep)) {
-    dir = join(dir, name);
-    await mkdir(dir, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "EEXIST") throw error;
-    });
-    await checkDirectory(dir);
-  }
-  await checkPrivateDirectory(dir);
-  return dir;
+  const state =
+    directory ?? (await resolveTarget(undefined, checkout, env)).directory;
+  privatePath(state, userStateDirectory(env), true);
+  return state;
 }

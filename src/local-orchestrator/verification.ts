@@ -1,12 +1,3 @@
-import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  fsyncSync,
-  openSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
 import { join } from "node:path";
 import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
 import type { Verification } from "../reviewed-integration.ts";
@@ -15,7 +6,12 @@ import {
   ROLE_PROFILES,
   type ProfileName,
 } from "../sandbox-profiles.ts";
-import { readPrivateConfig } from "./claude-config.ts";
+import {
+  configRoot,
+  loadConfig,
+  readLayer,
+  writePrivateConfig,
+} from "../config/layers.ts";
 import { ContractError, fields, oneOf } from "./model.ts";
 
 export interface VerificationConfig {
@@ -43,58 +39,23 @@ export function parseVerificationConfig(value: unknown): VerificationConfig {
   return { profile: name, argv: [...argv] };
 }
 
-function readTargetConfig(directory: string) {
-  return fields(
-    readPrivateConfig(join(directory, "config.json"), 256 * 1024, true),
-    ["profile", "argv", "claude"],
-  );
-}
-
 export function readVerificationConfig(
   directory: string,
+  env = process.env,
 ): VerificationConfig | null {
-  const { profile, argv } = readTargetConfig(directory);
-  return profile === undefined && argv === undefined
-    ? null
-    : parseVerificationConfig({ profile, argv });
+  return loadConfig(env, directory).config.verification ?? null;
 }
 
 /** The operator CLI holds the target's SQLite writer lock while publishing. */
 export function writeVerificationConfig(
   directory: string,
   config: VerificationConfig | null,
+  env = process.env,
 ): void {
-  const path = join(directory, "config.json");
-  const { claude } = readTargetConfig(directory);
-  if (config === null && claude === undefined) {
-    rmSync(path, { force: true });
-  } else {
-    const temporary = join(directory, `.config-${randomUUID()}`);
-    const file = openSync(temporary, "wx", 0o600);
-    try {
-      try {
-        writeFileSync(
-          file,
-          JSON.stringify({
-            ...config,
-            ...(claude === undefined ? {} : { claude }),
-          }) + "\n",
-        );
-        fsyncSync(file);
-      } finally {
-        closeSync(file);
-      }
-      renameSync(temporary, path);
-    } finally {
-      rmSync(temporary, { force: true });
-    }
-  }
-  const dir = openSync(directory, "r");
-  try {
-    fsyncSync(dir);
-  } finally {
-    closeSync(dir);
-  }
+  const local = readLayer("local", directory, env);
+  if (config === null) delete local.verification;
+  else local.verification = config;
+  writePrivateConfig(join(directory, "local.json"), configRoot(env), local);
 }
 
 // The shell source is fixed. Candidate output stays off the verdict channel,
