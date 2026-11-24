@@ -24,6 +24,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { closeSync, openSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
+import { runSecretTest } from "../local-orchestrator/secret-test.ts";
+import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
   ClaudeConfigError,
   parseClaudeAuthMode,
@@ -175,6 +177,41 @@ export async function runBootstrap(
           `agent-bootstrap — Audited, sandboxed coding agents\n\nagent-bootstrap help <topic>\nTopics: ${Object.keys(helpTopics).join(", ")}\n\nRun agent-bootstrap help --agent for the full manual or agent-bootstrap help --json for the command schema.\nnext: agent-bootstrap help start\n`,
         );
       return 0;
+    }
+
+    if (command === "secrets") {
+      let options: ReturnType<typeof claudeOptions>;
+      try {
+        options = claudeOptions(rest);
+      } catch {
+        return usage();
+      }
+      const { target, override, remaining } = options;
+      const [action, variable, ...extra] = remaining;
+      if (
+        action !== "test" ||
+        !isSafeCredentialVariable(variable) ||
+        override !== undefined ||
+        extra.length
+      )
+        return usage();
+      try {
+        const report = await runSecretTest(root, host, variable, target);
+        print(report);
+        if (!report.pass)
+          hint(
+            "Review the failed checks and run agent-bootstrap help secrets.",
+          );
+        return report.pass ? 0 : 1;
+      } catch (error) {
+        if (error instanceof ConfigError || error instanceof ClaudeConfigError)
+          throw error;
+        return fail(
+          1,
+          "The secret self-test stopped before a complete report was available.",
+          "Check the pinned VM prerequisites and the configured Keychain item, then retry.",
+        );
+      }
     }
 
     if (command === "project") {

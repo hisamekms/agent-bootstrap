@@ -26,7 +26,7 @@ export async function setupPlan(
 ) {
   const selected = extended ? allProfiles : defaultProfiles;
   const lock = await readLock(root);
-  const inputs = artifacts(selected);
+  const inputs = artifacts(selected, undefined, true);
   const profiles = selected.map((name) => {
     const entry = lock.profiles[name];
     if (!entry)

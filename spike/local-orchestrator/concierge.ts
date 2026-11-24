@@ -287,6 +287,8 @@ async function main(args: readonly string[]) {
         ...(scan ? { scan } : {}),
         install,
         auth,
+        config: effective.config,
+        note: (message) => console.error(message),
         ...(verificationConfig
           ? { verification: configuredVerification(verificationConfig) }
           : {}),

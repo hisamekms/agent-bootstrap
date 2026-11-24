@@ -230,6 +230,20 @@ export const helpTopics = {
     human:
       "Declare read-write mounts in a project's local.json for one actor and a dedicated directory.",
   },
+  secrets: {
+    purpose: "Check VM containment for a variable granted through secretEnv.",
+    prerequisites:
+      "Define the Keychain source under secrets in the user config. Grant the variable through secretEnv and set Claude authentication to external. Prepare the pinned Alpine VM and Claude CLI.",
+    commands: [
+      "agent-bootstrap secrets test TOOL_TOKEN",
+      `agent-bootstrap secrets test TOOL_TOKEN --target ${exampleTarget} --json`,
+    ],
+    output:
+      "The self-test runs a disposable Worker and reports check results and counts. A pass is recorded in host state for the variable and pinned CLI version.",
+    next: "Use --target for a project-local grant. Repeat the test after a CLI version change.",
+    human:
+      "Provision the configured Keychain entry and authorize model API access before running the test.",
+  },
 } satisfies Record<string, Topic>;
 
 export const operatorOutputs = {
@@ -355,6 +369,10 @@ export const onboardingOutputs = {
       "volume <init|attach|detach|status> <name> [--force for detach] | volume shell <mount> [--target <path>]",
     json: "{ mounted, active, stale } for status or { status } after a completed action.",
   },
+  secrets: {
+    usage: "secrets test <variable> [--target <path>] [--json]",
+    json: "{ pass, checks, counts }. Exit 1 can also return the failed check report.",
+  },
 } as const;
 
 export type HelpTopic = keyof typeof helpTopics;
@@ -390,11 +408,11 @@ export function renderAgentGuide(): string {
     "",
     "Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.",
     "",
-    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, or volume shell. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
+    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",
-    "Machine-readable errors use `{ error, next }` unless a completed doctor run reports prerequisite checks. Other next hints may appear on stderr.",
+    "Machine-readable errors use `{ error, next }`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.",
     "",
     ...Object.entries(exitCodes).map(
       ([code, label]) => `- \`${code}\` ${label}.`,

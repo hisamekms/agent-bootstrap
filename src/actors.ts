@@ -125,7 +125,7 @@ export function claudeRoleHarness(options: {
   const guest =
     options.guest ?? (options.profile ? guestOf(options.profile) : "alpine");
   const provider =
-    options.auth.mode === "external"
+    options.auth.mode === "external" || options.auth.mode === "secret-file"
       ? undefined
       : claudeCodeProvider(options.auth, options.fixture, options.gatewayHosts);
   const baseUrl = options.fixture

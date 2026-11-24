@@ -13,6 +13,8 @@ import {
 import { Volume, VolumeError } from "../volumes/volume.ts";
 import { loadConfig, missing, privatePath } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
+import { hasSecretTestPass } from "../local-orchestrator/secret-test-record.ts";
+import { CLAUDE_CODE } from "../claude-code.ts";
 import {
   driftWarning,
   listProjects,
@@ -466,11 +468,14 @@ export async function doctor(
   );
   if (verifyProfile && verifyProfile !== "base")
     requiredProfiles.add(verifyProfile);
-  const inputs = artifacts(profiles, alternate);
+  const includeSecrets = Object.keys(layers?.config.secretEnv ?? {}).length > 0;
+  const inputs = artifacts(profiles, alternate, includeSecrets);
   const mainInputs = new Set(
-    artifacts(concierge ? ["concierge"] : defaultProfiles, alternate).map(
-      ({ path }) => path,
-    ),
+    artifacts(
+      concierge ? ["concierge"] : defaultProfiles,
+      alternate,
+      includeSecrets,
+    ).map(({ path }) => path),
   );
   for (const item of inputs) {
     const custom = alternate !== undefined && item.path === alternate;
@@ -563,6 +568,26 @@ export async function doctor(
         check(`claude-config-warning-${index + 1}`, "skipped", warning),
         false,
       );
+    for (const [variable, { actors }] of Object.entries(
+      effective.config.secretEnv ?? {},
+    )) {
+      const passed = hasSecretTestPass(userStateDirectory(host.env), variable);
+      add(
+        check(
+          `secretEnv.${variable}`,
+          passed ? "ok" : "missing",
+          `${actors.join(", ")}. Self-test for CLI ${CLAUDE_CODE.version} ${passed ? "passed" : "required"}.`,
+          passed
+            ? []
+            : [
+                `Run agent-bootstrap secrets test ${variable} with the same target.`,
+              ],
+          false,
+          !passed,
+        ),
+        !concierge,
+      );
+    }
 
     const service = effective.keychainService;
     const account = host === systemHost ? userInfo().username : host.env.USER;

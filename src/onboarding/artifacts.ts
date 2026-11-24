@@ -8,6 +8,7 @@ import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
   CLAUDE_CODE_GUEST_PACKAGES,
+  SECRET_FILE_PACKAGES,
 } from "../claude-code.ts";
 import {
   ALPINE_3_23,
@@ -35,6 +36,7 @@ export interface Artifact {
 export function artifacts(
   profiles: readonly string[],
   alternateClaude?: string,
+  includeSecrets = false,
 ): Artifact[] {
   const inputs = new Map<string, Artifact>();
   function add(item: Artifact) {
@@ -55,6 +57,7 @@ export function artifacts(
   );
   for (const { name, sha256 } of [
     ...CLAUDE_CODE_GUEST_PACKAGES,
+    ...(includeSecrets ? SECRET_FILE_PACKAGES : []),
     ...alpineProfiles.flatMap(profilePackages),
   ])
     add({

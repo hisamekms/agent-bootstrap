@@ -47,6 +47,7 @@ export interface RunnerDeps {
     id: string,
   ) => Promise<ReviewerRun>;
   readonly harness: RoleHarness;
+  readonly plannerHarness?: RoleHarness;
   /** Model configured for the Reviewer in the harness. */
   readonly model: string;
   /** Host-selected files with paths relative to the repository root. */
@@ -461,10 +462,11 @@ export class ActorRunner {
     readOnlyFiles: readonly SandboxFile[],
     taskTimeoutMs: number = MICROSANDBOX_LIMITS.commandTimeoutMs,
   ): ReviewerPlan {
-    const { harness } = this.#deps;
+    const { harness, plannerHarness } = this.#deps;
+    const selected = role === "Planner" ? (plannerHarness ?? harness) : harness;
     return {
-      sandbox: { ...harness.sandbox, readOnlyFiles, maxLifetimeMs: 300_000 },
-      command: harness.command({
+      sandbox: { ...selected.sandbox, readOnlyFiles, maxLifetimeMs: 300_000 },
+      command: selected.command({
         role,
         prompt: role === "Planner" ? PLANNER_PROMPT : APPROVAL_PROMPT,
         timeoutMs:

@@ -313,6 +313,12 @@ export function loadClaudeConfig(
   const target = parseConfig(layers.local.claude, "local", localFix);
   const model = env.LO_CLAUDE_MODEL ?? target.model ?? user.model;
   const auth = override ?? target.auth ?? user.auth ?? "api-key";
+  if (auth !== "external" && Object.keys(layers.config.secretEnv ?? {}).length)
+    throw new ConfigError(
+      "secretEnv",
+      "Secret grants require claude.auth to be external.",
+      "Select external mode or remove the grants and retry.",
+    );
   const source = override
     ? "flag"
     : target.auth

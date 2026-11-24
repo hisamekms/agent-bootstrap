@@ -2,11 +2,11 @@
 
 Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.
 
-Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, or volume shell. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
+Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
 
 Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.
 
-Machine-readable errors use `{ error, next }` unless a completed doctor run reports prerequisite checks. Other next hints may appear on stderr.
+Machine-readable errors use `{ error, next }`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.
 
 - `0` Success.
 - `1` Command failed or was refused.
@@ -302,6 +302,27 @@ For stale state, run doctor. Confirm no VM is running before using volume detach
 **Human involvement**  
 Declare read-write mounts in a project's local.json for one actor and a dedicated directory.
 
+## secrets
+
+Check VM containment for a variable granted through secretEnv.
+
+**Prerequisites**  
+Define the Keychain source under secrets in the user config. Grant the variable through secretEnv and set Claude authentication to external. Prepare the pinned Alpine VM and Claude CLI.
+
+```sh
+agent-bootstrap secrets test TOOL_TOKEN
+agent-bootstrap secrets test TOOL_TOKEN --target /path/to/project --json
+```
+
+**Expected output**  
+The self-test runs a disposable Worker and reports check results and counts. A pass is recorded in host state for the variable and pinned CLI version.
+
+**Next action**  
+Use --target for a project-local grant. Repeat the test after a CLI version change.
+
+**Human involvement**  
+Provision the configured Keychain entry and authorize model API access before running the test.
+
 ## Command reference
 
 - `agent-bootstrap help [topic] [--json] | help --agent` → { topics, commands, exitCodes }
@@ -313,6 +334,7 @@ Declare read-write mounts in a project's local.json for one actor and a dedicate
 - `agent-bootstrap config edit [--project <name>]` → { edited: true } after the editor exits and file validation succeeds.
 - `agent-bootstrap migrate [<original-target-path>...]` → { projects, orphanedVolumes, volumeMigration? } with project names, legacy Concierge volume names and any mount migration guidance.
 - `agent-bootstrap volume <init|attach|detach|status> <name> [--force for detach] | volume shell <mount> [--target <path>]` → { mounted, active, stale } for status or { status } after a completed action.
+- `agent-bootstrap secrets test <variable> [--target <path>] [--json]` → { pass, checks, counts }. Exit 1 can also return the failed check report.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }
 - `agent-bootstrap proposals [--status <pending|approved|rejected|registered>]` → Array of proposals with effective policy.
 - `agent-bootstrap show <proposalId|goalId|taskId>` → One proposal, Goal, or Task object.
