@@ -56,7 +56,7 @@ export const helpTopics = {
       provisionKeychain,
     ],
     output:
-      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. Build VMs use an audited gateway limited to recipe destinations. The browser build uses a pinned Debian base and signed, hash-pinned snapshot metadata. Setup lists the build audit database and allowlist for each profile. A digest mismatch stops setup before the image is published under its locked reference.",
+      "Default setup prints pinned URLs, hashes and image references. Applying setup downloads missing inputs and builds missing images sequentially. Additional secret-file packages are included when the effective configuration grants a secret. Use --target to select a registered project's configuration. Build VMs use an audited gateway limited to recipe destinations. The browser build uses a pinned Debian base and signed, hash-pinned snapshot metadata. Setup lists the build audit database and allowlist for each profile. A digest mismatch stops setup before the image is published under its locked reference.",
     next: "API-key mode is the default. Enter the API key at the Keychain prompt, then run agent-bootstrap doctor.",
     human:
       "Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.",
@@ -233,14 +233,14 @@ export const helpTopics = {
   secrets: {
     purpose: "Check VM containment for a variable granted through secretEnv.",
     prerequisites:
-      "Define the Keychain source under secrets in the user config. Grant the variable through secretEnv and set Claude authentication to external. Prepare the pinned Alpine VM and Claude CLI.",
+      "Define the Keychain source under secrets in the user config. Grant the variable through secretEnv and select external authentication. Prepare the pinned guest image and CLI.",
     commands: [
-      "agent-bootstrap secrets test TOOL_TOKEN",
-      `agent-bootstrap secrets test TOOL_TOKEN --target ${exampleTarget} --json`,
+      'agent-bootstrap secrets test "$variable"',
+      `agent-bootstrap secrets test "$variable" --target ${exampleTarget} --json`,
     ],
     output:
-      "The self-test runs a disposable Worker and reports check results and counts. A pass is recorded in host state for the variable and pinned CLI version.",
-    next: "Use --target for a project-local grant. Repeat the test after a CLI version change.",
+      "The self-test runs a disposable Worker and reports check results and counts. A pass applies to the granted variable, pinned CLI version and current containment configuration.",
+    next: "Set $variable to the granted variable name. Use --target for a project-local grant. Repeat the test when doctor reports that a current pass is required.",
     human:
       "Provision the configured Keychain entry and authorize model API access before running the test.",
   },
@@ -338,7 +338,8 @@ export const onboardingOutputs = {
     json: "Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.",
   },
   setup: {
-    usage: "setup [--allow-network] [--yes] [--profiles] [--json]",
+    usage:
+      "setup [--target <path>] [--allow-network] [--yes] [--profiles] [--json]",
     json: "{ mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.",
   },
   concierge: {
@@ -408,7 +409,7 @@ export function renderAgentGuide(): string {
     "",
     "Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.",
     "",
-    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
+    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, setup, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",

@@ -255,6 +255,33 @@ test("Planner keeps the brief and context in files, records usage and submits a 
   assert.equal(store.getExecution(planned)?.status, "succeeded");
 });
 
+test("Planner rejects a non-base profile for an Executor with a secret grant before proposing tasks", async () => {
+  const goalId = registerGoal({
+    ...goal,
+    scope: { ...goal.scope, profiles: ["base", "bun"] },
+  });
+  const sessionId = store.startSession("Concierge", "runtime").id;
+  const work = runner({
+    executorRequiresBase: true,
+    runPlanner: async (plan, id) => {
+      const { contract } = JSON.parse(file(plan, "request.json"));
+      assert.match(contract.answer.tasks[0].profile, /Executor requires base/);
+      return response(id, { tasks: [task, { ...task, profile: "bun" }] });
+    },
+  });
+  const id = await work.requestPlanner({
+    ...goalRequest,
+    mode: "task-decomposition",
+    sessionId,
+    goalId,
+  });
+  await work.drain();
+  const execution = store.getExecution(id);
+  assert.equal(execution?.status, "failed");
+  assert.match(JSON.stringify(execution), /Task 2.*Choose the base profile/);
+  assert.equal(store.listProposals({ status: "pending" }).length, 0);
+});
+
 test("Planner keeps using the private base when decomposing a legacy Goal", async () => {
   const goalId = registerGoal();
   const sessionId = store.startSession("Concierge", "runtime").id;

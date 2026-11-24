@@ -50,7 +50,7 @@ import {
   userStateDirectory,
   type ClaudeAuthMode,
 } from "./claude-config.ts";
-import { orchestratorMcp } from "./claude-policy.ts";
+import { orchestratorMcp, SECRET_EXECUTOR_SHELL } from "./claude-policy.ts";
 import { HostApiServer } from "./host-api.ts";
 import { gitCommit } from "./model.ts";
 import { ActorRunner } from "./runner.ts";
@@ -110,7 +110,8 @@ export interface ConciergeDeps {
   ) => Promise<ConciergeSnapshot>;
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
-  readonly config?: Config;
+  readonly config: Config;
+  readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
   readonly listen?: (
@@ -442,7 +443,7 @@ export async function startConcierge(
   const { repoRoot } = options;
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
-  const config = deps.config ?? {};
+  const { config, baseImage } = deps;
   const secretHarness = (actor: SecretActor) => {
     const variable = secretVariable(config, actor);
     if (!variable) return;
@@ -457,7 +458,7 @@ export async function startConcierge(
       auth: secretAuth,
       model: options.model,
       profile: "base",
-      shell: actor === "Executor",
+      shell: actor === "Executor" && SECRET_EXECUTOR_SHELL,
       reportWorkerUsage: actor === "Executor",
       tools: claudeCodeTools(install, "alpine", secretAuth),
     });
@@ -486,7 +487,8 @@ export async function startConcierge(
           config,
           userStateDirectory(env),
           variable,
-          (secretFile) => run(plan, id, context, { ...runOptions, secretFile }),
+          baseImage,
+          (secret) => run(plan, id, context, { ...runOptions, ...secret }),
         );
       } catch (error) {
         if (error instanceof ConfigError)
@@ -609,6 +611,7 @@ export async function startConcierge(
       runReviewer,
       harness: reviewer,
       ...(planner ? { plannerHarness: planner } : {}),
+      ...(executor ? { executorRequiresBase: true } : {}),
       model: options.model,
       context: async (commit, goalRepository) => {
         if (commit === null || commit === snapshot.commit) return context;

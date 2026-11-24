@@ -447,10 +447,7 @@ describe("agent-bootstrap", () => {
     assert.equal(result.code, 0);
     const plan = JSON.parse(result.stdout);
     assert.equal(plan.mode, "plan");
-    assert.equal(
-      plan.artifacts.length,
-      artifacts(defaultProfiles, undefined, true).length,
-    );
+    assert.equal(plan.artifacts.length, artifacts(defaultProfiles).length);
     assert.ok(
       plan.artifacts[0].url.endsWith("/2.1.330/linux-arm64-musl/claude"),
     );
@@ -460,6 +457,20 @@ describe("agent-bootstrap", () => {
           /^[a-f0-9]{64}$/.test(sha256) && url.startsWith("https:"),
       ),
       true,
+    );
+    writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
+      version: 1,
+      claude: { auth: "external" },
+      secrets: { fixture: { keychainService: "fixture-private-service" } },
+      secretEnv: { TOOL_TOKEN: { secret: "fixture", actors: ["Executor"] } },
+    });
+    const withGrant = await invoke(["setup", "--json"], root, host);
+    assert.equal(withGrant.code, 0);
+    assert.deepEqual(
+      JSON.parse(withGrant.stdout).artifacts.map(
+        ({ path }: { path: string }) => path,
+      ),
+      artifacts(defaultProfiles, undefined, true).map(({ path }) => path),
     );
     assert.deepEqual(
       plan.images.profiles.map(({ name }: { name: string }) => name),

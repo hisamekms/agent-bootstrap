@@ -229,6 +229,7 @@ export interface SandboxCommand {
   readonly signal?: AbortSignal;
   readonly claudeShell?: true;
   readonly claudeSecretVariable?: string;
+  readonly secretFileProbe?: true;
 }
 
 export interface ExecResult {

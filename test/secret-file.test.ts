@@ -41,6 +41,7 @@ test("actor launch refuses an untested variable before reading Keychain or openi
       config,
       "/missing-fixture-state",
       auth.variable,
+      "fixture-image",
       async () => assert.fail("actor launched before passing the self-test"),
       async () => assert.fail("Keychain read before passing the self-test"),
     ),
@@ -173,6 +174,9 @@ test("secret-file managed settings require the Bash sandbox and constrain file t
   assert.equal(settings.disableAllHooks, true);
   assert.equal(settings.allowManagedPermissionRulesOnly, true);
   assert.ok(settings.permissions.allow.includes("Bash"));
+  assert.ok(
+    !managedClaudeSettings("Executor").permissions.allow.includes("Bash"),
+  );
   for (const deny of [
     "WebFetch",
     "WebSearch",

@@ -255,6 +255,8 @@ export interface TrustedHostOptions {
 export interface TrustedHostRunOptions {
   readonly hostServices?: readonly HostService[];
   readonly secretFile?: SecretFileDelivery;
+  /** Host authorization for delivery based on the self-test record or probe. */
+  readonly secretTest?: "passed" | "running";
   /** Host-owned inspection of the changed files in a collected tree. */
   readonly inspectWorkerTree?: (tree: Uint8Array) => Promise<void>;
   /** Best-effort host callback for the last 66 KiB of Worker stderr. */
@@ -986,6 +988,21 @@ export class TrustedHost {
     const secretFile = options?.secretFile;
     const secretVariable =
       "command" in input ? input.command.claudeSecretVariable : undefined;
+    const secretProbe = "command" in input && input.command.secretFileProbe;
+    if (
+      (secretFile ||
+        secretVariable !== undefined ||
+        secretProbe ||
+        options?.secretTest) &&
+      (secretProbe
+        ? options?.secretTest !== "running" || role !== "Worker" || !secretFile
+        : options?.secretTest !== "passed")
+    )
+      throw new ConfigError(
+        "secretEnv",
+        "A current secret self-test pass is required for delivery.",
+        "Run agent-bootstrap secrets test for the granted variable with the same target.",
+      );
     const auth =
       configuredAuth === "external" && secretFile && secretVariable
         ? "secret-file"

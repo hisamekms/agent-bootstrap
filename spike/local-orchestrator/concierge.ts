@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { exportAudit, exportAuditChecked } from "../../src/audit-export.ts";
 import {
   CLAUDE_CODE,
+  SECRET_FILE_PACKAGES,
   claudeCodeProvider,
   claudeCodeTools,
   type ClaudeCodeAuth,
@@ -23,6 +24,7 @@ import {
 } from "../../src/local-orchestrator/concierge.ts";
 import {
   loadClaudeConfig,
+  resolveClaudeModel,
   userStateDirectory,
 } from "../../src/local-orchestrator/claude-config.ts";
 import { createClaudePolicy } from "../../src/local-orchestrator/claude-policy.ts";
@@ -144,7 +146,7 @@ async function main(args: readonly string[]) {
     flags.claudeAuth,
     layers,
   );
-  const model = effective.model ?? "claude-opus-5-5";
+  const model = resolveClaudeModel(effective);
   const options = { model, mode: flags.mode, continue: flags.continue };
   for (const warning of effective.warnings) console.error(warning);
   const volumeShell = flags.volumeShell;
@@ -170,11 +172,18 @@ async function main(args: readonly string[]) {
     throw new Error("LO_CLAUDE_BINARY must be an absolute path");
   if (!volumeShell)
     await Promise.all(
-      claudeCodeTools(install, "alpine").map(({ hostPath }) =>
-        access(hostPath),
-      ),
+      [
+        ...claudeCodeTools(install, "alpine").map(({ hostPath }) => hostPath),
+        ...(Object.keys(effective.config.secretEnv ?? {}).length
+          ? SECRET_FILE_PACKAGES.map(({ name }) =>
+              join(install.packageDir, name),
+            )
+          : []),
+      ].map((path) => access(path)),
     ).catch(() => {
-      throw new Error("The pinned Claude CLI or Alpine packages are missing");
+      throw new Error(
+        "The pinned CLI or required guest packages are missing. Review agent-bootstrap help setup.",
+      );
     });
   const binary = await microsandboxBinary();
   const profiles = profileCatalog(
@@ -288,6 +297,7 @@ async function main(args: readonly string[]) {
         install,
         auth,
         config: effective.config,
+        baseImage: profiles.get("base").image,
         note: (message) => console.error(message),
         ...(verificationConfig
           ? { verification: configuredVerification(verificationConfig) }

@@ -379,9 +379,18 @@ export async function runBootstrap(
     }
 
     if (command === "setup") {
+      const options = (() => {
+        try {
+          return claudeOptions(rest);
+        } catch {
+          return undefined;
+        }
+      })();
       if (
-        rest.length !== new Set(rest).size ||
-        rest.some(
+        !options ||
+        options.override !== undefined ||
+        options.remaining.length !== new Set(options.remaining).size ||
+        options.remaining.some(
           (arg) => !["--allow-network", "--yes", "--profiles"].includes(arg),
         )
       )
@@ -393,7 +402,9 @@ export async function runBootstrap(
         root,
         rest.includes("--profiles"),
         host.env,
-      ).catch(() => {
+        options.target,
+      ).catch((error: unknown) => {
+        if (error instanceof ConfigError) throw error;
         throw new SetupError(
           "The setup plan could not load the required profile lock.",
           "Restore the checked-in lock and matching recipes.",
@@ -420,7 +431,7 @@ export async function runBootstrap(
           );
       }
       if (!allowNetwork) {
-        const next = `Review the plan, then run agent-bootstrap setup --allow-network${rest.includes("--profiles") ? " --profiles" : ""} when authorized.`;
+        const next = `Review the plan, then run agent-bootstrap setup --allow-network${rest.includes("--profiles") ? " --profiles" : ""}${options.target ? " with the same target" : ""} when authorized.`;
         print({ mode: "plan", ...plan, next });
         if (!json) hint(next);
         return 0;

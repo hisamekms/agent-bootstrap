@@ -19,12 +19,12 @@ import {
   driftWarning,
   listProjects,
   projectMissing,
-  repository,
 } from "../config/projects.ts";
 import { ALPINE_3_23, BUN_VERSION } from "../image-recipes.ts";
 import {
   hasLegacyState,
   rejectLegacyState,
+  resolveConfigTarget,
   resolveTarget,
 } from "../local-orchestrator/target.ts";
 import {
@@ -347,6 +347,7 @@ export async function doctor(
     ),
   );
 
+  const baseImage = lock?.base ?? ALPINE_3_23.reference;
   let verifyProfile: string | undefined;
   let layers: ReturnType<typeof loadConfig> | undefined;
   let configurationError = false;
@@ -385,21 +386,11 @@ export async function doctor(
           !concierge,
         );
     }
-    let defaultRegistered = false;
-    if (path === undefined && !concierge && projects.length) {
-      try {
-        const { identity } = repository(root);
-        defaultRegistered = projects.some(
-          (project) => project.identity === identity,
-        );
-      } catch (error) {
-        if (!(error instanceof ConfigError)) throw error;
-      }
-    }
-    const target =
-      path !== undefined || concierge || defaultRegistered
-        ? await resolveTarget(path, root, host.env)
-        : undefined;
+    const target = concierge
+      ? await resolveTarget(path, root, host.env)
+      : legacyRecovery
+        ? undefined
+        : await resolveConfigTarget(path, root, host.env);
     layers = loadConfig(host.env, target?.configDirectory, host.actorHarnesses);
     if (target) {
       add(
@@ -513,7 +504,7 @@ export async function doctor(
   }
 
   const images = {
-    base: ALPINE_3_23.reference,
+    base: baseImage,
     ...Object.fromEntries(
       Object.entries(lock?.profiles ?? {}).map(([name, profile]) => [
         name,
@@ -571,12 +562,17 @@ export async function doctor(
     for (const [variable, { actors }] of Object.entries(
       effective.config.secretEnv ?? {},
     )) {
-      const passed = hasSecretTestPass(userStateDirectory(host.env), variable);
+      const passed = hasSecretTestPass(
+        userStateDirectory(host.env),
+        variable,
+        undefined,
+        baseImage,
+      );
       add(
         check(
           `secretEnv.${variable}`,
           passed ? "ok" : "missing",
-          `${actors.join(", ")}. Self-test for CLI ${CLAUDE_CODE.version} ${passed ? "passed" : "required"}.`,
+          `${actors.join(", ")}. Self-test for CLI ${CLAUDE_CODE.version} and current containment ${passed ? "passed" : "required"}.`,
           passed
             ? []
             : [
@@ -585,7 +581,6 @@ export async function doctor(
           false,
           !passed,
         ),
-        !concierge,
       );
     }
 

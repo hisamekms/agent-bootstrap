@@ -1,6 +1,8 @@
 import { join } from "node:path";
+import { loadConfig } from "../config/layers.ts";
 import { buildSandboxPlan } from "../image-build-sandbox.ts";
 import { ALPINE_3_23, recipeFor } from "../image-recipes.ts";
+import { resolveConfigTarget } from "../local-orchestrator/target.ts";
 import { offlineMiseEnv } from "../mise-tools.ts";
 import {
   allProfiles,
@@ -23,10 +25,14 @@ export async function setupPlan(
   root: string,
   extended: boolean,
   env = process.env,
+  targetPath?: string,
 ) {
   const selected = extended ? allProfiles : defaultProfiles;
   const lock = await readLock(root);
-  const inputs = artifacts(selected, undefined, true);
+  const target = await resolveConfigTarget(targetPath, root, env);
+  const { config } = loadConfig(env, target?.configDirectory);
+  const includeSecrets = Object.keys(config.secretEnv ?? {}).length > 0;
+  const inputs = artifacts(selected, undefined, includeSecrets);
   const profiles = selected.map((name) => {
     const entry = lock.profiles[name];
     if (!entry)
@@ -50,7 +56,7 @@ export async function setupPlan(
         status: await artifactStatus(join(root, item.path), item.sha256),
       })),
     ),
-    images: { base: ALPINE_3_23.reference, profiles },
+    images: { base: lock.base ?? ALPINE_3_23.reference, profiles },
     keychain: {
       commands: [...configureClaude, provisionKeychain],
       promptValue: "<ANTHROPIC_API_KEY>",

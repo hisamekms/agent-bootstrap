@@ -1211,6 +1211,38 @@ function secretRunFixture(t: { after(fn: () => void): void }) {
   };
 }
 
+test("secret host refuses delivery without a current pass and limits the bypass to a probe", async (t) => {
+  const secret = secretRunFixture(t);
+  const observed = observedFixture(t, {}, undefined, { claude: secret.policy });
+  for (const secretTest of [undefined, "running"] as const)
+    await assert.rejects(
+      observed.host.runWorker(secret.plan, undefined, undefined, {
+        secretFile: secret.channel,
+        ...(secretTest ? { secretTest } : {}),
+      }),
+      /current secret self-test pass/,
+    );
+  assert.deepEqual(observed.calls, []);
+  assert.ok(!secret.history.includes("armed"));
+
+  const probe = {
+    ...secret.plan,
+    command: { ...secret.plan.command, secretFileProbe: true as const },
+  };
+  await assert.rejects(
+    observed.host.runWorker(probe, undefined, undefined, {
+      secretFile: secret.channel,
+      secretTest: "passed",
+    }),
+    /current secret self-test pass/,
+  );
+  await observed.host.runWorker(probe, undefined, undefined, {
+    secretFile: secret.channel,
+    secretTest: "running",
+  });
+  assert.ok(secret.history.includes("armed"));
+});
+
 test("secret host audits delivery and closes the channel before collection, with egress limited to the model endpoint", async (t) => {
   const secret = secretRunFixture(t);
   const id = randomUUID();
@@ -1245,6 +1277,7 @@ test("secret host audits delivery and closes the channel before collection, with
   );
   const run = await observed.host.runWorker(secret.plan, id, undefined, {
     secretFile: secret.channel,
+    secretTest: "passed",
     onWorkerStderr() {
       secret.history.push("published");
     },
@@ -1274,6 +1307,7 @@ test("secret host rejects added egress before arming", async (t) => {
   await assert.rejects(
     observed.host.runWorker(secret.plan, undefined, undefined, {
       secretFile: secret.channel,
+      secretTest: "passed",
     }),
     /cannot use added egress/,
   );
@@ -1292,6 +1326,7 @@ test("secret host rejects mount grants before arming", async (t) => {
   await assert.rejects(
     observed.host.runWorker(secret.plan, undefined, undefined, {
       secretFile: secret.channel,
+      secretTest: "passed",
     }),
     /Invalid audited secret-file run/,
   );
@@ -1304,6 +1339,7 @@ test("secret host refuses success when delivery was never acknowledged", async (
   const observed = observedFixture(t, {}, undefined, { claude: secret.policy });
   const run = await observed.host.runWorker(secret.plan, undefined, undefined, {
     secretFile: secret.channel,
+    secretTest: "passed",
   });
   assert.equal(run.outcome, "failed");
   assert.equal(run.artifacts, undefined);
@@ -1346,6 +1382,7 @@ test("secret host screens guest network metadata before the gateway audit stores
   );
   const run = await observed.host.runWorker(secret.plan, id, undefined, {
     secretFile: secret.channel,
+    secretTest: "passed",
   });
   assert.equal(run.code, "credential-leak");
   const execution = observed.db.readExecution(id);
@@ -1414,6 +1451,7 @@ for (const sink of [
         undefined,
         {
           secretFile: secret.channel,
+          secretTest: "passed",
           onWorkerStderr() {
             published = true;
           },

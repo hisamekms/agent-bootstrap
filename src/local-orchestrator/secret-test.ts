@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -15,6 +15,9 @@ import {
   CLAUDE_BWRAP_OK,
   CLAUDE_CODE,
   CLAUDE_WORKER_USAGE_MARKER,
+  SECRET_PROBE_HASH,
+  SECRET_PROBE_REPORT,
+  SECRET_PROBE_SCRIPT,
   claudeCodeCommand,
   claudeCodeTools,
   parseClaudeWorkerResult,
@@ -24,6 +27,7 @@ import { invalid } from "../config/messages.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../mise-tools.ts";
 import { createObservedHost } from "../observed-host.ts";
+import { PROFILE_LOCK_PATH, parseProfileLock } from "../profile-lock.ts";
 import { ProfileCatalog } from "../sandbox-profiles.ts";
 import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
@@ -36,10 +40,13 @@ import {
 } from "../secret-file.ts";
 import { workspaceFiles, type WorkspaceFile } from "../workspace-tree.ts";
 import type { Host } from "../onboarding/prerequisites.ts";
-import { loadClaudeConfig } from "./claude-config.ts";
-import { managedClaudeSettings } from "./claude-policy.ts";
+import { loadClaudeConfig, resolveClaudeModel } from "./claude-config.ts";
+import {
+  managedClaudeSettings,
+  SECRET_EXECUTOR_SHELL,
+} from "./claude-policy.ts";
 import { recordSecretTestPass } from "./secret-test-record.ts";
-import { resolveTarget } from "./target.ts";
+import { resolveConfigTarget } from "./target.ts";
 
 const runFile = promisify(execFile);
 const modelHost = "api.anthropic.com";
@@ -51,7 +58,7 @@ const helperNames = [
   "post-checkout",
   "pre-commit",
 ];
-const reportPath = "probe.txt";
+const noncePath = (nonce: string) => `.probe-${nonce}.sha256`;
 
 const fileProbes = [
   { tool: "Read", path: "/workspace/probe-self" },
@@ -65,11 +72,13 @@ const fileProbes = [
   ]),
 ];
 
-function selftestScript(variable: string): string {
+function selftestScript(variable: string, nonce: string): string {
   if (!isSafeCredentialVariable(variable)) throw new Error("Invalid variable");
   return String.raw`#!/bin/sh
 set -eu
 cd /workspace
+# Leave time for the root observer to sample the sandboxed shell.
+sleep 1
 scratch=$(mktemp -d /workspace/.probe.XXXXXX)
 trap 'rm -r "$scratch"' EXIT
 yn() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }
@@ -124,29 +133,35 @@ echo "core_hard_limit=$(ulimit -Hc)"
 echo "tcp_model=$(yn tcp ${modelHost}:443)"
 echo "tcp_ip=$(yn tcp 192.0.2.1:443)"
 echo "dns=$(yn timeout 3 nslookup ${modelHost})"
-} > /workspace/${reportPath}
+} > ${SECRET_PROBE_REPORT}
+hash=$(sha256sum ${SECRET_PROBE_REPORT})
+printf "probe_nonce=%s\\nsha256=%s\\n" "${nonce}" "${"$"}{hash%% *}" > ${noncePath(nonce)}
 `;
 }
 
 function prompt(): string {
   return [
     "Run this operator test in the disposable guest.",
-    "First run sh /workspace/selftest.sh using Bash exactly once. It writes only yes/no answers and counts.",
+    `First run sh ${SECRET_PROBE_SCRIPT} using Bash exactly once.`,
     "Then try each file tool below once. Use path and relative pattern for Glob. Use the harmless pattern ^isolation-fixture$ for Grep. Return no file contents.",
     ...fileProbes.map(({ tool, path }) => `${tool} ${path}`),
     "Finish with a brief confirmation after trying all probes.",
   ].join("\n");
 }
 
-async function seedRepository(root: string, variable: string) {
+async function seedRepository(root: string, variable: string, nonce: string) {
   const workspace = join(root, "input");
   const gitDir = join(root, "git");
   const tree = join(root, "tree.tar");
   await mkdir(workspace, { mode: 0o700 });
-  await writeFile(join(workspace, "selftest.sh"), selftestScript(variable), {
-    mode: 0o644,
-    flag: "wx",
-  });
+  await writeFile(
+    join(workspace, "selftest.sh"),
+    selftestScript(variable, nonce),
+    {
+      mode: 0o644,
+      flag: "wx",
+    },
+  );
   const git = (...args: string[]) =>
     runFile(
       "git",
@@ -234,6 +249,7 @@ function deniedProbes(envelope: string): number {
 
 export function evaluateSecretTest({
   variable,
+  nonce,
   stderr,
   files,
   audit,
@@ -241,13 +257,15 @@ export function evaluateSecretTest({
   auditScreened,
 }: {
   variable: string;
+  nonce: string;
   stderr: Uint8Array;
   files: ReadonlyMap<string, WorkspaceFile>;
   audit: ExecutionAudit;
   runSucceeded: boolean;
   auditScreened: boolean;
 }) {
-  const probe = files.get(reportPath);
+  const probe = files.get(SECRET_PROBE_REPORT);
+  const witness = files.get(noncePath(nonce));
   const fields =
     probe?.mode === "100644" && probe.bytes.length <= 4096
       ? parseFields(Buffer.from(probe.bytes).toString("utf8"))
@@ -260,7 +278,8 @@ export function evaluateSecretTest({
   };
   const text = Buffer.from(stderr).toString("utf8");
   const marker = "\n" + CLAUDE_WORKER_USAGE_MARKER;
-  const markerAt = text.lastIndexOf(marker);
+  // Probe launchers report root evidence directly. The CLI envelope follows it.
+  const markerAt = text.indexOf(marker);
   const header = markerAt < 0 ? "" : text.slice(0, markerAt);
   const denied =
     markerAt < 0 ? 0 : deniedProbes(text.slice(markerAt + marker.length));
@@ -309,11 +328,31 @@ export function evaluateSecretTest({
   const procEntries = count("proc_entries");
   const procReadable = count("proc_readable");
   const cliResult = parseClaudeWorkerResult(stderr);
+  const hash =
+    fields.size && probe
+      ? createHash("sha256").update(probe.bytes).digest("hex")
+      : undefined;
+  const rootHash = header
+    .split("\n")
+    .filter((line) => line.startsWith(SECRET_PROBE_HASH + " "));
   const checks = {
     worker:
       runSucceeded &&
       Boolean(cliResult && !cliResult.isError) &&
       header.split("\n").includes(CLAUDE_BWRAP_OK),
+    probeEvidence:
+      !!hash &&
+      ["bwrap", "sh"].every((expected) =>
+        processSamples.some(
+          ([, name, uid]) => name === expected && uid === "1000",
+        ),
+      ) &&
+      rootHash.length === 1 &&
+      rootHash[0] === `${SECRET_PROBE_HASH} ${hash}` &&
+      witness?.mode === "100644" &&
+      Buffer.from(witness.bytes).equals(
+        Buffer.from(`probe_nonce=${nonce}\nsha256=${hash}\n`),
+      ),
     scrub:
       count("uid") === 1000 &&
       fields.get("env_has_variable") === "no" &&
@@ -393,19 +432,28 @@ async function runProbe(
   checkout: string,
   msb: { binary: string; home: string },
   model: string,
+  baseImage: string,
   variable: string,
   value: Uint8Array,
 ) {
   const settings = join(root, "managed.json");
   await writeFile(
     settings,
-    JSON.stringify(managedClaudeSettings("Executor", true, [], "secret-file")),
+    JSON.stringify(
+      managedClaudeSettings(
+        "Executor",
+        SECRET_EXECUTOR_SHELL,
+        [],
+        "secret-file",
+      ),
+    ),
     {
       mode: 0o600,
       flag: "wx",
     },
   );
-  const repository = await seedRepository(root, variable);
+  const nonce = randomUUID();
+  const repository = await seedRepository(root, variable, nonce);
   const auth = { mode: "secret-file", variable } as const;
   const local = join(checkout, ".local");
   const tools = claudeCodeTools(
@@ -440,7 +488,7 @@ async function runProbe(
         auditPath,
         msb: { ...msb, stagingRoot: join(root, "sandboxes") },
         profiles: new ProfileCatalog({
-          base: { image: ALPINE_3_23.reference },
+          base: { image: baseImage },
         }),
         claude: { auth: auth.mode, managedSettings: () => settings, note() {} },
       });
@@ -457,7 +505,7 @@ async function runProbe(
             command: claudeCodeCommand(
               {
                 role: "Worker",
-                shell: true,
+                shell: SECRET_EXECUTOR_SHELL,
                 secretFileProbe: true,
                 model,
                 prompt: prompt(),
@@ -473,6 +521,7 @@ async function runProbe(
           undefined,
           {
             secretFile: channel,
+            secretTest: "running",
             onWorkerStderr(bytes) {
               received = bytes;
             },
@@ -502,6 +551,7 @@ async function runProbe(
         match ||= screen.matches(await readFile(auditPath));
         return evaluateSecretTest({
           variable,
+          nonce,
           stderr: match ? new Uint8Array() : received,
           files: match ? new Map() : files,
           audit,
@@ -527,10 +577,7 @@ export async function runSecretTest(
   variable: string,
   targetPath?: string,
 ) {
-  const target =
-    targetPath === undefined
-      ? undefined
-      : await resolveTarget(targetPath, checkout, host.env);
+  const target = await resolveConfigTarget(targetPath, checkout, host.env);
   const layers = loadConfig(host.env, target?.configDirectory);
   const effective = loadClaudeConfig(
     host.env,
@@ -562,6 +609,10 @@ export async function runSecretTest(
   if (tool.code !== 0 || !isAbsolute(tool.stdout.trim()))
     throw new Error("Pinned Microsandbox is unavailable");
   const binary = await realpath(join(tool.stdout.trim(), "msb"));
+  const lock = parseProfileLock(
+    await readFile(join(checkout, PROFILE_LOCK_PATH), "utf8"),
+  );
+  const baseImage = lock.base ?? ALPINE_3_23.reference;
   const root = await mkdtemp(join(await secretSocketRoot(), "ab-test-"));
   try {
     const value = await readKeychainSecret(definition.keychainService);
@@ -570,12 +621,18 @@ export async function runSecretTest(
         root,
         checkout,
         { binary, home },
-        effective.model ?? "claude-opus-5-5",
+        resolveClaudeModel(effective),
+        baseImage,
         variable,
         value,
       );
       if (report.pass)
-        recordSecretTestPass(userStateDirectory(host.env), variable);
+        recordSecretTestPass(
+          userStateDirectory(host.env),
+          variable,
+          undefined,
+          baseImage,
+        );
       return report;
     } finally {
       value.fill(0);

@@ -331,9 +331,25 @@ const secretGitEnv = [
   ]),
 ].join(" ");
 
+export const SECRET_PROBE_SCRIPT = SECRET_TOOL_DIRS.tmp + "/selftest.sh";
+export const SECRET_PROBE_REPORT = "probe.txt";
+export const SECRET_PROBE_HASH = "agent-probe-sha256";
+
 function secretFileLaunch(variable: string, probe: boolean): string {
+  // Keep the challenge script in the shell temp directory, outside file-tool access.
   const observe = probe
     ? String.raw`
+        mv /workspace/selftest.sh ${SECRET_PROBE_SCRIPT}
+        for dir in "$HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR"; do
+          printf "fixture\n" > "$dir/.isolation-fixture"
+          chmod 644 "$dir/.isolation-fixture"
+        done
+        printf "%s\n" "[core]" "fsmonitor=/workspace/.git/hooks/fsmonitor" "hooksPath=/workspace/.git/hooks" "pager=touch /workspace/pwned-pager" "sshCommand=touch /workspace/pwned-ssh" >> /workspace/.git/config
+        crash_status=0
+        /bin/busybox su -p -s /bin/sh -c "cd \"\$(mktemp -d \"\$TMPDIR/crash.XXXXXX\")\" && kill -SEGV \$\$" -- agent >/dev/null 2>&1 || crash_status=$?
+        printf "agent-crash-status=%s\n" "$crash_status" >&2
+        core_files=$(find /workspace /tmp /home/agent/run \( -name core -o -name "core.*" \) -type f | wc -l)
+        printf "agent-core-files=%s\n" "$core_files" >&2
         samples=$(mktemp /tmp/agent-observer.XXXXXX)
         (
           while :; do
@@ -350,25 +366,16 @@ function secretFileLaunch(variable: string, probe: boolean): string {
           done
         ) > "$samples" 2>/dev/null &
         observer=$!
-        for dir in "$HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR"; do
-          printf "fixture\n" > "$dir/.isolation-fixture"
-          chmod 644 "$dir/.isolation-fixture"
-        done
-        printf "%s\n" "[core]" "fsmonitor=/workspace/.git/hooks/fsmonitor" "hooksPath=/workspace/.git/hooks" "pager=touch /workspace/pwned-pager" "sshCommand=touch /workspace/pwned-ssh" >> /workspace/.git/config
-        crash_status=0
-        /bin/busybox su -p -s /bin/sh -c "cd \"\$(mktemp -d \"\$TMPDIR/crash.XXXXXX\")\" && kill -SEGV \$\$" -- agent >/dev/null 2>&1 || crash_status=$?
-        printf "agent-crash-status=%s\n" "$crash_status" >&2
-        core_files=$(find /workspace /tmp /home/agent/run \( -name core -o -name "core.*" \) -type f | wc -l)
-        printf "agent-core-files=%s\n" "$core_files" >&2
 `
     : "";
   const drop = String.raw`printf "%s\000" "$secret" |
           /bin/busybox su -p -s /bin/sh -c "IFS= read -r -d \"\" secret && test -n \"\$secret\" || exit 1
           export ${variable}=\"\$secret\"
           unset secret
-          exec \"\$@\" </dev/null" -- agent tool-secret "$@"`;
+          exec \"\$@\" </dev/null" -- agent tool-secret "$@" 2>/tmp/claude-err`;
   // Feed the privilege drop through a private pipe. Only the final tool
-  // exec receives the variable in its initial process environment.
+  // exec receives the variable in its initial process environment and writes
+  // stderr separately from root's probe evidence.
   return String.raw`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
       CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 /bin/sh -ec '
         umask 077
@@ -407,7 +414,24 @@ function secretFileLaunch(variable: string, probe: boolean): string {
             : ""
         }
         exit "$status"
-      ' tool-secret`;
+      ' tool-secret`.replace(/^ +/gm, "");
+}
+
+// Root reports the hash, while the bounded read runs with the agent's permissions.
+const secretProbeEvidence = `if test -f /workspace/${SECRET_PROBE_REPORT} && test ! -L /workspace/${SECRET_PROBE_REPORT}; then
+      hash=$(/bin/busybox su -p -s /bin/sh -c 'timeout 2 head -c 4097 /workspace/${SECRET_PROBE_REPORT}' -- agent | sha256sum)
+      printf '%s %s\\n' '${SECRET_PROBE_HASH}' "\${hash%% *}" >&2
+    fi`;
+
+export function secretFileLauncherTemplate() {
+  return [
+    secretFileSetup("/workspace", true),
+    secretFileSetup("/review", false),
+    secretFileLaunch("FIXTURE_TOKEN", false),
+    secretFileLaunch("FIXTURE_TOKEN", true),
+    secretGitEnv,
+    secretProbeEvidence,
+  ];
 }
 
 /**
@@ -534,8 +558,8 @@ ${
         --model '${task.model}' --max-turns ${task.maxTurns} \\
         --permission-mode "$permission_mode" \\
         "$@" \\
-        -- "$prompt" </dev/null >/tmp/claude-out.json 2>/tmp/claude-err || claude_status=$?
-    ${secretFile ? "tail -c 8192 /tmp/claude-err >&2" : ""}
+        -- "$prompt" </dev/null >/tmp/claude-out.json ${secretFile ? "" : "2>/tmp/claude-err "}|| claude_status=$?
+    ${task.secretFileProbe ? secretProbeEvidence : secretFile ? "tail -c 8192 /tmp/claude-err >&2" : ""}
     ${usageOutput}
     if test "$claude_status" -ne 0; then
       if test -s /tmp/claude-out.json; then
@@ -552,6 +576,7 @@ ${
     timeoutMs: task.timeoutMs,
     ...(secretFile ? { claudeSecretVariable: auth.variable } : {}),
     ...(task.shell ? { claudeShell: true } : {}),
+    ...(task.secretFileProbe ? { secretFileProbe: true } : {}),
   };
 }
 

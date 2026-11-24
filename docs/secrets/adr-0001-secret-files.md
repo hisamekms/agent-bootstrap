@@ -87,7 +87,16 @@ one CLI version, not about the name.
   for the pair (variable, CLI version) in the host state.
 - The adapter refuses a run with a grant that has no recorded pass for
   the pinned CLI version.
-- A CLI version change invalidates every pass.
+- A pass is also bound to a containment digest. The digest covers the
+  secret-mode launcher, the managed settings for each grantable actor,
+  the pinned sandbox packages and the base image digest. A change to any
+  of them invalidates every pass, as a CLI version change does.
+- A pass needs evidence from outside the model. The root-side observer
+  must see the unprivileged `bwrap` and shell processes while the probe
+  runs. The probe output must carry a nonce that the host generated for
+  that run. A probe file that the model writes itself does not count.
+- The trusted host checks for a pass before it arms a delivery, not only
+  the launcher. Only the self-test run itself is exempt.
 
 The repository therefore names no variable, and the operator proves
 each name on the version in use.
@@ -152,7 +161,10 @@ so that the unprivileged user can read it.
 
 ### S5. Commands and tools run contained
 
-An actor that receives a secret keeps Bash if its role has it. Every
+An Executor that receives a secret gets Bash, even though a task
+Executor without a secret has no shell today. Containment is what makes
+a shell acceptable next to a credential, and running tests and builds is
+the reason for this ADR. Planner and Reviewer get no shell. Every
 command it runs must be contained. For Claude this means:
 
 - **Bash sandbox.** Managed settings enforce:

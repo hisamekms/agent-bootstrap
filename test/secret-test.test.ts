@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   chmod,
   mkdtemp,
@@ -17,6 +18,7 @@ import {
   CLAUDE_BWRAP_OK,
   CLAUDE_CODE,
   CLAUDE_WORKER_USAGE_MARKER,
+  SECRET_PROBE_HASH,
 } from "../src/claude-code.ts";
 import { evaluateSecretTest } from "../src/local-orchestrator/secret-test.ts";
 import {
@@ -26,8 +28,9 @@ import {
 import { SECRET_TOOL_DIRS, SECRET_FILE_PORT } from "../src/secret-file.ts";
 
 const variable = "TOOL_TOKEN";
+const nonce = "fixture-nonce";
 
-test("secret self-test records match both variable and pinned CLI version", async () => {
+test("secret self-test records match the variable, pinned CLI version and containment", async () => {
   const temp = await realpath(await mkdtemp(join(tmpdir(), "ab-secret-pass-")));
   const state = join(temp, "state");
   try {
@@ -38,6 +41,10 @@ test("secret self-test records match both variable and pinned CLI version", asyn
     recordSecretTestPass(state, variable);
     assert.equal(hasSecretTestPass(state, variable), true);
     assert.equal(hasSecretTestPass(state, "OTHER_TOKEN"), false);
+    assert.equal(
+      hasSecretTestPass(state, variable, undefined, "sha256:" + "f".repeat(64)),
+      false,
+    );
 
     const directory = join(state, "secret-tests", CLAUDE_CODE.version);
     const path = join(directory, `${variable}.json`);
@@ -52,7 +59,11 @@ test("secret self-test records match both variable and pinned CLI version", asyn
     await symlink(otherPath, path);
     assert.equal(hasSecretTestPass(state, variable), false);
     await rm(path);
-    await writeFile(path, '{"schema":2}', { mode: 0o600 });
+    await writeFile(
+      path,
+      JSON.stringify({ schema: 1, variable, version: CLAUDE_CODE.version }),
+      { mode: 0o600 },
+    );
     assert.equal(hasSecretTestPass(state, variable), false);
     assert.equal(hasSecretTestPass(state, variable, "../../../state"), false);
   } finally {
@@ -166,13 +177,18 @@ function fixture() {
       { tool_name: "Glob", tool_input: { path, pattern: "**" } },
     ]),
   ];
+  const bytes = Buffer.from(signals.join("\n"));
+  const hash = createHash("sha256").update(bytes).digest("hex");
   const stderr = Buffer.from(
     [
       CLAUDE_BWRAP_OK,
       "agent-proc claude 1000 yes 20",
       "agent-proc git 1000 no 2",
+      "agent-proc bwrap 1000 no 10",
+      "agent-proc sh 1000 no 10",
       "agent-crash-status=139",
       "agent-core-files=0",
+      `${SECRET_PROBE_HASH} ${hash}`,
       CLAUDE_WORKER_USAGE_MARKER +
         JSON.stringify({ result: "All denied.", permission_denials }),
     ].join("\n"),
@@ -182,12 +198,20 @@ function fixture() {
       "probe.txt",
       {
         mode: "100644" as const,
-        bytes: Buffer.from(signals.join("\n")),
+        bytes,
+      },
+    ],
+    [
+      `.probe-${nonce}.sha256`,
+      {
+        mode: "100644" as const,
+        bytes: Buffer.from(`probe_nonce=${nonce}\nsha256=${hash}\n`),
       },
     ],
   ]);
   return {
     variable,
+    nonce,
     stderr,
     files,
     audit,
@@ -225,4 +249,25 @@ test("the secret self-test requires complete signals and recorded permission den
   );
   input.audit.auditEvents.pop();
   assert.equal(evaluateSecretTest(input).checks.delivery, false);
+});
+
+test("workspace probe output requires the current nonce, root hash and uid-1000 sandbox processes", () => {
+  const input = fixture();
+  const files = new Map(input.files);
+  files.delete(`.probe-${nonce}.sha256`);
+  assert.equal(evaluateSecretTest({ ...input, files }).pass, false);
+  assert.equal(
+    evaluateSecretTest({ ...input, nonce: "previous-run" }).pass,
+    false,
+  );
+
+  for (const [before, after] of [
+    ["agent-proc bwrap 1000", "agent-proc bwrap 0"],
+    ["agent-proc sh 1000", "agent-proc sh 0"],
+    [SECRET_PROBE_HASH, "ignored-hash"],
+    [SECRET_PROBE_HASH + " ", SECRET_PROBE_HASH + " f"],
+  ] as const) {
+    const stderr = Buffer.from(input.stderr.toString().replace(before, after));
+    assert.equal(evaluateSecretTest({ ...input, stderr }).pass, false);
+  }
 });

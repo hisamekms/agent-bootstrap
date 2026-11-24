@@ -362,3 +362,8 @@ export function loadClaudeConfig(
     warnings: [...warnings],
   };
 }
+export function resolveClaudeModel({
+  model,
+}: Pick<EffectiveClaudeConfig, "model">): string {
+  return model ?? "claude-opus-5-5";
+}

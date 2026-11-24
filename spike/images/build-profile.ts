@@ -294,7 +294,9 @@ async function main(): Promise<void> {
       // Refuse a malformed lock rather than rewrite it from a partial copy.
       if (
         !plain(raw) ||
-        Object.keys(raw).sort().join(",") !== "profiles,version" ||
+        !["profiles,version", "base,profiles,version"].includes(
+          Object.keys(raw).sort().join(","),
+        ) ||
         !plain(raw.profiles)
       )
         throw new Error("Profile lock is malformed");
@@ -305,6 +307,7 @@ async function main(): Promise<void> {
     const entry = lockEntry(profile, digest, packages);
     const lock = {
       version: 1,
+      ...(existing.base ? { base: existing.base } : {}),
       profiles: { ...existing.profiles, [profile]: entry },
     };
     await mkdir(join(root, "images"), { recursive: true });

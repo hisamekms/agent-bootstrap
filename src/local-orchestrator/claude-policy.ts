@@ -32,6 +32,9 @@ export const orchestratorMcp = {
   args: ["STDIO", "VSOCK-CONNECT:2:5000"],
 } as const;
 
+// S5 containment applies to the Executor shell in secret-file runs.
+export const SECRET_EXECUTOR_SHELL = true;
+
 export function managedClaudeSettings(
   actor: ClaudeActor,
   shell = false,

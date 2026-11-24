@@ -20,7 +20,11 @@ export async function withActorSecret<T>(
   config: SecretConfig,
   state: string,
   variable: string,
-  run: (secretFile: SecretFileDelivery) => Promise<T>,
+  baseImage: string,
+  run: (options: {
+    secretFile: SecretFileDelivery;
+    secretTest: "passed";
+  }) => Promise<T>,
   read = readKeychainSecret,
 ): Promise<T> {
   const key = `secretEnv.${variable}`;
@@ -32,10 +36,10 @@ export async function withActorSecret<T>(
       "The secret source is unavailable.",
       "Define the secret in the user configuration.",
     );
-  if (!hasSecretTestPass(state, variable))
+  if (!hasSecretTestPass(state, variable, undefined, baseImage))
     throw new ConfigError(
       key,
-      "The pinned CLI has no passing self-test for this credential variable.",
+      "This credential variable has no current self-test pass for the pinned CLI and containment.",
       `Run agent-bootstrap secrets test ${variable} with the same target, then retry.`,
     );
   const root = await secretSocketRoot();
@@ -53,7 +57,7 @@ export async function withActorSecret<T>(
     value.fill(0);
   }
   try {
-    return await run(delivery);
+    return await run({ secretFile: delivery, secretTest: "passed" });
   } finally {
     try {
       await delivery.close();
