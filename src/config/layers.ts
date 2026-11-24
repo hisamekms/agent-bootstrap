@@ -76,6 +76,7 @@ export interface SecretEnvGrant {
 }
 export interface Config {
   version: 1;
+  microsandbox?: { home: string };
   verification?: VerificationConfig;
   claude?: Record<string, unknown>;
   profiles?: Profiles;
@@ -459,14 +460,25 @@ export function parseConfig(
   const key = "$";
   const keys = ["version", "verification", "profiles", "egress"];
   if (layer !== "approved") keys.push("claude", "mounts", "secretEnv");
-  if (layer === "user") keys.push("volumes", "secrets");
+  if (layer === "user") keys.push("volumes", "secrets", "microsandbox");
   const raw = record(value, key, next);
+  if (Object.hasOwn(raw, "microsandbox") && layer !== "user")
+    invalid(
+      "microsandbox",
+      "The Microsandbox home holds images, volumes and VM state for the whole machine and is a trusted input allowed only in user configuration.",
+      next,
+    );
   for (const field of ["claude", "mounts", "volumes", "secrets", "secretEnv"])
     if (Object.hasOwn(raw, field) && !keys.includes(field))
       invalid(field, "This key is disallowed in this layer.", next);
   record(raw, key, next, keys);
   if (raw.version !== 1)
     invalid("version", "Expected configuration version 1.", next);
+  if ("microsandbox" in raw) {
+    const { home } = record(raw.microsandbox, "microsandbox", next, ["home"]);
+    if (typeof home !== "string" || !isAbsolute(home))
+      invalid("microsandbox.home", "Expected an absolute path string.", next);
+  }
   if ("verification" in raw) {
     const verification = record(raw.verification, "verification", next, [
       "profile",
@@ -766,6 +778,10 @@ export function mergeConfig(
 ) {
   const config: Config = { version: 1 };
   const sources: Record<string, Layer | Layer[]> = Object.create(null);
+  if (user.microsandbox) {
+    config.microsandbox = user.microsandbox;
+    sources["microsandbox.home"] = "user";
+  }
   const layers = { user, approved, local };
   for (const layer of ["user", "approved", "local"] as const) {
     const current = layers[layer];

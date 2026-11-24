@@ -100,7 +100,7 @@ Version 1 allows only these keys:
   appear (C8).
 
 The declaration cannot contain volume definitions, mounts, secret sources
-(`secrets`), or actor secret grants (`secretEnv`).
+(`secrets`), actor secret grants (`secretEnv`), or `microsandbox`.
 
 ### C4. Approval and drift
 
@@ -145,10 +145,16 @@ Re-approval replaces only `approved.json`. It never touches `local.json`.
 
 ### C5. Local permissions
 
-`local.json` takes every key the user config takes, except volume and
-secret source definitions. These are machine-wide and are defined only in
-the user config. `local.json` can refer to them. `agent-bootstrap config
-edit [--project <name>]` opens the right file in `$EDITOR`.
+`local.json` takes every key the user config takes except `microsandbox`,
+volume definitions, and secret source definitions. `local.json` can refer to
+volumes and secret sources defined in the user config. `agent-bootstrap
+config edit [--project <name>]` opens the right file in `$EDITOR`.
+
+The user config accepts `"microsandbox": { "home": "/absolute/path" }`.
+This trusted directory holds images, volumes and VM state for the whole
+machine. The CLI uses a nonempty `MSB_HOME` first, then the configured home,
+then `$HOME/.msb`. Create the chosen directory before use and keep its
+real path at most 40 bytes. Doctor reports the selected source.
 
 The user config defines Keychain sources by name.
 
@@ -207,8 +213,9 @@ declaration is exempt from these file checks, because it is read from a
 Git object.
 
 Each error names three things: the key path, the reason in one
-sentence, and a `next:` action. Errors never echo configuration values,
-only key paths and the fixed vocabulary, such as actor names:
+sentence, and a `next:` action. Configuration errors use key paths and fixed
+vocabulary, such as actor names. The Microsandbox home check can show the
+directory to create in its `mkdir -p` action.
 
 ```
 Invalid local configuration: egress.Verification is not allowed.

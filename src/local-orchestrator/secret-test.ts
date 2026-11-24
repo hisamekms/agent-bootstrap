@@ -24,6 +24,7 @@ import {
 } from "../claude-code.ts";
 import { loadConfig, userStateDirectory } from "../config/layers.ts";
 import { invalid } from "../config/messages.ts";
+import { requireMsbHome } from "../config/msb-home.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../mise-tools.ts";
 import { createObservedHost } from "../observed-host.ts";
@@ -598,9 +599,7 @@ export async function runSecretTest(
       "Review agent-bootstrap help secrets and the operator configuration.",
     );
 
-  const homePath = host.env.MSB_HOME;
-  if (!homePath || !isAbsolute(homePath)) throw new Error("Invalid VM home");
-  const home = await realpath(homePath);
+  const home = await requireMsbHome(host.env, layers.user);
   const tool = await host.command(
     "mise",
     [...MISE_FLAGS, "where", MSB_TOOL],

@@ -58,6 +58,12 @@ async function fixture() {
   return temp;
 }
 
+async function shortHomeRoot() {
+  const root = await realpath(await mkdtemp("/tmp/ab-home-"));
+  temporary.push(root);
+  return root;
+}
+
 function fakeHost(root: string) {
   const calls: Array<{
     file: string;
@@ -376,6 +382,61 @@ describe("agent-bootstrap", () => {
     }
   });
 
+  test("doctor reports the selected Microsandbox home source and fixes", async () => {
+    const root = await fixture();
+    const { host, calls } = fakeHost(root);
+    const homeRoot = await shortHomeRoot();
+    const destination = join(homeRoot, "user");
+    const fallback = join(homeRoot, ".msb");
+    await mkdir(destination);
+    delete host.env.MSB_HOME;
+    host.env.HOME = homeRoot;
+
+    async function inspect(source: string, status: string) {
+      calls.length = 0;
+      const result = await invoke(["doctor", "--json"], root, host);
+      const checks = JSON.parse(result.stdout) as Array<{
+        id: string;
+        status: string;
+        detail: string;
+        fix: string[];
+        effective?: { sources: Record<string, string> };
+      }>;
+      const home = checks.find(({ id }) => id === "msb-home");
+      assert.ok(home);
+      assert.equal(home.status, status);
+      assert.ok(home.detail.includes(`source: ${source}`));
+      assert.equal(
+        checks.find(({ id }) => id === "effective-configuration")?.effective
+          ?.sources["microsandbox.home"],
+        source,
+      );
+      return { ...home, stderr: result.stderr };
+    }
+
+    const missing = await inspect("default", "missing");
+    assert.deepEqual(missing.fix, [`mkdir -p ${fallback}`]);
+    assert.equal(missing.stderr, `next: mkdir -p ${fallback}\n`);
+    await assert.rejects(stat(fallback), { code: "ENOENT" });
+    const longPath = join(homeRoot, "x".repeat(40));
+    await mkdir(longPath);
+    await symlink(longPath, fallback);
+    const wrong = await inspect("default", "wrong");
+    assert.match(wrong.detail, /40 bytes after realpath/);
+    assert.match(wrong.stderr, /next: .*config edit.*microsandbox\.home/);
+
+    writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
+      version: 1,
+      microsandbox: { home: destination },
+    });
+    assert.deepEqual((await inspect("user", "ok")).fix, []);
+    const image = calls.find(({ args }) => args.includes("inspect"));
+    assert.equal(image?.env?.MSB_HOME, destination);
+    host.env.MSB_HOME = "relative";
+    const env = await inspect("env", "wrong");
+    assert.ok(env.fix.includes('export MSB_HOME="$HOME/.msb"'));
+  });
+
   test("doctor reports secret grants and pinned passes without showing the source", async () => {
     const root = await fixture();
     const { host, calls } = fakeHost(root);
@@ -499,7 +560,7 @@ describe("agent-bootstrap", () => {
       "next",
     ]);
     await assert.rejects(
-      applySetup(root, host, await setupPlan(root, false), false),
+      applySetup(root, host, await setupPlan(root, false, host.env), false),
       new RegExp("require --allow-network"),
     );
     assert.deepEqual(calls, []);
@@ -509,7 +570,7 @@ describe("agent-bootstrap", () => {
     const root = await fixture();
     const { host, calls, images } = fakeHost(root);
     host.env.MSB_HOME = "/tmp";
-    const plan = await setupPlan(root, false);
+    const plan = await setupPlan(root, false, host.env);
     const original = await readFile(join(root, lockFile), "utf8");
     const command = host.command;
     host.command = (file, args, env, timeout) => {
@@ -533,11 +594,25 @@ describe("agent-bootstrap", () => {
   test("setup pulls the pinned base, builds profiles in order, and skips completed work", async () => {
     const root = await fixture();
     const { host, images, calls } = fakeHost(root);
-    host.env.MSB_HOME = "/tmp";
+    delete host.env.MSB_HOME;
+    const home = await shortHomeRoot();
+    writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
+      version: 1,
+      microsandbox: { home },
+    });
     images.clear();
-    const plan = { ...(await setupPlan(root, false)), artifacts: [] };
+    const plan = {
+      ...(await setupPlan(root, false, host.env)),
+      artifacts: [],
+    };
     const command = host.command;
     host.command = (file, args, env, timeout) => {
+      if (
+        args.includes("inspect") ||
+        args.includes("pull") ||
+        args.includes("--locked")
+      )
+        assert.equal(env?.MSB_HOME, home);
       if (args.includes("pull")) {
         assert.equal(args.at(-1), plan.images.base);
         images.set(plan.images.base, plan.images.base.split("@")[1]!);
@@ -625,6 +700,51 @@ describe("agent-bootstrap", () => {
     assert.equal((await stat(join(root, item.path))).mode & 0o777, 0o600);
     assert.ok(!(await readdir(root)).includes("executed"));
   });
+});
+
+test("sandbox shell resolves the user home before checking protected mounts", async () => {
+  const root = await fixture();
+  const { host, calls } = fakeHost(root);
+  const home = await shortHomeRoot();
+  const missingHome = join(home, "missing");
+  const tool = join(root, "tool");
+  await mkdir(tool);
+  await writeFile(join(tool, "msb"), "");
+  delete host.env.MSB_HOME;
+  const command = host.command;
+  host.command = async (file, args, env) => {
+    await command(file, args, env);
+    assert.ok(args.includes("where"));
+    return { code: 0, stdout: tool };
+  };
+  const args = [
+    "sandbox",
+    "shell",
+    "--run",
+    "--mount-dir",
+    `${home}:/external`,
+  ];
+  function configure(path: string) {
+    writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
+      version: 1,
+      microsandbox: { home: path },
+    });
+  }
+  configure(missingHome);
+  const missing = await invoke(args, root, host, { conciergeTTY: true });
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /source: user/);
+  assert.ok(missing.stderr.includes(`next: mkdir -p ${missingHome}\n`));
+  assert.deepEqual(calls, []);
+
+  configure(home);
+  const protectedMount = await invoke(args, root, host, { conciergeTTY: true });
+  assert.equal(protectedMount.code, 1);
+  assert.match(
+    protectedMount.stderr,
+    /Check the profile, Microsandbox home, mount directories/,
+  );
+  assert.equal(calls.length, 1);
 });
 
 test("sandbox shell renders a credential-free gateway plan and validates options without host commands", async () => {

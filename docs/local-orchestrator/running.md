@@ -10,8 +10,10 @@ for details.
 
 ## Prepare the host
 
-- Install Bun and the mise-pinned Microsandbox 0.7.16 tool. Set
-  `MSB_HOME` to an absolute path at most 40 bytes after symlink resolution.
+- Install Bun and the mise-pinned Microsandbox 0.7.16 tool. Create
+  `$HOME/.msb` or use an existing directory via the user config's
+  `microsandbox.home` or the `MSB_HOME` override. The real path must be at
+  most 40 bytes.
   Preload the digest-pinned Concierge image from
   `images/profiles.lock.json` and the pinned Alpine base image in that
   Microsandbox home. The base image serves Planner runs.

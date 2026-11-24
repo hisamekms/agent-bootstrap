@@ -1,5 +1,6 @@
 import { loadConfig } from "../../src/config/layers.ts";
 import { ConfigError } from "../../src/config/messages.ts";
+import { MsbHomeError, requireMsbHome } from "../../src/config/msb-home.ts";
 import { driftWarning } from "../../src/config/projects.ts";
 import { GitIntegrationError } from "../../src/git-integration.ts";
 import { execFile } from "node:child_process";
@@ -124,21 +125,11 @@ async function main(args: readonly string[]) {
   if (!(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY))
     throw new Error("Concierge --run requires an operator TTY");
 
-  const { MSB_HOME, LO_CLAUDE_BINARY } = process.env;
-  if (!MSB_HOME || !isAbsolute(MSB_HOME))
-    throw new Error(
-      "Set MSB_HOME to a short absolute path with the pinned images preloaded",
-    );
-  const home = await realpath(MSB_HOME).catch(() => {
-    throw new Error("MSB_HOME is inaccessible");
-  });
-  if (Buffer.byteLength(home) > 40)
-    throw new Error(
-      "MSB_HOME must be at most 40 bytes after resolving symlinks",
-    );
+  const { LO_CLAUDE_BINARY } = process.env;
   const target = await resolveTarget(flags.target ?? bootstrapCheckout);
   const { bootstrapRoot, directory, repoRoot, configDirectory } = target;
   const layers = loadConfig(process.env, configDirectory);
+  const home = await requireMsbHome(process.env, layers.user);
   const warning = driftWarning(target.project, layers.approved);
   if (warning) console.error(warning);
   await prepareTargetDirectory(bootstrapRoot, directory);
@@ -376,7 +367,7 @@ if (import.meta.main) {
   try {
     await main(process.argv.slice(2));
   } catch (error) {
-    if (error instanceof ConfigError) {
+    if (error instanceof ConfigError || error instanceof MsbHomeError) {
       console.error(`${error.message}\nnext: ${error.next}`);
       process.exitCode = 1;
     } else {
