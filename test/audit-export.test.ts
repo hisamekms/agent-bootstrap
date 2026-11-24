@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import {
   AuditStoreError,
   SqliteAudit,
+  type AuditInput,
   type NetworkInput,
 } from "../src/audit.ts";
 import { exportAudit, exportAuditChecked } from "../src/audit-export.ts";
@@ -523,44 +524,118 @@ test("checked audit export screens projected records before publication", async 
   assert.equal(lines(dir)[0]?.actor, "Worker");
 });
 
-test("legacy Claude details remain readable for audit export and trace", (t) => {
+test("reopens a v7 audit with legacy Claude details, appends, and exports", (t) => {
   const { db, obs, dir, audit } = fixture(t);
-  const detail = {
-    authMode: "config-dir",
-    settingsDigest: "a".repeat(64),
-    managedPath: CLAUDE_MANAGED_PATH,
-    group: "fixture-group",
-    groupPath: "/claude-config",
-  };
-  assert.throws(
-    () => audit.append({ ...start, role: "Reviewer", detail } as never),
-    (error: AuditStoreError) => error.code === "invalid-event",
-  );
+  assert.equal(audit.schemaVersion, 7);
+  audit.close();
+  const conciergeId = randomUUID();
+  const reviewer = { invocationId, role: "Reviewer" } as const;
+  const concierge = { invocationId: conciergeId, role: "Concierge" } as const;
+  const create = {
+    kind: "operation.requested",
+    operation: "sandbox.create",
+  } as const;
+  const failed = { kind: "invocation.finished", outcome: "failed" } as const;
+  const group = "fixture-group";
+  const legacyEvents: (Omit<AuditInput, "detail"> & {
+    detail: Record<string, unknown>;
+  })[] = [
+    {
+      ...reviewer,
+      ...start,
+      detail: {
+        authMode: "config-dir",
+        settingsDigest: policyId,
+        managedPath: CLAUDE_MANAGED_PATH,
+        group,
+        groupPath: "/claude-config",
+      },
+    },
+    { ...reviewer, ...create, detail: { mode: "config-dir", group } },
+    { ...reviewer, ...failed, detail: { code: "credentials-detached" } },
+    {
+      ...concierge,
+      ...create,
+      profile: "concierge",
+      image: policyId,
+      detail: {
+        socketPath: "/tmp/fixture.sock",
+        vsockPort: 5000,
+        snapshotDir: "/tmp/snapshot",
+        volumeName: "lo-fixture-volume",
+        group,
+      },
+    },
+    { ...concierge, ...failed, detail: { code: "config-tampered" } },
+  ];
   const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
     Database: new (filename: string) => {
-      run(sql: string, values: string[]): void;
+      run(sql: string, values: (string | null)[]): void;
       close(): void;
     };
   };
   const legacy = new Database(db);
   try {
-    legacy.run(
-      "INSERT INTO audit_events (recorded_at, invocation_id, kind, role, detail) VALUES (?, ?, ?, ?, ?)",
-      [
-        now().toISOString(),
-        invocationId,
-        start.kind,
-        "Reviewer",
-        JSON.stringify(detail),
-      ],
-    );
+    for (const event of legacyEvents)
+      legacy.run(
+        `INSERT INTO audit_events
+          (recorded_at, invocation_id, kind, operation, outcome, role, profile, image, detail)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          now().toISOString(),
+          event.invocationId,
+          event.kind,
+          event.operation ?? null,
+          event.outcome ?? null,
+          event.role ?? null,
+          event.profile ?? null,
+          event.image ?? null,
+          JSON.stringify(event.detail),
+        ],
+      );
   } finally {
     legacy.close();
   }
-  assert.deepEqual(
-    readInvocationTrace(audit, invocationId)?.events[0]?.detail,
-    detail,
-  );
+
+  const reopened = new SqliteAudit(db);
+  t.after(() => reopened.close());
+  assert.equal(reopened.schemaVersion, 7);
+  for (const id of [invocationId, conciergeId]) {
+    const expected = legacyEvents
+      .filter((event) => event.invocationId === id)
+      .map((event) => event.detail);
+    assert.deepEqual(
+      reopened.read(id).map((event) => event.detail),
+      expected,
+    );
+    assert.deepEqual(
+      readInvocationTrace(reopened, id)?.events.map((event) => event.detail),
+      expected,
+    );
+  }
+  for (const event of legacyEvents) {
+    assert.throws(() => reopened.append(event as never), {
+      code: "invalid-event",
+    });
+  }
+  reopened.append({
+    ...concierge,
+    ...failed,
+    invocationId: randomUUID(),
+    detail: { code: "volume-detached" },
+  });
+
   exportAudit(db, obs, { now });
-  assert.deepEqual(lines(dir)[0]?.attributes, detail);
+  assert.deepEqual(
+    lines(dir)
+      .filter((line) => !line.derived)
+      .map((line) => line.attributes),
+    [
+      ...legacyEvents.map((event) => ({
+        ...(event.profile && { profile: event.profile, image: event.image }),
+        ...event.detail,
+      })),
+      { code: "volume-detached" },
+    ],
+  );
 });

@@ -31,6 +31,11 @@ export const CLAUDE_FAILURE_CODES = [
   "shell-disabled",
   "credential-leak",
 ] as const;
+// Keep these codes readable in pre-existing stores.
+export const RETIRED_CLAUDE_FAILURE_CODES = [
+  "credentials-detached",
+  "config-tampered",
+] as const;
 export type ClaudePatternCode = (typeof CLAUDE_PATTERN_CODES)[number];
 export type ClaudeFailureCode = (typeof CLAUDE_FAILURE_CODES)[number];
 export interface ClaudeErrorPattern {
