@@ -76,7 +76,8 @@ export interface InteractiveSpec {
   readonly snapshotDir: string;
 }
 
-export type InteractiveSandbox = InteractiveSpec | { readonly login: true };
+export type InteractiveSandbox =
+  InteractiveSpec | { readonly volumeShell: true };
 
 export function permitsProviderHeader(
   provider: SandboxProvider,
@@ -148,6 +149,12 @@ export function isDebugMount(mount: DebugMount): boolean {
   );
 }
 
+export interface SandboxMount {
+  readonly hostPath: string;
+  readonly guestPath: string;
+  readonly readOnly: boolean;
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -181,7 +188,8 @@ export interface SandboxSpec {
   readonly debugMounts?: readonly DebugMount[];
   /** The host assigns and validates paths for Claude runs. */
   readonly claude?: true;
-  readonly claudeMounts?: { readonly managed: string; readonly group?: string };
+  readonly claudeManagedSettings?: string;
+  readonly mounts?: readonly SandboxMount[];
   readonly maxLifetimeMs?: number;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
   readonly invocationId?: string;

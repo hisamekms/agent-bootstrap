@@ -22,6 +22,17 @@ export type Harness = "codex" | "claude";
 export const ACTORS = ["Coordinator", "Planner", "Worker", "Reviewer"] as const;
 export type Actor = (typeof ACTORS)[number];
 export type ActorHarnesses = Readonly<Record<Actor, Harness>>;
+export type LocalActorHarnesses = Readonly<
+  Record<"Concierge" | "Planner" | "Executor" | "Reviewer", Harness>
+>;
+
+// The local orchestrator uses the Claude adapter for these four actors.
+export const localActorHarnesses: LocalActorHarnesses = Object.freeze({
+  Concierge: "claude",
+  Planner: "claude",
+  Executor: "claude",
+  Reviewer: "claude",
+});
 
 /**
  * Parse `Coordinator=codex,Worker=claude` (or `all=claude`) into a harness
@@ -114,7 +125,7 @@ export function claudeRoleHarness(options: {
   const guest =
     options.guest ?? (options.profile ? guestOf(options.profile) : "alpine");
   const provider =
-    options.auth.mode === "config-dir"
+    options.auth.mode === "external"
       ? undefined
       : claudeCodeProvider(options.auth, options.fixture, options.gatewayHosts);
   const baseUrl = options.fixture

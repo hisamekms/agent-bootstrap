@@ -6,7 +6,7 @@ import { EgressPolicy, gatewayPolicyDigest } from "./egress-policy.ts";
 import { buildEgress } from "./image-recipes.ts";
 import { digestNetworkArgs, networkArgs } from "./microsandbox.ts";
 import { userStateDirectory } from "./local-orchestrator/claude-config.ts";
-import { privateDirectory } from "./local-orchestrator/credentials-volume.ts";
+import { privateDirectory } from "./volumes/volume.ts";
 import type { ProfileName } from "./sandbox-profiles.ts";
 import type { HostGateway } from "./trusted-host.ts";
 

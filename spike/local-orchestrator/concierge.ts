@@ -2,7 +2,6 @@ import { loadConfig } from "../../src/config/layers.ts";
 import { ConfigError } from "../../src/config/messages.ts";
 import { driftWarning } from "../../src/config/projects.ts";
 import { GitIntegrationError } from "../../src/git-integration.ts";
-import { configuredCredentialScanner } from "../../src/local-orchestrator/credential-scan.ts";
 import { execFile } from "node:child_process";
 import { access, readFile, realpath } from "node:fs/promises";
 import { userInfo } from "node:os";
@@ -17,7 +16,6 @@ import {
 } from "../../src/claude-code.ts";
 import { ALPINE_3_23 } from "../../src/image-recipes.ts";
 import {
-  claudeLoginCommand,
   conciergeCommand,
   parseConciergeArgs,
   snapshotConciergeRepo,
@@ -149,17 +147,12 @@ async function main(args: readonly string[]) {
   const model = effective.model ?? "claude-opus-5-5";
   const options = { model, mode: flags.mode, continue: flags.continue };
   for (const warning of effective.warnings) console.error(warning);
-  const login = flags.loginGroup;
-  if (
-    login &&
-    (!effective.configDir || !Object.hasOwn(effective.configDir.groups, login))
-  )
-    throw new Error("Select a configured Claude group for login.");
+  const volumeShell = flags.volumeShell;
   const auth: ClaudeCodeAuth =
-    effective.auth === "config-dir"
-      ? { mode: "config-dir" }
+    effective.auth === "external"
+      ? { mode: "external" }
       : { mode: "api-key", credential: "host-secret" };
-  if (!login) conciergeCommand(options, auth);
+  if (!volumeShell) conciergeCommand(options, auth);
   const local = join(bootstrapRoot, ".local");
   const install = {
     binary:
@@ -173,13 +166,16 @@ async function main(args: readonly string[]) {
       ),
     packageDir: join(local, "alpine/v3.23/main/aarch64"),
   };
-  if (!isAbsolute(install.binary))
+  if (!volumeShell && !isAbsolute(install.binary))
     throw new Error("LO_CLAUDE_BINARY must be an absolute path");
-  await Promise.all(
-    claudeCodeTools(install, "alpine").map(({ hostPath }) => access(hostPath)),
-  ).catch(() => {
-    throw new Error("The pinned Claude CLI or Alpine packages are missing");
-  });
+  if (!volumeShell)
+    await Promise.all(
+      claudeCodeTools(install, "alpine").map(({ hostPath }) =>
+        access(hostPath),
+      ),
+    ).catch(() => {
+      throw new Error("The pinned Claude CLI or Alpine packages are missing");
+    });
   const binary = await microsandboxBinary();
   const profiles = profileCatalog(
     ALPINE_3_23.reference,
@@ -190,7 +186,9 @@ async function main(args: readonly string[]) {
   if (!profiles.has("concierge"))
     throw new Error("The profile lock must include the Concierge image");
 
-  const verificationConfig = login ? undefined : layers.config.verification;
+  const verificationConfig = volumeShell
+    ? undefined
+    : layers.config.verification;
   if (verificationConfig && !profiles.has(verificationConfig.profile))
     throw new Error(
       "The profile lock must include the configured Verification profile",
@@ -206,35 +204,44 @@ async function main(args: readonly string[]) {
     { msbHome: home, stagingRoot: msb.stagingRoot },
   );
   const provider =
-    auth.mode === "config-dir" ? undefined : claudeCodeProvider(auth);
+    volumeShell || auth.mode === "external"
+      ? undefined
+      : claudeCodeProvider(auth);
   let credential = provider
     ? await fromKeychain(effective.keychainService)
     : "";
   const claude = createClaudePolicy(
-    effective,
+    volumeShell
+      ? {
+          ...effective,
+          config: {
+            ...effective.config,
+            egress: {
+              shell: [
+                ...new Set([
+                  ...(layers.user.egress?.shell ?? []),
+                  ...(layers.local.egress?.shell ?? []),
+                ]),
+              ],
+            },
+          },
+        }
+      : effective,
     userStateDirectory(process.env),
     (note) => console.error(note),
+    target.project,
   );
-  const scan = login
-    ? claude.configDir?.scan
-    : (claude.configDir?.scan ??
-      configuredCredentialScanner(
-        directory,
-        (note) => console.error(note),
-        process.env,
-        flags.claudeAuth,
-        configDirectory,
-        effective,
-      ));
+  const scan = volumeShell ? undefined : claude.scan;
   const telemetry = createTelemetry(config.telemetry, config.directory);
   let store: OrchestratorStore | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
   let sessionId: string | undefined;
   let stage = "open state";
   try {
-    if (!login) store = OrchestratorStore.open(join(directory, "state.db"));
+    if (!volumeShell)
+      store = OrchestratorStore.open(join(directory, "state.db"));
     console.log(`Audit database ${JSON.stringify(auditPath)}`);
-    if (!login)
+    if (!volumeShell)
       console.log(
         target.isDefault
           ? `Inspect proposals and approvals from another host terminal with ${operatorCli}`
@@ -264,16 +271,11 @@ async function main(args: readonly string[]) {
       observers: [telemetry],
     });
     stage = "launch or clean up session";
-    if (login) {
-      console.error(
-        "Disable OSC 52 clipboard access. Use the Claude Code CLI's own /login, then exit the CLI.",
-      );
-      const result = await observed.host.runClaudeLogin(
-        login,
-        claudeCodeTools(install),
-        claudeLoginCommand(),
-      );
-      if (result.outcome !== "ok") process.exitCode = 1;
+    if (volumeShell) {
+      const result = await observed.host.runVolumeShell(volumeShell);
+      if (result.code) console.error(result.code);
+      if (result.outcome !== "ok" || result.terminal?.exitCode !== 0)
+        process.exitCode = 1;
       return;
     }
     if (!store) throw new Error("Concierge state unavailable");

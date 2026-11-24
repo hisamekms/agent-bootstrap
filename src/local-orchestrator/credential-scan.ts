@@ -6,10 +6,11 @@ import {
   loadClaudeConfig,
   readLegacyPrivateFile,
   userStateDirectory,
-  type ClaudeDirectoryConfig,
+  type EffectiveClaudeConfig,
   type ClaudeAuthMode,
 } from "./claude-config.ts";
-import { ClaudeRunError, privateDirectory } from "./credentials-volume.ts";
+import { privateDirectory } from "../volumes/volume.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 
 export type CredentialScanner = (
   ...text: readonly (string | Uint8Array)[]
@@ -56,7 +57,7 @@ async function customMatch(text: string[], patterns: readonly string[]) {
 }
 
 export function createCredentialScanner(
-  config: Pick<ClaudeDirectoryConfig, "leakPatterns">,
+  config: Pick<EffectiveClaudeConfig, "leakPatterns">,
   state: string,
   note: (message: string) => void,
 ): CredentialScanner {
@@ -143,12 +144,13 @@ export function configuredCredentialScanner(
 ): CredentialScanner | undefined {
   const config =
     effective ?? loadClaudeConfig(env, configurationDirectory, override);
-  if (config.configDir || targetRequiresScan(directory))
-    return createCredentialScanner(
-      config.configDir ?? config,
-      userStateDirectory(env),
-      note,
-    );
+  if (
+    config.auth === "external" ||
+    config.leakPatterns?.length ||
+    Object.keys(config.config.mounts ?? {}).length ||
+    targetRequiresScan(directory)
+  )
+    return createCredentialScanner(config, userStateDirectory(env), note);
 }
 
 export function recordedCredentialScanner(

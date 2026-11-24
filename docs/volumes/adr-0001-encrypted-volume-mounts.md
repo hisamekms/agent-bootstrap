@@ -220,20 +220,20 @@ The change removes the following at once, with no compatibility period:
 
 `agent-bootstrap migrate` also converts `claude.configDir`. It refuses to
 run while any lease exists, a run is active or a volume is attached. It
-can be rerun safely. It writes new files atomically and removes the old
-keys last. It converts as follows:
+can be rerun safely and writes each configuration file atomically.
 
-- **Volume.** The configured volume becomes a `volumes` entry.
-- **Groups.** Every group becomes a `ro` mount in the user config. The
-  mount keeps `dir` as the group name and lists the group's actors.
+- The user config receives the `volumes` entry and `egress.shell` from
+  `loginEgress`. Only `volume shell` uses these destinations.
+- Each project whose effective legacy auth was `config-dir` receives
+  `claude.auth: "external"`, `ro` mounts for the groups from its user
+  and local layers, and per-actor egress in its `local.json`. A mount
+  keeps the group name as its `dir` and lists the group's actors.
+  Local egress takes precedence over legacy user egress for those actors.
 - **Write access.** The command prints which actors lose it. It also
   prints the `local.json` entry and the `volume shell` steps for
   creating a project-scoped `rw` directory when one is wanted. Under
   V3.1, a writable directory cannot be granted to several projects
   automatically.
-- **Egress.** `egress` becomes per-actor `egress` for exactly the actors
-  that the old group granted it to. `loginEgress` becomes
-  `egress.shell`.
 - **Concierge volumes.** Named Concierge volumes are renamed from the
   project name. Existing `lo-concierge-*` volumes are listed for the
   operator to review and remove, and their contents are never converted.
@@ -280,6 +280,16 @@ own disks and do not back the mount.
 
 Afterwards, every host file kept its modification time and size, and the
 host's before and after directory check passed on every run.
+
+### V9.2 result, 2026-11-24
+
+The policy smoke ran on the host against a registered project:
+
+- **Setup.** `claude.auth: "external"`, and one `ro` mount for Planner, Executor and Reviewer, with its configuration-directory variable set.
+- **Passing checks.** Reviewer file tools and shell, Executor file tools, shell and symlink access, read-only directory metadata, and no memory entries all passed.
+- **Skipped check.** The Reviewer symlink probe was skipped by design, because the review snapshot accepts regular files only.
+- **Repeat runs.** Two of three runs passed every check. One failed with `invalid-answer`, because the model's answer did not match the strict answer format.
+- **Fixed on the way.** The first live run found that macOS mounts the volume root as `0755`. Attach now sets the root to `0700` through a checked file descriptor.
 
 ## Consequences
 

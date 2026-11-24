@@ -1,119 +1,86 @@
 # Claude Code authentication
 
-| Mode                | What the Claude VM receives                                                                                                                                                                                       |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api-key` (default) | A guest placeholder for `ANTHROPIC_API_KEY`. Microsandbox substitutes the Keychain API key into `x-api-key` for `api.anthropic.com:443`.                                                                          |
-| `config-dir`        | Persistent Claude Code configuration directories per actor group, kept on an encrypted volume, signed in with the CLI's own `/login`. Each Claude VM mounts its group's directory read-write at `/claude-config`. |
+Set `claude.auth` in the user config or in a registered project's private
+`local.json`.
+
+| Mode                | Host behavior                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `api-key` (default) | Reads the API key from Keychain. Microsandbox substitutes it for the guest's placeholder on requests to the API host.                |
+| `external`          | Supplies no credential or substitution. The audited gateway relays plain HTTPS to the API host and to configured actor destinations. |
 
 ## Setup
 
-Use a private `${XDG_CONFIG_HOME:-~/.config}/agent-bootstrap/config.json`
-owned by the current user, with mode `0600`. The CLI refuses symlinks.
-Run `agent-bootstrap config edit` with `EDITOR` set to store the Keychain
-service name.
+For API-key mode, set `claude.apiKey.keychainService` and provision that
+service in Keychain. Use `agent-bootstrap doctor --target <path>` to check
+the project and the Keychain entry. Both modes use host-managed Claude
+permissions. Output credential screening also applies in `api-key` mode.
+`claude.leakPatterns` can add screening patterns. Built-in screening
+remains active, so keep fixtures that resemble credentials out of agent
+outputs and collected artifacts. Set additional failure mappings in
+`claude.errors`.
 
-```json
-{
-  "version": 1,
-  "claude": { "apiKey": { "keychainService": "agent-bootstrap-claude" } }
-}
-```
+## Encrypted volumes and mounts
 
-```sh
-security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w
-agent-bootstrap doctor
-```
+Declare each volume under `volumes` in the user config. A definition has
+an absolute sparse image path, a Keychain service and
+`"attach": "while-running"`. Run `agent-bootstrap volume init <name>`
+to create the encrypted APFS image and provision its passphrase.
 
-An optional `claude` section in the project's `local.json` overrides user
-settings per key. Use `agent-bootstrap config edit --project <name>` to
-open it. The same file can hold local verification settings. The invocation's `--claude-auth` flag takes precedence over
-both files. Doctor reports the mode and its source. The legacy
-`LO_CLAUDE_AUTH` and `LO_CLAUDE_KEYCHAIN` environment variables are a
-deprecated fallback for API-key mode.
+Declare mounts under `mounts`. Each entry names a volume, one directory
+at its root, a guest path under `/mnt`, and its actors. Mounts default
+to read-only. A read-write mount belongs in a project's `local.json`
+and has one actor and a directory dedicated to that mount across all
+registered projects. The Claude adapter supports the optional
+`CLAUDE_CONFIG_DIR` mount environment variable in both modes.
 
-API-key mode uses the `ANTHROPIC_API_KEY` variable. Authorization-header
-substitution requires an exact host in the operator file’s `claude.gateway`
-list (`hostname:443`). IP literals and Anthropic domains are excluded. The API endpoint uses `x-api-key`.
+A mounted actor loses shell tools. Managed permissions limit file tools
+to its working paths and deny access through file tools to every mounted
+path. Verification runs offline without mounts. Mount permissions and
+`egress` grants are configured independently. Doctor warns when a
+mounted actor has added egress.
 
-## Configuration directory fields
+Use `agent-bootstrap volume shell <mount> --target <path>` from an
+operator terminal to create or access the directory. It mounts the
+directory read-write on the Concierge image, takes an exclusive lease
+and applies `egress.shell`. Exit the shell before launching a run that
+needs the directory.
 
-- `claude.auth` selects the mode. `claude.apiKey.keychainService` names the
-  Keychain item. If `claude.apiKey.variable` is supplied, it must be
-  `ANTHROPIC_API_KEY`. Use letters, digits, dots, underscores and hyphens
-  in Keychain service names.
-- `claude.configDir.volume` contains the absolute path `image` to the
-  encrypted `.sparseimage`, its `keychainService`, and the `attach`
-  policy `while-running`.
-- `claude.configDir.groups` maps lowercase group names to `actors` lists.
-  Assign each of Concierge, Planner, Executor, and Reviewer once. For
-  different exposure between roles, use different groups. If Researcher
-  or verification is listed, the CLI warns and ignores that entry.
-- `claude.configDir.egress` and `loginEgress` list DNS names with port
-  `443`. Runs can reach the API host and the configured `egress` hosts
-  using plain HTTPS through the audited gateway. The login VM also
-  receives the `loginEgress` hosts.
-- `claude.configDir.errors` can map operator-written `match` regexes to
-  `auth-required`, `rate-limited`, or `config-invalid`. Patterns are
-  bounded and time-limited. Keep provider-specific text in your own
-  configuration.
-- `claude.configDir.leakPatterns` adds case-insensitive host-side patterns
-  to the built-in credential shape checks. Each file accepts up to 16
-  expressions of at most 160 characters. A scan exceeding its time or
-  size budget blocks the output. A rejection records a private evidence
-  path and the fixed code `credential-leak` without copying the match.
-  A target that has used configuration-directory mode continues to screen
-  later operator output and exports when the launch mode changes. Screening
-  is defence in depth. Encoding or splitting a value can bypass pattern
-  matching.
+The host checks the ownership and permissions of the volume root and
+mount directory at launch. It records the mount name, mode and guest
+path in the audit. It does not inspect directory contents. Read-only
+leases can overlap. An exclusive lease waits up to 30 seconds for a
+conflicting holder, then reports `mount-busy`.
 
-`credentials init` creates a small AES-256 encrypted APFS image and saves
-a randomly generated passphrase in Keychain. The launcher attaches it
-before granting a group mount and detaches it after the last lease ends.
-The SQLite lease serializes runs in the same group across launchers. A
-second run waits up to 30 seconds for its group. Use a dedicated Concierge
-group when Planner, Executor, or Reviewer must run during its session.
-The default Keychain ACL allows processes running as the same user to
-read the volume passphrase. This is an accepted risk of this setup.
-`credentials attach` prepares an attachment for the next run.
-`credentials status` reports active leases and stale state. For a stale
-lease, run `agent-bootstrap doctor`, confirm that no VM is still using
-the volume, and run `agent-bootstrap credentials detach --force`. Use
-the same target and mode options as the affected run.
+Use `agent-bootstrap volume status <name>` to inspect the attachment and
+leases. `volume attach <name>` prepares an attachment for the next run.
+After doctor reports a stale attachment or lease, confirm the VMs have
+stopped before running `volume detach <name> --force`.
 
-`login` opens the Concierge image with the selected group, an audited
-gateway, and a TTY. Use the CLI's own `/login` and exit afterwards.
-The Concierge uses its group directory for Claude Code state. The named
-Concierge volume also holds its guest home.
+## Migration
 
-## Integrity and managed settings
+Stop active runs and release leases and attachments before running
+`agent-bootstrap migrate`. The command reports which actors lose write
+access and shell tools. For each project, it reports the count of added
+mounts and egress destinations per actor. It also provides steps to
+declare a project-scoped read-write mount. Converted actor grants go to
+the projects that used the legacy mode. Each project keeps its legacy
+egress override. The user config receives the volume definition and
+the egress destinations for `volume shell`. Legacy custom screening
+patterns carry over to the projects that used `config-dir`. API-key
+projects can declare custom patterns using `claude.leakPatterns`.
 
-The host hashes the group directory before and after each run. It skips
-the contents of `.credentials.json`, `.claude.json`, `.claude.json.*`,
-`*.lock` and `*.lock.owner` files and the `backups/`, `projects/`,
-`sessions/`, `todos/`, `statsig/` and `shell-snapshots/` directories
-at the group root. Links and special files fail the integrity check
-throughout the tree, including the state directories. A change in the checked paths fails
-the run with `config-tampered`. Inspect the evidence path and use
-`credentials verify --accept` from an operator terminal to accept intended
-changes. Use `--group` to accept one group. Stop active Claude runs before
-accepting. A failed run can report a CLI version change since the group's
-last success. Interactive exits report lifecycle and integrity failures.
-The terminal transcript stays with the operator, so text matching applies
-to headless CLI results.
+## Live checks
 
-The pinned CLI accepts `disableAllHooks`, `allowManagedMcpServersOnly`,
-`allowedMcpServers`, `allowManagedPermissionRulesOnly`, and
-`permissions.disableBypassPermissionsMode` in managed settings. The host
-generates the file and mounts it read-only. The Concierge's MCP allowlist
-matches the fixed orchestrator relay command and arguments. Other actors
-and login have an empty MCP allowlist. Headless roles use fixed tool lists,
-managed permission rules, strict MCP, empty setting sources, and no
-session persistence.
+From the checkout, run the smoke against a registered project's effective
+configuration with `bun run spike/local-orchestrator/claude-policy-smoke.ts --run --target <path>`.
+It requires mounts for Reviewer and Executor, including a read-only
+mount. Use disposable mount directories with a regular
+`policy-smoke.txt` file containing `ok-marker` in each directory.
+The smoke checks file-tool scope, Executor symlink access, shell access,
+read-only directory metadata and the absence of memory entries. The
+report marks the Reviewer symlink probe as skipped because the review
+snapshot only accepts regular files and is already read-only at launch.
 
-Managed file permissions limit Planner and Reviewer to `/review` and
-Executor to `/workspace`. The rules deny access to `/claude-config` and
-`/etc/claude-code`. Claude permission rules use `//` for guest-absolute
-paths. Directory-mode Workers can return an optional commit message in
-the final answer. Worker shell is available only in API-key mode. The host audits
-the managed-settings digest, guest mount paths, mode and group for each
-run. The volume database records integrity holds and accepted baselines.
+Run `bun run spike/local-orchestrator/ro-probe.ts --run` from an operator
+terminal to test the backend's read-only enforcement with a disposable
+fixture directory.

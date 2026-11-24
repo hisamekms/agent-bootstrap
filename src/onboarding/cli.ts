@@ -1,7 +1,8 @@
 import {
   configRoot,
   projectConfigDirectory,
-  privatePath,
+  loadConfig,
+  projectName,
   hasEditableConfig,
   readLayer,
   userConfigPath,
@@ -25,18 +26,16 @@ import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
 import {
   ClaudeConfigError,
-  loadClaudeConfig,
   parseClaudeAuthMode,
   userStateDirectory,
-  validGroup,
   type ClaudeAuthMode,
 } from "../local-orchestrator/claude-config.ts";
-import { claudeNext } from "../local-orchestrator/claude-errors.ts";
 import {
   ClaudeRunError,
-  CredentialsVolume,
-} from "../local-orchestrator/credentials-volume.ts";
-import { hasLegacyState, resolveTarget } from "../local-orchestrator/target.ts";
+  claudeNext,
+} from "../local-orchestrator/claude-errors.ts";
+import { VolumeError, Volume } from "../volumes/volume.ts";
+import { resolveTarget } from "../local-orchestrator/target.ts";
 import { parseConciergeArgs } from "../local-orchestrator/concierge.ts";
 import {
   exitCodes,
@@ -150,10 +149,7 @@ export async function runBootstrap(
   const globalAuth = args[0] === "--claude-auth" ? args.splice(0, 2) : [];
   const [command = "help", ...commandArgs] = args;
   const rest = [...commandArgs, ...globalAuth];
-  if (
-    globalAuth.length &&
-    !["doctor", "concierge", "credentials", "login"].includes(command)
-  )
+  if (globalAuth.length && !["doctor", "concierge"].includes(command))
     return usage();
   try {
     if (command === "help" || command === "--help" || command === "-h") {
@@ -400,7 +396,7 @@ export async function runBootstrap(
       return 0;
     }
 
-    if (command === "login" || command === "credentials") {
+    if (command === "volume") {
       let options: ReturnType<typeof claudeOptions>;
       try {
         options = claudeOptions(rest);
@@ -408,110 +404,76 @@ export async function runBootstrap(
         return usage();
       }
       const { target: path, override, remaining } = options;
-      const [action, ...extra] = remaining;
-      const verifying = command === "credentials" && action === "verify";
-      let group: string | undefined;
-      if (command === "login" || verifying) {
-        const groupArgs = verifying
-          ? extra.filter((arg) => arg !== "--accept")
-          : remaining;
-        if (verifying && extra.filter((arg) => arg === "--accept").length !== 1)
-          return usage();
-        if (groupArgs.length) {
-          if (
-            groupArgs.length !== 2 ||
-            groupArgs[0] !== "--group" ||
-            !validGroup(groupArgs[1])
-          )
-            return usage();
-          group = groupArgs[1];
-        }
-        if (command === "login" && !group) return usage();
-        if (verifying ? !io.isTTY : !io.conciergeTTY)
-          return fail(
-            1,
-            "An operator terminal is required.",
-            `Run agent-bootstrap help ${command}.`,
-          );
-      } else if (
+      const [action, name, ...extra] = remaining;
+      if (
+        override ||
+        !name ||
+        !projectName.test(name) ||
+        !["status", "attach", "detach", "init", "shell"].includes(
+          action ?? "",
+        ) ||
+        (action !== "shell" && path !== undefined) ||
         (extra.length &&
           !(
             action === "detach" &&
             extra.length === 1 &&
             extra[0] === "--force"
-          )) ||
-        !["status", "attach", "detach", "init"].includes(action ?? "")
-      ) {
+          ))
+      )
         return usage();
-      }
-
-      // The user-owned volume can be released to unblock migration.
-      const recovering =
-        command === "credentials" &&
-        action === "detach" &&
-        extra[0] === "--force" &&
-        path === undefined &&
-        (await hasLegacyState(root));
-      const target = recovering
-        ? undefined
-        : await resolveTarget(path, root, host.env);
-      const effective = loadClaudeConfig(
-        host.env,
-        target?.configDirectory,
-        override,
-      );
-      for (const warning of effective.warnings) io.stderr.write(warning + "\n");
-      const config = effective.configDir;
-      if (!config || (group && !Object.hasOwn(config.groups, group)))
-        throw new ClaudeRunError("config-invalid");
-
-      if (command === "login") {
-        const { first } = await doctor(root, host, path, true, override);
-        if (first)
-          return fail(
-            3,
-            "Login prerequisites are missing.",
-            first.fix.join(" && ") || first.detail,
-          );
-        const launchArgs = ["--login-group", group!];
-        if (path) launchArgs.push("--target", path);
-        if (override) launchArgs.push("--claude-auth", override);
-        if (!(await (io.launch ?? launch)(root, launchArgs, json)))
+      if (action === "shell") {
+        if (json) return usage();
+        if (!io.conciergeTTY)
           return fail(
             1,
-            "Login launcher failed.",
-            "Review the terminal transcript and run agent-bootstrap help login.",
+            "An operator terminal is required.",
+            "Run agent-bootstrap volume shell from a TTY.",
+          );
+        const target = await resolveTarget(path, root, host.env);
+        const { config } = loadConfig(host.env, target.configDirectory);
+        if (!Object.hasOwn(config.mounts ?? {}, name))
+          invalid(
+            "mounts",
+            "The selected mount is undefined.",
+            "Select a mount from the effective configuration.",
+          );
+        const launchArgs = ["--volume-shell", name];
+        if (path) launchArgs.push("--target", path);
+        if (!(await (io.launch ?? launch)(root, launchArgs, false)))
+          return fail(
+            1,
+            "Volume shell failed.",
+            "Review the terminal output and run agent-bootstrap doctor.",
           );
         print({ status: "ok" });
         return 0;
       }
-
-      const state = userStateDirectory(host.env);
-      if (recovering) privatePath(join(state, "credentials"), state);
-      const volume = new CredentialsVolume(config, state);
+      const { config } = loadConfig(host.env);
+      const definition = config.volumes?.[name];
+      if (!definition)
+        invalid(
+          "volumes",
+          "The selected volume is undefined.",
+          "Define the volume in the user config.",
+        );
+      const volume = new Volume(
+        definition,
+        userStateDirectory(host.env),
+        undefined,
+        { volume: name },
+      );
       if (action === "status") {
         const status = volume.status();
         print(status);
         if (status.stale)
           hint(
-            "Run agent-bootstrap doctor, then credentials detach --force after confirming no VM is running.",
+            `Run agent-bootstrap doctor and confirm no VM is running before using agent-bootstrap volume detach ${name} --force.`,
           );
         return 0;
       }
       if (action === "init") volume.init();
       if (action === "attach") volume.attach();
       if (action === "detach") volume.detach(extra[0] === "--force");
-      if (verifying) {
-        const { release } = volume.acquire();
-        try {
-          for (const name of group ? [group] : Object.keys(config.groups))
-            volume.integrity(name, "accept", (note) =>
-              io.stderr.write(note + "\n"),
-            );
-        } finally {
-          release();
-        }
-      }
       print({ status: "ok" });
       return 0;
     }
@@ -520,7 +482,7 @@ export async function runBootstrap(
       let path: string | undefined;
       let override: ClaudeAuthMode | undefined;
       try {
-        if (rest.includes("--run") || rest.includes("--login-group"))
+        if (rest.includes("--run") || rest.includes("--volume-shell"))
           return usage();
         ({ target: path, claudeAuth: override } = parseConciergeArgs(rest));
       } catch {
@@ -629,6 +591,7 @@ export async function runBootstrap(
         error.message,
         "Review the private Claude config.json and run agent-bootstrap doctor.",
       );
+    if (error instanceof VolumeError) return fail(1, error.message, error.next);
     if (error instanceof ClaudeRunError)
       return fail(1, error.code, claudeNext(error.code));
     if (error instanceof SetupError)

@@ -146,8 +146,7 @@ const topics = [
   "configuration",
   "troubleshoot",
   "safety",
-  "credentials",
-  "login",
+  "volume",
 ];
 
 describe("agent-bootstrap", () => {
@@ -168,8 +167,7 @@ describe("agent-bootstrap", () => {
       "project",
       "config",
       "migrate",
-      "credentials",
-      "login",
+      "volume",
       "status",
       "proposals",
       "show",

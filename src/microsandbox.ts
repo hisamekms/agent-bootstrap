@@ -1,4 +1,4 @@
-import { CLAUDE_GROUP_PATH, CLAUDE_MANAGED_PATH } from "./claude-code.ts";
+import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, lstatSync, realpathSync } from "node:fs";
@@ -251,7 +251,8 @@ function debugArgs(spec: SandboxSpec): string[] {
     !spec.egressGateway ||
     spec.provider ||
     spec.claude ||
-    spec.claudeMounts ||
+    spec.claudeManagedSettings ||
+    spec.mounts ||
     spec.interactive ||
     spec.tools ||
     spec.repository ||
@@ -278,19 +279,20 @@ function interactiveArgs(spec: SandboxSpec): string[] {
   if (
     !interactive ||
     spec.profile !== "concierge" ||
-    !spec.egressGateway ||
-    (!spec.provider && !spec.claudeMounts?.group) ||
+    (!spec.egressGateway && !("volumeShell" in interactive)) ||
     spec.repository !== undefined ||
     spec.readOnlyFiles !== undefined ||
     spec.files !== undefined ||
     spec.hostTcpPort !== undefined
   )
     invalid();
-  if ("login" in interactive) {
+  if ("volumeShell" in interactive) {
     if (
-      interactive.login !== true ||
+      interactive.volumeShell !== true ||
       spec.provider ||
-      !spec.claudeMounts?.group
+      spec.mounts?.length !== 1 ||
+      spec.mounts[0]?.readOnly !== false ||
+      spec.claude
     )
       invalid();
     return [];
@@ -322,52 +324,55 @@ function interactiveArgs(spec: SandboxSpec): string[] {
   ];
 }
 
-function claudeMountArgs(spec: SandboxSpec): string[] {
-  const mounts = spec.claudeMounts;
-  if (!mounts) return [];
-  if (
-    spec.claude !== true ||
-    !spec.egressGateway ||
-    (mounts.group && spec.provider)
-  )
-    invalid();
-  for (const path of [
-    mounts.managed,
-    ...(mounts.group ? [mounts.group] : []),
-  ]) {
+function mountArgs(spec: SandboxSpec): string[] {
+  const args: string[] = [];
+  if (spec.claudeManagedSettings !== undefined) {
+    if (spec.claude !== true || !isMountHostPath(spec.claudeManagedSettings))
+      invalid();
+    args.push(
+      "--mount-file",
+      `${spec.claudeManagedSettings}:${CLAUDE_MANAGED_PATH}:ro`,
+    );
+  }
+  const paths = new Set<string>();
+  for (const mount of spec.mounts ?? []) {
     if (
-      typeof path !== "string" ||
-      !isAbsolute(path) ||
-      resolve(path) !== path ||
-      /[\0:=,\r\n]/.test(path)
+      (!spec.claudeManagedSettings &&
+        !(spec.interactive && "volumeShell" in spec.interactive)) ||
+      !isMountHostPath(mount.hostPath) ||
+      !/^\/mnt\/[a-z0-9][a-z0-9._-]{0,63}$/.test(mount.guestPath) ||
+      typeof mount.readOnly !== "boolean" ||
+      paths.has(mount.guestPath)
     )
       invalid();
+    paths.add(mount.guestPath);
+    args.push(
+      "--mount-dir",
+      `${mount.hostPath}:${mount.guestPath}${mount.readOnly ? ":ro" : ""}`,
+    );
   }
-  return [
-    "--mount-file",
-    `${mounts.managed}:${CLAUDE_MANAGED_PATH}:ro`,
-    ...(mounts.group
-      ? ["--mount-dir", `${mounts.group}:${CLAUDE_GROUP_PATH}`]
-      : []),
-  ];
+  return args;
 }
 
-function checkClaudeMounts(mounts: NonNullable<SandboxSpec["claudeMounts"]>) {
-  for (const [path, directory] of [
-    [mounts.managed, false],
-    [mounts.group, true],
-  ] as const) {
-    if (path === undefined) continue;
-    const info = lstatSync(path, { throwIfNoEntry: false });
-    if (
-      !info ||
-      !(directory ? info.isDirectory() : info.isFile() && info.nlink === 1) ||
-      info.uid !== process.getuid?.() ||
-      (info.mode & 0o7777) !== (directory ? 0o700 : 0o600) ||
-      realpathSync(path) !== path
-    )
-      invalid();
-  }
+function isMountHostPath(path: string) {
+  return (
+    typeof path === "string" &&
+    isAbsolute(path) &&
+    resolve(path) === path &&
+    !/[\0:=,\r\n]/.test(path)
+  );
+}
+
+function checkClaudeManagedSettings(path: string) {
+  const info = lstatSync(path, { throwIfNoEntry: false });
+  if (
+    !info?.isFile() ||
+    info.nlink !== 1 ||
+    info.uid !== process.getuid?.() ||
+    (info.mode & 0o7777) !== 0o600 ||
+    realpathSync(path) !== path
+  )
+    invalid();
 }
 
 function checkInteractivePaths(spec: InteractiveSpec): void {
@@ -683,7 +688,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     return digestNetworkArgs([
       ...this.#network(spec).args,
       ...interactiveArgs(spec),
-      ...claudeMountArgs(spec),
+      ...mountArgs(spec),
       ...debugArgs(spec),
     ]);
   }
@@ -694,7 +699,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     gateway?: SandboxEgressGateway,
     provider?: SandboxProvider,
     interactive?: InteractiveSpec,
-    mounts?: SandboxSpec["claudeMounts"],
+    managed?: string,
+    mounts?: SandboxSpec["mounts"],
   ): Promise<void> {
     const create = async (env: Record<string, string>) => {
       if (gateway) {
@@ -717,7 +723,19 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       }
       const args = buildArgs();
       if (interactive) checkInteractivePaths(interactive);
-      if (mounts) checkClaudeMounts(mounts);
+      if (managed) checkClaudeManagedSettings(managed);
+      for (const { hostPath } of mounts ?? []) {
+        for (const path of [dirname(hostPath), hostPath]) {
+          const info = lstatSync(path, { throwIfNoEntry: false });
+          if (
+            !info?.isDirectory() ||
+            info.uid !== process.getuid?.() ||
+            (info.mode & 0o7777) !== 0o700 ||
+            realpathSync(path) !== path
+          )
+            invalid();
+        }
+      }
       // A failed CLI create can leave a partially created sandbox.
       state.removed = false;
       return this.#checked(args, env);
@@ -804,10 +822,15 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       requestedInteractive && "vsock" in requestedInteractive
         ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
         : undefined;
-    const mounts = spec.claudeMounts && { ...spec.claudeMounts };
+    const managed = spec.claudeManagedSettings;
+    const mounts = spec.mounts?.map((mount) => ({ ...mount }));
     const channels = [
       ...interactiveArgs(interactive ? { ...spec, interactive } : spec),
-      ...claudeMountArgs(spec),
+      ...mountArgs({
+        ...spec,
+        ...(mounts ? { mounts } : {}),
+        ...(managed ? { claudeManagedSettings: managed } : {}),
+      }),
       ...debugArgs(spec),
     ];
     boundedInteger(
@@ -829,27 +852,27 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       : undefined;
     if (spec.repository !== undefined && (!repository || spec.files?.length))
       invalid();
-    if (repository) await checkRepository(repository);
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
     if (fileGroups.flat().length > MICROSANDBOX_LIMITS.files) invalid();
     let total = 0;
     // Copy input bytes before the first await so callers cannot mutate staged input.
     const snapshots = fileGroups.map((files) => {
       const paths = new Set<string>();
-      return files.map((file) => {
-        relativePath(file.path);
+      return files.map(({ path, bytes }) => {
+        relativePath(path);
         if (
-          !(file.bytes instanceof Uint8Array) ||
-          file.bytes.byteLength > MICROSANDBOX_LIMITS.fileBytes ||
-          paths.has(file.path)
+          !(bytes instanceof Uint8Array) ||
+          bytes.byteLength > MICROSANDBOX_LIMITS.fileBytes ||
+          paths.has(path)
         )
           invalid();
-        paths.add(file.path);
-        total += file.bytes.byteLength;
+        paths.add(path);
+        total += bytes.byteLength;
         if (total > MICROSANDBOX_LIMITS.workspaceBytes) invalid();
-        return { path: file.path, bytes: new Uint8Array(file.bytes) };
+        return { path, bytes: new Uint8Array(bytes) };
       });
     });
+    if (repository) await checkRepository(repository);
     let state: State | undefined;
     let directory: string | undefined;
     let reservation: string | undefined;
@@ -971,6 +994,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         gateway,
         provider,
         interactive,
+        managed,
         mounts,
       );
       if (stagedTree) {

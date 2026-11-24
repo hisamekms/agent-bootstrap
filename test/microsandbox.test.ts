@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -340,6 +341,56 @@ test("fake lifecycle uses a clean local backend, pinned cached image, copied wor
   }
   await Promise.all([f.runtime.destroy(handle), f.runtime.destroy(handle)]);
   await f.runtime.destroy(handle);
+  await assertCleanup(f);
+});
+
+test("readOnlyFiles stage regular files only under the /review mount", async (t) => {
+  const f = await fixture(t);
+  const target = join(f.home, "target");
+  const link = join(f.home, "review.txt");
+  await writeFile(target, "outside review");
+  await symlink(target, link);
+  for (const path of [link, "nested/../escape", "/review/absolute.txt"]) {
+    await assert.rejects(
+      f.runtime.create({ readOnlyFiles: [{ path, bytes: bytes("review") }] }),
+      /invalid-input/,
+    );
+  }
+  assert.deepEqual(await f.events(), []);
+
+  let pathReads = 0;
+  const handle = await f.runtime.create({
+    readOnlyFiles: [
+      {
+        get path() {
+          return pathReads++ === 0 ? "nested/review.txt" : "../escape";
+        },
+        bytes: bytes(target),
+      },
+    ],
+  });
+  try {
+    const create = (await f.events()).find(({ args }) => args[0] === "create");
+    assert.ok(create?.workspace);
+    const staging = dirname(create.workspace);
+    const review = join(staging, "review");
+    assert.deepEqual(
+      create.args.flatMap((arg, index) =>
+        create.args[index - 1] === "--mount-dir" ? [arg] : [],
+      ),
+      [`${review}:/review:ro`],
+    );
+    assert.deepEqual((await readdir(staging)).sort(), ["review", "workspace"]);
+    assert.deepEqual(await readdir(review), ["nested"]);
+    assert.deepEqual(await readdir(join(review, "nested")), ["review.txt"]);
+    const staged = join(review, "nested", "review.txt");
+    assert.ok((await lstat(staged)).isFile());
+    assert.equal(await readFile(staged, "utf8"), target);
+    assert.ok((await lstat(link)).isSymbolicLink());
+    assert.equal(await readFile(target, "utf8"), "outside review");
+  } finally {
+    await f.runtime.destroy(handle);
+  }
   await assertCleanup(f);
 });
 
@@ -1517,7 +1568,7 @@ test("interactive specs reject conflicting channels, invalid names and unsafe ho
   const invalidSpecs: SandboxSpec[] = [
     { profile: "concierge" },
     { ...spec, profile: "base" },
-    { ...spec, interactive, provider: undefined } as unknown as SandboxSpec,
+    // A Concierge without a provider is valid: external auth supplies no credential.
     {
       ...spec,
       interactive,
@@ -1741,61 +1792,70 @@ test("create checks gateway availability after asynchronous provider credential 
   );
 });
 
-test("Claude configuration and managed settings create mounts without a provider substitution", async (t) => {
+test("Microsandbox emits both declared mount modes and keeps managed settings read-only", async (t) => {
   const { config, events } = await fixture(t);
   const root = dirname(config.home);
   const managed = join(root, "managed.json");
-  const group = join(root, "actors");
+  const volume = join(root, "volume");
+  const directory = join(volume, "fixture");
   await writeFile(managed, "{}", { mode: 0o600 });
-  await mkdir(group, { mode: 0o700 });
+  await mkdir(volume, { mode: 0o700 });
+  await mkdir(directory, { mode: 0o700 });
   const runtime = new MicrosandboxRuntime({
     ...config,
     profiles: new ProfileCatalog({ base: { image }, concierge: { image } }),
     gatewayPassword: () => gatewayPassword,
   });
-
-  for (const extra of [
-    {},
-    { profile: "concierge", interactive: { login: true } },
-  ] as const) {
-    const spec = {
-      ...extra,
-      claude: true,
-      claudeMounts: { managed, group },
-      egressGateway: gateway,
-    } as const;
+  for (const readOnly of [true, false]) {
+    const spec: SandboxSpec = {
+      ...(readOnly
+        ? {
+            claude: true,
+            claudeManagedSettings: managed,
+            egressGateway: gateway,
+          }
+        : { profile: "concierge", interactive: { volumeShell: true } }),
+      mounts: [{ hostPath: directory, guestPath: "/mnt/fixture", readOnly }],
+    };
     const handle = await createBound(runtime, spec);
     try {
-      const create = (await events())
+      const { args, envKeys } = (await events())
         .filter(({ args }) => args[0] === "create")
         .at(-1)!;
       assert.equal(
-        create.args[create.args.indexOf("--mount-file") + 1],
-        `${managed}:/etc/claude-code/managed-settings.json:ro`,
+        args[args.indexOf("--mount-dir") + 1],
+        `${directory}:/mnt/fixture${readOnly ? ":ro" : ""}`,
       );
-      assert.equal(
-        create.args[create.args.indexOf("--mount-dir") + 1],
-        `${group}:/claude-config`,
-      );
-      assert.ok(!create.args.includes("--secret"));
-      assert.ok(!create.args.includes("--tls-intercept"));
-      assert.ok(!create.args.includes("--vsock"));
-      assert.ok(!create.args.includes("--mount-named"));
+      if (readOnly)
+        assert.equal(
+          args[args.indexOf("--mount-file") + 1],
+          `${managed}:/etc/claude-code/managed-settings.json:ro`,
+        );
+      assert.ok(!args.includes("--secret"));
+      assert.ok(!args.includes("--tls-intercept"));
       assert.deepEqual(
-        create.envKeys.filter((key) => key.startsWith("ANTHROPIC")),
+        envKeys.filter((key) => key.startsWith("ANTHROPIC")),
         [],
       );
-      if ("interactive" in extra) {
-        assert.deepEqual(
-          await runtime.attachTerminal(handle, {
-            argv: ["claude"],
-            workdir: "/",
-          }),
-          { exitCode: 0 },
-        );
-      }
     } finally {
       await runtime.destroy(handle);
     }
   }
+  const aliased = join(volume, "alias");
+  await symlink(directory, aliased);
+  await assert.rejects(
+    createBound(runtime, {
+      claude: true,
+      claudeManagedSettings: managed,
+      egressGateway: gateway,
+      mounts: [
+        { hostPath: aliased, guestPath: "/mnt/fixture", readOnly: true },
+      ],
+    }),
+    /invalid-input/,
+  );
+  assert.equal(
+    (await events()).filter(({ args }) => args[0] === "create").length,
+    2,
+  );
 });

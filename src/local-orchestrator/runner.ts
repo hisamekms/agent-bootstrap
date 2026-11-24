@@ -1,7 +1,7 @@
 import { GitIntegrationError } from "../git-integration.ts";
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
-import { ClaudeRunError } from "./credentials-volume.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 import { randomUUID } from "node:crypto";
 import type { RoleHarness } from "../actors.ts";
 import {

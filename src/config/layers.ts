@@ -25,7 +25,15 @@ import {
   parseVerificationConfig,
   type VerificationConfig,
 } from "../local-orchestrator/verification.ts";
-import { validateClaudeLayer } from "../local-orchestrator/claude-config.ts";
+import { listProjects } from "./projects.ts";
+import { localActorHarnesses, type LocalActorHarnesses } from "../actors.ts";
+import { CLAUDE_MOUNT_ENV } from "../claude-code.ts";
+import {
+  CLAUDE_ACTORS,
+  validClaudeHostname,
+  validService,
+  validateClaudeLayer,
+} from "../local-orchestrator/claude-config.ts";
 import { ConfigError, invalid, type ConfigFix } from "./messages.ts";
 
 export type Layer = "user" | "approved" | "local";
@@ -41,12 +49,14 @@ const egressActors = [
 ] as const;
 export type EgressActor = (typeof egressActors)[number];
 type Profiles = Partial<Record<ProfileRole, ProfileName>>;
-export interface VolumeSlot {
+export interface VolumeDefinition {
   image: string;
   keychainService: string;
   attach: "while-running";
 }
-export interface MountSlot {
+export const mountSegment = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+export const mountPath = /^\/mnt\/[a-z0-9][a-z0-9._-]{0,63}$/;
+export interface MountDeclaration {
   volume: string;
   dir: string;
   path: string;
@@ -60,8 +70,8 @@ export interface Config {
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
-  mounts?: Record<string, MountSlot>;
-  volumes?: Record<string, VolumeSlot>;
+  mounts?: Record<string, MountDeclaration>;
+  volumes?: Record<string, VolumeDefinition>;
 }
 
 export interface ApprovedConfig {
@@ -315,12 +325,14 @@ function readPrivateBytes(
   }
 }
 
+export const maxConfigBytes = 256 * 1024;
+
 export function readPrivateConfig(
   path: string,
   root: string,
   key: string,
   next: string | ConfigFix,
-  limit = 256 * 1024,
+  limit = maxConfigBytes,
 ): unknown {
   const bytes = readPrivateBytes(path, root, key, next, limit);
   return bytes === undefined ? undefined : parseJson(bytes, key, next);
@@ -508,14 +520,17 @@ export function parseConfig(
         );
       if (
         !Array.isArray(destinations) ||
+        destinations.length > 64 ||
         destinations.some(
           (item) =>
-            typeof item !== "string" || !/^[^\s\p{C}]+:[0-9]+$/u.test(item),
+            typeof item !== "string" ||
+            !item.endsWith(":443") ||
+            !validClaudeHostname(item.slice(0, -4)),
         )
       )
         invalid(
           `egress.${actor}`,
-          "Expected a list of host and port strings.",
+          "Expected a list of DNS hostnames with HTTPS port 443.",
           next,
         );
     }
@@ -534,12 +549,26 @@ export function parseConfig(
         ]);
         if (
           typeof entry.image !== "string" ||
-          typeof entry.keychainService !== "string" ||
-          entry.attach !== "while-running"
+          !isAbsolute(entry.image) ||
+          resolve(entry.image) !== entry.image ||
+          !entry.image.endsWith(".sparseimage") ||
+          /[\0\r\n:=,]/.test(entry.image)
         )
           invalid(
-            keyPath,
-            "Expected an image, Keychain service and attachment mode.",
+            `${keyPath}.image`,
+            "Expected a canonical absolute sparse image path.",
+            next,
+          );
+        if (!validService(entry.keychainService))
+          invalid(
+            `${keyPath}.keychainService`,
+            "Expected a valid Keychain service name.",
+            next,
+          );
+        if (entry.attach !== "while-running")
+          invalid(
+            `${keyPath}.attach`,
+            "Expected the while-running attachment mode.",
             next,
           );
       } else {
@@ -551,18 +580,67 @@ export function parseConfig(
           "mode",
           "env",
         ]);
+        if (typeof entry.volume !== "string" || !projectName.test(entry.volume))
+          invalid(`${keyPath}.volume`, "Expected a volume name.", next);
+        if (typeof entry.dir !== "string" || !mountSegment.test(entry.dir))
+          invalid(`${keyPath}.dir`, "Expected a single directory name.", next);
+        if (typeof entry.path !== "string" || !mountPath.test(entry.path))
+          invalid(
+            `${keyPath}.path`,
+            "Expected a single directory below /mnt.",
+            next,
+          );
         if (
-          typeof entry.volume !== "string" ||
-          typeof entry.dir !== "string" ||
-          typeof entry.path !== "string" ||
           !Array.isArray(entry.actors) ||
-          entry.actors.some((actor) => typeof actor !== "string") ||
-          ("mode" in entry && entry.mode !== "ro" && entry.mode !== "rw") ||
-          ("env" in entry && typeof entry.env !== "string")
+          !entry.actors.length ||
+          new Set(entry.actors).size !== entry.actors.length
         )
           invalid(
-            keyPath,
-            "Expected a volume, directory, path and actor list with optional mode and environment variable.",
+            `${keyPath}.actors`,
+            "Expected a nonempty list of distinct actors.",
+            next,
+          );
+        if (entry.actors.includes("Verification"))
+          invalid(
+            `${keyPath}.actors`,
+            "Verification cannot receive mounts.",
+            next,
+          );
+        if (
+          !entry.actors.every((actor) =>
+            CLAUDE_ACTORS.some((supported) => supported === actor),
+          )
+        )
+          invalid(
+            `${keyPath}.actors`,
+            "An actor has no adapter that can enforce mount restrictions.",
+            next,
+          );
+        if ("mode" in entry && entry.mode !== "ro" && entry.mode !== "rw")
+          invalid(
+            `${keyPath}.mode`,
+            "Expected a read-only or read-write mount mode.",
+            next,
+          );
+        if (entry.mode === "rw" && layer !== "local")
+          invalid(
+            `${keyPath}.mode`,
+            "Read-write mounts are restricted to local.json.",
+            next,
+          );
+        if (entry.mode === "rw" && entry.actors.length !== 1)
+          invalid(
+            `${keyPath}.actors`,
+            "A read-write mount must have exactly one actor.",
+            next,
+          );
+        if (
+          "env" in entry &&
+          !CLAUDE_MOUNT_ENV.some((name) => name === entry.env)
+        )
+          invalid(
+            `${keyPath}.env`,
+            "The variable is outside the adapter's mount allowlist.",
             next,
           );
       }
@@ -625,6 +703,7 @@ export function mergeConfig(
   local: Config,
   env = process.env,
   directory?: string,
+  harnesses = localActorHarnesses,
 ) {
   const config: Config = { version: 1 };
   const sources: Record<string, Layer | Layer[]> = Object.create(null);
@@ -641,6 +720,7 @@ export function mergeConfig(
       sources[`profiles.${role}`] = layer;
     }
     for (const [actor, values] of Object.entries(current.egress ?? {})) {
+      if (actor === "shell" && directory !== undefined) continue;
       const entries = ((config.egress ??= {})[actor as EgressActor] ??=
         []) as string[];
       const origins = (sources[`egress.${actor}`] ??= []) as Layer[];
@@ -660,7 +740,13 @@ export function mergeConfig(
             layerFile(layer, env, directory),
           );
         Object.defineProperty((config[key] ??= {}), name, {
-          value: entry,
+          value:
+            key === "mounts"
+              ? {
+                  ...(entry as MountDeclaration),
+                  mode: (entry as MountDeclaration).mode ?? "ro",
+                }
+              : entry,
           enumerable: true,
         });
         sources[path] = layer;
@@ -669,38 +755,27 @@ export function mergeConfig(
     if (current.claude) {
       const claude = (config.claude ??= {});
       for (const [key, value] of Object.entries(current.claude)) {
-        if (key === "apiKey" || key === "configDir") {
+        if (key === "apiKey") {
           const target = (claude[key] ??= {}) as Record<string, unknown>;
           for (const [field, entry] of Object.entries(
             value as Record<string, unknown>,
           )) {
-            const path = `claude.${key}.${field}`;
-            if (field === "volume" || field === "groups") {
-              const named = (target[field] ??= {}) as Record<string, unknown>;
-              for (const [name, item] of Object.entries(
-                entry as Record<string, unknown>,
-              )) {
-                if (field === "groups" && Object.hasOwn(named, name))
-                  invalid(
-                    `${path}.${name}`,
-                    "A named group appears in more than one layer.",
-                    layerFile(layer, env, directory),
-                  );
-                named[name] = item;
-                sources[`${path}.${name}`] = layer;
-              }
-            } else if (field === "leakPatterns") {
-              const patterns = (target[field] ??= []) as string[];
-              const origins = (sources[path] ??= []) as Layer[];
-              for (const pattern of entry as string[]) {
-                if (patterns.includes(pattern)) continue;
-                patterns.push(pattern);
-                origins.push(layer);
-              }
-            } else {
-              target[field] = entry;
-              sources[path] = layer;
-            }
+            target[field] = entry;
+            sources[`claude.apiKey.${field}`] = layer;
+          }
+        } else if (key === "leakPatterns" || key === "errors") {
+          const entries = (claude[key] ??= []) as unknown[];
+          const origins = (sources[`claude.${key}`] ??= []) as Layer[];
+          for (const entry of value as unknown[]) {
+            if (
+              entries.some(
+                (previous) =>
+                  JSON.stringify(previous) === JSON.stringify(entry),
+              )
+            )
+              continue;
+            entries.push(entry);
+            origins.push(layer);
           }
         } else {
           claude[key] = value;
@@ -709,17 +784,132 @@ export function mergeConfig(
       }
     }
   }
+  const images = new Set<string>();
+  const services = new Set<string>();
+  for (const [name, volume] of Object.entries(config.volumes ?? {})) {
+    if (images.has(volume.image) || services.has(volume.keychainService))
+      invalid(
+        `volumes.${name}`,
+        "Volume definitions must have distinct images and Keychain services.",
+        layerFile("user", env),
+      );
+    images.add(volume.image);
+    services.add(volume.keychainService);
+  }
+  const entries = Object.entries(config.mounts ?? {});
+  for (const [index, [name, mount]] of entries.entries()) {
+    const path = `mounts.${name}`;
+    const fix = layerFile(sources[path] as Layer, env, directory);
+    if (
+      mount.actors.some(
+        (actor) => harnesses[actor as keyof LocalActorHarnesses] !== "claude",
+      )
+    )
+      invalid(
+        `${path}.actors`,
+        "A mounted actor must use the Claude adapter.",
+        fix,
+      );
+    if (!Object.hasOwn(config.volumes ?? {}, mount.volume))
+      invalid(`${path}.volume`, "The referenced volume is undefined.", fix);
+    for (const [, previous] of entries.slice(0, index)) {
+      if (previous.path === mount.path)
+        invalid(`${path}.path`, "Two mounts share a guest path.", fix);
+      if (
+        mount.env &&
+        previous.env === mount.env &&
+        previous.actors.some((actor) => mount.actors.includes(actor))
+      )
+        invalid(
+          `${path}.env`,
+          "An actor receives the same variable from two mounts.",
+          fix,
+        );
+      if (conflictingClaims(previous, mount))
+        invalid(
+          `${path}.dir`,
+          "A writable directory must belong to a single mount.",
+          fix,
+        );
+    }
+  }
   return { config, sources };
 }
 
-export function loadConfig(env = process.env, directory?: string) {
+export function conflictingClaims(
+  left: MountDeclaration,
+  right: MountDeclaration,
+) {
+  return (
+    left.volume === right.volume &&
+    left.dir === right.dir &&
+    (left.mode === "rw" || right.mode === "rw")
+  );
+}
+
+function localMountClaims(directory: string, env: NodeJS.ProcessEnv) {
+  const fix = layerFile("local", env, directory);
+  let mounts: Record<string, unknown>;
+  try {
+    const raw = readPrivateConfig(fix.path, configRoot(env), "$", fix);
+    if (raw === undefined) return [];
+    const value = record(raw, "$", fix).mounts;
+    if (value === undefined) return [];
+    mounts = record(value, "mounts", fix);
+  } catch (error) {
+    if (error instanceof ConfigError) return [];
+    throw error;
+  }
+  return Object.entries(mounts).flatMap(([name, mount]) => {
+    try {
+      const local = parseConfig(
+        { version: 1, mounts: { [name]: mount } },
+        "local",
+        fix,
+      );
+      return Object.values(local.mounts ?? {});
+    } catch (error) {
+      if (error instanceof ConfigError) return [];
+      throw error;
+    }
+  });
+}
+
+export function loadConfig(
+  env = process.env,
+  directory?: string,
+  harnesses = localActorHarnesses,
+) {
   const user = readLayer("user", undefined, env);
   const local = directory
     ? readLayer("local", directory, env)
     : { version: 1 as const };
   const approved = directory ? readApproved(directory, env) : undefined;
+  const merged = mergeConfig(
+    user,
+    approved?.config,
+    local,
+    env,
+    directory,
+    harnesses,
+  );
+  if (directory && Object.keys(merged.config.mounts ?? {}).length) {
+    for (const project of listProjects(env)) {
+      const other = projectConfigDirectory(project.name, env);
+      if (other === directory) continue;
+      const claims = localMountClaims(other, env);
+      for (const [name, mount] of Object.entries(merged.config.mounts ?? {})) {
+        if (claims.some((claim) => conflictingClaims(claim, mount)))
+          invalid(
+            `mounts.${name}.dir`,
+            "A directory with a write grant is also claimed by another project.",
+            `Resolve the directory claim in project ${project.name}, then run agent-bootstrap doctor.`,
+          );
+      }
+    }
+  }
   return {
-    ...mergeConfig(user, approved?.config, local, env, directory),
+    ...merged,
     directory,
     user,
     local,

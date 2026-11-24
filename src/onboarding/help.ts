@@ -174,10 +174,10 @@ export const helpTopics = {
       "agent-bootstrap migrate",
     ],
     output:
-      "Doctor shows effective settings and their sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.",
+      "Doctor shows effective configuration keys and their layer sources and reports declaration drift. Local settings take precedence for single values, followed by approved and user settings. Lists of grants are combined. Concierge chooses its Claude model from LO_CLAUDE_MODEL, then the effective claude.model setting, then the launcher default. Removal preserves state.",
     next: "Use config edit for user settings. For legacy external targets, pass the original worktree paths to migrate.",
     human:
-      "Read the approval diff and type the project name to accept the full declaration at local main.",
+      "Review the declaration at local main and the approval summary, then type the project name to accept the declaration.",
   },
   troubleshoot: {
     purpose:
@@ -212,30 +212,23 @@ export const helpTopics = {
     output:
       "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.",
     next: "Review the proposed paths, verification result, digest, and policy before answering each gate.",
-    human: `${humanRepo} ${humanGate} Keep API keys in Keychain. In config-dir mode, processes inside a Claude VM can read the mounted group directory. Researcher and verification receive neither the directory nor its egress policy.`,
+    human: `${humanRepo} ${humanGate} Keep API keys in Keychain. Review mount and egress grants separately.`,
   },
-  credentials: {
+  volume: {
     purpose:
-      "Manage the encrypted volume for persistent Claude Code configuration directories per actor group, signed in with the CLI's own /login.",
+      "Manage encrypted volumes and open an audited operator shell for a declared mount.",
     prerequisites:
-      "A private config.json with the volume path, Keychain service name and actor groups. API-key mode remains the default.",
-    commands: [],
+      "Define volumes in the user config. The shell requires an operator terminal.",
+    commands: [
+      "agent-bootstrap volume init <name>",
+      "agent-bootstrap volume status <name>",
+      "agent-bootstrap volume shell <mount> [--target <path>]",
+    ],
     output:
-      "Status reports attachment, active leases and stale state. Init creates the encrypted image and stores its passphrase in Keychain. Attach prepares the volume for a run. After doctor reports a stale lease, confirm no VM is running and use detach --force.",
-    next: "If integrity fails, inspect the evidence path and use credentials verify --accept from an operator terminal. Use the same target and authentication options as the failing run.",
+      "Status reports attachment, active leases and stale state. The shell takes an exclusive lease and mounts the directory read-write.",
+    next: "For stale state, run doctor. Confirm no VM is running before using volume detach <name> --force.",
     human:
-      "The operator inspects and accepts any intended changes to the group's configuration.",
-  },
-  login: {
-    purpose:
-      "Open Claude Code in an audited terminal for a configured actor group.",
-    prerequisites:
-      "Config-dir mode and a configured encrypted volume. Use a terminal with OSC 52 clipboard access disabled.",
-    commands: [],
-    output:
-      "The CLI can reach the group's configured hosts and its additional login hosts.",
-    next: "Use the Claude Code CLI's own /login, then exit the CLI.",
-    human: "The operator signs in from the Claude Code CLI.",
+      "Declare read-write mounts in a project's local.json for one actor and a dedicated directory.",
   },
 } satisfies Record<string, Topic>;
 
@@ -327,8 +320,8 @@ export const onboardingOutputs = {
   },
   doctor: {
     usage:
-      "doctor [--target <path>] [--claude-auth <api-key|config-dir>] [--json]",
-    json: "Array of { id, status, detail, fix, needsNetwork, needsHuman } with effective settings and sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.",
+      "doctor [--target <path>] [--claude-auth <api-key|external>] [--json]",
+    json: "Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.",
   },
   setup: {
     usage: "setup [--allow-network] [--yes] [--profiles] [--json]",
@@ -336,7 +329,7 @@ export const onboardingOutputs = {
   },
   concierge: {
     usage:
-      "concierge [--target <path>] [--claude-auth <api-key|config-dir>] [--continue] [--mode <m>] [--json]",
+      "concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]",
     json: "{ status, next } after an interactive TTY session. Transcript goes to stderr.",
   },
   sandbox: {
@@ -355,17 +348,12 @@ export const onboardingOutputs = {
   },
   migrate: {
     usage: "migrate [<original-target-path>...]",
-    json: "{ projects, orphanedVolumes } with migrated project names and legacy Concierge volume names left for operator review.",
+    json: "{ projects, orphanedVolumes, volumeMigration? } with project names, legacy Concierge volume names and any mount migration guidance.",
   },
-  credentials: {
+  volume: {
     usage:
-      "credentials <status|init|attach|detach [--force]|verify --accept [--group <name>]> [--target <path>] [--claude-auth <mode>] [--json]",
+      "volume <init|attach|detach|status> <name> [--force for detach] | volume shell <mount> [--target <path>]",
     json: "{ mounted, active, stale } for status or { status } after a completed action.",
-  },
-  login: {
-    usage:
-      "login --group <name> [--target <path>] [--claude-auth <mode>] [--json]",
-    json: "{ status } after a successful interactive session. Transcript goes to stderr in JSON mode.",
   },
 } as const;
 
@@ -402,7 +390,7 @@ export function renderAgentGuide(): string {
     "",
     "Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.",
     "",
-    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, credentials, or login. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
+    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, concierge, or volume shell. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",

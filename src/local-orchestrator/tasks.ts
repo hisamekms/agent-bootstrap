@@ -1,6 +1,6 @@
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
-import { ClaudeRunError } from "./credentials-volume.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir } from "node:fs/promises";
