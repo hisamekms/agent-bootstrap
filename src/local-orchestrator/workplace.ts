@@ -45,3 +45,53 @@ export async function runWorkplace<T>(
     }
   }
 }
+
+type Listener = () => void;
+
+/** Stop control for a workplace launcher. The first SIGINT, SIGTERM or
+ * SIGHUP aborts for an audited shutdown. A second one exits at once, for a
+ * cleanup that hangs. When the parent's lifeline closes, the parent is gone
+ * (even after SIGKILL), so the launcher stops as for SIGTERM. */
+export function workplaceStop(
+  signals: {
+    on(event: NodeJS.Signals, listener: Listener): unknown;
+    off(event: NodeJS.Signals, listener: Listener): unknown;
+  },
+  forceExit: (code: number) => void,
+  lifeline?: {
+    once(event: "close", listener: Listener): unknown;
+    destroy(): void;
+  },
+) {
+  const controller = new AbortController();
+  let exitCode: number | undefined;
+  let disposed = false;
+  const stop = (code: number) => {
+    if (disposed) return;
+    if (exitCode !== undefined) {
+      forceExit(code);
+      return;
+    }
+    exitCode = code;
+    controller.abort();
+  };
+  const interrupt = () => stop(130);
+  const terminate = () => stop(143);
+  signals.on("SIGINT", interrupt);
+  signals.on("SIGTERM", terminate);
+  signals.on("SIGHUP", terminate);
+  lifeline?.once("close", terminate);
+  return {
+    signal: controller.signal,
+    get exitCode() {
+      return exitCode;
+    },
+    dispose() {
+      disposed = true;
+      signals.off("SIGINT", interrupt);
+      signals.off("SIGTERM", terminate);
+      signals.off("SIGHUP", terminate);
+      lifeline?.destroy();
+    },
+  };
+}

@@ -6,6 +6,7 @@ import { MsbHomeError, requireMsbHome } from "../../src/config/msb-home.ts";
 import { driftWarning } from "../../src/config/projects.ts";
 import { GitIntegrationError } from "../../src/git-integration.ts";
 import { execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
 import { access, readFile, realpath } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -31,6 +32,7 @@ import {
 import {
   parseWorkplaceArgs,
   runWorkplace,
+  workplaceStop,
 } from "../../src/local-orchestrator/workplace.ts";
 import { loadWorkplaceAssets } from "../../src/operator-ui/assets.ts";
 import {
@@ -167,16 +169,24 @@ async function main(args: readonly string[]) {
     } catch {
       throw new Error("Run agent-bootstrap help workplace for usage.");
     }
-    const controller = new AbortController();
-    let signalExitCode: number | undefined;
-    const stop = (code: number) => {
-      signalExitCode ??= code;
-      controller.abort();
-    };
-    const interrupt = () => stop(130);
-    const terminate = () => stop(143);
-    process.on("SIGINT", interrupt);
-    process.on("SIGTERM", terminate);
+    const lifelineFd = process.env.AGENT_BOOTSTRAP_LIFELINE_FD;
+    delete process.env.AGENT_BOOTSTRAP_LIFELINE_FD;
+    const lifeline =
+      lifelineFd === "3"
+        ? createReadStream("", { fd: 3 }).on("error", () => {})
+        : undefined;
+    lifeline?.resume();
+    const stopControl = workplaceStop(
+      process,
+      (code) => {
+        process.stderr.write(
+          "Stopped without cleanup. Run agent-bootstrap doctor before the next launch.\n",
+        );
+        process.exit(code);
+      },
+      lifeline,
+    );
+    const controller = { signal: stopControl.signal };
     let stage = "resolve target";
     try {
       await launchConcierge(
@@ -193,9 +203,9 @@ async function main(args: readonly string[]) {
       if (!controller.signal.aborted || error !== controller.signal.reason)
         throw new Error(conciergeFailure(stage, error));
     } finally {
-      process.off("SIGINT", interrupt);
-      process.off("SIGTERM", terminate);
-      if (signalExitCode !== undefined) process.exitCode = signalExitCode;
+      stopControl.dispose();
+      if (stopControl.exitCode !== undefined)
+        process.exitCode = stopControl.exitCode;
     }
     return;
   }
