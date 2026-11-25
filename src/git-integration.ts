@@ -454,15 +454,22 @@ export class LocalGitIntegration {
 
   async #compareAndSwap(
     ref: string,
-    next: string,
+    next: string | null,
     previous: string | null,
     checkout?: string,
   ): Promise<void> {
     // --no-deref alone can replace a symbolic ref whose referent matches the
     // old OID. Prepare locks this exact ref; inspect it while that lock is held
-    // and commit only for a direct ref (or absence for candidate-pin creation).
+    // and commit only for a direct ref or verified absence.
+    const old = previous ?? "0".repeat(40);
+    const command =
+      next !== null
+        ? `update ${ref} ${next} ${old}`
+        : previous === null
+          ? `verify ${ref} ${old}`
+          : `delete ${ref} ${old}`;
     await this.#git(["update-ref", "--stdin"], checkout, false, {
-      input: `start\noption no-deref\nupdate ${ref} ${next} ${previous ?? "0".repeat(40)}\nprepare\n`,
+      input: `start\noption no-deref\n${command}\nprepare\n`,
       validate: async () => {
         if ((await this.#reference(ref, checkout)) !== previous)
           throw new GitIntegrationError("stale-base");
@@ -979,6 +986,22 @@ export class LocalGitIntegration {
     oid(from);
     await this.#repository();
     await this.#commit(to);
+    await this.#changeGoalBranch(from, to);
+  }
+
+  /** Delete a direct Goal branch at the confirmed head or verify its absence. */
+  async deleteGoalBranch(expectedHead: string | null): Promise<void> {
+    if (!/^lo\/goal-[a-f0-9]{8}$/.test(this.#config.branch))
+      throw new GitIntegrationError("invalid-input");
+    if (expectedHead !== null) oid(expectedHead);
+    await this.#repository();
+    await this.#changeGoalBranch(expectedHead, null);
+  }
+
+  async #changeGoalBranch(
+    from: string | null,
+    to: string | null,
+  ): Promise<void> {
     if ((await this.#reference(this.#ref)) !== from)
       throw new GitIntegrationError("stale-base");
     try {

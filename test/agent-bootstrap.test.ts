@@ -179,6 +179,7 @@ describe("agent-bootstrap", () => {
       "retry-task",
       "reconcile",
       "update-goal-base",
+      "discard-goal",
       "verification",
       "export-goal-branch",
       "analyze",

@@ -47,6 +47,7 @@ import {
 import {
   candidateDiffStat,
   previewGoalBaseUpdate,
+  previewGoalDiscard,
   previewGoalBranchExport,
   reconciliationIntegrationHeads,
 } from "./tasks.ts";
@@ -88,6 +89,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   watch
   retry-task <taskId>
   update-goal-base <goalId>
+  discard-goal <goalId>
   export-goal-branch <goalId> [--target <checkout>]
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
@@ -107,7 +109,11 @@ type Command =
   | AnalysisCommand
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
-  | { kind: "show-execution" | "retry-task" | "update-goal-base"; id: string }
+  | {
+      kind:
+        "show-execution" | "retry-task" | "update-goal-base" | "discard-goal";
+      id: string;
+    }
   | { kind: "export-goal-branch"; id: string; checkout?: string }
   | {
       kind: "approve" | "reject";
@@ -199,6 +205,7 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     case "show-execution":
     case "retry-task":
     case "update-goal-base":
+    case "discard-goal":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
       break;
     case "export-goal-branch": {
@@ -437,6 +444,22 @@ async function execute(
       );
       await writeCheckedJson({ goalId: command.id, from, to });
       const phrase = `update-goal-base ${command.id} ${to.slice(0, 12)}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      await apply();
+      await writeCheckedJson(store.getGoal(command.id));
+      return 0;
+    }
+    case "discard-goal": {
+      if (directory === undefined)
+        return refuse(io, "discard-goal with --db requires --target <path>.");
+      const { branch, head, apply } = await previewGoalDiscard(
+        store,
+        directory,
+        command.id,
+      );
+      await writeCheckedJson({ goalId: command.id, branch, head });
+      const phrase = `discard-goal ${command.id} ${head?.slice(0, 12) ?? "none"}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await apply();
@@ -777,6 +800,7 @@ export async function runCli(
       "reconcile",
       "retry-task",
       "update-goal-base",
+      "discard-goal",
       "export-goal-branch",
       "verification-set",
       "verification-clear",
@@ -869,7 +893,10 @@ export async function runCli(
       command.kind === "export-goal-branch" &&
       error instanceof OrchestratorStoreError
     ) {
-      if (error.code === "export-head-mismatch")
+      if (
+        error.code === "export-head-mismatch" ||
+        error.code === "goal-inactive"
+      )
         return refuse(io, `Goal branch export refused (${error.code}).`);
       if (error.code === "goal-export-record-failed")
         return refuse(
@@ -898,6 +925,11 @@ export async function runCli(
       )
         return refuse(io, "Goal base update refused (ineligible).");
       if (
+        error instanceof OrchestratorStoreError &&
+        error.code === "goal-inactive"
+      )
+        return refuse(io, "Goal base update refused (goal-inactive).");
+      if (
         (error instanceof OrchestratorStoreError &&
           error.code === "goal-base-stale") ||
         (error instanceof GitIntegrationError && error.code === "stale-base")
@@ -925,6 +957,29 @@ export async function runCli(
           "Goal branch update outcome is unknown. Inspect the branch and store before retrying.",
         );
     }
+    if (command.kind === "discard-goal") {
+      if (
+        error instanceof OrchestratorStoreError &&
+        error.code === "goal-discard-record-failed"
+      )
+        return refuse(
+          io,
+          "The Git step completed, but recording the Goal cancellation failed. Inspect the branch and store before retrying.",
+        );
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "ambiguous-update"
+      )
+        return refuse(
+          io,
+          "Goal branch deletion outcome is unknown. Inspect the branch and store before retrying.",
+        );
+      if (
+        error instanceof OrchestratorStoreError ||
+        error instanceof GitIntegrationError
+      )
+        return refuse(io, `Goal discard refused (${error.code}).`);
+    }
     if (
       error instanceof OrchestratorStoreError &&
       error.code === "stale-digest"
@@ -938,6 +993,12 @@ export async function runCli(
         io,
         "The reconciliation list changed. Run reconcile again.",
       );
+    if (
+      command.kind === "retry-task" &&
+      error instanceof OrchestratorStoreError &&
+      error.code === "goal-inactive"
+    )
+      return refuse(io, "Task retry refused (goal-inactive).");
     if (
       command.kind === "retry-task" &&
       error instanceof OrchestratorStoreError &&

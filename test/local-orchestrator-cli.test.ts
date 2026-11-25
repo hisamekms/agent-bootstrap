@@ -79,6 +79,19 @@ async function cli(
   return { code, stdout, stderr, questions };
 }
 
+test("discard-goal requires a terminal and a target with a custom database", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const args = ["discard-goal", "goal-id"];
+  const unattended = await cli(state, args);
+  assert.equal(unattended.code, 1);
+  assert.match(unattended.stderr, /requires a terminal/);
+  const untargeted = await cli(state, args, { isTTY: true });
+  assert.equal(untargeted.code, 1);
+  assert.match(untargeted.stderr, /with --db requires --target/);
+  assert.equal(untargeted.stdout, "");
+  assert.deepEqual(untargeted.questions, []);
+});
+
 test("status reports counts and pending gates, and show and proposals include content and origin", async () => {
   using state = orchestratorFixture("local-orchestrator-cli-");
   const { store } = state;

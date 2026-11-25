@@ -138,6 +138,16 @@ function localGit(directory: string, branch: string) {
   });
 }
 
+async function privateRepositoryExists(directory: string): Promise<boolean> {
+  try {
+    await lstat(join(directory, "repository.git"));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function processExit(child: ReturnType<typeof spawn>) {
   return new Promise<void>((resolve, reject) => {
     child.once("error", reject);
@@ -244,6 +254,7 @@ export async function previewGoalBaseUpdate(
     from,
     to,
     async apply() {
+      store.goalBaseForUpdate(goalId);
       if (
         (await localMainCommit(repoRoot)) !== to ||
         (await goalBranchHead(git)) !== from
@@ -261,6 +272,31 @@ export async function previewGoalBaseUpdate(
   };
 }
 
+export async function previewGoalDiscard(
+  store: OrchestratorStore,
+  directory: string,
+  goalId: string,
+) {
+  store.assertGoalDiscardable(goalId);
+  const branch = goalBranch(goalId);
+  const git = localGit(directory, branch);
+  const head = (await privateRepositoryExists(directory))
+    ? await goalBranchHead(git)
+    : null;
+  return {
+    branch,
+    head,
+    apply: () =>
+      store.discardGoal(goalId, head, async (expectedHead) => {
+        if (await privateRepositoryExists(directory)) {
+          await git.deleteGoalBranch(expectedHead);
+        } else if (expectedHead !== null) {
+          throw new GitIntegrationError("stale-base");
+        }
+      }),
+  };
+}
+
 export async function previewGoalBranchExport(
   store: OrchestratorStore,
   checkout: string,
@@ -270,6 +306,8 @@ export async function previewGoalBranchExport(
 ) {
   const goal = store.getGoal(goalId);
   if (!goal) throw new OrchestratorStoreError("not-found");
+  if (goal.status === "cancelled")
+    throw new OrchestratorStoreError("goal-inactive");
   store.assertGoalScheduling(goalId);
   const git = localGit(directory, goalBranch(goalId));
   const { from, to, branch, apply } = await git.previewGoalExport(
@@ -298,6 +336,8 @@ export async function previewGoalBranchExport(
     to,
     branch,
     async apply() {
+      if (store.getGoal(goalId)?.status === "cancelled")
+        throw new OrchestratorStoreError("goal-inactive");
       await apply(() => store.auditGoalExport(goalId, branch, from, to, false));
       try {
         store.auditGoalExport(goalId, branch, from, to, true);
@@ -512,22 +552,8 @@ export function createTaskExecutor(options: {
 
   return {
     async existingBase(goalId) {
-      try {
-        await lstat(join(directory, "repository.git"));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-        throw error;
-      }
-      try {
-        return await localGit(directory, goalBranch(goalId)).head();
-      } catch (error) {
-        if (
-          error instanceof GitIntegrationError &&
-          error.code === "invalid-object"
-        )
-          return null;
-        throw error;
-      }
+      if (!(await privateRepositoryExists(directory))) return null;
+      return goalBranchHead(localGit(directory, goalBranch(goalId)));
     },
     async open(task) {
       const branch = goalBranch(task.goalId);

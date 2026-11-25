@@ -95,6 +95,62 @@ function startReviewer(context: { goalId?: string; taskId?: string } = {}) {
   return reviewerAnswer(execution.id);
 }
 
+test("discard refuses busy goals before Git and rolls back a failed audit write", async () => {
+  const id = goalId();
+  const registered = store.proposeTask({ ...task, goalId: id }, operator);
+  assert.equal(registered.status, "registered");
+  if (registered.status !== "registered")
+    throw new Error("Task registration failed");
+  const { taskId } = registered;
+  let refChecks = 0;
+  const discard = () =>
+    store.discardGoal(id, null, async (head) => {
+      assert.equal(head, null);
+      refChecks++;
+    });
+  const goalRun = store.createExecution({
+    actor: "Planner",
+    mode: "plan",
+    requestedBy: host,
+    goalId: id,
+  });
+  await assert.rejects(discard(), { code: "goal-busy" });
+  store.finishExecution(goalRun.id, "cancelled");
+  const taskRun = startReviewer({ taskId });
+  await assert.rejects(discard(), { code: "goal-busy" });
+  store.finishExecution(taskRun.executionId, "succeeded");
+  const db = new Database(filename);
+  try {
+    for (const status of ["running", "awaiting-integration"]) {
+      db.query("UPDATE tasks SET status = ? WHERE id = ? RETURNING id").get(
+        status,
+        taskId,
+      );
+      await assert.rejects(discard(), { code: "goal-busy" });
+    }
+    db.query(
+      "UPDATE tasks SET status = 'registered' WHERE id = ? RETURNING id",
+    ).get(taskId);
+    assert.equal(refChecks, 0);
+    db.exec(`
+      CREATE TRIGGER deny_goal_status BEFORE INSERT ON events
+      WHEN NEW.kind = 'goal.status'
+      BEGIN SELECT RAISE(ABORT, 'audit failure'); END
+    `);
+    await assert.rejects(discard(), { code: "goal-discard-record-failed" });
+    assert.equal(refChecks, 1);
+    assert.equal(store.getGoal(id)?.status, "active");
+    assert.equal(store.getTask(taskId)?.status, "registered");
+    assert.ok(
+      !store
+        .listEvents({ subjectId: taskId, limit: 20 })
+        .some(({ kind }) => kind === "task.status"),
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("persists private WAL state, approvals and immutable read records across reopen", () => {
   assert.equal(statSync(filename).mode & 0o777, 0o600);
   const pending = store.proposeGoal(goal, {
