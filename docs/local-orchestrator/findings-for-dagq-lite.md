@@ -216,3 +216,47 @@ and integration.
   operator previews the private ref, types a confirmation, and the host
   rechecks that the Goal is idle, deletes the ref by compare-and-swap,
   closes the Goal and records the event under one lock.
+
+## 2026-11-26: answering and delegating decisions (#49 to #52)
+
+- **The locked browser image is now stable across days.** A rebuild on
+  2026-11-26 produced the digest locked on 2026-11-25, after #42 cleared
+  the install date from `/etc/shadow-`.
+  _Lesson:_ keep one cross-day rebuild in the release checklist for every
+  locked image.
+- **A "problems" view showed history, not problems.** The first version
+  listed every path violation a Task ever hit, including ones fixed by a
+  later attempt and Tasks of a discarded Goal. A budget overrun stayed
+  listed after the operator retried the Task.
+  _Lesson:_ define when each problem kind is resolved, test it with the
+  same retry and discard sequences as the inbox, and keep history
+  behind an explicit option.
+- **Store states did not map one to one to stages.** An integrating Task
+  is stored as `running` with an integration code, so the panel showed
+  it moving back from "awaiting integration" to "running".
+  _Lesson:_ derive UI stages from status plus code, not status alone,
+  and test every transition the integrator makes.
+- **Delegation opened a path that had no scheduler before.** A Reviewer
+  could approve a Task registration outside the Goal's scope once rules
+  or Goal overrides allowed agent answers. Before, nothing scheduled an
+  agent for registrations, so a scope exception was a human act in
+  practice.
+  _Lesson:_ when a change adds a new automatic answerer, list every
+  pending reason it could now answer and make scope exceptions an
+  invariant.
+- **A migration can widen authority.** Marking old defaults as
+  "explicit" while adding a precedence where explicit defaults win would
+  have let an old `agent` default override Goal and Task `human`
+  policies after an upgrade.
+  _Lesson:_ migrations that touch authority keep the old precedence and
+  let the operator opt in.
+- **Text checks on paths need their own case rules.** Exclusions matched
+  exactly, so `src/Secret/a` escaped `src/secret/**` on a
+  case-insensitive checkout. Exclusions now fold case and Unicode form;
+  allow-lists stay exact.
+  _Lesson:_ fold exclusions and keep allow-lists strict.
+- **Headless Chrome can report a page as hidden.** A long-lived headless
+  instance reported `document.hidden`, so the panel skipped its refresh
+  and looked broken. A fresh instance behaved.
+  _Lesson:_ start a fresh browser for each UI check and assert
+  visibility before judging the page.

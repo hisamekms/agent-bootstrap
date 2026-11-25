@@ -8,6 +8,18 @@
       "memoryMiB": 1024,
       "cpus": 2
     },
+    "concierge": {
+      "image": "localhost/agent-bootstrap/concierge@sha256:fea25f3c0edd801bc8f50edb4701e624233622f7eaf6340fd76461db6a3a86dc",
+      "recipeDigest": "0b8941e99cad4b66b727a04df31ce89a4a0043aaf4e2abbbac96a2e144cd984e",
+      "memoryMiB": 1024,
+      "cpus": 2
+    },
+    "bun": {
+      "image": "localhost/agent-bootstrap/bun@sha256:f7ee4da9f20ebf016f9c59e41fa2e9da3cad69dce893c44fedee7abcf7aac2d3",
+      "recipeDigest": "310032b3c7a47c66536247c44c6b81dbcc3282c7aaaf9324db73f7af6f8749a3",
+      "memoryMiB": 2048,
+      "cpus": 2
+    },
     "browser": {
       "image": "localhost/agent-bootstrap/browser@sha256:bb85b94626eca15128968c4f9a53d9fb3e8c7fdd9be2f529e9af63cb23aa6cff",
       "recipeDigest": "2212db9f2a1fe97af2175c5153194907610b6c6cb38839a02c0d55c40d6c71a5",
@@ -307,18 +319,6 @@
         "xkb-data=2.42-1",
         "zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1"
       ]
-    },
-    "concierge": {
-      "image": "localhost/agent-bootstrap/concierge@sha256:fea25f3c0edd801bc8f50edb4701e624233622f7eaf6340fd76461db6a3a86dc",
-      "recipeDigest": "0b8941e99cad4b66b727a04df31ce89a4a0043aaf4e2abbbac96a2e144cd984e",
-      "memoryMiB": 1024,
-      "cpus": 2
-    },
-    "bun": {
-      "image": "localhost/agent-bootstrap/bun@sha256:f7ee4da9f20ebf016f9c59e41fa2e9da3cad69dce893c44fedee7abcf7aac2d3",
-      "recipeDigest": "310032b3c7a47c66536247c44c6b81dbcc3282c7aaaf9324db73f7af6f8749a3",
-      "memoryMiB": 2048,
-      "cpus": 2
     }
   }
 }
