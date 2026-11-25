@@ -5,6 +5,10 @@ import {
   clampSize,
   decodeBase64,
   encodeBase64,
+  estimateLabel,
+  formatDuration,
+  formatTimestamp,
+  formatTokens,
   orderInbox,
 } from "../src/operator-ui/web/protocol.ts";
 
@@ -24,6 +28,36 @@ test("base64 preserves all byte values and split UTF-8 sequences", () => {
     decodeBase64(encodeBase64(utf8.subarray(1))),
     utf8.subarray(1),
   );
+});
+
+test("panel shows one rounded estimate with the current-plan qualification", () => {
+  assert.equal(estimateLabel(null), "");
+  assert.equal(estimateLabel(0), "");
+  assert.equal(estimateLabel(1), "あと約 1 分（現時点の計画では）");
+  assert.equal(estimateLabel(120_001), "あと約 2 分（現時点の計画では）");
+});
+
+test("panel formats timestamps in local time or as recent ages", () => {
+  const date = new Date(2026, 10, 25, 9, 40, 34, 4);
+  const at = date.toISOString();
+  const now = date.getTime();
+  assert.equal(formatTimestamp(at, now), "たった今");
+  assert.equal(formatTimestamp(at, now + 8 * 60_000), "8 分前");
+  assert.equal(formatTimestamp(at, now + 86_400_000), "11/25 09:40");
+  assert.equal(formatTimestamp(at, now - 1), "11/25 09:40");
+  assert.equal(formatTimestamp(null, now), "—");
+});
+
+test("panel formats whole minutes and groups token counts", () => {
+  assert.equal(formatDuration(59_999), "1 分未満");
+  assert.equal(formatDuration(60_000), "1 分");
+  assert.equal(formatDuration(245_000), "4 分");
+  assert.equal(formatDuration(1_800_000), "30 分");
+  assert.equal(
+    `${formatTokens(22_140)} / ${formatTokens(200_000)}`,
+    "22,140 / 200,000",
+  );
+  assert.equal(formatTokens(null), "—");
 });
 
 test("input chunks preserve bytes and fit the 16 KiB decoded limit", () => {

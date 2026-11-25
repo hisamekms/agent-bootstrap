@@ -18,7 +18,15 @@ import { test } from "node:test";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import type { TerminalExit } from "../src/sandbox-runtime.ts";
 import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
-import { operatorStatus } from "../src/local-orchestrator/operator-read.ts";
+import { goalBranch } from "../src/local-orchestrator/model.ts";
+import {
+  operatorGoal,
+  operatorGoalList,
+  operatorProblems,
+  operatorStatus,
+  operatorTask,
+  operatorTaskList,
+} from "../src/local-orchestrator/operator-read.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 const goal = {
@@ -230,7 +238,7 @@ test(
   },
 );
 
-async function terminalClient(path: string) {
+async function operatorClient(path: string, prefix = "concierge.") {
   const socket = createConnection(path);
   const reader = createInterface({ input: socket });
   const lines = reader[Symbol.asyncIterator]();
@@ -244,7 +252,7 @@ async function terminalClient(path: string) {
     async request(method: string, params: object = {}) {
       const id = ++seq;
       socket.write(
-        JSON.stringify({ id, method: `concierge.${method}`, params }) + "\n",
+        JSON.stringify({ id, method: prefix + method, params }) + "\n",
       );
       const response = await next();
       assert.equal(response.id, id);
@@ -279,8 +287,8 @@ test(
       terminal,
     });
     try {
-      const first = await terminalClient(path);
-      const second = await terminalClient(path);
+      const first = await operatorClient(path);
+      const second = await operatorClient(path);
       assert.deepEqual((await first.request("attach")).result, {
         replay: Buffer.from("x".repeat(512 * 1024 - 5) + "hello").toString(
           "base64",
@@ -386,7 +394,7 @@ test(
       terminal,
     });
     try {
-      const client = await terminalClient(path);
+      const client = await operatorClient(path);
       assert.deepEqual((await client.request("attach")).result, { replay: "" });
       client.reader.close();
       client.socket.pause();
@@ -435,3 +443,432 @@ test("terminal hub maintains bounded filtered replay and ends the stream indepen
     { method: "concierge.exit", params: { exitCode: 7 } },
   ]);
 });
+
+function readFixture(store: ReturnType<typeof orchestratorFixture>["store"]) {
+  const host = { kind: "host" } as const;
+  const approve = ({ id, digest }: { id: string; digest: string }) =>
+    store.decide(id, {
+      digest,
+      decision: "approve",
+      answerer: { kind: "human" },
+    });
+  const { goalId } = approve(store.proposeGoal(goal, { kind: "operator" }));
+  assert.ok(goalId);
+  const base = "a".repeat(40);
+  store.recordGoalCommit(goalId, base, "base");
+  const task = (title: string) => {
+    const result = store.proposeTask(
+      {
+        title,
+        goalId,
+        description: "<script>task description</script>",
+        acceptance: ["Pass"],
+        actor: "Executor",
+        profile: "base",
+        paths: ["src/a.ts"],
+        budgets: goal.scope.budgets,
+        dependsOn: [],
+      },
+      host,
+    );
+    assert.equal(result.status, "registered");
+    return result.taskId;
+  };
+  const failed = task("Failed Task");
+  const reviewed = task("Reviewed Task");
+  const registered = task("Registered Task");
+  assert.ok(store.claimTask(failed));
+  const execution = store.createExecution({
+    taskId: failed,
+    actor: "Executor",
+    mode: "task",
+    requestedBy: host,
+  }).id;
+  store.startExecution(execution);
+  store.finishExecution(execution, "failed", {
+    tokens: 501,
+    rawAnswer: "must stay private",
+  });
+  const rejectedPaths = [{ path: "private/rejected", symlink: false }];
+  store.failTask(failed, "path-violation", rejectedPaths);
+  assert.ok(store.claimTask(reviewed));
+  function startReview(taskId: string) {
+    const review = store.createExecution({
+      taskId,
+      actor: "Reviewer",
+      mode: "review",
+      requestedBy: host,
+    }).id;
+    store.startExecution(review);
+    return review;
+  }
+  const review = startReview(reviewed);
+
+  function finishReviewed(taskId = reviewed, reviewId = review) {
+    const pin = { base, candidate: "b".repeat(40), digest: "c".repeat(64) };
+    store.finishExecution(reviewId, "succeeded", { review: "pass", pin });
+    const integration = store.proposeIntegration(
+      {
+        taskId,
+        goalId: goalId!,
+        branch: goalBranch(goalId!),
+        ...pin,
+        changedPaths: ["src/a.ts"],
+        review: { result: "pass" },
+      },
+      reviewId,
+    );
+    approve(integration);
+    const { approvalId } = store.approvedIntegration(integration.id);
+    store.beginIntegration(integration.id, integration.digest, approvalId);
+    store.finishIntegration(integration.id, "completed", "ok");
+  }
+  return {
+    goalId,
+    failed,
+    reviewed,
+    registered,
+    execution,
+    rejectedPaths,
+    startReview,
+    finishReviewed,
+  };
+}
+
+test("operator read projections use scoped durable Task state and safe metadata", () => {
+  using state = orchestratorFixture("lo-op-read-");
+  const { store } = state;
+  const {
+    goalId,
+    failed,
+    reviewed,
+    registered,
+    execution,
+    rejectedPaths,
+    finishReviewed,
+  } = readFixture(store);
+  const summary = operatorGoalList(store, "active")[0]!;
+  assert.partialDeepStrictEqual(summary, {
+    id: goalId,
+    status: "active",
+    progress: {
+      done: 0,
+      total: 3,
+      failed: 1,
+      running: 1,
+      awaitingIntegration: 0,
+    },
+    estimate: { basis: "current-plan", remainingMs: null },
+  });
+  assert.deepEqual(operatorGoalList(store, "done"), []);
+  assert.deepEqual(
+    operatorGoal(store, goalId)?.tasks.map(({ id, stage }) => [id, stage]),
+    [
+      [failed, "failed"],
+      [reviewed, "review"],
+      [registered, "registered"],
+    ],
+  );
+  assert.equal(operatorTaskList(store, "missing"), null);
+  assert.equal(operatorTask(store, "missing"), null);
+  assert.partialDeepStrictEqual(operatorTask(store, failed)!, {
+    tokensUsed: 501,
+    failure: { code: "path-violation", stage: "running", rejectedPaths },
+    executions: [{ id: execution, actor: "Executor", tokens: 501 }],
+  });
+  assert.doesNotMatch(
+    JSON.stringify(operatorTask(store, failed)),
+    /must stay private|category/,
+  );
+  assert.deepEqual(
+    Object.keys(operatorTask(store, failed)!.events[0]!).sort(),
+    ["at", "kind"],
+  );
+  const problems = operatorProblems(store);
+  assert.equal(problems.length, 2);
+  assert.partialDeepStrictEqual(
+    problems.find(({ kind }) => kind === "path-violation"),
+    {
+      goalId,
+      taskId: failed,
+      canRetry: true,
+      rejectedPaths,
+    },
+  );
+  assert.partialDeepStrictEqual(
+    problems.find(({ kind }) => kind === "execution-over-budget"),
+    {
+      goalId,
+      taskId: failed,
+      executionId: execution,
+      title: "Failed Task",
+    },
+  );
+  const planning = store.createExecution({
+    goalId,
+    actor: "Planner",
+    mode: "plan",
+    requestedBy: { kind: "host" },
+  });
+  store.startExecution(planning.id);
+  store.finishExecution(planning.id, "succeeded", { tokens: 501 });
+  assert.partialDeepStrictEqual(
+    operatorProblems(store).find(
+      ({ executionId }) => executionId === planning.id,
+    ),
+    {
+      goalId,
+      taskId: null,
+      title: goal.title,
+    },
+  );
+  finishReviewed();
+  assert.equal(operatorGoalList(store)[0]?.progress.done, 1);
+  assert.equal(
+    typeof operatorGoalList(store)[0]?.estimate.remainingMs,
+    "number",
+  );
+  assert.equal(
+    typeof operatorTask(store, registered)?.estimate.remainingMs,
+    "number",
+  );
+  assert.equal(operatorTask(store, reviewed)?.stage, "done");
+  store.retryTask(failed, 0);
+  assert.equal(operatorTask(store, failed)?.stage, "registered");
+  assert.equal(operatorTask(store, failed)?.elapsedMs, 0);
+  assert.ok(
+    !operatorProblems(store).some(({ kind }) => kind === "path-violation"),
+  );
+
+  assert.ok(store.claimTask(registered));
+  const blocked = store.createExecution({
+    taskId: registered,
+    actor: "Executor",
+    mode: "task",
+    requestedBy: { kind: "host" },
+  });
+  store.startExecution(blocked.id);
+  store.finishExecution(blocked.id, "failed", {
+    code: "path-violation",
+    rejectedPaths,
+    rawAnswer: "exclude execution output",
+  });
+  const violation = () =>
+    operatorProblems(store).filter(({ kind }) => kind === "path-violation");
+  assert.partialDeepStrictEqual(violation(), [
+    { taskId: registered, executionId: blocked.id, rejectedPaths },
+  ]);
+  assert.doesNotMatch(JSON.stringify(violation()), /exclude execution output/);
+  const legacy = store.createExecution({
+    taskId: registered,
+    actor: "Executor",
+    mode: "task",
+    requestedBy: { kind: "host" },
+  });
+  store.startExecution(legacy.id);
+  store.finishExecution(legacy.id, "failed", { code: "path-violation" });
+  assert.partialDeepStrictEqual(
+    violation().find(({ executionId }) => executionId === legacy.id),
+    { taskId: registered, kind: "path-violation" },
+  );
+  store.failTask(registered, "path-violation", rejectedPaths);
+  assert.partialDeepStrictEqual(violation(), [
+    { taskId: registered, canRetry: true, rejectedPaths },
+  ]);
+
+  const other = readFixture(store);
+  assert.equal(
+    typeof operatorGoal(store, other.goalId)?.estimate.remainingMs,
+    "number",
+  );
+  assert.equal(
+    typeof operatorTask(store, other.registered)?.estimate.remainingMs,
+    "number",
+  );
+});
+
+test("problems drop early path violations after success and disappear when the Goal is discarded", async () => {
+  using state = orchestratorFixture("lo-op-problems-");
+  const { store } = state;
+  const { goalId, failed, registered, startReview, finishReviewed } =
+    readFixture(store);
+  assert.ok(store.claimTask(registered));
+  const startAttempt = () => {
+    const { id } = store.createExecution({
+      taskId: registered,
+      actor: "Executor",
+      mode: "task",
+      requestedBy: { kind: "host" },
+    });
+    store.startExecution(id);
+    return id;
+  };
+  const taskProblems = (includeResolved = false) =>
+    operatorProblems(store, includeResolved).filter(
+      ({ taskId }) => taskId === registered,
+    );
+  const paths = (attempt: number) => [
+    { path: `private/rejected-${attempt}`, symlink: false },
+  ];
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const executionId = startAttempt();
+    const rejectedPaths = paths(attempt);
+    store.finishExecution(executionId, "failed", {
+      code: "path-violation",
+      rejectedPaths,
+    });
+    assert.partialDeepStrictEqual(taskProblems(), [
+      { kind: "path-violation", executionId, rejectedPaths },
+    ]);
+    if (attempt % 2 === 0) {
+      store.failTask(registered, "path-violation", rejectedPaths);
+      store.retryTask(registered, attempt / 2 - 1);
+      assert.deepEqual(taskProblems(), []);
+      assert.ok(store.claimTask(registered));
+    }
+  }
+
+  const successful = startAttempt();
+  assert.deepEqual(taskProblems(), []);
+  store.finishExecution(successful, "succeeded", {});
+  finishReviewed(registered, startReview(registered));
+  assert.equal(store.getTask(registered)?.status, "succeeded");
+  assert.deepEqual(taskProblems(), []);
+  const latestPaths = paths(4);
+  assert.partialDeepStrictEqual(taskProblems(true), [
+    { kind: "path-violation", rejectedPaths: latestPaths, canRetry: false },
+  ]);
+
+  finishReviewed();
+  assert.equal(
+    operatorProblems(store).filter(({ taskId }) => taskId === failed).length,
+    2,
+  );
+  await store.discardGoal(goalId, null, async () => {});
+  assert.equal(store.getGoal(goalId)?.status, "cancelled");
+  assert.deepEqual(operatorProblems(store), []);
+  assert.partialDeepStrictEqual(taskProblems(true), [
+    { kind: "path-violation", rejectedPaths: latestPaths, canRetry: false },
+  ]);
+});
+
+test(
+  "operator API validates, screens and serves Goal, Task and problem reads",
+  { timeout: 5000 },
+  async () => {
+    const { state, options, path } = socketFixture();
+    using fixture = state;
+    const { store } = fixture;
+    const { goalId, failed, reviewed, rejectedPaths, finishReviewed } =
+      readFixture(store);
+    const screened: unknown[] = [];
+    let reject = false;
+    const api = await listenOperatorApi({
+      ...options,
+      async scan(...sources) {
+        screened.push(JSON.parse(String(sources[0])));
+        if (reject) throw new Error("secret must not escape");
+      },
+    });
+    try {
+      const client = await operatorClient(path, "");
+      for (const { method, params, invalid, check } of [
+        {
+          method: "goal.list",
+          params: { status: "active" },
+          invalid: { status: "running" },
+          check: (result: unknown) =>
+            assert.partialDeepStrictEqual(result, [
+              { id: goalId, status: "active" },
+            ]),
+        },
+        {
+          method: "goal.get",
+          params: { id: goalId },
+          invalid: {},
+          check: (result: unknown) =>
+            assert.partialDeepStrictEqual(result, {
+              id: goalId,
+              branch: goalBranch(goalId),
+              baseCommit: "a".repeat(40),
+              scope: goal.scope,
+            }),
+        },
+        {
+          method: "task.list",
+          params: { goalId },
+          invalid: { goalId: 99 },
+          check: (result: unknown) =>
+            assert.partialDeepStrictEqual(result, [
+              { id: failed, stage: "failed" },
+              { id: reviewed, stage: "review" },
+            ]),
+        },
+        {
+          method: "task.get",
+          params: { id: failed },
+          invalid: { id: "invalid id" },
+          check: (result: unknown) =>
+            assert.partialDeepStrictEqual(result, {
+              id: failed,
+              failure: { rejectedPaths },
+            }),
+        },
+        {
+          method: "problem.list",
+          params: { includeResolved: true },
+          invalid: { includeResolved: "yes" },
+          check: (result: unknown) =>
+            assert.partialDeepStrictEqual(result, [
+              { taskId: failed, kind: "path-violation" },
+            ]),
+        },
+      ]) {
+        const { result } = await client.request(method, params);
+        check(result);
+        assert.deepEqual(screened.pop(), result);
+        assert.deepEqual((await client.request(method, invalid)).error, {
+          code: "invalid-params",
+        });
+        reject = true;
+        assert.deepEqual((await client.request(method, params)).error, {
+          code: "read-failed",
+        });
+        assert.ok(screened.pop());
+        reject = false;
+      }
+      for (const [method, params] of [
+        ["goal.get", { id: "missing" }],
+        ["task.get", { id: "missing" }],
+        ["task.list", { goalId: "missing" }],
+      ] as const) {
+        assert.deepEqual((await client.request(method, params)).error, {
+          code: "not-found",
+        });
+      }
+      assert.deepEqual(
+        (await client.request("goal.list", { status: "cancelled" })).result,
+        [],
+      );
+      assert.deepEqual(screened, [[]]);
+      finishReviewed();
+      await store.discardGoal(goalId, null, async () => {});
+      for (const params of [{}, { includeResolved: false }]) {
+        assert.deepEqual(
+          (await client.request("problem.list", params)).result,
+          [],
+        );
+      }
+      assert.partialDeepStrictEqual(
+        (await client.request("problem.list", { includeResolved: true }))
+          .result,
+        [
+          { taskId: failed, kind: "path-violation" },
+          { taskId: failed, kind: "execution-over-budget" },
+        ],
+      );
+    } finally {
+      await api.close();
+    }
+  },
+);

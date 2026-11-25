@@ -2404,12 +2404,17 @@ export class OrchestratorStore {
     });
   }
 
-  listGoals() {
+  listGoals(status: GoalRow["status"] | null = null, limit = -1) {
     return this.#read(() =>
       freeze(
         this.#db
-          .query<GoalRow>(`SELECT ${goalColumns} FROM goals ORDER BY rowid`)
-          .all()
+          .query<GoalRow>(
+            `SELECT ${goalColumns} FROM goals
+             WHERE (? IS NULL OR status = ?)
+             ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END * ?, rowid
+             LIMIT ?`,
+          )
+          .all(status, status, Number(limit > 0), limit)
           .map(goalRecord),
       ),
     );
@@ -2554,20 +2559,122 @@ export class OrchestratorStore {
       });
   }
 
-  listTasks(goalId: string) {
+  listTasks(goalId: string, limit = -1) {
     const id = identifier(goalId);
     return this.#read(() =>
       freeze(
         this.#db
           .query<TaskRow>(
-            `SELECT ${taskColumns} FROM tasks WHERE goal_id = ? ORDER BY rowid`,
+            `SELECT ${taskColumns} FROM tasks WHERE goal_id = ? ORDER BY rowid LIMIT ?`,
           )
-          .all(id)
+          .all(id, limit)
           .map((row) => ({
             ...taskRecord(row),
             ...this.#runningIntegrationState(row),
           })),
       ),
+    );
+  }
+
+  goalTaskProgress(goalId: string) {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          total: number;
+          done: number;
+          failed: number;
+          running: number;
+          awaitingIntegration: number;
+        }>(
+          `SELECT count(*) AS total,
+             count(*) FILTER (WHERE status = 'succeeded') AS done,
+             count(*) FILTER (WHERE status = 'failed') AS failed,
+             count(*) FILTER (WHERE status = 'running') AS running,
+             count(*) FILTER (WHERE status = 'awaiting-integration') AS awaitingIntegration
+           FROM tasks WHERE goal_id = ?`,
+        )
+        .get(identifier(goalId))!,
+    );
+  }
+
+  succeededTaskWallTimes() {
+    return this.#read(() =>
+      this.#db
+        .query<{ startedAt: string; finishedAt: string }>(
+          `SELECT min(e.at) FILTER (WHERE json_extract(e.data, '$.status') = 'running'
+                                      AND json_extract(e.data, '$.code') IS NULL) AS startedAt,
+                  max(e.at) FILTER (WHERE json_extract(e.data, '$.status') = 'succeeded') AS finishedAt
+           FROM tasks AS t JOIN events AS e ON e.subject_id = t.id
+           WHERE t.status = 'succeeded'
+             AND e.subject_kind = 'task' AND e.kind = 'task.status'
+           GROUP BY t.id HAVING startedAt IS NOT NULL AND finishedAt IS NOT NULL
+           ORDER BY finishedAt DESC LIMIT 200`,
+        )
+        .all(),
+    );
+  }
+
+  operatorTaskTimeline(goalId: string, taskId?: string) {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          taskId: string;
+          at: string;
+          status: TaskRow["status"] | null;
+          code: string | null;
+          actor: ActorKind | null;
+          mode: string | null;
+          executionStatus: ExecutionStatus | null;
+        }>(
+          `WITH relevant AS (
+             SELECT id, created_at FROM tasks
+             WHERE status = 'succeeded' OR (goal_id = ?1 AND (?2 IS NULL OR id = ?2))
+           )
+           SELECT 0 AS position, id AS taskId, created_at AS at, 'registered' AS status,
+                  NULL AS code, NULL AS actor, NULL AS mode, NULL AS executionStatus
+           FROM relevant
+           UNION ALL
+           SELECT e.rowid, t.id, e.at, json_extract(e.data, '$.status'),
+                  json_extract(e.data, '$.code') AS code,
+                  NULL AS actor, NULL AS mode, NULL AS executionStatus
+           FROM relevant AS t JOIN events AS e ON e.subject_id = t.id
+           WHERE e.subject_kind = 'task' AND e.kind = 'task.status'
+           UNION ALL
+           SELECT e.rowid, x.task_id, e.at, NULL, NULL, x.actor, x.mode, x.status
+           FROM executions AS x JOIN relevant AS t ON x.task_id = t.id
+             JOIN events AS e ON e.subject_id = x.id
+           WHERE e.subject_kind = 'execution' AND e.kind = 'execution.started'
+           ORDER BY position`,
+        )
+        .all(
+          identifier(goalId),
+          taskId === undefined ? null : identifier(taskId),
+        ),
+    );
+  }
+
+  recentTaskExecutions(taskId: string) {
+    return this.#read(() =>
+      this.#db
+        .query<ExecutionRow>(
+          `SELECT ${executionColumns} FROM executions
+           WHERE task_id = ? ORDER BY rowid DESC LIMIT 10`,
+        )
+        .all(identifier(taskId))
+        .map(
+          ({ id, actor, mode, status, startedAt, finishedAt, resultJson }) => ({
+            id,
+            actor,
+            mode,
+            status,
+            startedAt,
+            finishedAt,
+            tokens: readTokenReport(
+              resultJson === null ? null : JSON.parse(resultJson),
+              startedAt !== null && finishedAt !== null,
+            ).tokens,
+          }),
+        ),
     );
   }
 
@@ -2588,18 +2695,24 @@ export class OrchestratorStore {
     });
   }
 
-  inboxRows(includeResolved: boolean, cutoff: string): InboxRow[] {
+  inboxRows(
+    includeResolved: boolean,
+    cutoff: string,
+    problemsOnly = false,
+  ): InboxRow[] {
     return this.#read(() =>
       this.#db
         .query<InboxRow>(
           `
         WITH history(kind, version, at, goalId, taskId, proposalId, executionId,
-                     modelText, wasResolved, code, rejectedCount, info, canRetry) AS (
+                     modelText, wasResolved, code, rejectedCount, info, canRetry,
+                     position, rejectedPathsJson) AS (
           SELECT CASE p.kind WHEN 'goal' THEN 'goal-registration'
                     WHEN 'task' THEN 'task-registration' ELSE 'integration' END,
                  p.id, p.created_at, json_extract(p.content_json, '$.goalId'),
                  json_extract(p.content_json, '$.taskId'), p.id, NULL,
-                 json_extract(p.content_json, '$.title'), p.status <> 'pending', NULL, NULL, 0, 0
+                 json_extract(p.content_json, '$.title'), p.status <> 'pending', NULL, NULL, 0, 0,
+                 NULL, NULL
           FROM proposals AS p
           WHERE p.status <> 'registered'
           UNION ALL
@@ -2621,14 +2734,41 @@ export class OrchestratorStore {
                    SELECT count(*) FROM events AS retry
                    WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
                      AND retry.subject_kind = 'task'
-                 ) < ${MAX_TASK_RETRIES}
+                 ) < ${MAX_TASK_RETRIES}, e.rowid,
+                 CASE WHEN ?3 AND json_type(e.data, '$.rejectedPaths') = 'array'
+                      THEN json_extract(e.data, '$.rejectedPaths') END
           FROM events AS e JOIN tasks AS t ON e.subject_id = t.id
           WHERE e.kind = 'task.status' AND e.subject_kind = 'task'
             AND json_extract(e.data, '$.status') IN ('failed', 'succeeded', 'running')
             AND (json_extract(e.data, '$.status') <> 'running' OR json_extract(e.data, '$.code') IS NULL)
           UNION ALL
+          SELECT 'task-failed', x.id, x.finished_at, t.goal_id, t.id, NULL, x.id,
+                 json_extract(t.content_json, '$.title'),
+                 EXISTS (
+                   SELECT 1 FROM executions AS newer
+                   WHERE newer.task_id = t.id AND newer.actor = 'Executor' AND newer.mode = 'task'
+                     AND newer.rowid > x.rowid
+                 ) OR EXISTS (
+                   SELECT 1 FROM events AS retry
+                   WHERE retry.subject_id = t.id AND retry.subject_kind = 'task'
+                     AND retry.kind = 'task.retried' AND retry.rowid > (
+                       SELECT queued.rowid FROM events AS queued
+                       WHERE queued.subject_id = x.id AND queued.subject_kind = 'execution'
+                         AND queued.kind = 'execution.queued' LIMIT 1
+                     )
+                 ), 'path-violation', json_array_length(x.result_json, '$.rejectedPaths'), 0, 0,
+                 (SELECT e.rowid FROM events AS e WHERE e.subject_id = x.id
+                    AND e.subject_kind = 'execution' AND e.kind = 'execution.finished' LIMIT 1),
+                 CASE WHEN json_type(x.result_json, '$.rejectedPaths') = 'array'
+                      THEN json_extract(x.result_json, '$.rejectedPaths') END
+          FROM executions AS x JOIN tasks AS t ON x.task_id = t.id
+          WHERE ?3 AND x.actor = 'Executor' AND x.mode = 'task' AND x.status = 'failed'
+            AND x.finished_at IS NOT NULL AND json_extract(x.result_json, '$.code') = 'path-violation'
+          UNION ALL
           SELECT 'execution-over-budget', x.id, x.finished_at, coalesce(x.goal_id, t.goal_id),
-                 x.task_id, NULL, x.id, NULL,
+                 x.task_id, NULL, x.id, CASE WHEN ?3 THEN coalesce(
+                   json_extract(t.content_json, '$.title'), json_extract(g.content_json, '$.title')
+                 ) END,
                  coalesce(t.status IN ('succeeded', 'cancelled') OR EXISTS (
                    SELECT 1 FROM events AS retry
                    WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
@@ -2638,7 +2778,10 @@ export class OrchestratorStore {
                          AND queued.subject_kind = 'execution' LIMIT 1
                      )
                  ), 0),
-                 NULL, NULL, 0, 0
+                 NULL, NULL, 0, 0,
+                 CASE WHEN ?3 THEN (SELECT e.rowid FROM events AS e WHERE e.subject_id = x.id
+                    AND e.subject_kind = 'execution' AND e.kind = 'execution.finished' LIMIT 1) END,
+                 NULL
           FROM executions AS x LEFT JOIN tasks AS t ON x.task_id = t.id
             LEFT JOIN goals AS g ON x.goal_id = g.id
           WHERE x.finished_at IS NOT NULL AND x.started_at IS NOT NULL
@@ -2658,22 +2801,42 @@ export class OrchestratorStore {
                      AND e.subject_kind = 'goal' AND e.kind = 'goal.status'
                      AND json_extract(e.data, '$.status') = 'done' ORDER BY e.rowid DESC LIMIT 1
                  ), g.created_at),
-                 g.id, NULL, NULL, NULL, json_extract(g.content_json, '$.title'), 0, NULL, NULL, 1, 0
+                 g.id, NULL, NULL, NULL, json_extract(g.content_json, '$.title'), 0, NULL, NULL, 1, 0,
+                 NULL, NULL
           FROM goals AS g WHERE g.status = 'done'
         ), items AS (
-          SELECT history.*, wasResolved OR coalesce(g.status = 'cancelled', 0) AS resolved
+          SELECT history.*, CASE WHEN NOT ?3 THEN wasResolved OR coalesce(g.status = 'cancelled', 0)
+            WHEN g.status IS NOT 'active' OR t.status IN ('succeeded', 'cancelled') THEN 1
+            WHEN kind = 'execution-over-budget' THEN wasResolved
+            WHEN executionId IS NOT NULL THEN wasResolved
+            ELSE wasResolved OR t.status IS NOT 'failed'
+          END AS resolved
           FROM history LEFT JOIN goals AS g ON history.goalId = g.id
+            LEFT JOIN tasks AS t ON ?3 AND history.taskId = t.id
+          WHERE NOT ?3 OR kind IN ('task-failed', 'execution-over-budget')
+        ), ranked AS (
+          SELECT *, ${
+            problemsOnly
+              ? `row_number() OVER (
+                  PARTITION BY kind, (code IS 'path-violation'), taskId,
+                               CASE WHEN taskId IS NULL THEN version END
+                  ORDER BY at DESC, position DESC, version DESC
+                )`
+              : "1"
+          } AS rank
+          FROM items WHERE (?1 OR NOT resolved)
+            AND (?3 OR NOT info OR at >= ?2 OR (kind = 'task-running' AND NOT resolved))
         )
         SELECT kind || ':' || CASE WHEN kind IN ('task-failed', 'task-succeeded', 'task-running')
                                    THEN taskId || ':' ELSE '' END || version AS id,
                kind, at, goalId, taskId, proposalId, executionId, modelText, resolved, code,
-               rejectedCount, canRetry
-        FROM items WHERE (? OR NOT resolved)
-          AND (NOT info OR at >= ? OR (kind = 'task-running' AND NOT resolved))
-        ORDER BY (NOT resolved AND NOT info) DESC, at DESC, version DESC LIMIT 200
+               rejectedCount, canRetry, rejectedPathsJson
+        FROM ranked WHERE rank = 1
+        ORDER BY (NOT resolved AND NOT info) DESC, at DESC,
+                 CASE WHEN ?3 THEN position END DESC, version DESC LIMIT 200
       `,
         )
-        .all(Number(includeResolved), cutoff),
+        .all(Number(includeResolved), cutoff, Number(problemsOnly)),
     );
   }
 
