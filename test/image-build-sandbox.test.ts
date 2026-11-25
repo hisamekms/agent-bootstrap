@@ -165,3 +165,48 @@ test("builds bind the recipe gateway to durable create, DNS, connection and dest
     { code: "open-failed" },
   );
 });
+
+test("smoke tests run with no network and open no gateway", async (t) => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), "build-smoke-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = { XDG_STATE_HOME: root };
+  const plan = buildSandboxPlan("browser", env);
+  const digest = "b".repeat(64);
+  const creates: string[][] = [];
+  const output = await withBuildSandbox({
+    profile: "browser",
+    image: `example.invalid/browser@sha256:${digest}`,
+    digest,
+    memoryMiB: 1024,
+    cpus: 1,
+    smoke: true,
+    env,
+    async run(args, _timeout, extraEnv) {
+      if (args[0] === "create") {
+        creates.push(args);
+        assert.deepEqual(extraEnv, {});
+      }
+      return "";
+    },
+    openGateway: () => {
+      throw new Error("smoke tests must not open a gateway");
+    },
+    use: async () => "smoke-ok",
+  });
+  assert.equal(output, "smoke-ok");
+  assert.equal(creates.length, 1);
+  const args = creates[0]!;
+  assert.ok(args.includes("--no-net"));
+  for (const flag of ["--net-rule", "--proxy", "--dns-nameserver"])
+    assert.ok(!args.includes(flag), flag);
+  const label = args[args.indexOf("--label") + 1]!;
+  const id = label.slice("agent-bootstrap-invocation=".length);
+  const reader = new SqliteAudit(plan.auditPath, { readonly: true });
+  try {
+    const { sandboxBindings } = reader.readExecution(id);
+    assert.equal(sandboxBindings.length, 1);
+    assert.equal(sandboxBindings[0]?.egressMode, "none");
+  } finally {
+    reader.close();
+  }
+});

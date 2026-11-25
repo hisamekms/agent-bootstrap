@@ -578,7 +578,10 @@ function debianBuildScript(recipe: DebianRecipe, name: string): string {
     // Account change dates are install-day numbers; fix them.
     // An empty last-change field disables password aging and carries no date.
     // (0 would mean "change the password now", which makes su refuse.)
-    "sed -i -E 's/^([^:]*:[^:]*):[0-9]*:/\\1::/' /etc/shadow",
+    // The shadow- backup that useradd leaves holds the same dates.
+    "for file in /etc/shadow /etc/shadow-; do",
+    '  if [ -f "$file" ] && [ ! -L "$file" ]; then sed -i -E \'s/^([^:]*:[^:]*):[0-9]*:/\\1::/\' "$file"; fi',
+    "done",
     ": > /etc/machine-id",
     // Random per install: an empty machine id, and font caches that fontconfig
     // regenerates on demand (they embed build-time data).

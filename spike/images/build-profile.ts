@@ -226,11 +226,29 @@ async function main(): Promise<void> {
     if (expected) {
       stage = "locked digest verification";
       const entry = lockEntry(profile, digest, packages);
+      const wanted = new Set(expected.packages ?? []);
+      const got = new Set(entry.packages ?? []);
+      const added = (entry.packages ?? []).filter((item) => !wanted.has(item));
+      const removed = (expected.packages ?? []).filter(
+        (item) => !got.has(item),
+      );
       if (
         entry.image !== expected.image ||
         JSON.stringify(entry.packages) !== JSON.stringify(expected.packages)
-      )
+      ) {
+        // Package names and versions are public build inputs; print them so a
+        // mismatch can be diagnosed without another build.
+        console.error(
+          JSON.stringify({
+            mismatch: profile,
+            expectedImage: expected.image,
+            builtImage: entry.image,
+            packagesAdded: added,
+            packagesRemoved: removed,
+          }),
+        );
         throw new Error("Build differs from the checked-in profile lock");
+      }
     }
 
     const smokeReference = locked
@@ -261,8 +279,13 @@ async function main(): Promise<void> {
       use: (name, run) => guestExec(run, name, smoke.script, 5 * MINUTE),
     });
     const lines = output.split("\n").filter((l) => l !== "");
-    if (lines.join("\n") !== smoke.expected.join("\n"))
+    if (lines.join("\n") !== smoke.expected.join("\n")) {
+      // The smoke script prints only fixed markers and tool versions.
+      console.error(
+        JSON.stringify({ smokeExpected: smoke.expected, smokeOutput: lines }),
+      );
       throw new Error("smoke test output differs");
+    }
 
     if (locked) {
       stage = "smoke image cleanup";
@@ -332,6 +355,7 @@ try {
   await main();
 } catch (error) {
   console.error(`Image build stopped at ${stage}.`);
+  if (error instanceof Error) console.error(error.message.slice(0, 500));
   if (process.env["IMAGE_DEBUG"] === "1")
     console.error(error instanceof Error ? error.name : "Unknown error");
   process.exit(1);
