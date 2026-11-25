@@ -24,6 +24,10 @@ const term = new Terminal({
   allowProposedApi: true,
   disableStdin: true,
   linkHandler: { activate() {} },
+  // xterm's default (Courier New first) draws block and box characters
+  // wider than one cell on macOS, which breaks banners. Menlo keeps them
+  // at one cell.
+  fontFamily: 'Menlo, "DejaVu Sans Mono", Consolas, monospace',
   theme: { background: "#101419", foreground: "#eef2f8" },
 });
 for (const osc of [0, 1, 2, 4, 7, 8, 9, 10, 11, 12, 52, 104, 133, 777, 1337]) {
