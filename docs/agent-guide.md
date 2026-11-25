@@ -389,6 +389,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap retry-task <taskId>` → Updated Task record.
 - `agent-bootstrap reconcile` → { reconciled } with sessions, executions, and tasks.
 - `agent-bootstrap update-goal-base <goalId>` → { preview, result } with old and new commits and updated Goal.
+- `agent-bootstrap discard-goal <goalId>` → { goalId, branch, head } preview, followed by the cancelled Goal record on confirmation.
 - `agent-bootstrap verification show | verification clear | verification set --profile <name> -- <argv...>` → { profile, argv } or null for show. { target, current, verification } for set or clear.
 - `agent-bootstrap export-goal-branch <goalId> [--target <checkout>]` → { goalId, checkout, branch, from, to } for the completed export.
 - `agent-bootstrap analyze [--audit <file>] [--out <dir>] [--sql <file>]` → { report } with human-readable tables, export path, and manual DuckDB command.

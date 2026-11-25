@@ -90,6 +90,8 @@ type ErrorCode =
   | "task-retry-changed"
   | "approval-forbidden"
   | "goal-inactive"
+  | "goal-busy"
+  | "goal-discard-record-failed"
   | "goal-base-ineligible"
   | "goal-base-stale"
   | "goal-base-record-failed"
@@ -457,7 +459,7 @@ export class OrchestratorStore {
   readonly #db: Connection;
   #closed = false;
   #writeFailed = false;
-  #updatingGoalBase = false;
+  #changingGoalBranch = false;
 
   private constructor(db: Connection) {
     this.#db = db;
@@ -596,7 +598,7 @@ export class OrchestratorStore {
 
   #write<T>(write: (at: string) => T): T {
     if (this.#closed) throw new OrchestratorStoreError("closed");
-    if (this.#writeFailed || this.#updatingGoalBase)
+    if (this.#writeFailed || this.#changingGoalBranch)
       throw new OrchestratorStoreError("write-failed");
     try {
       return this.#db
@@ -1174,6 +1176,8 @@ export class OrchestratorStore {
       const task = required(this.#task(id));
       if (task.status !== "failed")
         throw new OrchestratorStoreError("invalid-transition");
+      if (required(this.#goal(task.goalId)).status === "cancelled")
+        throw new OrchestratorStoreError("goal-inactive");
       if (task.retries !== expectedRetries)
         throw new OrchestratorStoreError("task-retry-changed");
       if (task.retries >= MAX_TASK_RETRIES)
@@ -1469,6 +1473,8 @@ export class OrchestratorStore {
       if (!this.#ownsGoalBranch(goalId) || branch !== goalBranch(goalId))
         throw new OrchestratorStoreError("context-mismatch");
       if (!completed) {
+        if (goal.status === "cancelled")
+          throw new OrchestratorStoreError("goal-inactive");
         if (this.#goalIntegrationInProgress(goalId))
           throw new OrchestratorStoreError("integration-uncertain");
         if ((this.goalIntegrationHead(goalId) ?? goal.baseCommit) !== to)
@@ -1569,7 +1575,11 @@ export class OrchestratorStore {
       if (task && requestedGoalId !== null && requestedGoalId !== task.goalId)
         throw new OrchestratorStoreError("context-mismatch");
       const goalId = task?.goalId ?? requestedGoalId;
-      if (goalId !== null) required(this.#goal(goalId));
+      if (
+        goalId !== null &&
+        required(this.#goal(goalId)).status === "cancelled"
+      )
+        throw new OrchestratorStoreError("goal-inactive");
       const approvalProposalId =
         input.approvalProposalId === undefined
           ? null
@@ -1870,6 +1880,8 @@ export class OrchestratorStore {
 
   #eligibleGoalBase(id: string): string | null {
     const goal = this.#goal(id);
+    if (goal?.status === "cancelled")
+      throw new OrchestratorStoreError("goal-inactive");
     if (
       goal?.status !== "active" ||
       !this.#ownsGoalBranch(id) ||
@@ -1920,8 +1932,86 @@ export class OrchestratorStore {
     const id = identifier(goalId);
     gitCommit(from);
     gitCommit(to);
+    await this.#changeGoalBranch(
+      () => {
+        if (this.#eligibleGoalBase(id) !== (legacyBase ? null : from))
+          throw new OrchestratorStoreError("goal-base-stale");
+      },
+      moveRef,
+      (at) => {
+        this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", to, id);
+        this.#event(at, "goal.base-updated", "goal", id, {
+          from,
+          to,
+          ...(legacyBase && { legacyBase: true }),
+        });
+      },
+      "goal-base-record-failed",
+    );
+  }
+
+  #eligibleGoalDiscard(id: string): void {
+    this.#activeGoal(id);
+    if (!this.#ownsGoalBranch(id))
+      throw new OrchestratorStoreError("context-mismatch");
+    if (
+      this.#db
+        .query(
+          `SELECT 1 WHERE EXISTS (
+            SELECT 1 FROM tasks WHERE goal_id = ?1 AND status IN ('running', 'awaiting-integration')
+          ) OR EXISTS (
+            SELECT 1 FROM executions AS x LEFT JOIN tasks AS t ON x.task_id = t.id
+            WHERE (x.goal_id = ?1 OR t.goal_id = ?1) AND x.status IN ('queued', 'running')
+          ) OR EXISTS (
+            SELECT 1 FROM proposals WHERE kind = 'integration' AND status = 'pending'
+              AND json_extract(content_json, '$.goalId') = ?1
+          )`,
+        )
+        .get(id)
+    )
+      throw new OrchestratorStoreError("goal-busy");
+  }
+
+  assertGoalDiscardable(goalId: string): void {
+    this.#read(() => this.#eligibleGoalDiscard(identifier(goalId)));
+  }
+
+  async discardGoal(
+    goalId: string,
+    expectedHead: string | null,
+    deleteRef: (head: string | null) => Promise<void>,
+  ): Promise<void> {
+    const id = identifier(goalId);
+    const head = expectedHead === null ? null : gitCommit(expectedHead);
+    await this.#changeGoalBranch(
+      () => this.#eligibleGoalDiscard(id),
+      () => deleteRef(head),
+      (at) => {
+        this.#run("UPDATE goals SET status = 'cancelled' WHERE id = ?", id);
+        const registered = this.#db
+          .query<{ id: string }>(
+            "SELECT id FROM tasks WHERE goal_id = ? AND status = 'registered' ORDER BY rowid",
+          )
+          .all(id);
+        for (const task of registered)
+          this.#setTaskStatus(task.id, "cancelled", null, at);
+        this.#event(at, "goal.status", "goal", id, {
+          status: "cancelled",
+          discardedHead: head,
+        });
+      },
+      "goal-discard-record-failed",
+    );
+  }
+
+  async #changeGoalBranch(
+    check: () => void,
+    changeRef: () => Promise<void>,
+    record: (at: string) => void,
+    recordError: "goal-base-record-failed" | "goal-discard-record-failed",
+  ): Promise<void> {
     if (this.#closed) throw new OrchestratorStoreError("closed");
-    if (this.#writeFailed || this.#updatingGoalBase)
+    if (this.#writeFailed || this.#changingGoalBranch)
       throw new OrchestratorStoreError("write-failed");
 
     // Hold the SQLite writer lock from the final eligibility check through
@@ -1931,19 +2021,13 @@ export class OrchestratorStore {
     } catch {
       throw new OrchestratorStoreError("write-failed");
     }
-    this.#updatingGoalBase = true;
-    let moved = false;
+    this.#changingGoalBranch = true;
+    let changed = false;
     try {
-      if (this.#eligibleGoalBase(id) !== (legacyBase ? null : from))
-        throw new OrchestratorStoreError("goal-base-stale");
-      await moveRef();
-      moved = true;
-      this.#run("UPDATE goals SET base_commit = ? WHERE id = ?", to, id);
-      this.#event(new Date().toISOString(), "goal.base-updated", "goal", id, {
-        from,
-        to,
-        ...(legacyBase && { legacyBase: true }),
-      });
+      check();
+      await changeRef();
+      changed = true;
+      record(new Date().toISOString());
       this.#db.exec("COMMIT");
     } catch (error) {
       try {
@@ -1951,10 +2035,10 @@ export class OrchestratorStore {
       } catch {
         this.#writeFailed = true;
       }
-      if (moved) throw new OrchestratorStoreError("goal-base-record-failed");
+      if (changed) throw new OrchestratorStoreError(recordError);
       throw error;
     } finally {
-      this.#updatingGoalBase = false;
+      this.#changingGoalBranch = false;
     }
   }
 
@@ -2509,8 +2593,8 @@ export class OrchestratorStore {
       this.#db
         .query<InboxRow>(
           `
-        WITH items(kind, version, at, goalId, taskId, proposalId, executionId,
-                   modelText, resolved, code, rejectedCount, info, canRetry) AS (
+        WITH history(kind, version, at, goalId, taskId, proposalId, executionId,
+                     modelText, wasResolved, code, rejectedCount, info, canRetry) AS (
           SELECT CASE p.kind WHEN 'goal' THEN 'goal-registration'
                     WHEN 'task' THEN 'task-registration' ELSE 'integration' END,
                  p.id, p.created_at, json_extract(p.content_json, '$.goalId'),
@@ -2576,6 +2660,9 @@ export class OrchestratorStore {
                  ), g.created_at),
                  g.id, NULL, NULL, NULL, json_extract(g.content_json, '$.title'), 0, NULL, NULL, 1, 0
           FROM goals AS g WHERE g.status = 'done'
+        ), items AS (
+          SELECT history.*, wasResolved OR coalesce(g.status = 'cancelled', 0) AS resolved
+          FROM history LEFT JOIN goals AS g ON history.goalId = g.id
         )
         SELECT kind || ':' || CASE WHEN kind IN ('task-failed', 'task-succeeded', 'task-running')
                                    THEN taskId || ':' ELSE '' END || version AS id,

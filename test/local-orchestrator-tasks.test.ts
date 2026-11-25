@@ -930,6 +930,14 @@ exec /usr/bin/git "$@"
     assert.equal(f.head(), winner);
     assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
     assert.deepEqual(f.events(), []);
+
+    f.bareGit(["update-ref", f.ref, f.base, winner]);
+    await assert.rejects(
+      store.discardGoal(f.goalId, f.base, (head) => git.deleteGoalBranch(head)),
+      { code: "stale-base" },
+    );
+    assert.equal(f.head(), winner);
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
   },
 );
 
@@ -959,6 +967,150 @@ test(
     } finally {
       db.close();
     }
+  },
+);
+
+test(
+  "discard-goal confirms the private head, cancels registered tasks, and closes the goal",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = goalBaseFixture(state);
+    f.git(["push", f.bare, `${f.next}:${f.ref}`]);
+    const taskId = task(store, f.goalId);
+    const failed = task(store, f.goalId);
+    assert.ok(store.claimTask(failed));
+    store.failTask(failed, "review-concern");
+    const args = ["discard-goal", f.goalId];
+    const phrase = `discard-goal ${f.goalId} ${f.next.slice(0, 12)}`;
+    const mismatch = await f.cli(args, true, () => "wrong");
+    assert.equal(mismatch.code, 1);
+    assert.deepEqual(mismatch.stderr, [
+      "Confirmation did not match. Operation cancelled.\n",
+    ]);
+    assert.deepEqual(mismatch.questions, [`Type "${phrase}" to confirm: `]);
+    assert.deepEqual(JSON.parse(mismatch.stdout[0]!), {
+      goalId: f.goalId,
+      branch: goalBranch(f.goalId),
+      head: f.next,
+    });
+    assert.equal(f.head(), f.next);
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
+
+    const result = await f.cli(args, true, () => phrase);
+    assert.equal(result.code, 0, result.stderr.join(""));
+    assert.equal(JSON.parse(result.stdout[1]!).status, "cancelled");
+    assert.equal(f.bareGit(["for-each-ref", "--format=%(refname)", f.ref]), "");
+    assert.equal(store.getTask(taskId)?.status, "cancelled");
+    assert.equal(store.getTask(failed)?.status, "failed");
+    assert.throws(() => store.retryTask(failed, 0), { code: "goal-inactive" });
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: taskId, limit: 1 })[0],
+      { kind: "task.status", data: { status: "cancelled", code: null } },
+    );
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: f.goalId, limit: 1 })[0],
+      {
+        kind: "goal.status",
+        data: { status: "cancelled", discardedHead: f.next },
+      },
+    );
+    for (const [command, message] of [
+      ["discard-goal", "Goal discard refused"],
+      ["update-goal-base", "Goal base update refused"],
+      ["export-goal-branch", "Goal branch export refused"],
+    ]) {
+      const refused = await f.cli([command!, f.goalId]);
+      assert.equal(refused.code, 1);
+      assert.deepEqual(refused.stderr, [`${message} (goal-inactive).\n`]);
+      assert.deepEqual(refused.questions, []);
+    }
+    const shown = await f.cli(["show", f.goalId], false);
+    assert.equal(JSON.parse(shown.stdout[0]!).status, "cancelled");
+  },
+);
+
+test(
+  "discard-goal verifies an absent ref again after confirmation",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = goalBaseFixture(state);
+    const args = ["discard-goal", f.goalId];
+    const phrase = `discard-goal ${f.goalId} none`;
+    f.bareGit(["update-ref", "-d", f.ref, f.base]);
+    const stale = await f.cli(args, true, () => {
+      f.bareGit(["update-ref", f.ref, f.base]);
+      return phrase;
+    });
+    assert.deepEqual(stale.stderr, ["Goal discard refused (stale-base).\n"]);
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
+
+    f.bareGit(["update-ref", "-d", f.ref, f.base]);
+    const result = await f.cli(args, true, () => phrase);
+    assert.equal(result.code, 0, result.stderr.join(""));
+    assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
+    assert.deepEqual(JSON.parse(result.stdout[0]!), {
+      goalId: f.goalId,
+      branch: goalBranch(f.goalId),
+      head: null,
+    });
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: f.goalId, limit: 1 })[0],
+      {
+        kind: "goal.status",
+        data: { status: "cancelled", discardedHead: null },
+      },
+    );
+  },
+);
+
+test(
+  "discard-goal refuses busy goals and changed heads without deleting the ref",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store, filename } = state;
+    const f = goalBaseFixture(state);
+    const taskId = task(store, f.goalId);
+    const args = ["discard-goal", f.goalId];
+    const phrase = `discard-goal ${f.goalId} ${f.base.slice(0, 12)}`;
+    const busy = await f.cli(args, true, () => {
+      assert.ok(store.claimTask(taskId));
+      return phrase;
+    });
+    assert.deepEqual(busy.stderr, ["Goal discard refused (goal-busy).\n"]);
+    assert.equal(f.head(), f.base);
+    store.failTask(taskId, "review-concern");
+    store.retryTask(taskId, 0);
+
+    const { executor } = fixture();
+    await runner(store, executor).drain();
+    assert.equal(store.pendingIntegrations(f.goalId).length, 1);
+    const db = new Database(filename);
+    try {
+      db.query("UPDATE tasks SET status = 'failed' WHERE id = ?").run(taskId);
+      const pending = await f.cli(args);
+      assert.deepEqual(pending.stderr, ["Goal discard refused (goal-busy).\n"]);
+      assert.equal(f.head(), f.base);
+      db.query(
+        "UPDATE proposals SET status = 'rejected' WHERE kind = 'integration'",
+      ).run();
+    } finally {
+      db.close();
+    }
+
+    f.git(["push", f.bare, `${f.next}:refs/heads/next`]);
+    const stale = await f.cli(args, true, () => {
+      f.bareGit(["update-ref", f.ref, f.next, f.base]);
+      return phrase;
+    });
+    assert.deepEqual(stale.stderr, ["Goal discard refused (stale-base).\n"]);
+    assert.equal(f.head(), f.next);
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
   },
 );
 

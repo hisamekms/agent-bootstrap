@@ -334,6 +334,11 @@ export const operatorOutputs = {
     json: "{ preview, result } with old and new commits and updated Goal.",
     next: "Check the Goal's base and retry eligible failed Tasks.",
   },
+  "discard-goal": {
+    usage: "discard-goal <goalId>",
+    json: "{ goalId, branch, head } preview, followed by the cancelled Goal record on confirmation.",
+    next: "Use events --subject <goalId> to inspect the cancellation.",
+  },
   verification: {
     usage:
       "verification show | verification clear | verification set --profile <name> -- <argv...>",

@@ -251,6 +251,41 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
     { now: Date.now() + 8 * 86400_000, includeResolved: true },
   );
   assert.ok(!future.some(({ weight }) => weight === "info"));
+
+  const reopen = new Database(state.filename);
+  try {
+    reopen.query("UPDATE goals SET status = 'active' WHERE id = ?").run(goalId);
+  } finally {
+    reopen.close();
+  }
+  const pendingTask = store.proposeTask(
+    { ...taskContent, goalId, paths: ["other/a.ts"] },
+    host,
+  );
+  const planning = store.createExecution({
+    actor: "Planner",
+    mode: "plan",
+    goalId,
+    requestedBy: host,
+  });
+  store.startExecution(planning.id);
+  store.finishExecution(planning.id, "succeeded", { tokens: 501 });
+  const open = read();
+  assert.deepEqual(open.map(({ kind }) => kind).sort(), [
+    "execution-over-budget",
+    "task-registration",
+    "task-succeeded",
+  ]);
+  assert.ok(open.some(({ subject }) => subject.proposalId === pendingTask.id));
+  await store.discardGoal(goalId, null, async () => {});
+  assert.deepEqual(read(), []);
+  const history = read(true);
+  for (const { id } of open)
+    assert.equal(history.find((item) => item.id === id)?.state, "resolved");
+  assert.match(
+    history.find(({ subject }) => subject.proposalId === pendingTask.id)!.title,
+    /closed$/,
+  );
 });
 
 test("inbox bounds its history and keeps the secret check ID through a pass", () => {

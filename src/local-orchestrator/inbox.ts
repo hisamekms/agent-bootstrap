@@ -87,7 +87,7 @@ export function projectInbox(
               ? "Task registration"
               : "Integration";
         title = row.resolved
-          ? `${gate} proposal ${proposalId?.slice(0, 8)} answered`
+          ? `${gate} proposal ${proposalId?.slice(0, 8)} closed`
           : `${gate} approval waiting for ${task ? `Task ${task}` : `proposal ${proposalId?.slice(0, 8)}`}`;
         next = `${row.resolved ? "show" : "approve"} ${proposalId}`;
         break;

@@ -224,6 +224,24 @@ recording fails or the command is interrupted after the ref moves, Git and
 SQLite can disagree. Inspect the private Goal branch and the stored base
 and event before retrying.
 
+## Discard an active Goal
+
+Run `agent-bootstrap discard-goal <goalId>` from a host terminal. With a
+custom database, pass the launcher's live `--db <path>` and its `--target <path>`.
+Review the preview, then type `discard-goal <goalId> <first 12 hex of head>`
+or `discard-goal <goalId> none` if the private branch is absent.
+
+Running or awaiting-integration Tasks, queued or running executions, and
+pending integration proposals block discard. After confirmation, the command
+rechecks eligibility and deletes the private branch only at the confirmed head,
+or verifies its absence. It cancels the Goal and its registered Tasks and
+records the discarded head in a `goal.status` event. Its inbox items move to
+resolved history. Export and base updates refuse cancelled Goals.
+
+Git and SQLite can disagree if recording fails or the command is interrupted
+after the ref is deleted. Inspect the private branch and the Goal's stored
+status and events before retrying.
+
 ## Review proposals
 
 Use another host terminal for approval. The Concierge can draft proposals
