@@ -99,7 +99,7 @@ agent-bootstrap workplace --target /path/to/project --dev-bridge
 The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.
 
 **Next action**  
-Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI.
+Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI. Use 任せ方 to manage delegation.
 
 **Human involvement**  
 Keep the URL private. Stop the workplace process to end the session.
@@ -334,7 +334,7 @@ agent-bootstrap sandbox shell --allow example.com:443 --json
 ```
 
 **Expected output**  
-Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.
+Policy reports gate defaults, ordered rules, and Goal and Task overrides. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.
 
 **Next action**  
 Review the proposed paths, verification result, digest, and policy before answering each gate.
@@ -405,7 +405,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap show <proposalId|goalId|taskId>` → One proposal, Goal, or Task object.
 - `agent-bootstrap approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]` → { preview, result } with proposal preview and recorded decision.
 - `agent-bootstrap reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]` → { preview, result } with proposal preview and recorded decision.
-- `agent-bootstrap policy show | policy set <gate> <human|agent>` → Gate-to-policy map for show. { updated: true } for set.
+- `agent-bootstrap policy show | policy set <gate> <human|agent> | policy rules set --file <json> | policy goal <goalId> <task-registration|integration> <inherit|human|agent> | policy task <taskId> <rule|human|agent>` → Gate defaults, ordered rules with recent hits, and Goal and Task overrides for show.
 - `agent-bootstrap events [--subject <id>] [--limit <1-1000>]` → Array of event records.
 - `agent-bootstrap show-execution <executionId>` → One execution record with available outcome and usage.
 - `agent-bootstrap retry-task <taskId>` → Updated Task record.

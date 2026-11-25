@@ -818,7 +818,7 @@ export class LocalGitIntegration {
     if (fields.pop() !== "" || fields.length % 2 !== 0)
       throw new GitIntegrationError("invalid-candidate");
     const modes = new Set(["100644", "100755", "120000"]);
-    const changes: { path: string; newMode: string }[] = [];
+    const changes: { path: string; oldMode: string; newMode: string }[] = [];
     const symlinks: { path: string; oid: string }[] = [];
     const seen = new Set<string>();
     for (let i = 0; i < fields.length; i += 2) {
@@ -860,7 +860,7 @@ export class LocalGitIntegration {
         throw new GitIntegrationError("invalid-candidate");
       if (seen.has(path)) throw new GitIntegrationError("invalid-candidate");
       seen.add(path);
-      changes.push({ path, newMode });
+      changes.push({ path, oldMode, newMode });
       if (newMode === "120000") symlinks.push({ path, oid: meta[4]! });
       if (changes.length > changeCountLimit)
         throw new GitIntegrationError("invalid-candidate");
@@ -883,8 +883,9 @@ export class LocalGitIntegration {
         throw new GitIntegrationError("invalid-candidate");
       }
     }
-    return changes.map(({ path, newMode }) => ({
+    return changes.map(({ path, oldMode, newMode }) => ({
       path,
+      oldMode,
       newMode,
       target: targets.get(path),
     }));
@@ -947,6 +948,42 @@ export class LocalGitIntegration {
     return (await this.#candidate(base, candidate)).sort((a, b) =>
       a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
     );
+  }
+
+  async diffSize(base: string, candidate: string) {
+    await this.#repository();
+    await this.#candidate(base, candidate);
+    const rows = (
+      await this.#git([
+        "-c",
+        `attr.tree=${emptyTree}`,
+        "diff",
+        "--numstat",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--no-color",
+        base,
+        candidate,
+        "--",
+      ])
+    )
+      .toString("utf8")
+      .split("\0");
+    if (rows.pop() !== "") throw new GitIntegrationError("invalid-candidate");
+    let changedLines: number | null = 0;
+    for (const row of rows) {
+      const counts = /^(\d+|-)\t(\d+|-)\t/.exec(row);
+      if (!counts) throw new GitIntegrationError("invalid-candidate");
+      if (counts[1] === "-" || counts[2] === "-") changedLines = null;
+      else if (changedLines !== null) {
+        changedLines += Number(counts[1]) + Number(counts[2]);
+        if (!Number.isSafeInteger(changedLines))
+          throw new GitIntegrationError("invalid-candidate");
+      }
+    }
+    return { changedLines, changedFiles: rows.length };
   }
 
   async diffStat(base: string, candidate: string): Promise<string> {
@@ -1128,8 +1165,10 @@ export class LocalGitIntegration {
     const changes = await this.#candidate(base, candidate);
     return changes
       .filter(
-        ({ path, newMode }) =>
-          newMode === "120000" || matchesTreePaths(path, protectedPaths),
+        ({ path, oldMode, newMode }) =>
+          oldMode === "120000" ||
+          newMode === "120000" ||
+          matchesTreePaths(path, protectedPaths),
       )
       .map(({ path }) => path)
       .sort();

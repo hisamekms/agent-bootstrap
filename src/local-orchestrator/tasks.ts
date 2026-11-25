@@ -1,3 +1,4 @@
+import type { DiffSize } from "./delegation.ts";
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
@@ -69,6 +70,7 @@ type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
 type CandidateChange = {
   path: string;
   newMode: string;
+  oldMode?: string;
   target?: string | null | undefined;
 };
 type TaskRunMode = "task" | "review" | "verification";
@@ -88,6 +90,7 @@ export interface TaskFlow {
   verify?: (id: string, observed: ActorResult) => Promise<boolean>;
   reject(candidate: PinnedCandidate): Promise<void>;
   changes(candidate: PinnedCandidate): Promise<CandidateChange[]>;
+  diffSize?(candidate: PinnedCandidate): Promise<DiffSize>;
 }
 
 export interface TaskExecutor {
@@ -546,6 +549,7 @@ export function createTaskExecutor(options: {
         : {}),
       reject: (candidate) => integration.rejectCandidate(candidate),
       changes: ({ base, candidate }) => git.candidateChanges(base, candidate),
+      diffSize: ({ base, candidate }) => git.diffSize(base, candidate),
     };
     return { flow, integration };
   }
@@ -762,15 +766,19 @@ export async function runTask(
           const pin = await flow.worker(runId, attempt > 0, observed);
           const changes = await flow.changes(pin);
           const changedPaths = changes.map(({ path }) => path);
-          const links = changes.filter(({ newMode }) => newMode === "120000");
+          const links = changes.filter(
+            ({ newMode, oldMode }) =>
+              newMode === "120000" || oldMode === "120000",
+          );
           const symlinks = links.map(({ path }) => path);
           const value = { pin, changedPaths, symlinks };
           const offendingChanges: { path: string; symlink: boolean }[] = [];
-          for (const { path, newMode, target } of changes) {
-            const symlink = newMode === "120000";
+          for (const { path, newMode, oldMode, target } of changes) {
+            const symlink = newMode === "120000" || oldMode === "120000";
             if (
               !allowsPath(paths, path) ||
-              (symlink && !allowsSymlinkTarget(paths, path, target))
+              (newMode === "120000" &&
+                !allowsSymlinkTarget(paths, path, target))
             ) {
               offendingChanges.push({ path, symlink });
               if (offendingChanges.length === MAX_PATH_VIOLATIONS) break;
@@ -878,7 +886,12 @@ export async function runTask(
         },
       };
       await scan?.(JSON.stringify(proposal));
-      store.proposeIntegration(proposal, review.executionId);
+      const diffSize = await flow.diffSize?.(pin).catch(() => undefined);
+      store.proposeIntegration(
+        proposal,
+        review.executionId,
+        diffSize?.changedFiles === changedPaths.length ? diffSize : undefined,
+      );
       return;
     }
   } catch (error) {
@@ -956,14 +969,20 @@ export async function integrateApprovedProposal(
     const protectedPaths = await integration.protectedPaths(pin);
     if (protectedPaths.length && answerer.kind !== "human")
       throw new OrchestratorStoreError("approval-forbidden");
-    if (
-      content.symlinks !== undefined &&
-      (protectedPaths.length !== content.symlinks.length ||
-        protectedPaths.some(
-          (path, index) => path !== content.symlinks?.[index],
-        ))
-    )
-      throw new TaskError("candidate-mismatch");
+    if (content.symlinks !== undefined) {
+      const matches = (paths: readonly string[]) =>
+        content.symlinks?.length === paths.length &&
+        paths.every((path, index) => path === content.symlinks?.[index]);
+      // Earlier proposals only recorded links present in the candidate.
+      const survivingLinks = changes
+        .filter(({ newMode }) => newMode === "120000")
+        .map(({ path }) => path);
+      if (
+        !matches(protectedPaths) &&
+        !(answerer.kind === "human" && matches(survivingLinks))
+      )
+        throw new TaskError("candidate-mismatch");
+    }
 
     if ((await goalBranchHead(git)) !== base)
       throw new GitIntegrationError("stale-base");

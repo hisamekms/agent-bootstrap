@@ -626,7 +626,9 @@ export async function startConcierge(
     const runner = new ActorRunner({
       ...(scan ? { scan } : {}),
       store,
-      ...(tasks ? { tasks, canScheduleTasks: () => !stopping } : {}),
+      ...(tasks ? { tasks } : {}),
+      autoApproveRegistrations: true,
+      canScheduleTasks: () => !stopping,
       runPlanner: (...args) => {
         if (stopping) throw new Error("Concierge session ended");
         return runPlanner(...args);
@@ -700,12 +702,10 @@ export async function startConcierge(
     options.signal?.throwIfAborted();
     await host.prepareConciergeVolume(stateVolume);
     options.signal?.throwIfAborted();
-    if (tasks) {
-      scheduleDrain();
-      // Operator decisions can arrive from another process via state.db.
-      scheduler = setInterval(scheduleDrain, 1000);
-      scheduler.unref();
-    }
+    scheduleDrain();
+    // Operator decisions and policy changes can arrive through state.db.
+    scheduler = setInterval(scheduleDrain, 1000);
+    scheduler.unref();
     ({ outcome, code } = await host.runConcierge(
       {
         sandbox: {

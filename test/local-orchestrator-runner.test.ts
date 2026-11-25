@@ -723,7 +723,7 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
   );
 });
 
-test("Reviewer refuses human policy, including pending content tightening an agent gate", async () => {
+test("Reviewer refuses human policy and honors an explicit operator default over proposal content", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
   const work = runner(store);
@@ -741,15 +741,14 @@ test("Reviewer refuses human policy, including pending content tightening an age
     { ...goal, policies: { "goal-registration": "human" } },
     plannerOrigin,
   );
-  await assert.rejects(work.requestApproval(tightened.id), {
-    code: "approval-forbidden",
-  });
   assert.equal(
     store
       .listEvents({ limit: 10 })
       .some((event) => event.kind === "execution.queued"),
     false,
   );
+  const id = await work.requestApproval(tightened.id);
+  assert.equal(store.getExecution(id)?.status, "queued");
 });
 
 test("Reviewer cannot queue an approval for a goal that loosens integration policy", async () => {
@@ -937,4 +936,108 @@ test("Planner and approval answers with credentials fail without copying their t
   assert.equal(store.listProposals().length, 1);
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
   assert.equal(notes.length, 2);
+});
+
+test("the active scheduler delegates rule-matched Task registrations in dependency order", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store);
+  store.setRules(
+    [
+      {
+        id: "docs",
+        name: "Small docs Tasks",
+        gate: "task-registration",
+        order: 0,
+        action: "agent",
+        enabled: true,
+        conditions: { pathsWithin: ["src/**"], categories: ["docs"] },
+      },
+    ],
+    "operator-ui",
+  );
+  const work = runner(store, {
+    autoApproveRegistrations: true,
+    runPlanner: async (_plan, id) =>
+      response(id, {
+        tasks: [
+          { ...task, title: "First", category: "docs" },
+          { ...task, title: "Second", category: "docs", dependsOn: ["#0"] },
+        ],
+      }),
+    runReviewer: async (_plan, id) =>
+      response(id, {
+        decision: "approve",
+        reasons: ["Fits the plan"],
+      }),
+  });
+  await work.requestPlanner({
+    ...goalRequest,
+    mode: "task-decomposition",
+    goalId,
+  });
+  await work.drain();
+  assert.deepEqual(
+    store.listTasks(goalId).map(({ content }) => content.title),
+    ["First", "Second"],
+  );
+  assert.deepEqual(
+    store
+      .decisionHistory()
+      .map(({ setting, reasons }) => [setting.ruleId, reasons]),
+    [
+      ["docs", ["Fits the plan"]],
+      ["docs", ["Fits the plan"]],
+    ],
+  );
+});
+
+test("the scheduler records only rejection when approval would widen model delegation", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
+  const make = () =>
+    store.proposeGoal(
+      { ...goal, policies: { integration: "agent" } },
+      plannerOrigin,
+    );
+  const awaitingHuman = make();
+  const rejected = make();
+  let nowDelegable = false;
+  let reviews = 0;
+  const work = runner(store, {
+    autoApproveRegistrations: true,
+    runReviewer: async (plan, id) => {
+      const proposal = JSON.parse(file(plan, "proposal.json"));
+      reviews++;
+      assert.deepEqual(
+        proposal.allowedDecisions,
+        nowDelegable ? undefined : ["reject"],
+      );
+      return response(id, {
+        decision: proposal.id === rejected.id ? "reject" : "approve",
+        reasons: ["Reviewed"],
+      });
+    },
+  });
+  await work.drain();
+  assert.equal(store.getProposal(awaitingHuman.id)?.status, "pending");
+  assert.equal(store.getProposal(rejected.id)?.status, "rejected");
+  assert.deepEqual(
+    store
+      .decisionHistory()
+      .map(({ proposalId, result }) => [proposalId, result]),
+    [[rejected.id, "reject"]],
+  );
+  await work.drain();
+  assert.equal(reviews, 2);
+  store.setProjectDefaults(
+    { integration: "agent" },
+    { kind: "operator" },
+    "operator-ui",
+  );
+  nowDelegable = true;
+  await work.drain();
+  assert.equal(reviews, 3);
+  assert.equal(store.getProposal(awaitingHuman.id)?.status, "approved");
 });

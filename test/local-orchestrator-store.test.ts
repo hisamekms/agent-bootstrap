@@ -84,7 +84,13 @@ function goalId(content: unknown = goal): string {
   return registered.goalId;
 }
 
-function startReviewer(context: { goalId?: string; taskId?: string } = {}) {
+function startReviewer(
+  context: {
+    goalId?: string;
+    taskId?: string;
+    approvalProposalId?: string;
+  } = {},
+) {
   const execution = store.createExecution({
     actor: "Reviewer",
     mode: "approval",
@@ -432,7 +438,6 @@ test("requires a host origin for Reviewer approval executions", () => {
 });
 
 test("requires the Reviewer execution's goal to match a task proposal", () => {
-  store.setProjectDefaults({ "task-registration": "agent" }, operator);
   const id = goalId();
   const unrelatedGoal = goalId();
   const unrelated = store.proposeTask(
@@ -441,6 +446,9 @@ test("requires the Reviewer execution's goal to match a task proposal", () => {
   );
   if (unrelated.status !== "registered")
     throw new Error("Expected registration");
+  const related = store.proposeTask({ ...task, goalId: id }, operator);
+  if (related.status !== "registered") throw new Error("Expected registration");
+  store.setProjectDefaults({ "task-registration": "agent" }, operator);
   const proposal = store.proposeTask(
     { ...task, goalId: id, paths: ["other/file"] },
     operator,
@@ -455,8 +463,6 @@ test("requires the Reviewer execution's goal to match a task proposal", () => {
       new OrchestratorStoreError("approval-forbidden"),
     );
   }
-  const related = store.proposeTask({ ...task, goalId: id }, operator);
-  if (related.status !== "registered") throw new Error("Expected registration");
   const agent = startReviewer({ taskId: related.taskId });
   assert.ok(approve(proposal, agent).taskId);
 });
@@ -605,8 +611,7 @@ test("registers explicit scope exceptions and policy changes, while rechecking h
 });
 
 test("uses the prior task gate but honors a request that requires a human", () => {
-  store.setProjectDefaults({ "task-registration": "agent" }, operator);
-  const id = goalId();
+  const id = goalId({ ...goal, policies: { "task-registration": "agent" } });
   const agent = startReviewer({ goalId: id });
   const pending = store.proposeTask(
     {
@@ -751,5 +756,156 @@ test("enforces execution and session transitions and keeps results out of events
       .listEvents({ subjectId: session.id, limit: 2 })
       .map((event) => event.kind),
     ["session.ended", "session.started"],
+  );
+});
+
+test("Goal and rule settings apply to Task registrations and preserve the recorded deciding rule", () => {
+  const id = goalId();
+  const planner = { kind: "actor", actor: "Planner" } as const;
+  const rule = {
+    id: "small-source",
+    name: "Small source change",
+    gate: "task-registration",
+    action: "agent",
+    enabled: true,
+    order: 0,
+    conditions: {
+      pathsWithin: ["src/**"],
+      maxTokens: 500,
+      categories: ["bugfix"],
+    },
+  };
+  store.setRules([rule], "cli");
+  const unmatched = store.proposeTask(
+    { ...task, goalId: id, category: "docs" },
+    planner,
+  );
+  assert.partialDeepStrictEqual(unmatched, {
+    status: "pending",
+    policy: "human",
+    source: "default",
+  });
+  const pending = store.proposeTask(
+    {
+      ...task,
+      goalId: id,
+      category: "bugfix",
+      policies: { "task-registration": "human" },
+    },
+    planner,
+  );
+  assert.partialDeepStrictEqual(pending, {
+    status: "pending",
+    policy: "agent",
+    source: "rule",
+    ruleId: rule.id,
+  });
+  store.setGoalPolicy(id, "task-registration", "human", "operator-ui");
+  const agent = startReviewer({ goalId: id });
+  assert.throws(() => approve(pending, agent), { code: "approval-forbidden" });
+  assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), {
+    source: "operator-goal",
+    policy: "human",
+  });
+  store.setGoalPolicy(id, "task-registration", "inherit", "operator-ui");
+  assert.throws(() => approve(pending, agent), { code: "approval-forbidden" });
+  const other = store.proposeTask(
+    { ...task, goalId: id, category: "bugfix" },
+    planner,
+  );
+  const bound = startReviewer({ goalId: id, approvalProposalId: other.id });
+  assert.throws(() => approve(pending, bound), { code: "approval-forbidden" });
+  const { taskId } = store.decide(pending.id, {
+    digest: pending.digest,
+    decision: "approve",
+    answerer: startReviewer({ goalId: id, approvalProposalId: pending.id }),
+    reasons: ["Meets the pinned scope."],
+  });
+  const setting = {
+    policy: "agent",
+    source: "rule",
+    ruleId: rule.id,
+    ruleName: rule.name,
+  };
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: pending.id, limit: 1 })[0]?.data,
+    {
+      ...setting,
+      answererKind: "agent",
+    },
+  );
+  assert.equal(store.policySettings().rules[0]?.hitsLast7Days, 1);
+  store.setRules([{ ...rule, name: "Renamed", enabled: false }], "operator-ui");
+  assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), setting);
+  assert.partialDeepStrictEqual(store.decisionHistory(1)[0], {
+    goalId: id,
+    taskId,
+    setting,
+    result: "approve",
+    reasons: ["Meets the pinned scope."],
+  });
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: "project", limit: 1 })[0],
+    {
+      kind: "project.rule-set",
+      data: {
+        origin: "operator-ui",
+        before: rule,
+        after: { name: "Renamed", enabled: false },
+      },
+    },
+  );
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: id, limit: 1 })[0],
+    {
+      kind: "goal.policy-set",
+      data: { origin: "operator-ui", before: "human", after: "inherit" },
+    },
+  );
+});
+
+test("model loosening needs human approval even when the Goal delegates Task registration", () => {
+  const id = goalId();
+  store.setGoalPolicy(id, "task-registration", "agent", "operator-ui");
+  const pending = store.proposeTask(
+    { ...task, goalId: id, policies: { integration: "agent" } },
+    operator,
+  );
+  assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), {
+    source: "operator-goal",
+    humanApprovalRequired: true,
+    loosening: ["integration"],
+  });
+  assert.throws(() => approve(pending, startReviewer({ goalId: id })), {
+    code: "approval-forbidden",
+  });
+  assert.ok(approve(pending).taskId);
+  assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), {
+    policy: "human",
+    source: "invariant",
+    invariant: "policy-loosening",
+  });
+});
+
+test("an explicit project default supersedes legacy model delegation after a Goal registers", () => {
+  const id = goalId({ ...goal, policies: { integration: "agent" } });
+  assert.deepEqual(store.effectivePolicy("integration", { goalId: id }), {
+    policy: "agent",
+    source: "goal",
+  });
+  store.setProjectDefaults({ integration: "human" }, operator, "operator-ui");
+  assert.deepEqual(store.effectivePolicy("integration", { goalId: id }), {
+    policy: "human",
+    source: "default",
+  });
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: "project", limit: 1 })[0]?.data,
+    {
+      origin: "operator-ui",
+      before: { integration: "human" },
+      after: { integration: "human" },
+      beforeExplicit: [],
+      afterExplicit: ["integration"],
+    },
   );
 });

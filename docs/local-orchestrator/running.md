@@ -101,6 +101,89 @@ If a proposal changed, review the refreshed details before answering
 again. The copyable CLI command remains available as a fallback. Use the
 TTY CLI with the same target for on-behalf answers.
 
+## Choose what the Reviewer can decide
+
+**任せ方** controls the defaults for **Goal の登録**, **Task の登録**, and
+**統合**. All three start at **人** and the rule list starts empty.
+Choose **AI** to let the Reviewer answer eligible gates. The panel asks
+for confirmation before changes that can widen delegation. Each Goal
+can override Task registration and integration. Each Task can override
+its own integration. **全体に従う** and **ルールに従う** defer to the next
+applicable setting.
+
+The host checks invariants first, then the Task override, the Goal
+override, the first enabled rule that matches, and the project default.
+An explicitly set project default supersedes any policy in model-written
+content for that gate. Gates with untouched defaults retain their legacy
+inheritance from approved model content. Existing in-scope Task
+auto-registration applies until the operator configures the Task-registration
+default, enables a Task-registration rule, or overrides registration on the
+Goal. Other Task constraints still apply.
+
+Integration requires passing verification and review for a Reviewer answer.
+Changes to symbolic links and Concierge proposals require an operator
+answer. Pending integration proposals from older databases also need an
+operator answer when they lack the host's symlink check record. A model's request to widen delegation requires operator approval.
+The Reviewer may still reject it when the gate allows delegated rejection.
+Goal discard and branch export remain operator commands.
+
+The **ルール** list is evaluated from top to bottom. Rules for Task
+registration can check planned paths and the proposed maximum token
+budget. Integration rules check the pinned candidate's changed paths and
+Git diff counts. Changed lines are additions plus deletions. Binary
+changes have an unknown line count, so they cannot match a line limit.
+A missing count never matches a rule that requires it. A Planner's
+category can narrow a rule that also checks a path, budget, or diff count.
+The Task detail labels the category as the Planner's claim.
+
+Use repository-relative patterns such as `docs/**` and `README.*`.
+`*` matches within a path component and `**` is a whole component
+that can span directories. To allow a planned directory and everything
+in it, use a pattern such as `docs/**`. An exclusion also checks
+descendants covered by a planned directory. Each rule shows how many gate
+decisions it determined in the last seven days. **判断待ち** shows recent
+Reviewer answers with the recorded policy source and the Reviewer's reason
+as model text.
+
+The TTY CLI uses the same target settings:
+
+```sh
+agent-bootstrap policy show
+agent-bootstrap policy set integration human
+agent-bootstrap policy goal <goalId> task-registration human
+agent-bootstrap policy task <taskId> rule
+agent-bootstrap policy rules set --file rules.json
+```
+
+For `policy rules set`, supply the entire ordered JSON array, with unique
+IDs and consecutive zero-based `order` values. Pass an empty array to
+clear the rules. For example:
+
+```json
+[
+  {
+    "id": "small-docs",
+    "name": "Small documentation integrations",
+    "gate": "integration",
+    "action": "agent",
+    "enabled": true,
+    "order": 0,
+    "conditions": {
+      "pathsWithin": ["docs/**"],
+      "pathsExclude": ["docs/private/**"],
+      "maxChangedLines": 80,
+      "maxChangedFiles": 4,
+      "categories": ["docs"]
+    }
+  }
+]
+```
+
+The target's events record the before and after values with origin `cli`
+or `operator-ui`. A recorded decision keeps its original source when
+settings change. The panel rejects an edit to a rule list or an override
+that another operation changed after it was displayed.
+
 ## Work on another repository
 
 Run the launcher and operator CLI from agent-bootstrap. Use the same

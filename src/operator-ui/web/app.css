@@ -318,3 +318,84 @@ pre {
 .model-link span {
   unicode-bidi: plaintext;
 }
+
+#decision-history {
+  padding: 0.7rem 1rem;
+  border-top: 1px solid #384452;
+}
+
+.policy-section {
+  margin-block: 0.8rem;
+  padding-block: 0.55rem;
+  border-top: 1px solid #384452;
+}
+
+.policy-controls,
+.rule-form fieldset {
+  border: 0;
+  min-inline-size: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.policy-segments,
+.policy-categories {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-block: 0.45rem;
+}
+
+.policy-segments > span {
+  flex-basis: 100%;
+}
+
+.policy-section button[aria-pressed="true"] {
+  border-color: #8cb9f4;
+  background: #304662;
+}
+
+.policy-section button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.policy-confirmation:not(:empty),
+.rule-form {
+  margin-block: 0.55rem;
+  padding: 0.55rem;
+  border: 1px solid #8cb9f4;
+  border-radius: 0.3rem;
+}
+
+.policy-confirmation button + button,
+.rule-form button + button {
+  margin-inline-start: 0.4rem;
+}
+
+.policy-rules {
+  padding-inline-start: 1.5rem;
+}
+
+.policy-rules > li {
+  margin-block: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.rule-form label:not([hidden]) {
+  display: block;
+  margin-block: 0.45rem;
+}
+
+.rule-form :is(input:not([type="checkbox"]), textarea, select) {
+  display: block;
+  box-sizing: border-box;
+  max-width: 100%;
+  background: #17202c;
+  color: inherit;
+  font: inherit;
+  border: 1px solid #4c5c70;
+  border-radius: 0.3rem;
+  padding: 0.3rem;
+}

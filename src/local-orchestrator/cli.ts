@@ -1,3 +1,12 @@
+import {
+  GOAL_POLICIES,
+  RULE_GATES,
+  TASK_POLICIES,
+  validateDelegationRules,
+  type GoalPolicy,
+  type RuleGate,
+  type TaskPolicy,
+} from "./delegation.ts";
 import { loadConfig, mergeConfig } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
 import {
@@ -101,6 +110,9 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   verification clear
   policy show
   policy set <gate> <human|agent>
+  policy rules set --file <json>
+  policy goal <goalId> <task-registration|integration> <inherit|human|agent>
+  policy task <taskId> <rule|human|agent>
   events [--subject <id>] [--limit <1-1000>]`;
 
 type Command =
@@ -123,6 +135,9 @@ type Command =
   | { kind: "verification-show" | "verification-clear" }
   | { kind: "verification-set"; config: VerificationConfig }
   | { kind: "policy-set"; gate: Gate; value: Policy }
+  | { kind: "policy-rules"; file: string }
+  | { kind: "policy-goal"; id: string; gate: RuleGate; value: GoalPolicy }
+  | { kind: "policy-task"; id: string; value: TaskPolicy }
   | { kind: "events"; subjectId?: string; limit: number };
 
 function parseCommand([kind, ...args]: readonly string[]): Command {
@@ -266,6 +281,27 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     case "policy":
       if (args.length === 1 && args[0] === "show")
         return { kind: "policy-show" };
+      if (
+        args.length === 4 &&
+        args[0] === "rules" &&
+        args[1] === "set" &&
+        args[2] === "--file" &&
+        args[3]
+      )
+        return { kind: "policy-rules", file: args[3] };
+      if (args.length === 4 && args[0] === "goal")
+        return {
+          kind: "policy-goal",
+          id: identifier(args[1]),
+          gate: oneOf(args[2], RULE_GATES),
+          value: oneOf(args[3], GOAL_POLICIES),
+        };
+      if (args.length === 3 && args[0] === "task")
+        return {
+          kind: "policy-task",
+          id: identifier(args[1]),
+          value: oneOf(args[2], TASK_POLICIES),
+        };
       if (args.length === 3 && args[0] === "set")
         return {
           kind: "policy-set",
@@ -326,14 +362,6 @@ function writeJson(io: CliIo, value: unknown): void {
   const output = json.split("\n").map(escapeTerminalControls).join("\n");
   if (io.json) io.json(output);
   else io.stdout.write(`${output}\n`);
-}
-
-function projectDefaults(store: OrchestratorStore): Record<Gate, Policy> {
-  return {
-    "goal-registration": store.effectivePolicy("goal-registration").policy,
-    "task-registration": store.effectivePolicy("task-registration").policy,
-    integration: store.effectivePolicy("integration").policy,
-  };
 }
 
 function requireProposalDetails(store: OrchestratorStore, id: string) {
@@ -712,9 +740,45 @@ async function execute(
       if (command.delegate) io.stdout.write("Answer recorded as delegated.\n");
       return 0;
     }
-    case "policy-show":
-      await writeCheckedJson(projectDefaults(store));
+    case "policy-show": {
+      const { defaults, rules } = store.policySettings();
+      await writeCheckedJson({
+        ...defaults,
+        rules,
+        overrides: store.policyOverrides(),
+      });
       return 0;
+    }
+    case "policy-rules": {
+      const rules = validateDelegationRules(
+        JSON.parse(readFileSync(command.file, "utf8")),
+      );
+      await scan?.(JSON.stringify(rules));
+      if (
+        (await io.prompt(
+          'Type "set rules" to replace the delegation rule list: ',
+        )) !== "set rules"
+      )
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      store.setRules(rules, "cli");
+      io.stdout.write("Delegation rules updated.\n");
+      return 0;
+    }
+    case "policy-goal":
+    case "policy-task": {
+      if (
+        command.value !== "human" &&
+        (await io.prompt(
+          'Type "set policy" to confirm this setting can allow eligible AI answers: ',
+        )) !== "set policy"
+      )
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      if (command.kind === "policy-goal")
+        store.setGoalPolicy(command.id, command.gate, command.value, "cli");
+      else store.setTaskIntegrationPolicy(command.id, command.value, "cli");
+      io.stdout.write("Delegation override updated.\n");
+      return 0;
+    }
     case "policy-set":
       store.setProjectDefaults(
         { [command.gate]: command.value },
@@ -782,6 +846,9 @@ export async function runCli(
       "approve",
       "reject",
       "policy-set",
+      "policy-rules",
+      "policy-goal",
+      "policy-task",
       "reconcile",
       "retry-task",
       "update-goal-base",

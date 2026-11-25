@@ -17,7 +17,10 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import type { TerminalExit } from "../src/sandbox-runtime.ts";
-import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
+import {
+  dispatchPolicy,
+  listenOperatorApi,
+} from "../src/local-orchestrator/operator-api.ts";
 import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
 import {
@@ -48,6 +51,194 @@ const goal = {
     budgets: { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 500 },
   },
 };
+
+test("operator delegation methods validate, audit and expose the effective settings", async () => {
+  using fixture = orchestratorFixture("lo-op-policy-");
+  const { store } = fixture;
+  const operator = { kind: "operator" } as const;
+  const planner = { kind: "actor", actor: "Planner" } as const;
+  const call = (method: string, params: object) =>
+    dispatchPolicy(store, method, params);
+  const ok = { result: { ok: true } };
+  const invalid = { error: { code: "invalid-params" } };
+  const original = store.policySettings();
+  assert.deepEqual(await call("policy.get", {}), { result: original });
+  assert.deepEqual(original.defaults, {
+    "goal-registration": "human",
+    "task-registration": "human",
+    integration: "human",
+  });
+  assert.deepEqual(original.rules, []);
+  assert.ok(original.invariants.includes("policy-loosening"));
+
+  const proposal = store.proposeGoal(goal, operator);
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const task = store.proposeTask(
+    {
+      goalId,
+      title: "Document",
+      description: "",
+      acceptance: ["Pass"],
+      category: "docs",
+      actor: "Executor",
+      profile: "base",
+      paths: ["src/a.md"],
+      dependsOn: [],
+      budgets: goal.scope.budgets,
+    },
+    planner,
+  );
+  if (task.status !== "registered")
+    throw new Error("Expected automatic registration");
+  const { taskId } = task;
+  assert.deepEqual(
+    await call("policy.setDefault", { gate: "integration", policy: "agent" }),
+    ok,
+  );
+  assert.deepEqual(
+    await call("goal.setPolicy", {
+      goalId,
+      gate: "integration",
+      value: "human",
+    }),
+    ok,
+  );
+  assert.deepEqual(
+    await call("task.setIntegrationPolicy", { taskId, value: "agent" }),
+    ok,
+  );
+  assert.partialDeepStrictEqual(operatorGoal(store, goalId!), {
+    policyOverrides: { "task-registration": "inherit", integration: "human" },
+  });
+  assert.partialDeepStrictEqual(operatorTask(store, taskId), {
+    category: "docs",
+    integrationPolicy: "agent",
+    effectiveIntegrationPolicy: { policy: "agent", source: "operator-task" },
+  });
+  assert.deepEqual(
+    await call("task.setIntegrationPolicy", {
+      taskId,
+      value: "rule",
+      expected: "human",
+    }),
+    { error: { code: "stale-policy" } },
+  );
+
+  const rule = {
+    id: "small",
+    name: "Small integration",
+    gate: "integration",
+    action: "agent",
+    enabled: true,
+    order: 0,
+    conditions: { maxChangedFiles: 2 },
+  };
+  assert.deepEqual(
+    await call("policy.setRules", {
+      rules: [rule],
+      expectedRevision: original.rulesRevision,
+    }),
+    ok,
+  );
+  assert.deepEqual(
+    await call("policy.setRules", {
+      rules: [],
+      expectedRevision: original.rulesRevision,
+    }),
+    { error: { code: "stale-policy" } },
+  );
+  assert.deepEqual(
+    await dispatchPolicy(store, "policy.setRules", { rules: [] }, async () => {
+      throw new Error("screened");
+    }),
+    { error: { code: "write-failed" } },
+  );
+  assert.deepEqual(store.policySettings().rules, [
+    { ...rule, hitsLast7Days: 0 },
+  ]);
+
+  for (const [method, params] of [
+    ["policy.get", { extra: true }],
+    ["policy.setDefault", { gate: "other", policy: "agent" }],
+    ["policy.setDefault", { gate: "integration", policy: "inherit" }],
+    [
+      "policy.setRules",
+      { rules: [{ ...rule, conditions: { categories: ["docs"] } }] },
+    ],
+    ["policy.setRules", { rules: [], expectedRevision: "invalid" }],
+    ["goal.setPolicy", { goalId, gate: "goal-registration", value: "agent" }],
+    ["goal.setPolicy", { goalId, gate: "integration", value: "rule" }],
+    ["task.setIntegrationPolicy", { taskId, value: "inherit" }],
+    ["decision.history", { limit: 0 }],
+    ["decision.history", { limit: 1.1 }],
+  ] as const)
+    assert.deepEqual(await call(method, params), invalid, method);
+  assert.deepEqual(
+    await call("task.setIntegrationPolicy", {
+      taskId: "missing",
+      value: "human",
+    }),
+    { error: { code: "not-found" } },
+  );
+  assert.deepEqual(await call("decision.history", {}), { result: [] });
+
+  assert.deepEqual(
+    await call("policy.setDefault", {
+      gate: "goal-registration",
+      policy: "agent",
+    }),
+    ok,
+  );
+  const agentProposal = store.proposeGoal(goal, planner);
+  const execution = store.createExecution({
+    actor: "Reviewer",
+    mode: "approval",
+    requestedBy: { kind: "host" },
+    approvalProposalId: agentProposal.id,
+  });
+  store.startExecution(execution.id);
+  const decision = store.decide(agentProposal.id, {
+    digest: agentProposal.digest,
+    decision: "approve",
+    reasons: ["Reviewer model text"],
+    answerer: {
+      kind: "agent",
+      executionId: execution.id,
+      model: "claude-test",
+    },
+  });
+  assert.partialDeepStrictEqual(await call("decision.history", { limit: 1 }), {
+    result: [
+      {
+        goalId: decision.goalId,
+        taskId: null,
+        result: "approve",
+        setting: { policy: "agent", source: "default" },
+        reasons: ["Reviewer model text"],
+      },
+    ],
+  });
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: taskId, limit: 1 })[0],
+    {
+      kind: "task.policy-set",
+      data: { origin: "operator-ui", before: "rule", after: "agent" },
+    },
+  );
+  assert.ok(
+    store
+      .listEvents({ subjectId: "project", limit: 10 })
+      .some(
+        ({ kind, data }) =>
+          kind === "project.defaults-set" &&
+          (data as { origin: string }).origin === "operator-ui",
+      ),
+  );
+});
 
 test("operator API answers return per-item errors in order and audit the panel origin", async () => {
   using fixture = orchestratorFixture("lo-op-answer-");

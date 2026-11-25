@@ -23,6 +23,9 @@ function proposalPolicy({
   gate,
   policy,
   source,
+  ruleId,
+  ruleName,
+  invariant,
   loosening,
   humanApprovalRequired,
   humanAnswerRequired,
@@ -31,6 +34,8 @@ function proposalPolicy({
     gate,
     effectivePolicy: policy,
     policySource: source,
+    ...(ruleId && { ruleId, ruleName }),
+    ...(invariant && { invariant }),
     loosening,
     humanApprovalRequired,
     humanAnswerRequired,
@@ -237,6 +242,7 @@ export function operatorGoal(store: OrchestratorStore, id: string) {
     budgets: scope.budgets,
     baseCommit: goal.baseCommit,
     branch: goalBranch(id),
+    policyOverrides: store.goalPolicyOverrides(id),
     tasks: taskSummaries(store, id),
   };
 }
@@ -250,7 +256,7 @@ export function operatorTask(store: OrchestratorStore, id: string) {
   if (!task) return null;
   const {
     goalId,
-    content: { description, acceptance, actor, paths, budgets },
+    content: { description, acceptance, actor, paths, budgets, category },
   } = task;
   const context = taskContext(store, goalId, id);
   const timing = context.timings.get(id);
@@ -259,14 +265,26 @@ export function operatorTask(store: OrchestratorStore, id: string) {
       ? store.taskPathViolations(id)
       : undefined;
   const usage = store.taskUsage(id);
+  const origin = category
+    ? store.getProposal(task.proposalId)?.source
+    : undefined;
+  const plannerCategory =
+    origin?.kind === "actor" && origin.actor === "Planner"
+      ? category
+      : undefined;
   return {
     ...taskSummary(task, context),
     goalId,
     description,
     acceptance,
     actor,
+    ...(plannerCategory && { category: plannerCategory }),
     paths,
     budgets,
+    integrationPolicy: store.taskPolicyOverride(id),
+    effectiveIntegrationPolicy: store.effectivePolicy("integration", {
+      taskId: id,
+    }),
     tokensUsed: usage.tokens,
     tokensIncomplete: usage.usage === "unavailable",
     executions: store.recentTaskExecutions(id),
