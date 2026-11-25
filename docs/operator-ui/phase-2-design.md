@@ -117,6 +117,10 @@ The filter is a byte state machine that keeps its state across chunks:
 - It caps any sequence at 4 KiB and drops one that runs longer.
 - It drops C1 controls in their 8-bit form.
 
+The UI must always write filtered output to xterm.js as a `Uint8Array`.
+Binary or Latin-1 strings bypass the UTF-8 decoding that the filter
+assumes takes place before control-sequence parsing.
+
 The renderer also turns off its own OSC 52 and link handlers, as a
 second layer.
 

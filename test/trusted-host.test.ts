@@ -2081,6 +2081,64 @@ const conciergePlan = {
   },
 } as const;
 
+test("Concierge preserves audit and attachment lifetime with a terminal sink", async (t) => {
+  const id = randomUUID();
+  const { promise: finished, resolve } = Promise.withResolvers<{
+    exitCode: number | null;
+  }>();
+  const input: Uint8Array[] = [];
+  const output: Uint8Array[] = [];
+  const sizes: number[][] = [];
+  const { host, db } = observedFixture(t, {
+    async attachTerminal(_handle, command, sink) {
+      assert.equal(db.read(id).at(-1)?.kind, "operation.allowed");
+      assert.equal(db.read(id).at(-1)?.operation, "sandbox.exec");
+      assert.deepEqual(command.argv, ["claude"]);
+      assert.equal(sink?.cols, 80);
+      assert.equal(sink?.rows, 24);
+      sink?.data(Buffer.from("output"));
+      return {
+        finished,
+        terminal: {
+          write: (data) => input.push(data),
+          resize: (cols, rows) => sizes.push([cols, rows]),
+        },
+      };
+    },
+  });
+  const result = await host.runConcierge(
+    conciergePlan,
+    id,
+    async ({ attach }) => {
+      const command = { argv: ["claude"] };
+      const sink = {
+        cols: 80,
+        rows: 24,
+        data: (data: Uint8Array) => output.push(data),
+      };
+      await assert.rejects(attach(command, { ...sink, cols: 19 }), {
+        code: "invalid-input",
+      });
+      const attached = await attach(command, sink);
+      await assert.rejects(attach(command), { code: "busy" });
+      attached.terminal.write(Buffer.from("input"));
+      assert.throws(() => attached.terminal.resize(80, 4), {
+        code: "invalid-input",
+      });
+      attached.terminal.resize(100, 30);
+      resolve({ exitCode: 0 });
+      assert.deepEqual(await attached.finished, { exitCode: 0 });
+      assert.throws(() => attached.terminal.write(Buffer.from("late")), {
+        code: "unknown-handle",
+      });
+    },
+  );
+  assert.equal(result.outcome, "ok");
+  assert.deepEqual(input, [Buffer.from("input")]);
+  assert.deepEqual(output, [Buffer.from("output")]);
+  assert.deepEqual(sizes, [[100, 30]]);
+});
+
 test("Concierge creates through the audited provider gateway and records each terminal attach", async (t) => {
   const id = randomUUID();
   const results = [7, 0];

@@ -47,6 +47,7 @@ import {
   isDebugMount,
   INTERACTIVE_MAX_LIFETIME_MS,
   isConciergeVolumeName,
+  isTerminalSize,
   permitsProviderHeader,
   SandboxRuntimeError,
   terminalEnvEntries,
@@ -86,7 +87,11 @@ import type {
   SandboxRuntime,
   SandboxSession,
   SandboxSpec,
+  AttachedTerminal,
+  TerminalAttachment,
   TerminalCommand,
+  TerminalExit,
+  TerminalSink,
 } from "./sandbox-runtime.ts";
 import {
   ProfileCatalog,
@@ -162,7 +167,11 @@ export interface ConciergePlan {
 }
 
 type ConciergeTerminal = {
-  attach(command: TerminalCommand): Promise<{ exitCode: number | null }>;
+  attach(command: TerminalCommand): Promise<TerminalExit>;
+  attach(
+    command: TerminalCommand,
+    sink: TerminalSink,
+  ): Promise<TerminalAttachment>;
 };
 
 export interface VerificationPlan {
@@ -1644,7 +1653,7 @@ export class TrustedHost {
         const current = handle;
         const terminalAudit = audit!; // Terminal entry points require an audited host.
         let accepting = true;
-        let pending: Promise<{ exitCode: number | null }> | undefined;
+        let pending: Promise<TerminalExit> | undefined;
         outcome = "ok";
         let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
         const lifetime = sandbox.maxLifetimeMs!;
@@ -1653,7 +1662,10 @@ export class TrustedHost {
         const expiry = new Promise<typeof expired>((resolve) => {
           lifetimeTimer = setTimeout(() => resolve(expired), lifetime);
         });
-        const execute = async (command: TerminalCommand) => {
+        const execute = async (
+          command: TerminalCommand,
+          pty?: { sink: TerminalSink; ready(terminal: AttachedTerminal): void },
+        ) => {
           await authorize("sandbox.exec");
           ensureAudit();
           const operationId = randomUUID();
@@ -1667,13 +1679,47 @@ export class TrustedHost {
             ensureAudit();
             if (performance.now() >= deadline)
               throw new SandboxRuntimeError("lifetime-expired");
-            const result = await Promise.race([
-              input.attach(current, command),
+            const attachment = await Promise.race([
+              pty
+                ? input.attach(current, command, pty.sink)
+                : input.attach(current, command),
               expiry,
             ]);
-            if (result === expired)
+            if (attachment === expired)
               throw new SandboxRuntimeError("lifetime-expired");
-            ({ exitCode } = result);
+            if (pty && "terminal" in attachment) {
+              let active = true;
+              const check = () => {
+                ensureAudit();
+                if (!accepting || !active)
+                  throw new SandboxRuntimeError("unknown-handle");
+                if (performance.now() >= deadline)
+                  throw new SandboxRuntimeError("lifetime-expired");
+              };
+              const finished = attachment.finished.finally(() => {
+                active = false;
+              });
+              pty.ready({
+                write(data) {
+                  check();
+                  attachment.terminal.write(data);
+                },
+                resize(cols, rows) {
+                  check();
+                  if (!isTerminalSize(cols, rows))
+                    throw new SandboxRuntimeError("invalid-input");
+                  attachment.terminal.resize(cols, rows);
+                },
+              });
+              const result = await Promise.race([finished, expiry]);
+              if (result === expired)
+                throw new SandboxRuntimeError("lifetime-expired");
+              ({ exitCode } = result);
+            } else {
+              if (pty || "terminal" in attachment)
+                throw new SandboxRuntimeError("unsupported");
+              ({ exitCode } = attachment);
+            }
             attachOutcome = exitCode === 0 ? "ok" : "failed";
           } catch (error) {
             if (error instanceof HostAuditError) throw error;
@@ -1720,46 +1766,68 @@ export class TrustedHost {
             }
           }, AUDIT_HEALTH_POLL_MS);
         });
+        function attach(command: TerminalCommand): Promise<TerminalExit>;
+        function attach(
+          command: TerminalCommand,
+          sink: TerminalSink,
+        ): Promise<TerminalAttachment>;
+        function attach(
+          command: TerminalCommand,
+          sink?: TerminalSink,
+        ): Promise<TerminalExit | TerminalAttachment> {
+          if (!accepting || pending)
+            return Promise.reject(
+              new SandboxRuntimeError(accepting ? "busy" : "unknown-handle"),
+            );
+          ensureAudit();
+          let request: TerminalCommand;
+          let terminalSink: TerminalSink | undefined;
+          try {
+            if (sink !== undefined) {
+              const { cols, rows } = sink;
+              if (!isTerminalSize(cols, rows))
+                throw new SandboxRuntimeError("invalid-input");
+              terminalSink = { cols, rows, data: sink.data.bind(sink) };
+            }
+            const { argv, env, workdir } = command;
+            request = {
+              argv:
+                Array.isArray(argv) && !shellMount
+                  ? claudeMountArgv(argv, mountConfigDir, mounted.length > 0)
+                  : argv,
+              ...(workdir === undefined ? {} : { workdir }),
+              ...(env === undefined
+                ? {}
+                : { env: Object.fromEntries(terminalEnvEntries(env)) }),
+            };
+          } catch (error) {
+            return Promise.reject(error);
+          }
+          const started = terminalSink
+            ? Promise.withResolvers<AttachedTerminal>()
+            : undefined;
+          const pty =
+            terminalSink && started
+              ? { sink: terminalSink, ready: started.resolve }
+              : undefined;
+          const finished = execute(request, pty).finally(() => {
+            pending = undefined;
+          });
+          pending = finished;
+          // The callback can start an attach and return without awaiting it.
+          void finished.catch((error) => started?.reject(error));
+          if (!started) return finished;
+          const attached = started.promise.then((terminal) => ({
+            terminal,
+            finished,
+          }));
+          void attached.catch(() => {});
+          return attached;
+        }
         const callback = async () => {
           try {
             ensureAudit();
-            return await input.use({
-              attach(command) {
-                if (!accepting || pending)
-                  return Promise.reject(
-                    new SandboxRuntimeError(
-                      accepting ? "busy" : "unknown-handle",
-                    ),
-                  );
-                ensureAudit();
-                let request: TerminalCommand;
-                try {
-                  const { argv, env, workdir } = command;
-                  request = {
-                    argv:
-                      Array.isArray(argv) && !shellMount
-                        ? claudeMountArgv(
-                            argv,
-                            mountConfigDir,
-                            mounted.length > 0,
-                          )
-                        : argv,
-                    ...(workdir === undefined ? {} : { workdir }),
-                    ...(env === undefined
-                      ? {}
-                      : { env: Object.fromEntries(terminalEnvEntries(env)) }),
-                  };
-                } catch (error) {
-                  return Promise.reject(error);
-                }
-                pending = execute(request).finally(() => {
-                  pending = undefined;
-                });
-                // The callback can start an attach and return without awaiting it.
-                void pending.catch(() => {});
-                return pending;
-              },
-            });
+            return await input.use({ attach });
           } finally {
             accepting = false;
             await pending;

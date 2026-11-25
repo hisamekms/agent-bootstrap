@@ -101,6 +101,39 @@ export interface TerminalCommand {
   readonly workdir?: "/repo" | "/state" | "/";
 }
 
+export interface TerminalSink {
+  readonly cols: number;
+  readonly rows: number;
+  data(chunk: Uint8Array): void;
+}
+
+export interface AttachedTerminal {
+  write(input: Uint8Array): void;
+  resize(cols: number, rows: number): void;
+}
+
+export interface TerminalExit {
+  readonly exitCode: number | null;
+}
+
+export interface TerminalAttachment {
+  readonly terminal: AttachedTerminal;
+  readonly finished: Promise<TerminalExit>;
+}
+
+export function isTerminalSize(cols: unknown, rows: unknown): boolean {
+  return (
+    typeof cols === "number" &&
+    Number.isInteger(cols) &&
+    cols >= 20 &&
+    cols <= 500 &&
+    typeof rows === "number" &&
+    Number.isInteger(rows) &&
+    rows >= 5 &&
+    rows <= 200
+  );
+}
+
 export const INTERACTIVE_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
 
 export function isConciergeVolumeName(name: unknown): name is string {
@@ -286,7 +319,8 @@ export interface SandboxRuntime {
   attachTerminal?(
     handle: SandboxHandle,
     command: TerminalCommand,
-  ): Promise<{ exitCode: number | null }>;
+    sink?: TerminalSink,
+  ): Promise<TerminalExit | TerminalAttachment>;
   collect(
     handle: SandboxHandle,
     spec: CollectSpec,
