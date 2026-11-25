@@ -71,6 +71,21 @@ export const helpTopics = {
     next: "Describe the desired Goal in the Concierge and inspect proposals from a second host terminal.",
     human: `The operator starts the session and reviews provider access and costs. ${humanRepo}`,
   },
+  workplace: {
+    purpose:
+      "Start the Concierge and the target's operator API for a separate client.",
+    prerequisites:
+      "A registered target and passing Concierge launch prerequisites.",
+    commands: [
+      `${target} workplace`,
+      `agent-bootstrap workplace --target ${exampleTarget} --dev-bridge`,
+    ],
+    output:
+      "The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.",
+    next: "Open the printed URL when using the development bridge. Use the operator CLI to answer gates.",
+    human:
+      "Keep the URL private. Stop the workplace process to end the session.",
+  },
   goals: {
     purpose:
       "Use the Concierge to draft Goals and Tasks, then inspect their progress through the operator CLI.",
@@ -381,6 +396,11 @@ export const onboardingOutputs = {
     usage:
       "concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]",
     json: "{ status, next } after an interactive TTY session. Transcript goes to stderr.",
+  },
+  workplace: {
+    usage:
+      "workplace --target <path> [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--dev-bridge]",
+    json: "Text output with the optional loopback URL.",
   },
   sandbox: {
     usage:

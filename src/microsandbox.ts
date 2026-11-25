@@ -1305,6 +1305,8 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   ): Promise<TerminalExit | TerminalAttachment> {
     const state = this.#state(handle);
     if (!state.interactive) throw new SandboxRuntimeError("unsupported");
+    const { signal } = command;
+    if (signal?.aborted) throw new SandboxRuntimeError("cancelled");
     const argv = terminalArgs(command);
     const remaining = state.deadline - performance.now();
     if (remaining <= 0) throw new SandboxRuntimeError("lifetime-expired");
@@ -1325,6 +1327,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       ? undefined
       : spawn(this.#config.binary, args, { ...options, stdio: "inherit" });
     const stop = attached?.stop ?? (() => child!.kill("SIGKILL"));
+    signal?.addEventListener("abort", stop, { once: true });
     let expired = false;
     const timer = setTimeout(() => {
       expired = true;
@@ -1349,6 +1352,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       })
       .finally(() => {
         clearDeadline();
+        signal?.removeEventListener("abort", stop);
         delete state.terminal;
         state.busy = false;
       });

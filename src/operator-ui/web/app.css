@@ -1,0 +1,176 @@
+@import "@xterm/xterm/css/xterm.css";
+
+:root {
+  color-scheme: dark;
+  font:
+    15px/1.5 system-ui,
+    sans-serif;
+  background: #11161e;
+  color: #eef2f8;
+}
+
+body {
+  margin: 0;
+}
+
+#workplace {
+  display: grid;
+  grid-template-columns: minmax(0, var(--conversation-width, 60%)) 9px minmax(
+      0,
+      1fr
+    );
+  height: 100dvh;
+}
+
+#conversation,
+#host {
+  min-width: 0;
+  min-height: 0;
+}
+
+#conversation {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #101419;
+}
+
+header {
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid #384452;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+p {
+  margin: 0.35rem 0;
+}
+
+#terminal {
+  position: relative;
+  min-height: 0;
+  padding: 0.6rem;
+  overflow: hidden;
+}
+
+#divider {
+  background: #384452;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+#divider:hover,
+#divider:focus-visible {
+  background: #8cb9f4;
+}
+
+#host {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  overflow: auto;
+  background: #19212c;
+  overflow-wrap: anywhere;
+}
+
+#summary,
+#inbox,
+#details {
+  padding: 0.7rem 1rem;
+}
+
+#summary {
+  border-bottom: 1px solid #384452;
+  color: #c1ccdb;
+}
+
+#summary p:empty {
+  display: none;
+}
+
+#details:empty {
+  padding: 0;
+  border: 0;
+}
+
+#details {
+  max-height: 40dvh;
+  overflow: auto;
+  border-bottom: 1px solid #384452;
+}
+
+#inbox {
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+#terminal-notice,
+#inbox-notice {
+  color: #ffda9a;
+}
+
+#inbox-items {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+button {
+  padding: 0.4rem 0.65rem;
+  border: 1px solid #4c5c70;
+  border-radius: 0.3rem;
+  background: #253142;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+#inbox-items button {
+  width: 100%;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+#inbox-items button[aria-pressed="true"] {
+  border-color: #8cb9f4;
+  background: #304662;
+}
+
+:focus-visible {
+  outline: 2px solid #8cb9f4;
+  outline-offset: -2px;
+}
+
+dl {
+  margin: 0.6rem 0;
+}
+
+dt {
+  color: #c1ccdb;
+}
+
+dd {
+  margin: 0 0 0.4rem;
+}
+
+pre {
+  margin: 0.4rem 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.model-text {
+  margin-top: 0.9rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #ae8752;
+  border-radius: 0.3rem;
+  background: #322921;
+  color: #ffe0b2;
+}

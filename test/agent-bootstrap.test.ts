@@ -132,6 +132,7 @@ const topics = [
   "start",
   "setup",
   "concierge",
+  "workplace",
   "goals",
   "inbox",
   "watch",
@@ -160,6 +161,7 @@ describe("agent-bootstrap", () => {
       "doctor",
       "setup",
       "concierge",
+      "workplace",
       "sandbox",
       "project",
       "config",
@@ -509,6 +511,33 @@ describe("agent-bootstrap", () => {
       JSON.parse(result.stdout).error,
       "Concierge prerequisites are missing.",
     );
+  });
+
+  test("workplace accepts the target in both positions without a TTY", async () => {
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
+    const { host } = fakeHost(root);
+    for (const args of [
+      ["workplace", "--target", root, "--dev-bridge", "--mode", "plan"],
+      ["--target", root, "workplace", "--dev-bridge", "--mode", "plan"],
+    ]) {
+      const result = await invoke(args, root, host, {
+        launchWorkplace: () => {
+          throw new Error("Unexpected launch");
+        },
+      });
+      assert.equal(result.code, 3);
+      assert.match(result.stderr, /Workplace prerequisites are missing/);
+    }
+    for (const args of [
+      ["workplace"],
+      ["workplace", "--target", "--dev-bridge", root],
+      ["workplace", "--target", root, "--dev-bridge", "--dev-bridge"],
+      ["workplace", "--target", root, "--volume-shell", "state"],
+      ["workplace", "--target", root, "--run"],
+      ["workplace", "--target", root, "--json"],
+    ])
+      assert.equal((await invoke(args, root, host)).code, 2);
   });
 
   test("setup plan stays offline and apply itself refuses without authorization", async () => {

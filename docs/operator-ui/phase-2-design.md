@@ -4,6 +4,10 @@
 - Date: 2026-11-25
 - Builds on: [ADR 0001](adr-0001-operator-ui.md), phase 1 (#38)
 
+The workplace command and development bridge are implemented. The bridge's
+asset loader currently serves a placeholder while the browser bundle is
+being integrated.
+
 Phase 2 puts the Concierge conversation and a read-only host panel in one
 browser window, served by the development bridge (ADR D3). Gates are
 still answered with the TTY CLI. The desktop shell, notifications and
@@ -15,10 +19,10 @@ Touch ID stay in phase 3.
   gives a real PTY with `write` and `resize`. A probe ran `tty`,
   `stty size`, a resize and input as expected. No native helper is
   needed. This closes the ADR's PTY open question.
-- **Nothing hosts the phase 1 API yet.** `listenOperatorApi` is only
-  called by tests. `inbox` and `watch` read the store directly. Phase 2
-  adds the first long-lived process that serves it.
-- **The launcher attaches with `stdio: "inherit"`.** The Concierge PTY
+- **The TTY launcher's operator API has no terminal stream.**
+  `inbox` and `watch` read the store directly. The workplace connects
+  the operator API to the host-managed PTY.
+- **The TTY launcher attaches with `stdio: "inherit"`.** The Concierge PTY
   belongs to the operator's terminal today
   (`MicrosandboxRuntime.attachTerminal`).
 

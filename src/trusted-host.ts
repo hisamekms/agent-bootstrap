@@ -1691,7 +1691,7 @@ export class TrustedHost {
               let active = true;
               const check = () => {
                 ensureAudit();
-                if (!accepting || !active)
+                if (!accepting || !active || command.signal?.aborted)
                   throw new SandboxRuntimeError("unknown-handle");
                 if (performance.now() >= deadline)
                   throw new SandboxRuntimeError("lifetime-expired");
@@ -1789,13 +1789,14 @@ export class TrustedHost {
                 throw new SandboxRuntimeError("invalid-input");
               terminalSink = { cols, rows, data: sink.data.bind(sink) };
             }
-            const { argv, env, workdir } = command;
+            const { argv, env, workdir, signal } = command;
             request = {
               argv:
                 Array.isArray(argv) && !shellMount
                   ? claudeMountArgv(argv, mountConfigDir, mounted.length > 0)
                   : argv,
               ...(workdir === undefined ? {} : { workdir }),
+              ...(signal === undefined ? {} : { signal }),
               ...(env === undefined
                 ? {}
                 : { env: Object.fromEntries(terminalEnvEntries(env)) }),
