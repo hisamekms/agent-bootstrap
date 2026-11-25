@@ -354,6 +354,17 @@ were fixed first:
   fontconfig regenerates them on demand.
 - **D-Bus machine ID.** It is random per install, so it is emptied.
 
+On 2026-11-25 a locked rebuild no longer matched `4ad2da06…`. Two builds
+that day agreed with each other, and so did a build with the 2026-11-23
+build script, so the difference came from the build date. `useradd`
+leaves a `/etc/shadow-` backup that still held the install day for two
+accounts; only `/etc/shadow` was normalized. Both files are now
+normalized, and the lock records `bb85b946…`. The same rebuild showed that
+the smoke test had stopped working after builds moved to the audited
+gateway: Chromium's startup lookups exceeded the gateway's attempt burst
+and quarantined it. Smoke tests now run with no network, as task VMs do,
+and record egress mode `none`.
+
 Toolchains, language packages, the preparer VM and dependency changes are
 planned in `docs/repository-environments.md`.
 

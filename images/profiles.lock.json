@@ -9,7 +9,7 @@
       "cpus": 2
     },
     "browser": {
-      "image": "localhost/agent-bootstrap/browser@sha256:4ad2da06e20ef267ee03bc3a0bb35fe480984f06dfafd38d7f9574c2465f0120",
+      "image": "localhost/agent-bootstrap/browser@sha256:bb85b94626eca15128968c4f9a53d9fb3e8c7fdd9be2f529e9af63cb23aa6cff",
       "recipeDigest": "2212db9f2a1fe97af2175c5153194907610b6c6cb38839a02c0d55c40d6c71a5",
       "memoryMiB": 2048,
       "cpus": 2,

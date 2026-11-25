@@ -71,8 +71,11 @@ export async function withBuildSandbox<T>({
   let created = false;
   let outcome: "ok" | "failed" = "failed";
   const abort = new AbortController();
+  // Smoke tests run with no network at all, like task VMs: a gateway with an
+  // empty allowlist would quarantine on a browser's startup lookups.
+  const gatewayDown = () => !smoke && gateway?.quarantined !== false;
   const ensureAudit = () => {
-    if (!audit.isV5Writable || gateway?.quarantined !== false)
+    if (!audit.isV5Writable || gatewayDown())
       throw new Error("Image build gateway or audit unavailable");
   };
 
@@ -117,37 +120,44 @@ export async function withBuildSandbox<T>({
       executionId: invocationId,
       attributes: { purpose: smoke ? "image-smoke" : "image-build" },
     });
-    gateway = await openGateway({
-      executionId: invocationId,
-      sandboxLabel: sandboxId,
-      policy,
-      audit,
-    });
+    if (!smoke)
+      gateway = await openGateway({
+        executionId: invocationId,
+        sandboxLabel: sandboxId,
+        policy,
+        audit,
+      });
     ensureAudit();
     const passwordEnv = "AGENT_GATEWAY_BUILD_SECRET";
-    const args = networkArgs({
-      socksPort: gateway.socksPort,
-      dnsPort: gateway.dnsPort,
-      username: gateway.username,
-      passwordEnv,
-    });
+    const args = networkArgs(
+      gateway && {
+        socksPort: gateway.socksPort,
+        dnsPort: gateway.dnsPort,
+        username: gateway.username,
+        passwordEnv,
+      },
+    );
     authorize("sandbox.create");
     audit.appendSandboxBinding({
       invocationId,
       sandboxId,
       runtimeKind: "microsandbox",
-      egressMode: "gateway",
       netRuleDigest: digestNetworkArgs(args),
-      gatewayPolicyId: policy.policyId,
-      gatewayPolicyDigest: gatewayPolicyDigest(policy),
+      ...(gateway
+        ? {
+            egressMode: "gateway",
+            gatewayPolicyId: policy.policyId,
+            gatewayPolicyDigest: gatewayPolicyDigest(policy),
+          }
+        : { egressMode: "none" }),
     });
     const timer = setInterval(() => {
-      if (!audit.isV5Writable || gateway?.quarantined !== false) abort.abort();
+      if (!audit.isV5Writable || gatewayDown()) abort.abort();
     }, 25);
     try {
       ensureAudit();
-      const password = gateway.password;
-      if (!/^[\x21-\x7e]{1,255}$/.test(password))
+      const password = gateway?.password;
+      if (gateway && !/^[\x21-\x7e]{1,255}$/.test(password ?? ""))
         throw new Error("Image build gateway credential unavailable");
       ensureAudit();
       created = true; // A failing backend may still have created the VM.
@@ -172,7 +182,7 @@ export async function withBuildSandbox<T>({
             image,
           ],
           300_000,
-          { [passwordEnv]: password },
+          password === undefined ? {} : { [passwordEnv]: password },
           abort.signal,
         );
       } catch (error) {

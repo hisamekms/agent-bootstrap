@@ -159,3 +159,18 @@ and integration.
   fail as stale.
   _Lesson:_ Goals need a host-recorded discard that closes the Goal,
   resolves its inbox items and removes its private refs together.
+- **A locked image drifted with the calendar.** The browser image was
+  reproducible on one day and not two days later. The build normalized
+  `/etc/shadow` dates but not the `/etc/shadow-` backup. Two rebuilds on
+  the same day agreed, which hid the problem.
+  _Lesson:_ reproducibility checks must build on different days (or with a
+  shifted clock), and setup must print why a locked build differs instead
+  of only the stage.
+- **A security change silently broke a smoke test.** Moving image builds
+  behind the audited gateway also routed the smoke test through it with
+  an empty allowlist. Chromium's startup lookups exceeded the burst limit
+  and quarantined the gateway. No locked build had reached the smoke stage
+  since, so nothing noticed.
+  _Lesson:_ when a boundary changes, run every profile's full build path
+  once, and give no-network stages no network instead of an empty
+  allowlist.
