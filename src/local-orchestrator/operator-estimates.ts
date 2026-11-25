@@ -19,8 +19,15 @@ type TaskStage = TrackStage | "failed" | "cancelled";
 export function taskStage(
   status: TaskStatus,
   execution?: Pick<TimelineEvent, "actor" | "mode">,
+  code?: string | null,
 ): TaskStage {
   if (status === "succeeded") return "done";
+  // The store keeps an integrating Task "running" with an integration code.
+  if (
+    status === "running" &&
+    (code === "integration-in-progress" || code === "integration-uncertain")
+  )
+    return "awaiting-integration";
   if (status === "running" && isReview(execution)) return "review";
   return status;
 }

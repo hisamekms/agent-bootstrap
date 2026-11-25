@@ -2607,7 +2607,8 @@ export class OrchestratorStore {
            FROM tasks AS t JOIN events AS e ON e.subject_id = t.id
            WHERE t.status = 'succeeded'
              AND e.subject_kind = 'task' AND e.kind = 'task.status'
-           GROUP BY t.id HAVING startedAt IS NOT NULL AND finishedAt IS NOT NULL`,
+           GROUP BY t.id HAVING startedAt IS NOT NULL AND finishedAt IS NOT NULL
+           ORDER BY finishedAt DESC LIMIT 200`,
         )
         .all(),
     );
@@ -2806,7 +2807,7 @@ export class OrchestratorStore {
         ), items AS (
           SELECT history.*, CASE WHEN NOT ?3 THEN wasResolved OR coalesce(g.status = 'cancelled', 0)
             WHEN g.status IS NOT 'active' OR t.status IN ('succeeded', 'cancelled') THEN 1
-            WHEN kind = 'execution-over-budget' THEN 0
+            WHEN kind = 'execution-over-budget' THEN wasResolved
             WHEN executionId IS NOT NULL THEN wasResolved
             ELSE wasResolved OR t.status IS NOT 'failed'
           END AS resolved

@@ -113,7 +113,10 @@ function goalSummary(
     status,
     createdAt,
     progress,
-    estimate: goalEstimate(progress.total - progress.done, wallTime),
+    estimate:
+      status === "active"
+        ? goalEstimate(progress.total - progress.done, wallTime)
+        : { remainingMs: null, basis: "current-plan" as const },
   };
 }
 
@@ -147,7 +150,11 @@ function taskSummary(
 ) {
   const { id, content, status, attempts, retries } = task;
   const timing = timings.get(id);
-  const stage = taskStage(status, timing?.activeExecution);
+  const stage = taskStage(
+    status,
+    timing?.activeExecution,
+    "code" in task ? (task.code as string | undefined) : undefined,
+  );
   const started = timing?.times.running;
   const stageStarted =
     stage === "failed" || stage === "cancelled"

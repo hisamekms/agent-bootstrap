@@ -88,3 +88,9 @@ test("Task stages use the running execution only while the Task is running", () 
     "running",
   );
 });
+
+test("a Task that is integrating stays at the awaiting-integration stage", () => {
+  for (const code of ["integration-in-progress", "integration-uncertain"])
+    assert.equal(taskStage("running", undefined, code), "awaiting-integration");
+  assert.equal(taskStage("running", undefined, "other"), "running");
+});
