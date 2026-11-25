@@ -335,7 +335,62 @@ export const SECRET_PROBE_SCRIPT = SECRET_TOOL_DIRS.tmp + "/selftest.sh";
 export const SECRET_PROBE_REPORT = "probe.txt";
 export const SECRET_PROBE_HASH = "agent-probe-sha256";
 
-function secretFileLaunch(variable: string, probe: boolean): string {
+// Matches the pinned CLI's sandbox placeholders. Recheck when the CLI pin changes.
+export const SANDBOX_PLACEHOLDER_BASENAMES = [
+  ".env",
+  ".env.development",
+  ".env.development.local",
+  ".env.local",
+  ".env.production",
+  ".env.production.local",
+  ".env.test",
+  ".env.test.local",
+  ".gitmodules",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  "bunfig.toml",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+] as const;
+
+export function secretFilePlaceholderCleanup(root = "/workspace"): string {
+  const names = SANDBOX_PLACEHOLDER_BASENAMES.map((name) => `-name ${name}`);
+  return String.raw`placeholder_root='${root.replaceAll("'", "'\\''")}'
+placeholder_paths() {
+  find "$placeholder_root" -xdev -path "$placeholder_root/.git" -prune -o \( ${names.join(" -o ")} \) "$@" -print0
+}
+snapshot_placeholders() {
+  umask 077
+  placeholders=$(mktemp -d /tmp/agent-placeholders.XXXXXX)
+  trap 'rm -f -- "$placeholders/before" "$placeholders/after"; rmdir -- "$placeholders"' EXIT
+  placeholder_paths > "$placeholders/before"
+}
+clean_placeholders() {
+  placeholder_paths -type f -size 0 > "$placeholders/after" || return
+  bash -ec '
+    while IFS= read -r -d "" path; do
+      while IFS= read -r -d "" prior; do
+        if test "$prior" = "$path"; then continue 2; fi
+      done < "$1/before"
+      (
+        # Anchor the removal in the physical parent and reject redirected paths.
+        parent=${"$"}{path%/*}
+        cd -P -- "$parent"
+        test "$PWD" = "$parent"
+        find "./${"$"}{path##*/}" -prune -type f -size 0 -exec rm -f -- {} +
+      )
+    done < "$1/after"
+  ' tool-cleanup "$placeholders"
+}`;
+}
+
+function secretFileLaunch(
+  variable: string,
+  probe: boolean,
+  worker: boolean,
+): string {
   // Keep the challenge script in the shell temp directory, outside file-tool access.
   const observe = probe
     ? String.raw`
@@ -395,6 +450,7 @@ function secretFileLaunch(variable: string, probe: boolean): string {
           printf "%s\n" "${CLAUDE_BWRAP_FAILED}" >&2
           exit 1
         fi
+        ${worker ? 'eval "$1"; shift; snapshot_placeholders' : ""}
         ${probe ? `printf "%s\\n" "${CLAUDE_BWRAP_OK}" >&2` : ""}
         ${observe}
         (
@@ -413,8 +469,12 @@ function secretFileLaunch(variable: string, probe: boolean): string {
         rm -f "$samples"`
             : ""
         }
+        ${worker ? 'clean_placeholders || printf "%s\\n" "sandbox placeholder cleanup failed" >&2 || :' : ""}
         exit "$status"
-      ' tool-secret`.replace(/^ +/gm, "");
+      ' tool-secret${worker ? ' "$placeholder_cleanup"' : ""}`.replace(
+    /^ +/gm,
+    "",
+  );
 }
 
 // Root reports the hash, while the bounded read runs with the agent's permissions.
@@ -427,8 +487,10 @@ export function secretFileLauncherTemplate() {
   return [
     secretFileSetup("/workspace", true),
     secretFileSetup("/review", false),
-    secretFileLaunch("FIXTURE_TOKEN", false),
-    secretFileLaunch("FIXTURE_TOKEN", true),
+    secretFileLaunch("FIXTURE_TOKEN", false, false),
+    secretFileLaunch("FIXTURE_TOKEN", false, true),
+    secretFileLaunch("FIXTURE_TOKEN", true, true),
+    secretFilePlaceholderCleanup(),
     secretGitEnv,
     secretProbeEvidence,
   ];
@@ -523,6 +585,8 @@ $(cat /review/review-notes.txt)"
   const output = worker
     ? `printf '%s' '{"tool":"collect"}'`
     : "head -c 65536 /tmp/claude-out.json";
+  const placeholderCleanup = secretFile && worker;
+  const baseUrl = placeholderCleanup ? '"$tool_base_url"' : `'${task.baseUrl}'`;
   const script = `
 ${claudeCodeGuestSetup(credential?.variable, guest, secretFile)}    test ! -e /root/.claude
 ${
@@ -538,6 +602,8 @@ ${
     cd ${cwd}
     ${promptSetup}
     ${reviewNotes}
+    ${placeholderCleanup ? 'placeholder_cleanup="$2"' : ""}
+    ${placeholderCleanup && task.baseUrl ? 'tool_base_url="$3"' : ""}
     permission_mode=${credential ? tools.mode : "default"}
     set -- ${toolFlags}
     if test -n "\${LO_MOUNT_RESTRICTED:-}"; then
@@ -550,10 +616,10 @@ ${
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
       ${credential ? `${credential.variable}="$${credential.variable}"` : ""} \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" \\
-      ${task.baseUrl ? `ANTHROPIC_BASE_URL='${task.baseUrl}' ` : ""}\\
+      ${task.baseUrl ? `ANTHROPIC_BASE_URL=${baseUrl} ` : ""}\\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
-      ${secretFile ? `${secretFileLaunch(auth.variable, task.secretFileProbe === true)} ` : ""}${CLAUDE_CODE.guestPath} -p ${credential?.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
+      ${secretFile ? `${secretFileLaunch(auth.variable, task.secretFileProbe === true, worker)} ` : ""}${CLAUDE_CODE.guestPath} -p ${credential?.bare ? "--bare " : ""}--strict-mcp-config --setting-sources '' \\
         --disable-slash-commands --no-session-persistence --output-format json \\
         --model '${task.model}' --max-turns ${task.maxTurns} \\
         --permission-mode "$permission_mode" \\
@@ -572,7 +638,16 @@ ${
     ${output}
   `;
   return {
-    argv: ["/bin/sh", "-ec", script, "claude-code", task.prompt],
+    argv: [
+      "/bin/sh",
+      "-ec",
+      script,
+      "claude-code",
+      task.prompt,
+      // Keep the cleanup functions and optional endpoint within the argv limit.
+      ...(placeholderCleanup ? [secretFilePlaceholderCleanup(cwd)] : []),
+      ...(placeholderCleanup && task.baseUrl ? [task.baseUrl] : []),
+    ],
     timeoutMs: task.timeoutMs,
     ...(secretFile ? { claudeSecretVariable: auth.variable } : {}),
     ...(task.shell ? { claudeShell: true } : {}),

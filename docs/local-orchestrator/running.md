@@ -116,6 +116,12 @@ budget. A passing command allows review to proceed and the resulting
 proposal records `verified: true`. Verification runs again at integration.
 Without a suite, a human must answer the integration gate.
 
+### Run with secret files
+
+Before collecting output for a [secret-file run](../agent-guide.md#secrets),
+the Worker launcher removes newly created empty sandbox placeholders and
+preserves pre-existing paths.
+
 ## Troubleshooting
 
 ### Claude Code cannot reach platform.claude.com

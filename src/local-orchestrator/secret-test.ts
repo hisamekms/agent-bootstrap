@@ -8,13 +8,14 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExecutionAudit, NetworkEvent } from "../audit.ts";
 import {
   CLAUDE_BWRAP_OK,
   CLAUDE_CODE,
   CLAUDE_WORKER_USAGE_MARKER,
+  SANDBOX_PLACEHOLDER_BASENAMES,
   SECRET_PROBE_HASH,
   SECRET_PROBE_REPORT,
   SECRET_PROBE_SCRIPT,
@@ -336,11 +337,21 @@ export function evaluateSecretTest({
   const rootHash = header
     .split("\n")
     .filter((line) => line.startsWith(SECRET_PROBE_HASH + " "));
+  const placeholderNames: ReadonlySet<string> = new Set(
+    SANDBOX_PLACEHOLDER_BASENAMES,
+  );
   const checks = {
     worker:
       runSucceeded &&
       Boolean(cliResult && !cliResult.isError) &&
       header.split("\n").includes(CLAUDE_BWRAP_OK),
+    // The self-test repository is seeded without any sandbox placeholders.
+    placeholdersCleaned: ![...files].some(
+      ([path, { mode, bytes }]) =>
+        mode !== "120000" &&
+        bytes.length === 0 &&
+        placeholderNames.has(basename(path)),
+    ),
     probeEvidence:
       !!hash &&
       ["bwrap", "sh"].every((expected) =>

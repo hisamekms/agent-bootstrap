@@ -5,7 +5,9 @@ import { createConnection } from "node:net";
 import {
   mkdir,
   mkdtemp,
+  lstat,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -18,6 +20,8 @@ import {
   claudeCodeCommand,
   claudeCodeProvider,
   claudeCodeTools,
+  secretFileLauncherTemplate,
+  secretFilePlaceholderCleanup,
 } from "../src/claude-code.ts";
 import { managedClaudeSettings } from "../src/local-orchestrator/claude-policy.ts";
 import { withActorSecret } from "../src/local-orchestrator/secret-launch.ts";
@@ -123,12 +127,17 @@ test("secret-file Claude command stages a restricted launcher and drops privileg
     assert.ok(!script.includes(part), part);
     assert.ok(probe.includes(part), part);
   }
-  assert.ok(
-    claudeCodeCommand(
-      { ...task, model: "m".repeat(81), secretFileProbe: true },
-      { ...auth, variable: "V".repeat(58) + "_TOKEN" },
-    ).argv[2]!.length <= 8192,
+  const baseUrl = "https://" + "a".repeat(253) + ":65535";
+  const largestProbe = claudeCodeCommand(
+    { ...task, model: "m".repeat(81), secretFileProbe: true, baseUrl },
+    { ...auth, variable: "V".repeat(58) + "_TOKEN" },
   );
+  assert.ok(largestProbe.argv.every((arg) => arg.length <= 8192));
+  const largestScript = largestProbe.argv[2]!;
+  const saveBaseUrl = largestScript.indexOf('tool_base_url="$3"');
+  assert.ok(saveBaseUrl >= 0 && saveBaseUrl < largestScript.indexOf("set --"));
+  assert.ok(largestScript.includes('BASE_URL="$tool_base_url"'));
+  assert.equal(largestProbe.argv[6], baseUrl);
   assert.ok(probe.length <= 8192);
   assert.equal(spawnSync("/bin/sh", ["-n", "-c", probe]).status, 0);
   const launch = /\/bin\/sh -ec '([\s\S]+)' tool-secret/.exec(probe)?.[1];
@@ -151,6 +160,104 @@ test("secret-file Claude command stages a restricted launcher and drops privileg
     claudeCodeCommand(task, { ...auth, variable: "LD_UNSAFE_SECRET" }),
   );
   assert.throws(() => claudeCodeProvider(auth));
+});
+
+test("secret-file Worker scans and cleans placeholders in the root launcher", () => {
+  const task = {
+    model: "fixture",
+    prompt: "Fixture",
+    maxTurns: 1,
+    timeoutMs: 1000,
+  } as const;
+  const snippet = secretFilePlaceholderCleanup();
+  const templates = secretFileLauncherTemplate();
+  assert.ok(templates.includes(snippet));
+  for (const secretFileProbe of [false, true]) {
+    const { argv } = claudeCodeCommand(
+      { ...task, role: "Worker", secretFileProbe },
+      auth,
+    );
+    assert.equal(argv[5], snippet);
+    const script = argv[2]!;
+    const save = script.indexOf('placeholder_cleanup="$2"');
+    assert.ok(save >= 0 && save < script.indexOf("set --"));
+    const root =
+      /\/bin\/sh -ec '([\s\S]+)' tool-secret "\$placeholder_cleanup"/.exec(
+        script,
+      )?.[1];
+    assert.ok(root);
+    const scan = root.indexOf('eval "$1"; shift; snapshot_placeholders');
+    const drop = root.indexOf('/bin/busybox su -p -s /bin/sh -c "IFS=');
+    const wait = root.indexOf('wait "$tool" || status=$?');
+    const cleanup = root.indexOf("clean_placeholders ||");
+    assert.ok(scan >= 0 && scan < drop && drop < wait && wait < cleanup);
+    assert.ok(cleanup < root.indexOf('exit "$status"'));
+    if (secretFileProbe) {
+      assert.ok(scan < root.indexOf("samples=$(mktemp"));
+      assert.ok(root.indexOf('wait "$observer"') < cleanup);
+    }
+  }
+  for (const role of ["Planner", "Reviewer"] as const) {
+    const { argv } = claudeCodeCommand({ ...task, role }, auth);
+    assert.equal(argv.length, 5);
+    assert.doesNotMatch(argv[2]!, /snapshot_placeholders|clean_placeholders/);
+  }
+});
+
+test("placeholder cleanup removes only new empty regular files outside root .git", async () => {
+  const temp = await realpath(await mkdtemp(join(tmpdir(), "ab-placeholder-")));
+  try {
+    const root = join(temp, "work ' tree");
+    const subdir = join(root, "sub\nline");
+    const git = join(root, ".git");
+    const target = join(temp, "target");
+    const manifest = join(temp, "manifest");
+    await mkdir(subdir, { recursive: true });
+    await mkdir(git);
+    await mkdir(target);
+    await writeFile(join(target, ".env"), "");
+    await writeFile(join(subdir, ".env.local"), "");
+    const script = `${secretFilePlaceholderCleanup(root)}
+snapshot_placeholders
+stat_path="$placeholders/before"
+test -f "$stat_path"
+ls -ld "$stat_path" > "$1"
+: > "${root}/.env"
+: > "${subdir}/.npmrc"
+printf data > "${root}/yarn.lock"
+ln -s "${target}/.env" "${root}/bunfig.toml"
+ln -s "${target}" "${root}/linked"
+: > "${git}/.yarnrc"
+: > "${root}/unrelated"
+: > "${root}/.env.test"
+bash() {
+  rm "${root}/.env.test"
+  mkdir "${root}/.env.test"
+  : > "${root}/.env.test/unrelated"
+  command bash "$@"
+}
+clean_placeholders`;
+    const result = spawnSync("/bin/sh", ["-ec", script, "fixture", manifest]);
+    assert.equal(result.status, 0, result.stderr.toString());
+    assert.match(await readFile(manifest, "utf8"), /^-rw-------[ @+]/);
+    for (const path of [join(root, ".env"), join(subdir, ".npmrc")]) {
+      await assert.rejects(lstat(path), { code: "ENOENT" });
+    }
+    for (const path of [
+      join(subdir, ".env.local"),
+      join(git, ".yarnrc"),
+      join(root, "unrelated"),
+      join(root, ".env.test", "unrelated"),
+      join(target, ".env"),
+    ]) {
+      assert.equal((await lstat(path)).size, 0, path);
+    }
+    assert.equal(await readFile(join(root, "yarn.lock"), "utf8"), "data");
+    assert.ok((await lstat(join(root, "bunfig.toml"))).isSymbolicLink());
+    assert.ok((await lstat(join(root, "linked"))).isSymbolicLink());
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test("secret-file managed settings require the Bash sandbox and constrain file tools", () => {

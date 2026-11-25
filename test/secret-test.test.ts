@@ -271,3 +271,18 @@ test("workspace probe output requires the current nonce, root hash and uid-1000 
     assert.equal(evaluateSecretTest({ ...input, stderr }).pass, false);
   }
 });
+
+test("the secret self-test rejects new empty sandbox placeholders in collected files", () => {
+  const input = fixture();
+  const files = new Map(input.files);
+  files.set("unrelated-empty", { mode: "100644", bytes: Buffer.alloc(0) });
+  files.set(".env.test", { mode: "100644", bytes: Buffer.from("data") });
+  assert.equal(
+    evaluateSecretTest({ ...input, files }).checks.placeholdersCleaned,
+    true,
+  );
+  files.set("nested/.npmrc", { mode: "100644", bytes: Buffer.alloc(0) });
+  const result = evaluateSecretTest({ ...input, files });
+  assert.equal(result.checks.placeholdersCleaned, false);
+  assert.equal(result.pass, false);
+});
