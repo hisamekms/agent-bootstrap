@@ -20,7 +20,10 @@ import {
 } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
 import { resolveMsbHome, type MsbHomeResolution } from "../config/msb-home.ts";
-import { hasSecretTestPass } from "../local-orchestrator/secret-test-record.ts";
+import {
+  hasSecretTestPass,
+  secretTestCommand,
+} from "../local-orchestrator/secret-test-record.ts";
 import { CLAUDE_CODE } from "../claude-code.ts";
 import {
   driftWarning,
@@ -351,6 +354,7 @@ export async function doctor(
   let verifyProfile: string | undefined;
   let layers: ReturnType<typeof loadConfig> | undefined;
   let configurationError = false;
+  let secretTestTarget = path ?? root;
   try {
     const legacyRecovery =
       !concierge && path === undefined && (await hasLegacyState(root));
@@ -393,6 +397,7 @@ export async function doctor(
         : await resolveConfigTarget(path, root, host.env);
     layers = loadConfig(host.env, target?.configDirectory, host.actorHarnesses);
     if (target) {
+      secretTestTarget = target.repoRoot;
       add(
         check(
           "target",
@@ -597,11 +602,7 @@ export async function doctor(
           `secretEnv.${variable}`,
           passed ? "ok" : "missing",
           `${actors.join(", ")}. Self-test for CLI ${CLAUDE_CODE.version} and current containment ${passed ? "passed" : "required"}.`,
-          passed
-            ? []
-            : [
-                `Run agent-bootstrap secrets test ${variable} with the same target.`,
-              ],
+          passed ? [] : [secretTestCommand(variable, secretTestTarget)],
           false,
           !passed,
         ),

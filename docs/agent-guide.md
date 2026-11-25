@@ -248,7 +248,7 @@ agent-bootstrap sandbox shell --profile base --run
 ```
 
 **Expected output**  
-Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. Claude failures can include a fixed code and next action. For unsafe-input-symlink, replace absolute or escaping links with relative links inside the repository and retry with the corrected commit. If the audit store does not open, keep the file and report the displayed code. Do not delete the audit database. Doctor reports the effective authentication mode and its source.
+Reconcile previews unfinished records before confirmation. Retry registers a failed Task with a new attempt. For path-violation, inspect the rejected paths with show or show-execution. For unsafe-input-symlink, use relative links inside the repository and retry with the corrected commit. For secret-test-required, run the self-test command printed by doctor or the launcher. Launcher codes identify configuration, volume, runtime home or version, audit store, Git integration, state store, and gateway startup failures. Follow the displayed next action and keep the audit database for diagnosis.
 
 **Next action**  
 Check status for the new attempt. If integration remains uncertain, inspect the private ref and integration journal before retrying.

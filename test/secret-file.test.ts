@@ -46,11 +46,12 @@ test("actor launch refuses an untested variable before reading Keychain or openi
       "/missing-fixture-state",
       auth.variable,
       "fixture-image",
+      "/fixture-target",
       async () => assert.fail("actor launched before passing the self-test"),
       async () => assert.fail("Keychain read before passing the self-test"),
     ),
     {
-      next: "Run agent-bootstrap secrets test TOOL_TOKEN with the same target, then retry.",
+      next: "agent-bootstrap secrets test TOOL_TOKEN --target /fixture-target",
     },
   );
 });

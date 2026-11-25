@@ -6,7 +6,7 @@ import {
   secretSocketRoot,
 } from "../secret-file.ts";
 import type { SecretFileDelivery } from "../secret-file.ts";
-import { hasSecretTestPass } from "./secret-test-record.ts";
+import { hasSecretTestPass, secretTestCommand } from "./secret-test-record.ts";
 
 type SecretConfig = Pick<Config, "secretEnv" | "secrets">;
 
@@ -16,11 +16,40 @@ export function secretVariable(config: SecretConfig, actor: SecretActor) {
   )?.[0];
 }
 
+export class SecretTestRequiredError extends ConfigError {
+  readonly code = "secret-test-required";
+
+  constructor(variable: string, target: string) {
+    super(
+      `secretEnv.${variable}`,
+      "This credential variable has no current self-test pass for the pinned CLI and containment.",
+      secretTestCommand(variable, target),
+    );
+  }
+}
+
+export function secretTestWarnings(
+  config: SecretConfig,
+  state: string,
+  baseImage: string,
+  target: string,
+): string[] {
+  return Object.keys(config.secretEnv ?? {})
+    .filter(
+      (variable) => !hasSecretTestPass(state, variable, undefined, baseImage),
+    )
+    .map(
+      (variable) =>
+        `Warning: ${variable} has no current self-test pass.\nnext: ${secretTestCommand(variable, target)}`,
+    );
+}
+
 export async function withActorSecret<T>(
   config: SecretConfig,
   state: string,
   variable: string,
   baseImage: string,
+  target: string,
   run: (options: {
     secretFile: SecretFileDelivery;
     secretTest: "passed";
@@ -37,11 +66,7 @@ export async function withActorSecret<T>(
       "Define the secret in the user configuration.",
     );
   if (!hasSecretTestPass(state, variable, undefined, baseImage))
-    throw new ConfigError(
-      key,
-      "This credential variable has no current self-test pass for the pinned CLI and containment.",
-      `Run agent-bootstrap secrets test ${variable} with the same target, then retry.`,
-    );
+    throw new SecretTestRequiredError(variable, target);
   const root = await secretSocketRoot();
   const value = await read(definition.keychainService).catch(() => {
     throw new ConfigError(

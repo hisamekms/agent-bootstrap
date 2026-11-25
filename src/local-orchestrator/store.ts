@@ -1,3 +1,4 @@
+import { readPathViolations, type PathViolation } from "./path-violations.ts";
 import { randomUUID } from "node:crypto";
 import { closeSync, lstatSync, openSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -1118,12 +1119,14 @@ export class OrchestratorStore {
     code: string | null,
     at: string,
     proposalId?: string,
+    rejectedPaths?: readonly PathViolation[],
   ) {
     this.#run("UPDATE tasks SET status = ? WHERE id = ?", status, id);
     this.#event(at, "task.status", "task", id, {
       status,
       code,
       ...(proposalId && { proposalId }),
+      ...(rejectedPaths && { rejectedPaths }),
     });
   }
 
@@ -1141,13 +1144,17 @@ export class OrchestratorStore {
     });
   }
 
-  failTask(taskId: string, code: string) {
+  failTask(
+    taskId: string,
+    code: string,
+    rejectedPaths?: readonly PathViolation[],
+  ) {
     const id = identifier(taskId);
     const reason = identifier(code);
     this.#write((at) => {
       if (required(this.#task(id)).status !== "running")
         throw new OrchestratorStoreError("invalid-transition");
-      this.#setTaskStatus(id, "failed", reason, at);
+      this.#setTaskStatus(id, "failed", reason, at, undefined, rejectedPaths);
     });
   }
 
@@ -2323,6 +2330,24 @@ export class OrchestratorStore {
       code === "integration-uncertain"
       ? { code }
       : {};
+  }
+
+  taskPathViolations(taskId: string) {
+    return this.#read(() => {
+      const latest = this.#db
+        .query<{ data: string }>(
+          `SELECT data FROM events WHERE subject_kind = 'task' AND subject_id = ? AND kind = 'task.status'
+         ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(identifier(taskId));
+      if (!latest) return;
+      const data = JSON.parse(latest.data) as {
+        code?: string;
+        rejectedPaths?: unknown;
+      };
+      if (data?.code === "path-violation")
+        return readPathViolations(data.rejectedPaths);
+    });
   }
 
   getTask(taskId: string) {

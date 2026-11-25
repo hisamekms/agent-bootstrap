@@ -1,6 +1,7 @@
 import { GitIntegrationError } from "../git-integration.ts";
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
+import { SecretTestRequiredError } from "./secret-launch.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
 import { randomUUID } from "node:crypto";
 import type { RoleHarness } from "../actors.ts";
@@ -513,14 +514,20 @@ export class ActorRunner {
         error instanceof OrchestratorStoreError
           ? error.code
           : "host-error";
-      completion =
+      if (error instanceof SecretTestRequiredError)
+        completion = {
+          status: "failed",
+          result: { code: error.code, next: error.next },
+        };
+      else if (
         error instanceof GitIntegrationError &&
         error.code === "unsafe-input-symlink"
-          ? {
-              status: "failed",
-              result: { code: error.code, next: unsafeInputSymlinkNext },
-            }
-          : { status: "failed", result: { code } };
+      )
+        completion = {
+          status: "failed",
+          result: { code: error.code, next: unsafeInputSymlinkNext },
+        };
+      else completion = { status: "failed", result: { code } };
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {

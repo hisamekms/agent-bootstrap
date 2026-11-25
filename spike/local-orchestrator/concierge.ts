@@ -43,13 +43,19 @@ import {
 import { configuredVerification } from "../../src/local-orchestrator/verification.ts";
 import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../../src/mise-tools.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
-import { createObservedHost } from "../../src/observed-host.ts";
+import {
+  createObservedHost,
+  ObservedHostStartupError,
+} from "../../src/observed-host.ts";
 import {
   parseProfileLock,
   profileCatalog,
   PROFILE_LOCK_PATH,
 } from "../../src/profile-lock.ts";
 import { createTelemetry } from "../../src/telemetry.ts";
+import { VolumeError } from "../../src/volumes/volume.ts";
+import { unsafeInputSymlinkNext } from "../../src/workspace-tree.ts";
+import { secretTestWarnings } from "../../src/local-orchestrator/secret-launch.ts";
 
 const usage =
   "Usage: bun run spike/local-orchestrator/concierge.ts --run [--continue] [--mode <m>] [--target <path>] [--claude-auth <mode>]";
@@ -64,8 +70,10 @@ async function fromKeychain(service: string | undefined): Promise<string> {
     !service ||
     !/^[A-Za-z0-9._-]+$/.test(service)
   )
-    throw new Error(
-      "Configure the API key Keychain service for the current user.",
+    throw new ConfigError(
+      "credential source",
+      "The configured credential source is unavailable.",
+      "Configure the credential source for the current user, then retry.",
     );
   try {
     const { stdout } = await runFile(
@@ -77,7 +85,11 @@ async function fromKeychain(service: string | undefined): Promise<string> {
     if (value.length < 20 || /\s/.test(value)) throw new Error();
     return value;
   } catch {
-    throw new Error("Unable to read a usable Claude credential from Keychain");
+    throw new ConfigError(
+      "credential source",
+      "The configured credential could not be read.",
+      "Check the configured credential source for your account, then retry.",
+    );
   }
 }
 
@@ -96,10 +108,47 @@ async function microsandboxBinary() {
     if (!isAbsolute(dir)) throw new Error();
     return await realpath(join(dir, "msb"));
   } catch {
-    throw new Error(
-      "Install the pinned Microsandbox 0.7.16 mise tool before launching",
-    );
+    throw new ObservedHostStartupError("microsandbox-version-check-failed");
   }
+}
+
+export function conciergeFailure(stage: string, error: unknown): string {
+  const message = `Concierge failed to ${stage}`;
+  const withCause = (code: string, next: string) =>
+    `${message} (${code})\nnext: ${escapeTerminalControls(next)}`;
+  if (error instanceof ConfigError)
+    return withCause("config-invalid", error.next);
+  if (error instanceof VolumeError)
+    return withCause(`volume/${error.code}`, error.next);
+  if (error instanceof MsbHomeError)
+    return withCause("runtime-home-invalid", error.next);
+  if (error instanceof AuditStoreError)
+    return withCause(
+      `audit-store/${error.code}`,
+      "Keep the audit database and run agent-bootstrap help troubleshoot.",
+    );
+  if (error instanceof GitIntegrationError)
+    return withCause(
+      `git-integration/${error.code}`,
+      error.code === "unsafe-input-symlink"
+        ? unsafeInputSymlinkNext
+        : "Check the target checkout and local main, then run agent-bootstrap help troubleshoot.",
+    );
+  if (error instanceof OrchestratorStoreError)
+    return withCause(
+      `orchestrator-store/${error.code}`,
+      error.code === "session-busy"
+        ? "Wait for the active launcher, or run agent-bootstrap reconcile with the same target if it stopped."
+        : "Check the target state directory and run agent-bootstrap help troubleshoot.",
+    );
+  if (error instanceof ObservedHostStartupError)
+    return withCause(
+      error.code,
+      error.code === "gateway-startup-failed"
+        ? "Check local socket permissions and run agent-bootstrap help troubleshoot."
+        : "Check the pinned runtime with agent-bootstrap doctor.",
+    );
+  return message;
 }
 
 async function main(args: readonly string[]) {
@@ -114,7 +163,11 @@ async function main(args: readonly string[]) {
       `Dry run. The launcher would open the audited Concierge VM in ${flags.mode} mode${flags.continue ? " and resume the last conversation" : ""}, expose the Host API over vsock, and queue Planner runs.`,
     );
     if (flags.target !== undefined) {
-      const target = await resolveTarget(flags.target);
+      const target = await resolveTarget(flags.target).catch(
+        (error: unknown) => {
+          throw new Error(conciergeFailure("resolve target", error));
+        },
+      );
       console.log(
         JSON.stringify({ target: target.repoRoot, state: target.directory }),
       );
@@ -125,14 +178,32 @@ async function main(args: readonly string[]) {
   if (!(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY))
     throw new Error("Concierge --run requires an operator TTY");
 
+  let stage = "resolve target";
+  try {
+    await launchConcierge(flags, (next) => {
+      stage = next;
+    });
+  } catch (error) {
+    throw new Error(conciergeFailure(stage, error));
+  }
+}
+
+async function launchConcierge(
+  flags: ReturnType<typeof parseConciergeArgs>,
+  setStage: (stage: string) => void,
+) {
   const { LO_CLAUDE_BINARY } = process.env;
   const target = await resolveTarget(flags.target ?? bootstrapCheckout);
   const { bootstrapRoot, directory, repoRoot, configDirectory } = target;
+  setStage("load configuration");
   const layers = loadConfig(process.env, configDirectory);
+  setStage("resolve runtime home");
   const home = await requireMsbHome(process.env, layers.user);
   const warning = driftWarning(target.project, layers.approved);
   if (warning) console.error(warning);
+  setStage("prepare target state");
   await prepareTargetDirectory(bootstrapRoot, directory);
+  setStage("configure Concierge");
   const effective = loadClaudeConfig(
     process.env,
     configDirectory,
@@ -162,7 +233,11 @@ async function main(args: readonly string[]) {
     packageDir: join(local, "alpine/v3.23/main/aarch64"),
   };
   if (!volumeShell && !isAbsolute(install.binary))
-    throw new Error("LO_CLAUDE_BINARY must be an absolute path");
+    throw new ConfigError(
+      "CLI path",
+      "The path must be absolute.",
+      "Configure an absolute path to the pinned CLI.",
+    );
   if (!volumeShell)
     await Promise.all(
       [
@@ -174,11 +249,15 @@ async function main(args: readonly string[]) {
           : []),
       ].map((path) => access(path)),
     ).catch(() => {
-      throw new Error(
-        "The pinned CLI or required guest packages are missing. Review agent-bootstrap help setup.",
+      throw new ConfigError(
+        "CLI installation",
+        "The pinned CLI or required guest packages are missing.",
+        "Run agent-bootstrap help setup.",
       );
     });
+  setStage("locate runtime");
   const binary = await microsandboxBinary();
+  setStage("load runtime profiles");
   const profiles = profileCatalog(
     ALPINE_3_23.reference,
     parseProfileLock(
@@ -195,6 +274,15 @@ async function main(args: readonly string[]) {
     throw new Error(
       "The profile lock must include the configured Verification profile",
     );
+  const baseImage = profiles.get("base").image;
+  if (!volumeShell)
+    for (const warning of secretTestWarnings(
+      effective.config,
+      userStateDirectory(process.env),
+      baseImage,
+      repoRoot,
+    ))
+      console.error(warning);
   const auditPath = join(directory, "audit.sqlite");
   const displayedAuditPath = escapeTerminalControls(JSON.stringify(auditPath));
   const msb = { binary, home, stagingRoot: join(directory, "sandboxes") };
@@ -210,9 +298,11 @@ async function main(args: readonly string[]) {
     volumeShell || auth.mode === "external"
       ? undefined
       : claudeCodeProvider(auth);
+  setStage("read Concierge credential");
   let credential = provider
     ? await fromKeychain(effective.keychainService)
     : "";
+  setStage("configure audited host");
   const claude = createClaudePolicy(
     volumeShell
       ? {
@@ -239,7 +329,7 @@ async function main(args: readonly string[]) {
   let store: OrchestratorStore | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
   let sessionId: string | undefined;
-  let stage = "open state";
+  setStage("open state");
   try {
     if (!volumeShell)
       store = OrchestratorStore.open(join(directory, "state.db"));
@@ -250,7 +340,7 @@ async function main(args: readonly string[]) {
           ? `Inspect proposals and approvals from another host terminal with ${operatorCli}`
           : "Inspect proposals and approvals with the operator CLI and the same --target argument.",
       );
-    stage = "open audited host";
+    setStage("open audited host");
     observed = await createObservedHost({
       config,
       auditPath,
@@ -273,7 +363,7 @@ async function main(args: readonly string[]) {
         : {}),
       observers: [telemetry],
     });
-    stage = "launch or clean up session";
+    setStage("launch or clean up session");
     if (volumeShell) {
       const result = await observed.host.runVolumeShell(volumeShell);
       if (result.code) console.error(result.code);
@@ -291,7 +381,7 @@ async function main(args: readonly string[]) {
         install,
         auth,
         config: effective.config,
-        baseImage: profiles.get("base").image,
+        baseImage,
         note: (message) => console.error(message),
         ...(verificationConfig
           ? { verification: configuredVerification(verificationConfig) }
@@ -311,22 +401,6 @@ async function main(args: readonly string[]) {
       `Concierge outcome ${result.outcome}, exit code ${result.exitCode ?? "unavailable"}`,
     );
     if (result.outcome !== "ok" || result.exitCode !== 0) process.exitCode = 1;
-  } catch (error) {
-    if (error instanceof AuditStoreError)
-      throw new Error(
-        `Concierge failed to ${stage} (audit store ${error.code}, path ${displayedAuditPath})\nnext: agent-bootstrap help troubleshoot`,
-      );
-    if (
-      error instanceof GitIntegrationError &&
-      error.code === "unsafe-input-symlink"
-    )
-      throw new Error(error.message);
-    if (
-      error instanceof OrchestratorStoreError &&
-      error.code === "session-busy"
-    )
-      throw new Error(error.message);
-    throw new Error(`Concierge failed to ${stage}`);
   } finally {
     credential = "";
     const closed = await Promise.allSettled([
@@ -367,17 +441,10 @@ if (import.meta.main) {
   try {
     await main(process.argv.slice(2));
   } catch (error) {
-    if (error instanceof ConfigError || error instanceof MsbHomeError) {
-      console.error(`${error.message}\nnext: ${error.next}`);
-      process.exitCode = 1;
-    } else {
-      // Only fixed messages leave the launcher. Never echo subprocess errors.
-      console.error(
-        error instanceof Error && !("code" in error)
-          ? error.message
-          : "Concierge launcher failed",
-      );
-      process.exitCode = 1;
-    }
+    // main exposes fixed diagnostics and known recovery actions.
+    console.error(
+      error instanceof Error ? error.message : "Concierge launcher failed",
+    );
+    process.exitCode = 1;
   }
 }

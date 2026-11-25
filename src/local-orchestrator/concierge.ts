@@ -488,6 +488,7 @@ export async function startConcierge(
           userStateDirectory(env),
           variable,
           baseImage,
+          target.repoRoot,
           (secret) => run(plan, id, context, { ...runOptions, ...secret }),
         );
       } catch (error) {
