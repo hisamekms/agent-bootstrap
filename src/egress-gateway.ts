@@ -1,5 +1,9 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createSocket, type RemoteInfo } from "node:dgram";
+import {
+  createSocket,
+  type RemoteInfo,
+  type Socket as DgramSocket,
+} from "node:dgram";
 import { Resolver } from "node:dns/promises";
 import {
   connect as netConnect,
@@ -123,6 +127,30 @@ function listen(server: Server): Promise<number> {
   });
 }
 
+// TCP picks a free port and UDP reuses its number, so another process can
+// already hold the UDP side. Retry with a fresh pair a bounded number of times.
+export const DNS_BIND_ATTEMPTS = 8;
+
+function bindUdp(socket: DgramSocket, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(port, LOOPBACK, () => {
+      socket.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeUdp(socket: DgramSocket): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      socket.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 function credentialMatches(actual: Uint8Array, expected: Buffer): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
@@ -171,7 +199,7 @@ export class EgressGateway {
     this.#acceptSocks(socket),
   );
   readonly #dnsTcp = createServer((socket) => this.#acceptDnsTcp(socket));
-  readonly #dnsUdp = createSocket("udp4");
+  #dnsUdp = createSocket("udp4");
   readonly #flows = new Set<(reason: EndReason) => void>();
   readonly #dnsClients = new Set<Socket>();
   readonly #socksClients = new Set<Socket>();
@@ -236,18 +264,11 @@ export class EgressGateway {
         gateway.#quarantine("audit-failure"),
       );
       if (gateway.quarantined) throw new Error("Egress audit is unwritable");
+      gateway.#socksPort = await listen(gateway.#socks);
+      gateway.#dnsPort = await gateway.#bindDns();
+      // Attach after binding so a retried bind failure is not a quarantine.
       for (const listener of [gateway.#socks, gateway.#dnsTcp, gateway.#dnsUdp])
         listener.on("error", () => gateway.#quarantine("listener-error"));
-      gateway.#socksPort = await listen(gateway.#socks);
-      gateway.#dnsPort = await listen(gateway.#dnsTcp);
-      await new Promise<void>((resolve, reject) => {
-        const socket = gateway.#dnsUdp;
-        socket.once("error", reject);
-        socket.bind(gateway.#dnsPort, LOOPBACK, () => {
-          socket.off("error", reject);
-          resolve();
-        });
-      });
       if (gateway.quarantined) throw new Error("Egress gateway quarantined");
       gateway.#dnsUdp.on("message", (message, remote) =>
         gateway.#acceptDnsUdp(message, remote),
@@ -257,6 +278,24 @@ export class EgressGateway {
     } catch (error) {
       await gateway.close();
       throw error;
+    }
+  }
+
+  async #bindDns(): Promise<number> {
+    for (let attempt = 1; ; attempt += 1) {
+      const port = await listen(this.#dnsTcp);
+      try {
+        await bindUdp(this.#dnsUdp, port);
+        return port;
+      } catch (error) {
+        await Promise.all([
+          new Promise<void>((resolve) => this.#dnsTcp.close(() => resolve())),
+          closeUdp(this.#dnsUdp),
+        ]);
+        this.#dnsUdp = createSocket("udp4");
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "EADDRINUSE" || attempt >= DNS_BIND_ATTEMPTS) throw error;
+      }
     }
   }
 

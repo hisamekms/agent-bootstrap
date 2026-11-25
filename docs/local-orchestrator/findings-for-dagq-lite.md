@@ -139,6 +139,7 @@ and integration.
   takes an ephemeral TCP port for DNS and then binds UDP to the same
   number. If another process holds that UDP port, the bind fails with
   `EADDRINUSE` and the gateway does not start. A verification run hit
-  this once.
+  this once. The gateway now closes both listeners and retries with a
+  new pair, up to eight times. Any other bind error still fails at once.
   _Lesson:_ when two protocols must share a port, retry with a new port
   on collision, or let each listener choose its own port.

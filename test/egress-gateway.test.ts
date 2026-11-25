@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { createSocket } from "node:dgram";
+import { createSocket, Socket as DgramSocket } from "node:dgram";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -17,6 +17,7 @@ import {
 } from "../src/audit.ts";
 import { encodeDnsTcpFrame } from "../src/dns-wire.ts";
 import {
+  DNS_BIND_ATTEMPTS,
   EgressGateway,
   type EgressGatewayOptions,
 } from "../src/egress-gateway.ts";
@@ -891,4 +892,48 @@ test("a DNS pin that expires while the decision is committing cannot authorize a
   assert.equal((await client.read(10))[1], 2);
   assert.deepEqual(destinations, []);
   assert.equal(audit.outcomes[0]?.result, "refused");
+});
+
+function failUdpBinds(t: TestContext, count: number, code = "EADDRINUSE") {
+  const proto = DgramSocket.prototype;
+  const original = proto.bind;
+  let calls = 0;
+  const restore = () => {
+    proto.bind = original;
+  };
+  proto.bind = function (this: DgramSocket, ...args: unknown[]) {
+    calls += 1;
+    if (calls > count) return (original as Function).apply(this, args);
+    const error = Object.assign(new Error(`bind ${code}`), { code });
+    process.nextTick(() => this.emit("error", error));
+    return this;
+  } as typeof proto.bind;
+  t.after(restore);
+  return { calls: () => calls, restore };
+}
+
+test("retries the DNS port pair when another process holds the UDP side", async (t) => {
+  const binds = failUdpBinds(t, 2);
+  const { proxy } = await gateway(t);
+  binds.restore();
+  assert.equal(binds.calls(), 3);
+  assert.equal(proxy.quarantined, false);
+  const reply = await dnsUdp(t, proxy, question(hostname)).read();
+  assert.equal(reply.readUInt16BE(6), 1);
+  const tcp = socketClient(t, proxy.dnsPort);
+  await once(tcp.socket, "connect");
+});
+
+test("gives up on the DNS port pair after bounded collisions", async (t) => {
+  const binds = failUdpBinds(t, Number.MAX_SAFE_INTEGER);
+  await assert.rejects(gateway(t), { code: "EADDRINUSE" });
+  binds.restore();
+  assert.equal(binds.calls(), DNS_BIND_ATTEMPTS);
+});
+
+test("does not retry a DNS bind failure other than a port collision", async (t) => {
+  const binds = failUdpBinds(t, Number.MAX_SAFE_INTEGER, "EACCES");
+  await assert.rejects(gateway(t), { code: "EACCES" });
+  binds.restore();
+  assert.equal(binds.calls(), 1);
 });
