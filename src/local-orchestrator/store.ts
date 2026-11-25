@@ -623,6 +623,7 @@ export class OrchestratorStore {
             }
             if (version !== schemaVersion) {
               if (version !== 5) connection.exec(inboxSeenSchema);
+              // Legacy defaults keep their precedence until explicitly set again.
               connection.exec(`
                 ${delegationSchema}
                 ALTER TABLE project_policy ADD COLUMN explicit_json TEXT NOT NULL DEFAULT '[]';
@@ -633,27 +634,6 @@ export class OrchestratorStore {
                 ALTER TABLE next_approvals RENAME TO approvals;
                 PRAGMA user_version=${schemaVersion};
               `);
-              // Older events stored the full defaults after each write. Recover the
-              // gates whose values changed, including those later reset to human.
-              const explicit = new Set<Gate>();
-              let previous: PolicySet = {};
-              for (const { data } of connection
-                .query<{ data: string }>(
-                  "SELECT data FROM events WHERE kind = 'project.defaults-set' ORDER BY rowid",
-                )
-                .all()) {
-                const next = validatePolicies(JSON.parse(data).defaults);
-                for (const gate of GATES) {
-                  if ((previous[gate] ?? "human") !== (next[gate] ?? "human"))
-                    explicit.add(gate);
-                }
-                previous = next;
-              }
-              connection
-                .query(
-                  "UPDATE project_policy SET explicit_json = ? WHERE id = 1",
-                )
-                .run(canonicalJson(GATES.filter((gate) => explicit.has(gate))));
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
             }
@@ -1133,7 +1113,12 @@ export class OrchestratorStore {
     });
   }
 
-  #taskPolicy(task: TaskContent, goal: GoalContent, origin: Origin) {
+  #taskPolicy(
+    task: TaskContent,
+    goal: GoalContent,
+    origin: Origin,
+    inScope: boolean,
+  ) {
     const gate = "task-registration";
     const layers = this.#goalLayers(goal);
     const facts = {
@@ -1147,7 +1132,7 @@ export class OrchestratorStore {
     const answer = this.#resolveGate(gate, layers, {
       goalId: task.goalId,
       facts,
-      invariant: this.#proposalInvariant(origin),
+      invariant: inScope ? this.#proposalInvariant(origin) : "scope-exception",
     });
     const loosening = requestedLoosening(layers, task.policies ?? {});
     for (const requested of GATES) {
@@ -1263,12 +1248,13 @@ export class OrchestratorStore {
     const source = parseOrigin(origin);
     return this.#write((at) => {
       const goal = this.#activeGoal(task.goalId);
+      const scope = fitsScope(goal, task, this.#taskCount(task.goalId));
       const { gate, loosening, ...policy } = this.#taskPolicy(
         task,
         goal,
         source,
+        scope.ok,
       );
-      const scope = fitsScope(goal, task, this.#taskCount(task.goalId));
       const reasons = scope.ok ? [] : scope.reasons;
       if (!this.#hasDependencies(task)) reasons.push("dependsOn");
       if (loosening.length !== 0) reasons.push("policy-loosening");
@@ -2749,7 +2735,16 @@ export class OrchestratorStore {
         ...this.#integrationPolicy(task, goal.content, proposal),
       };
     }
-    return this.#taskPolicy(proposal.content, goal.content, proposal.source);
+    // Resolve pending Tasks against current scope, including at decision time.
+    const inScope =
+      proposal.status !== "pending" ||
+      fitsScope(goal.content, proposal.content, this.#taskCount(goal.id)).ok;
+    return this.#taskPolicy(
+      proposal.content,
+      goal.content,
+      proposal.source,
+      inScope,
+    );
   }
 
   #plannerCategory(task: ReturnType<typeof taskRecord>) {

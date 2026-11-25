@@ -226,7 +226,11 @@ const pathFields = [
   ["pathsExclude", "除外するパス（1 行に 1 パターン）"],
 ] as const;
 const numberFields = [
-  ["maxTokens", "予算の最大トークン数", "task-registration"],
+  [
+    "maxTokens",
+    "予算の最大トークン数（Planner の計画値）",
+    "task-registration",
+  ],
   ["maxChangedLines", "最大変更行数", "integration"],
   ["maxChangedFiles", "最大変更ファイル数", "integration"],
 ] as const;

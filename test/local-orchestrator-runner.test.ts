@@ -653,14 +653,9 @@ test("A throwing Planner is finalized without leaking the exception or retrying 
 test("Reviewer sees only digest-bound approval files and registers an approved task", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
-  const goalId = registerGoal(store, {
-    ...goal,
-    policies: { "task-registration": "agent" },
-  });
-  const proposal = store.proposeTask(
-    { ...task, goalId, paths: ["README.md"] },
-    plannerOrigin,
-  );
+  const goalId = registerGoal(store);
+  store.setProjectDefaults({ "task-registration": "agent" }, operator);
+  const proposal = store.proposeTask({ ...task, goalId }, plannerOrigin);
   const work = runner(store, {
     context: async () => {
       throw new Error("Approval cannot read repo context");
@@ -676,7 +671,7 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
       assert.deepEqual(JSON.parse(file(plan, "proposal.json")), {
         id: proposal.id,
         kind: "task",
-        content: { ...task, goalId, paths: ["README.md"] },
+        content: { ...task, goalId },
         digest: proposal.digest,
         gate: "task-registration",
         policy: "agent",
@@ -938,7 +933,7 @@ test("Planner and approval answers with credentials fail without copying their t
   assert.equal(notes.length, 2);
 });
 
-test("the active scheduler delegates rule-matched Task registrations in dependency order", async () => {
+test("the active scheduler delegates in-scope Task registrations in dependency order", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
   const goalId = registerGoal(store);
@@ -951,7 +946,7 @@ test("the active scheduler delegates rule-matched Task registrations in dependen
         order: 0,
         action: "agent",
         enabled: true,
-        conditions: { pathsWithin: ["src/**"], categories: ["docs"] },
+        conditions: { maxTokens: 1000, categories: ["docs"] },
       },
     ],
     "operator-ui",
@@ -963,6 +958,12 @@ test("the active scheduler delegates rule-matched Task registrations in dependen
         tasks: [
           { ...task, title: "First", category: "docs" },
           { ...task, title: "Second", category: "docs", dependsOn: ["#0"] },
+          {
+            ...task,
+            title: "Outside",
+            category: "docs",
+            paths: [".github/workflows/"],
+          },
         ],
       }),
     runReviewer: async (_plan, id) =>
@@ -980,6 +981,22 @@ test("the active scheduler delegates rule-matched Task registrations in dependen
   assert.deepEqual(
     store.listTasks(goalId).map(({ content }) => content.title),
     ["First", "Second"],
+  );
+  const outside = store
+    .listProposals()
+    .find(({ content }) => "title" in content && content.title === "Outside");
+  assert.ok(outside);
+  assert.partialDeepStrictEqual(store.getProposalDetails(outside.id), {
+    status: "pending",
+    policy: "human",
+    source: "invariant",
+    invariant: "scope-exception",
+  });
+  assert.equal(
+    store
+      .getHostApiStatus()
+      .recentExecutions.filter(({ actor }) => actor === "Reviewer").length,
+    2,
   );
   assert.deepEqual(
     store

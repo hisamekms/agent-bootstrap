@@ -146,6 +146,40 @@ test("Task registration rules check paths, exclusions, budget and the optional c
   );
 });
 
+test("path exclusions ignore case and Unicode composition while allowed globs match exactly", () => {
+  const composed = "src/café";
+  const decomposed = composed.normalize("NFD");
+  for (const pattern of [
+    "src/secret/**",
+    `${composed}/**`,
+    `${decomposed}/**`,
+  ]) {
+    const [rule] = validateDelegationRules([
+      { ...small, conditions: { pathsExclude: [pattern] } },
+    ]);
+    const path = pattern.startsWith("src/secret")
+      ? "src/Secret/a"
+      : `${composed.toUpperCase()}/a`;
+    for (const variant of [path, path.normalize("NFD")])
+      assert.equal(ruleMatches(rule!, { paths: [variant] }), false);
+    assert.equal(ruleMatches(rule!, { paths: ["src/public/a"] }), true);
+  }
+  const [within] = validateDelegationRules([
+    { ...small, conditions: { pathsWithin: [`${composed}/**`] } },
+  ]);
+  assert.equal(ruleMatches(within!, { paths: [`${composed}/a`] }), true);
+  for (const path of [decomposed, composed.toUpperCase()])
+    assert.equal(ruleMatches(within!, { paths: [`${path}/a`] }), false);
+
+  const [unicode] = validateDelegationRules([
+    { ...small, conditions: { pathsExclude: ["src/οσ*middle*.txt"] } },
+  ]);
+  for (const path of ["src/ος-MIDDLE-end.TXT", "src/ΟΣmiddle.txt"])
+    assert.equal(ruleMatches(unicode!, { paths: [path] }), false);
+  for (const path of ["src/ος-middleXtxt", "src/ος-mid.txt"])
+    assert.equal(ruleMatches(unicode!, { paths: [path] }), true);
+});
+
 test("integration rule size limits use actual facts and fail closed for unknown counts", () => {
   const facts = {
     paths: ["docs/a.md"],

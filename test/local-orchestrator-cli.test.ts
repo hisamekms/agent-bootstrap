@@ -137,7 +137,7 @@ test("status reports counts and pending gates, and show and proposals include co
   assert.deepEqual(JSON.parse(rejected.stdout), []);
 });
 
-test("proposal display identifies human requirements under an inherited agent policy", async () => {
+test("proposal display identifies policy loosening and Task scope exceptions", async () => {
   using state = orchestratorFixture("local-orchestrator-cli-");
   const { store } = state;
   store.setProjectDefaults(
@@ -177,7 +177,6 @@ test("proposal display identifies human requirements under an inherited agent po
       paths: ["src/outside.ts"],
       dependsOn: [],
       budgets: goal.scope.budgets,
-      policies: { "task-registration": "human" },
     },
     origin,
   );
@@ -189,8 +188,9 @@ test("proposal display identifies human requirements under an inherited agent po
       {
         id: task.id,
         gate: "task-registration",
-        effectivePolicy: "agent",
-        policySource: "goal",
+        effectivePolicy: "human",
+        policySource: "invariant",
+        invariant: "scope-exception",
         humanAnswerRequired: true,
       },
     ],

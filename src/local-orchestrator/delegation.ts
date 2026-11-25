@@ -24,6 +24,7 @@ export const POLICY_INVARIANTS = [
   "integration-symlink-evidence",
   "integration-review",
   "concierge-proposal",
+  "scope-exception",
   "policy-loosening",
   "operator-commands",
 ] as const;
@@ -62,11 +63,11 @@ export type DelegationRule = {
   conditions: RuleConditions;
 };
 
-function glob(value: unknown): string {
+function glob(value: unknown, exclusion: boolean): string {
   if (
     typeof value !== "string" ||
     value.length > 160 ||
-    value
+    (exclusion ? value.normalize("NFC") : value)
       .split("/")
       .some(
         (segment) =>
@@ -109,7 +110,9 @@ export function validateDelegationRules(value: unknown): DelegationRule[] {
     const parsed: RuleConditions = {};
     for (const key of paths) {
       if (Object.hasOwn(input, key))
-        parsed[key] = unique(input[key], 1, 16, glob);
+        parsed[key] = unique(input[key], 1, 16, (pattern) =>
+          glob(pattern, key === "pathsExclude"),
+        );
     }
     for (const key of numbers) {
       if (Object.hasOwn(input, key))
@@ -164,8 +167,49 @@ function matchesSegment(pattern: string, path: string): boolean {
   return i === pattern.length || pattern.slice(i) === "*";
 }
 
+function excludedSegmentMatcher(pattern: string): (path: string) => boolean {
+  const literals = pattern
+    .normalize("NFC")
+    .split("*")
+    .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const first = literals.shift()!;
+  if (literals.length === 0) {
+    const exact = new RegExp(`^${first}$`, "iu");
+    return (path) => exact.test(path);
+  }
+  const prefix = new RegExp(`^${first}`, "iu");
+  const suffix = new RegExp(`${literals.pop()!}$`, "iu");
+  const middle = literals.map((literal) => new RegExp(literal, "giu"));
+  // Match each literal in order between the anchored ends. The regular
+  // expressions contain no wildcards, so glob stars never backtrack here.
+  return (path) => {
+    const start = prefix.exec(path)?.[0].length;
+    const end = suffix.exec(path)?.index;
+    if (start === undefined || end === undefined || start > end) return false;
+    const interior = path.slice(start, end);
+    let offset = 0;
+    for (const literal of middle) {
+      literal.lastIndex = offset;
+      if (!literal.test(interior)) return false;
+      offset = literal.lastIndex;
+    }
+    return true;
+  };
+}
+
+type GlobSegment = "**" | ((path: string) => boolean);
+
+function compileGlob(glob: string, mode: "within" | "exclude"): GlobSegment[] {
+  return glob.split("/").map((segment) => {
+    if (segment === "**") return segment;
+    return mode === "exclude"
+      ? excludedSegmentMatcher(segment)
+      : (path) => matchesSegment(segment, path);
+  });
+}
+
 function matchesPath(
-  segments: readonly string[],
+  segments: readonly GlobSegment[],
   path: string,
   mode: "within" | "exclude",
 ) {
@@ -180,8 +224,7 @@ function matchesPath(
     for (const i of states) {
       const segment = segments[i];
       if (segment === "**") next.add(i);
-      else if (segment !== undefined && matchesSegment(segment, part))
-        next.add(i + 1);
+      else if (segment?.(part)) next.add(i + 1);
     }
     expand(next);
     states = next;
@@ -222,8 +265,8 @@ export function ruleMatches(
       (facts.diffSize?.changedFiles ?? Infinity) > maxChangedFiles)
   )
     return false;
-  const within = pathsWithin?.map((glob) => glob.split("/"));
-  const exclude = pathsExclude?.map((glob) => glob.split("/"));
+  const within = pathsWithin?.map((glob) => compileGlob(glob, "within"));
+  const exclude = pathsExclude?.map((glob) => compileGlob(glob, "exclude"));
   return (
     (!categories ||
       (facts.category !== undefined && categories.includes(facts.category))) &&
@@ -233,9 +276,12 @@ export function ruleMatches(
         within.some((segments) => matchesPath(segments, path, "within")),
       )) &&
     (!exclude ||
-      !facts.paths.some((path) =>
-        exclude.some((segments) => matchesPath(segments, path, "exclude")),
-      ))
+      !facts.paths.some((path) => {
+        const normalized = path.normalize("NFC");
+        return exclude.some((segments) =>
+          matchesPath(segments, normalized, "exclude"),
+        );
+      }))
   );
 }
 

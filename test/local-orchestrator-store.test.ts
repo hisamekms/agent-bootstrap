@@ -4,7 +4,10 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ContractError } from "../src/local-orchestrator/model.ts";
+import {
+  ContractError,
+  resolvePolicy,
+} from "../src/local-orchestrator/model.ts";
 import {
   OrchestratorStore,
   OrchestratorStoreError,
@@ -449,10 +452,7 @@ test("requires the Reviewer execution's goal to match a task proposal", () => {
   const related = store.proposeTask({ ...task, goalId: id }, operator);
   if (related.status !== "registered") throw new Error("Expected registration");
   store.setProjectDefaults({ "task-registration": "agent" }, operator);
-  const proposal = store.proposeTask(
-    { ...task, goalId: id, paths: ["other/file"] },
-    operator,
-  );
+  const proposal = store.proposeTask({ ...task, goalId: id }, operator);
   for (const agent of [
     startReviewer(),
     startReviewer({ goalId: unrelatedGoal }),
@@ -610,23 +610,95 @@ test("registers explicit scope exceptions and policy changes, while rechecking h
   );
 });
 
-test("uses the prior task gate but honors a request that requires a human", () => {
-  const id = goalId({ ...goal, policies: { "task-registration": "agent" } });
-  const agent = startReviewer({ goalId: id });
-  const pending = store.proposeTask(
-    {
-      ...task,
-      goalId: id,
-      paths: ["other/file"],
-      policies: { "task-registration": "human" },
-    },
+test("only humans can answer Task registrations outside the Goal scope", () => {
+  const id = goalId({ ...goal, scope: { ...goal.scope, maxTasks: 4 } });
+  store.setRules(
+    [
+      {
+        id: "small",
+        name: "Small Tasks",
+        gate: "task-registration",
+        action: "agent",
+        enabled: true,
+        order: 0,
+        conditions: { maxTokens: 1000 },
+      },
+    ],
+    "cli",
+  );
+  const planner = store.createExecution({
+    actor: "Planner",
+    mode: "plan",
+    requestedBy: host,
+    goalId: id,
+  });
+  const origin = {
+    kind: "actor",
+    actor: "Planner",
+    executionId: planner.id,
+  } as const;
+  for (const [reason, override] of [
+    ["paths", { paths: [".github/workflows/"] }],
+    ["profile", { profile: "db" }],
+    ["actor", { actor: "Researcher", paths: [] }],
+    ["maxExecutionMs", { budgets: { ...budgets, maxExecutionMs: 1001 } }],
+  ] as const) {
+    const pending = store.proposeTask(
+      { ...task, goalId: id, ...override },
+      origin,
+    );
+    const setting = {
+      policy: "human",
+      source: "invariant",
+      invariant: "scope-exception",
+    };
+    assert.partialDeepStrictEqual(pending, {
+      status: "pending",
+      reasons: [reason],
+      ...setting,
+    });
+    assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), {
+      ...setting,
+      humanAnswerRequired: true,
+    });
+    assert.deepEqual(store.pendingRegistrationApprovals(0, 10).ids, []);
+    assert.throws(
+      () => startReviewer({ goalId: id, approvalProposalId: pending.id }),
+      { code: "approval-forbidden" },
+    );
+    const agent = startReviewer({ goalId: id });
+    assert.throws(() => approve(pending, agent), {
+      code: "approval-forbidden",
+    });
+    if (reason === "maxExecutionMs") {
+      assert.throws(() => approve(pending), { code: "task-constraints" });
+    } else {
+      assert.ok(approve(pending).taskId);
+      assert.partialDeepStrictEqual(
+        store.getProposalDetails(pending.id),
+        setting,
+      );
+    }
+  }
+});
+
+test("rechecks scope at decision time for an already running Reviewer", () => {
+  const id = goalId({ ...goal, scope: { ...goal.scope, maxTasks: 1 } });
+  store.setProjectDefaults({ "task-registration": "agent" }, operator);
+  const pending = store.proposeTask({ ...task, goalId: id }, operator);
+  const agent = startReviewer({ goalId: id, approvalProposalId: pending.id });
+  const other = store.proposeTask(
+    { ...task, goalId: id, title: "First Task" },
     operator,
   );
-  assert.throws(
-    () => approve(pending, agent),
-    new OrchestratorStoreError("approval-forbidden"),
-  );
-  assert.ok(approve(pending).taskId);
+  assert.ok(approve(other).taskId);
+  assert.deepEqual(store.pendingRegistrationApprovals(0, 10).ids, []);
+  assert.partialDeepStrictEqual(store.getProposalDetails(pending.id), {
+    policy: "human",
+    source: "invariant",
+    invariant: "scope-exception",
+  });
+  assert.throws(() => approve(pending, agent), { code: "approval-forbidden" });
 });
 
 test("keeps events append-only, including replacement", () => {
@@ -907,5 +979,61 @@ test("an explicit project default supersedes legacy model delegation after a Goa
       beforeExplicit: [],
       afterExplicit: ["integration"],
     },
+  );
+});
+
+test("schema 6 migration preserves legacy Goal policies over project defaults", () => {
+  const defaults = {
+    integration: "agent",
+    "task-registration": "agent",
+  } as const;
+  const policies = {
+    integration: "human",
+    "task-registration": "human",
+  } as const;
+  const gates = ["integration", "task-registration"] as const;
+  const legacy = { policy: "human", source: "goal" };
+  store.setProjectDefaults(defaults, operator);
+  const id = goalId({ ...goal, policies });
+  for (const gate of gates)
+    assert.deepEqual(resolvePolicy(gate, { defaults, goal: policies }), legacy);
+
+  // Recreate the version 5 schema with its persisted defaults and audit event.
+  store.close();
+  const db = new Database(filename);
+  try {
+    db.exec(`
+      DROP TABLE delegation_rules;
+      DROP TABLE goal_policy;
+      DROP TABLE task_policy;
+      DROP TABLE integration_policy_facts;
+      DROP INDEX events_decisions_at;
+      ALTER TABLE project_policy DROP COLUMN explicit_json;
+      ALTER TABLE proposal_approval_runs RENAME TO integration_approval_runs;
+      ALTER TABLE approvals DROP COLUMN policy_details_json;
+      ALTER TABLE approvals DROP COLUMN reasons_json;
+      PRAGMA user_version=5;
+    `);
+  } finally {
+    db.close();
+  }
+  store = OrchestratorStore.open(filename);
+  assert.deepEqual(store.policySettings().defaults, {
+    "goal-registration": "human",
+    ...defaults,
+  });
+  assert.deepEqual(store.policySettings().explicitDefaults, []);
+  for (const gate of gates)
+    assert.deepEqual(store.effectivePolicy(gate, { goalId: id }), legacy);
+
+  store.setProjectDefaults({ integration: "agent" }, operator);
+  assert.deepEqual(store.policySettings().explicitDefaults, ["integration"]);
+  assert.deepEqual(store.effectivePolicy("integration", { goalId: id }), {
+    policy: "agent",
+    source: "default",
+  });
+  assert.deepEqual(
+    store.effectivePolicy("task-registration", { goalId: id }),
+    legacy,
   );
 });

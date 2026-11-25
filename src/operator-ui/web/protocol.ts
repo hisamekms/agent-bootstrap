@@ -64,6 +64,7 @@ export const invariantLabels: Record<PolicyInvariant, string> = {
   "integration-review":
     "統合を AI に任せるにはレビューに合格している必要があります。",
   "concierge-proposal": "Concierge の提案は人が判断します。",
+  "scope-exception": "Goal の範囲を外れる Task の登録は人が判断します。",
   "policy-loosening": "モデルからの委任拡大は人の承認が必要です。",
   "operator-commands":
     "Goal の破棄とブランチのエクスポートはオペレーターが行います。",
