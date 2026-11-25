@@ -16,4 +16,4 @@ execution, review, integration, and branch export.
 
 - Start an audited Concierge session in a VM with a read-only snapshot at `/repo` and Host API access over vsock, and resume it with `--continue`.
 - From the Concierge, draft Goal and Task proposals and request Planner executions that submit proposals. In-scope Tasks auto-register.
-- Approve or reject proposals with the operator CLI by typing the first 12 hex digits of the digest, and list recorded audit events with `events`.
+- Approve or reject eligible proposals from the workplace panel. With the operator CLI, confirm by typing the first 12 hex digits of the digest and list recorded audit events with `events`.

@@ -73,8 +73,8 @@ provider-neutral and holds no credential values.
 
 For development before a desktop shell exists, an opt-in loopback bridge
 may serve the same UI on `127.0.0.1` with a per-launch random token,
-`Host` and `Origin` checks, and a strict CSP. It is off by default and
-cannot answer gates.
+`Host` and `Origin` checks, and a strict CSP. It is off by default.
+The D5 amendment allows gate answers through the bridge.
 
 ### D4. Trusted and untrusted regions stay apart
 

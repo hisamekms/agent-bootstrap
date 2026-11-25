@@ -45,12 +45,12 @@ import {
   parseHumanDelegate,
 } from "./store.ts";
 import {
-  candidateDiffStat,
   previewGoalBaseUpdate,
   previewGoalDiscard,
   previewGoalBranchExport,
   reconciliationIntegrationHeads,
 } from "./tasks.ts";
+import { displayProposal, proposalDecisionPreview } from "./proposal-answer.ts";
 
 import {
   prepareTargetDirectory,
@@ -334,14 +334,6 @@ function projectDefaults(store: OrchestratorStore): Record<Gate, Policy> {
     "task-registration": store.effectivePolicy("task-registration").policy,
     integration: store.effectivePolicy("integration").policy,
   };
-}
-
-function displayProposal({
-  policy: effectivePolicy,
-  source: policySource,
-  ...proposal
-}: ProposalDetails) {
-  return { ...proposal, effectivePolicy, policySource };
 }
 
 function requireProposalDetails(store: OrchestratorStore, id: string) {
@@ -672,24 +664,18 @@ async function execute(
         includeDelegation: command.kind === "show",
       });
       if (!proposal) return refuse(io, "Proposal was not found.");
-      let diffStat: string | undefined;
-      if (proposal.kind === "integration") {
-        if (directory === undefined)
-          return refuse(
-            io,
-            "Integration proposals with --db also require --target <path>.",
-          );
-        if (command.kind !== "reject" || !scan)
-          diffStat = await candidateDiffStat(directory, proposal.content, scan);
-      }
+      if (proposal.kind === "integration" && directory === undefined)
+        return refuse(
+          io,
+          "Integration proposals with --db also require --target <path>.",
+        );
       await writeCheckedJson({
-        ...(command.kind === "reject" && scan
-          ? {
-              id: proposal.id,
-              digest: proposal.digest,
-              status: proposal.status,
-            }
-          : displayProposal(proposal)),
+        ...(await proposalDecisionPreview(
+          directory,
+          proposal,
+          command.kind,
+          scan,
+        )),
         ...(command.kind === "show" &&
         proposal.kind === "goal" &&
         proposal.status === "approved"
@@ -701,7 +687,6 @@ async function execute(
                   ?.baseCommit ?? null,
             }
           : {}),
-        ...(diffStat === undefined ? {} : { diffStat }),
       });
       if (command.kind === "show") return 0;
       if (proposal.status !== "pending")

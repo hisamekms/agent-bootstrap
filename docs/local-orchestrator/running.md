@@ -78,7 +78,7 @@ slot as the TTY launcher.
 
 With `--dev-bridge`, open the private loopback URL printed at startup.
 Keep the URL private. The page shows the Concierge terminal beside a
-read-only host panel. **判断待ち** shows the inbox, proposal details and a
+host panel. **判断待ち** shows the inbox, proposal details and a
 copyable CLI command. **問題** links failures, rejected paths and budget
 overruns to their Task or Goal. **Goal** shows Task progress and estimates
 for the current plan based on completed work in this target. Task details show the stage,
@@ -89,8 +89,17 @@ workplace process. The launcher closes the operator API and the bridge at
 shutdown. If that shutdown hangs, press Ctrl-C again to exit at once
 without cleanup, then run `agent-bootstrap doctor`. A third Ctrl-C kills
 the launcher. The launcher also stops when the workplace command ends for
-any reason, including SIGKILL. Use the operator CLI with the same target to
-answer gates.
+any reason, including SIGKILL.
+
+In **判断待ち**, choose **承認** or **却下** on a proposal that needs the
+operator. **承認して統合** records approval for the runner to integrate
+the candidate. Check the proposal kind, model-generated title and
+pinned digest prefix, then choose **確定** to record the answer.
+Select two to twenty proposals to approve them in one confirmation.
+The panel reports the outcome for each proposal and refreshes the inbox.
+If a proposal changed, review the refreshed details before answering
+again. The copyable CLI command remains available as a fallback. Use the
+TTY CLI with the same target for on-behalf answers.
 
 ## Work on another repository
 

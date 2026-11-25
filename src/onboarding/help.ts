@@ -82,7 +82,7 @@ export const helpTopics = {
     ],
     output:
       "The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.",
-    next: "Open the printed URL when using the development bridge. Use the operator CLI to answer gates.",
+    next: "Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI.",
     human:
       "Keep the URL private. Stop the workplace process to end the session.",
   },

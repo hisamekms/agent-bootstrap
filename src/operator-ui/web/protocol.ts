@@ -3,12 +3,17 @@ import type {
   goalStatuses,
   operatorGoal,
   operatorGoalList,
+  operatorInbox,
   operatorProblems,
   operatorProposal,
   operatorStatus,
   operatorTask,
   operatorTaskList,
 } from "../../local-orchestrator/operator-read.ts";
+import type {
+  PanelAnswer,
+  PanelAnswerResult,
+} from "../../local-orchestrator/proposal-answer.ts";
 
 export type Proposal = NonNullable<
   Awaited<ReturnType<typeof operatorProposal>>
@@ -21,16 +26,32 @@ export type TaskSummary = NonNullable<
 >[number];
 export type TaskDetail = NonNullable<ReturnType<typeof operatorTask>>;
 export type Problem = ReturnType<typeof operatorProblems>[number];
+export type PanelInboxItem = ReturnType<typeof operatorInbox>[number];
+export type AnswerableProposal = Extract<
+  PanelInboxItem,
+  { answer: unknown }
+>["answer"];
 
 export interface Methods {
   status: { params: Record<string, never>; result: Status };
-  "inbox.list": { params: { includeResolved?: boolean }; result: InboxItem[] };
+  "inbox.list": {
+    params: { includeResolved?: boolean };
+    result: PanelInboxItem[];
+  };
   "inbox.subscribe": {
     params: Record<string, never>;
     result: { subscribed: true };
   };
   "inbox.markSeen": { params: { ids: string[] }; result: { marked: number } };
   "proposal.get": { params: { id: string }; result: Proposal };
+  "proposal.answer": {
+    params: PanelAnswer;
+    result: Extract<PanelAnswerResult, { ok: true }>;
+  };
+  "proposal.answerMany": {
+    params: { answers: PanelAnswer[] };
+    result: PanelAnswerResult[];
+  };
   "goal.list": {
     params: { status?: (typeof goalStatuses)[number] };
     result: GoalSummary[];

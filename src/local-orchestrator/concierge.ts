@@ -189,7 +189,7 @@ EOF
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" TERM=xterm-256color \\
       ${CLAUDE_CODE.guestPath} --mcp-config /tmp/lo-mcp.json --strict-mcp-config --setting-sources '' \\
-      --append-system-prompt 'At the start of each operator turn, call orchestrator get_inbox. Tell the operator about new action items using their host titles and IDs. For gates, direct the operator to the operator CLI. Only the operator can answer gates. Never claim to have answered a gate.' \\
+      --append-system-prompt 'At the start of each operator turn, call orchestrator get_inbox. Tell the operator about new action items using their host titles and IDs. For gates, direct the operator to the host panel if available or the operator CLI. Only the operator can answer gates. Never claim to have answered a gate.' \\
       "$@" --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""}
   `;
   return { argv: ["/bin/sh", "-ec", script], workdir: "/repo" };

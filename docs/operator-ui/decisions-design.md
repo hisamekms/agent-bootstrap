@@ -72,7 +72,10 @@ choice?}` and `proposal.answerMany` with a list of the same. The bridge
 - The host records the answer as the operator's, with origin
   `operator-ui`, the digest and the chosen alternative.
 - Only gates whose effective policy is "human" are answered here.
-  On-behalf answers keep their CLI path.
+  This includes decisions reserved to a human by the gate invariants
+  under an inherited agent policy. A loosening of policy may require a
+  human approval while a Reviewer can still reject it. On-behalf answers
+  keep their CLI path.
 - No extra presence check for now. A loopback page that holds the
   per-launch token can answer. On one operator's machine this matches the
   TTY CLI: any process running as the operator can already drive the CLI
