@@ -99,6 +99,11 @@ cannot answer gates.
   confirmation remain the way to answer.
 - Delegated and on-behalf answers keep their current rules.
 
+Amended 2026-11-25 by [decisions-design.md](decisions-design.md) Q1: the
+development bridge answers with the per-launch token and one
+confirmation. The presence check is deferred until the operator uses
+software that can drive their browser or screen.
+
 ### D6. The Concierge knows the inbox
 
 The Concierge's host API gets a read-only inbox tool that returns kinds,

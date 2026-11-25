@@ -4,9 +4,8 @@
 - Date: 2026-11-25
 - Builds on: [ADR 0001](adr-0001-operator-ui.md), phase 1 (#38)
 
-The workplace command and development bridge are implemented. The bridge's
-asset loader currently serves a placeholder while the browser bundle is
-being integrated.
+Implemented in #43 to #47. [decisions-design.md](decisions-design.md)
+builds on this phase and amends P4: the bridge relays gate answers.
 
 Phase 2 puts the Concierge conversation and a read-only host panel in one
 browser window, served by the development bridge (ADR D3). Gates are
