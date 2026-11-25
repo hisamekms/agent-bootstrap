@@ -1,3 +1,19 @@
+import {
+  GOAL_POLICIES,
+  TASK_POLICIES,
+  RULE_GATES,
+  POLICY_INVARIANTS,
+  resolveDelegation,
+  validateDelegationRules,
+  type DelegationRule,
+  type DiffSize,
+  type EffectivePolicy,
+  type GoalPolicy,
+  type PolicyInvariant,
+  type RuleFacts,
+  type RuleGate,
+  type TaskPolicy,
+} from "./delegation.ts";
 import type { InboxRow } from "./inbox.ts";
 import { readPathViolations, type PathViolation } from "./path-violations.ts";
 import { randomUUID } from "node:crypto";
@@ -29,6 +45,7 @@ import {
   type Gate,
   type GoalContent,
   type IntegrationContent,
+  type Policy,
   type PolicyLayers,
   type PolicySet,
   type TaskContent,
@@ -86,6 +103,7 @@ export type StoreErrorCode =
   | "read-failed"
   | "not-found"
   | "stale-digest"
+  | "stale-policy"
   | "invalid-transition"
   | "task-retry-limit"
   | "task-retry-changed"
@@ -133,10 +151,11 @@ const finalExecutionStatuses = [
 type FinalExecutionStatus = (typeof finalExecutionStatuses)[number];
 type ExecutionStatus = "queued" | "running" | FinalExecutionStatus;
 type Decision = "approve" | "reject";
-type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
+type ApprovalPolicy = EffectivePolicy;
+type SettingsOrigin = "cli" | "operator-ui";
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 5;
+const schemaVersion = 6;
 const inboxSeenSchema = "CREATE TABLE inbox_seen (id TEXT PRIMARY KEY) STRICT;";
 export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
@@ -157,12 +176,36 @@ const approvalRunColumnsSql = `
     execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id),
     PRIMARY KEY (proposal_id, execution_id)
   `;
+const approvalColumnsSql = `
+    id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
+    gate TEXT NOT NULL CHECK (gate IN ('goal-registration', 'task-registration', 'integration')),
+    digest TEXT NOT NULL, policy TEXT NOT NULL CHECK (policy IN ('human', 'agent')),
+    policy_source TEXT NOT NULL CHECK (policy_source IN ('default', 'request', 'goal', 'task', 'invariant', 'operator-task', 'operator-goal', 'rule')),
+    answerer_kind TEXT NOT NULL CHECK (answerer_kind IN ('human', 'agent')), answerer_json TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')), at TEXT NOT NULL,
+    policy_details_json TEXT, reasons_json TEXT
+  `;
+const delegationSchema = `
+  CREATE TABLE delegation_rules (id INTEGER PRIMARY KEY CHECK (id = 1), rules_json TEXT NOT NULL) STRICT;
+  INSERT INTO delegation_rules VALUES (1, '[]');
+  CREATE TABLE goal_policy (
+    goal_id TEXT NOT NULL REFERENCES goals(id), gate TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (goal_id, gate)
+  ) STRICT;
+  CREATE TABLE task_policy (task_id TEXT PRIMARY KEY REFERENCES tasks(id), value TEXT NOT NULL) STRICT;
+  CREATE TABLE integration_policy_facts (
+    proposal_id TEXT PRIMARY KEY REFERENCES proposals(id),
+    changed_files INTEGER NOT NULL, changed_lines INTEGER
+  ) STRICT;
+  CREATE INDEX events_decisions_at ON events(at) WHERE kind = 'proposal.decided';
+`;
 const schema = `
   ${inboxSeenSchema}
   CREATE TABLE project_policy (
-    id INTEGER PRIMARY KEY CHECK (id = 1), policies_json TEXT NOT NULL
+    id INTEGER PRIMARY KEY CHECK (id = 1), policies_json TEXT NOT NULL,
+    explicit_json TEXT NOT NULL DEFAULT '[]'
   ) STRICT;
-  INSERT INTO project_policy VALUES (1, '{"goal-registration":"human","task-registration":"human","integration":"human"}');
+  INSERT INTO project_policy (id, policies_json) VALUES (1, '{"goal-registration":"human","task-registration":"human","integration":"human"}');
   CREATE TABLE proposals (${proposalColumnsSql}) STRICT;
   CREATE TABLE goals (
     id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
@@ -172,21 +215,14 @@ const schema = `
   ) STRICT;
   CREATE TABLE tasks (${taskColumnsSql}) STRICT;
   CREATE INDEX tasks_goal ON tasks(goal_id);
-  CREATE TABLE approvals (
-    id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
-    gate TEXT NOT NULL CHECK (gate IN ('goal-registration', 'task-registration', 'integration')),
-    digest TEXT NOT NULL, policy TEXT NOT NULL CHECK (policy IN ('human', 'agent')),
-    policy_source TEXT NOT NULL CHECK (policy_source IN ('default', 'request', 'goal', 'task')),
-    answerer_kind TEXT NOT NULL CHECK (answerer_kind IN ('human', 'agent')), answerer_json TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')), at TEXT NOT NULL
-  ) STRICT;
+  CREATE TABLE approvals (${approvalColumnsSql}) STRICT;
   CREATE TABLE executions (
     id TEXT PRIMARY KEY, actor TEXT NOT NULL, mode TEXT NOT NULL, requested_by_json TEXT NOT NULL,
     goal_id TEXT REFERENCES goals(id), task_id TEXT REFERENCES tasks(id),
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'timed-out', 'cancelled')),
     result_json TEXT, started_at TEXT, finished_at TEXT
   ) STRICT;
-  CREATE TABLE integration_approval_runs (${approvalRunColumnsSql}) STRICT;
+  CREATE TABLE proposal_approval_runs (${approvalRunColumnsSql}) STRICT;
   CREATE TABLE actor_sessions (
     id TEXT PRIMARY KEY, actor TEXT NOT NULL, runtime_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT,
@@ -203,6 +239,7 @@ const schema = `
   CREATE TRIGGER events_no_replace BEFORE INSERT ON events
     WHEN EXISTS (SELECT 1 FROM events WHERE id = NEW.id OR rowid = NEW.rowid)
     BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  ${delegationSchema}
 `;
 
 function required<T>(row: T | null): T {
@@ -380,18 +417,27 @@ function proposalRecord({
   }
 }
 
+function integrationInvariant(
+  proposal: ReturnType<typeof proposalRecord>,
+): PolicyInvariant | undefined {
+  if (proposal.kind !== "integration") return;
+  if (proposal.content.verified !== true) return "integration-verification";
+  if (proposal.content.symlinks?.length !== 0) return "integration-symlinks";
+}
+
 function proposalAnswerRequirements(
   proposal: ReturnType<typeof proposalRecord>,
   policy: ApprovalPolicy["policy"] | null,
   loosening: readonly Gate[],
+  source?: ApprovalPolicy["source"] | null,
 ) {
   const humanAnswerRequired =
+    source === "invariant" ||
     (policy === "agent" &&
+      source === "goal" &&
       proposal.kind === "task" &&
       proposal.content.policies?.["task-registration"] === "human") ||
-    (proposal.kind === "integration" &&
-      (proposal.content.verified !== true ||
-        proposal.content.symlinks?.length !== 0));
+    integrationInvariant(proposal) !== undefined;
   return {
     ...(policy === "agent" &&
       loosening.length > 0 && { humanApprovalRequired: true }),
@@ -563,6 +609,7 @@ export class OrchestratorStore {
             } else if (
               version !== 3 &&
               version !== 4 &&
+              version !== 5 &&
               version !== schemaVersion
             ) {
               throw new Error();
@@ -574,10 +621,22 @@ export class OrchestratorStore {
                 ALTER TABLE goals ADD COLUMN base_commit TEXT;
               `);
             }
-            if (version !== schemaVersion)
-              connection.exec(
-                `${inboxSeenSchema} PRAGMA user_version=${schemaVersion};`,
-              );
+            if (version !== schemaVersion) {
+              if (version !== 5) connection.exec(inboxSeenSchema);
+              // Legacy defaults keep their precedence until explicitly set again.
+              connection.exec(`
+                ${delegationSchema}
+                ALTER TABLE project_policy ADD COLUMN explicit_json TEXT NOT NULL DEFAULT '[]';
+                ALTER TABLE integration_approval_runs RENAME TO proposal_approval_runs;
+                CREATE TABLE next_approvals (${approvalColumnsSql}) STRICT;
+                INSERT INTO next_approvals SELECT *, NULL, NULL FROM approvals;
+                DROP TABLE approvals;
+                ALTER TABLE next_approvals RENAME TO approvals;
+                PRAGMA user_version=${schemaVersion};
+              `);
+              if (connection.query("PRAGMA foreign_key_check").get())
+                throw new Error();
+            }
           }
         })
         .immediate();
@@ -710,17 +769,229 @@ export class OrchestratorStore {
     return validatePolicies(JSON.parse(row.policies_json));
   }
 
-  setProjectDefaults(policies: PolicySet, by: Operator): void {
+  #explicitDefaults(): Gate[] {
+    return JSON.parse(
+      required(
+        this.#db
+          .query<{ json: string }>(
+            "SELECT explicit_json AS json FROM project_policy WHERE id = 1",
+          )
+          .get(),
+      ).json,
+    ) as Gate[];
+  }
+
+  setProjectDefaults(
+    policies: PolicySet,
+    by: Operator,
+    origin: SettingsOrigin = "cli",
+  ): void {
+    oneOf(origin, ["cli", "operator-ui"]);
     const requested = validatePolicies(policies);
     if (parseOrigin(by).kind !== "operator") throw new ContractError();
     this.#write((at) => {
-      const defaults = { ...this.#defaults(), ...requested };
+      const before = this.#defaults();
+      const defaults = { ...before, ...requested };
+      const beforeExplicit = this.#explicitDefaults();
+      const afterExplicit = GATES.filter(
+        (gate) =>
+          beforeExplicit.includes(gate) || Object.hasOwn(requested, gate),
+      );
       this.#run(
-        "UPDATE project_policy SET policies_json = ? WHERE id = 1",
+        "UPDATE project_policy SET policies_json = ?, explicit_json = ? WHERE id = 1",
         canonicalJson(defaults),
+        canonicalJson(afterExplicit),
       );
       this.#event(at, "project.defaults-set", "project", "project", {
         defaults,
+        before,
+        after: defaults,
+        beforeExplicit,
+        afterExplicit,
+        origin,
+      });
+    });
+  }
+
+  #rules(): DelegationRule[] {
+    return JSON.parse(
+      required(
+        this.#db
+          .query<{ json: string }>(
+            "SELECT rules_json AS json FROM delegation_rules WHERE id = 1",
+          )
+          .get(),
+      ).json,
+    ) as DelegationRule[];
+  }
+
+  #goalPolicyOverride(goalId: string, gate: RuleGate): GoalPolicy {
+    return (
+      this.#db
+        .query<{ value: GoalPolicy }>(
+          "SELECT value FROM goal_policy WHERE goal_id = ? AND gate = ?",
+        )
+        .get(goalId, gate)?.value ?? "inherit"
+    );
+  }
+
+  #taskPolicyOverride(taskId: string): TaskPolicy {
+    return (
+      this.#db
+        .query<{ value: TaskPolicy }>(
+          "SELECT value FROM task_policy WHERE task_id = ?",
+        )
+        .get(taskId)?.value ?? "rule"
+    );
+  }
+
+  goalPolicyOverrides(goalId: string) {
+    const id = identifier(goalId);
+    return this.#read(() => ({
+      "task-registration": this.#goalPolicyOverride(id, "task-registration"),
+      integration: this.#goalPolicyOverride(id, "integration"),
+    }));
+  }
+
+  taskPolicyOverride(taskId: string): TaskPolicy {
+    return this.#read(() => this.#taskPolicyOverride(identifier(taskId)));
+  }
+
+  policySettings() {
+    return this.#read(() =>
+      this.#db
+        .transaction(() => {
+          const hits = this.#db
+            .query<{ ruleId: string; hits: number }>(
+              `
+        SELECT json_extract(data, '$.ruleId') AS ruleId, count(*) AS hits FROM events
+        WHERE kind = 'proposal.decided' AND at >= ? AND json_extract(data, '$.source') = 'rule'
+        GROUP BY ruleId
+      `,
+            )
+            .all(new Date(Date.now() - 7 * 86_400_000).toISOString());
+          const counts = new Map(
+            hits.map(({ ruleId, hits }) => [ruleId, hits]),
+          );
+          const rules = this.#rules();
+          return freeze({
+            defaults: this.#defaults(),
+            explicitDefaults: this.#explicitDefaults(),
+            rulesRevision: contentDigest(rules),
+            rules: rules.map((rule) => ({
+              ...rule,
+              hitsLast7Days: counts.get(rule.id) ?? 0,
+            })),
+            invariants: POLICY_INVARIANTS,
+          });
+        })
+        .deferred(),
+    );
+  }
+
+  policyOverrides() {
+    return this.#read(() => ({
+      goals: this.#db
+        .query<{ goalId: string; gate: RuleGate; value: GoalPolicy }>(
+          "SELECT goal_id AS goalId, gate, value FROM goal_policy WHERE value <> 'inherit' ORDER BY goal_id, gate",
+        )
+        .all(),
+      tasks: this.#db
+        .query<{ taskId: string; value: TaskPolicy }>(
+          "SELECT task_id AS taskId, value FROM task_policy WHERE value <> 'rule' ORDER BY task_id",
+        )
+        .all(),
+    }));
+  }
+
+  setRules(
+    rules: unknown,
+    origin: SettingsOrigin,
+    expectedRevision?: string,
+  ): void {
+    const after = validateDelegationRules(rules);
+    oneOf(origin, ["cli", "operator-ui"]);
+    this.#write((at) => {
+      const current = this.#rules();
+      if (
+        expectedRevision !== undefined &&
+        contentDigest(current) !== expectedRevision
+      )
+        throw new OrchestratorStoreError("stale-policy");
+      const before = new Map(current.map((rule) => [rule.id, rule]));
+      const next = new Map(after.map((rule) => [rule.id, rule]));
+      this.#run(
+        "UPDATE delegation_rules SET rules_json = ? WHERE id = 1",
+        canonicalJson(after),
+      );
+      for (const id of new Set([...before.keys(), ...next.keys()])) {
+        const prior = before.get(id) ?? null;
+        const rule = next.get(id) ?? null;
+        if (canonicalJson(prior) !== canonicalJson(rule))
+          this.#event(at, "project.rule-set", "project", "project", {
+            ruleId: id,
+            origin,
+            before: prior,
+            after: rule,
+          });
+      }
+    });
+  }
+
+  setGoalPolicy(
+    goalId: string,
+    gate: RuleGate,
+    value: GoalPolicy,
+    origin: SettingsOrigin,
+    expected?: GoalPolicy,
+  ): void {
+    const id = identifier(goalId);
+    oneOf(gate, RULE_GATES);
+    oneOf(value, GOAL_POLICIES);
+    oneOf(origin, ["cli", "operator-ui"]);
+    this.#write((at) => {
+      required(this.#goal(id));
+      const before = this.#goalPolicyOverride(id, gate);
+      if (expected !== undefined && expected !== before)
+        throw new OrchestratorStoreError("stale-policy");
+      this.#run(
+        "INSERT INTO goal_policy VALUES (?, ?, ?) ON CONFLICT (goal_id, gate) DO UPDATE SET value = excluded.value",
+        id,
+        gate,
+        value,
+      );
+      this.#event(at, "goal.policy-set", "goal", id, {
+        gate,
+        origin,
+        before,
+        after: value,
+      });
+    });
+  }
+
+  setTaskIntegrationPolicy(
+    taskId: string,
+    value: TaskPolicy,
+    origin: SettingsOrigin,
+    expected?: TaskPolicy,
+  ): void {
+    const id = identifier(taskId);
+    oneOf(value, TASK_POLICIES);
+    oneOf(origin, ["cli", "operator-ui"]);
+    this.#write((at) => {
+      required(this.#task(id));
+      const before = this.#taskPolicyOverride(id);
+      if (expected !== undefined && expected !== before)
+        throw new OrchestratorStoreError("stale-policy");
+      this.#run(
+        "INSERT INTO task_policy VALUES (?, ?) ON CONFLICT (task_id) DO UPDATE SET value = excluded.value",
+        id,
+        value,
+      );
+      this.#event(at, "task.policy-set", "task", id, {
+        origin,
+        before,
+        after: value,
       });
     });
   }
@@ -786,7 +1057,7 @@ export class OrchestratorStore {
     return row;
   }
 
-  #goalPolicy(content: GoalContent) {
+  #goalPolicy(content: GoalContent, origin: Origin) {
     const gate = "goal-registration";
     const layers = { defaults: this.#defaults() };
     const request = content.policies ?? {};
@@ -794,9 +1065,10 @@ export class OrchestratorStore {
     return {
       gate,
       loosening,
-      ...resolvePolicy(
+      ...this.#resolveGate(
         gate,
         loosening.includes(gate) ? layers : { ...layers, request },
+        { invariant: this.#proposalInvariant(origin) },
       ),
     } as const;
   }
@@ -805,21 +1077,84 @@ export class OrchestratorStore {
     return { defaults: this.#defaults(), goal: goal.policies ?? {} };
   }
 
-  #taskPolicy(task: TaskContent, goal: GoalContent) {
+  #proposalInvariant(origin: Origin): PolicyInvariant | undefined {
+    if (origin.kind === "actor" && origin.actor === "Concierge")
+      return "concierge-proposal";
+  }
+
+  #resolveGate(
+    gate: Gate,
+    layers: PolicyLayers,
+    context: {
+      goalId?: string;
+      taskId?: string;
+      invariant?: PolicyInvariant | undefined;
+      facts?: RuleFacts | undefined;
+    } = {},
+  ) {
+    return resolveDelegation(gate, {
+      fallback: resolvePolicy(
+        gate,
+        this.#explicitDefaults().includes(gate)
+          ? { defaults: layers.defaults }
+          : layers,
+      ),
+      invariant: context.invariant,
+      task:
+        gate === "integration" && context.taskId
+          ? this.#taskPolicyOverride(context.taskId)
+          : undefined,
+      goal:
+        gate !== "goal-registration" && context.goalId
+          ? this.#goalPolicyOverride(context.goalId, gate)
+          : undefined,
+      rules: context.facts ? this.#rules() : [],
+      facts: context.facts,
+    });
+  }
+
+  #taskPolicy(
+    task: TaskContent,
+    goal: GoalContent,
+    origin: Origin,
+    inScope: boolean,
+  ) {
     const gate = "task-registration";
     const layers = this.#goalLayers(goal);
-    return {
-      gate,
-      loosening: requestedLoosening(layers, task.policies ?? {}),
-      ...resolvePolicy(gate, layers),
-    } as const;
+    const facts = {
+      paths: task.paths,
+      maxTokens: task.budgets.maxTokens,
+      category:
+        origin.kind === "actor" && origin.actor === "Planner"
+          ? task.category
+          : undefined,
+    };
+    const answer = this.#resolveGate(gate, layers, {
+      goalId: task.goalId,
+      facts,
+      invariant: inScope ? this.#proposalInvariant(origin) : "scope-exception",
+    });
+    const loosening = requestedLoosening(layers, task.policies ?? {});
+    for (const requested of GATES) {
+      if (
+        task.policies?.[requested] !== "agent" ||
+        loosening.includes(requested)
+      )
+        continue;
+      const prior =
+        requested === gate
+          ? answer
+          : this.#resolveGate(requested, layers, { goalId: task.goalId });
+      if (prior.policy === "human") loosening.push(requested);
+    }
+    return { gate, loosening, ...answer } as const;
   }
 
   proposeGoal(content: unknown, origin: Origin): GoalReceipt {
     const goal = validateGoalContent(content);
     const source = parseOrigin(origin);
     return this.#write((at) => {
-      const policy = this.#goalPolicy(goal);
+      const policy = this.#goalPolicy(goal, source);
       const row = this.#newProposal("goal", goal, source, "pending", at);
       this.#event(
         at,
@@ -866,11 +1201,19 @@ export class OrchestratorStore {
     ).count;
   }
 
+  #taskDependency(goalId: string, id: string) {
+    // A Planner batch pins a proposal ID when an earlier Task needs approval.
+    return this.#db
+      .query<{ status: TaskRow["status"] }>(
+        "SELECT status FROM tasks WHERE goal_id = ? AND (id = ? OR proposal_id = ?)",
+      )
+      .get(goalId, id, id);
+  }
+
   #hasDependencies(task: TaskContent): boolean {
-    const query = this.#db.query(
-      "SELECT id FROM tasks WHERE id = ? AND goal_id = ?",
+    return task.dependsOn.every(
+      (id) => this.#taskDependency(task.goalId, id) !== null,
     );
-    return task.dependsOn.every((id) => query.get(id, task.goalId) !== null);
   }
 
   #taskApprovalError(task: TaskContent, goal: ReturnType<typeof goalRecord>) {
@@ -905,11 +1248,23 @@ export class OrchestratorStore {
     const source = parseOrigin(origin);
     return this.#write((at) => {
       const goal = this.#activeGoal(task.goalId);
-      const { gate, loosening, ...policy } = this.#taskPolicy(task, goal);
       const scope = fitsScope(goal, task, this.#taskCount(task.goalId));
+      const { gate, loosening, ...policy } = this.#taskPolicy(
+        task,
+        goal,
+        source,
+        scope.ok,
+      );
       const reasons = scope.ok ? [] : scope.reasons;
       if (!this.#hasDependencies(task)) reasons.push("dependsOn");
       if (loosening.length !== 0) reasons.push("policy-loosening");
+      if (
+        reasons.length === 0 &&
+        (policy.source === "operator-goal" ||
+          this.#explicitDefaults().includes(gate) ||
+          this.#rules().some((rule) => rule.enabled && rule.gate === gate))
+      )
+        reasons.push("operator-delegation");
       if (reasons.length === 0) {
         const row = this.#newProposal("task", task, source, "registered", at);
         const taskId = this.#registerTask(row, task, at);
@@ -953,13 +1308,30 @@ export class OrchestratorStore {
 
   decide(
     proposalId: string,
-    answer: { digest: string; decision: Decision; answerer: Answerer },
+    answer: {
+      digest: string;
+      decision: Decision;
+      answerer: Answerer;
+      reasons?: readonly string[];
+    },
   ): DecisionReceipt {
     const id = identifier(proposalId);
-    const input = fields(answer, ["digest", "decision", "answerer"]);
+    const input = fields(answer, ["digest", "decision", "answerer", "reasons"]);
     if (typeof input.digest !== "string") throw new ContractError();
     const decision = oneOf(input.decision, ["approve", "reject"]);
     const answerer = parseAnswerer(input.answerer);
+    const reasons = input.reasons;
+    if (
+      reasons !== undefined &&
+      (answerer.kind !== "agent" ||
+        !Array.isArray(reasons) ||
+        reasons.length > 16 ||
+        reasons.some(
+          (reason) => typeof reason !== "string" || reason.length > 500,
+        ))
+    )
+      throw new ContractError();
+    const reasonsJson = reasons === undefined ? null : canonicalJson(reasons);
     return this.#write((at) => {
       const row = required(this.#proposal(id));
       if (row.digest !== input.digest)
@@ -973,7 +1345,8 @@ export class OrchestratorStore {
         proposal.kind === "task"
           ? goalRecord(required(this.#goal(proposal.content.goalId)))
           : undefined;
-      const { gate, policy, source, loosening } = this.#proposalGate(proposal);
+      const { gate, policy, source, loosening, ...details } =
+        this.#proposalGate(proposal);
       if (gate === null || policy === null || source === null)
         throw new OrchestratorStoreError("invalid-transition");
       const integration =
@@ -983,8 +1356,18 @@ export class OrchestratorStore {
       const origin = proposal.source;
       const requirements = {
         policy,
-        ...proposalAnswerRequirements(proposal, policy, loosening),
+        ...proposalAnswerRequirements(proposal, policy, loosening, source),
       };
+      const setting: EffectivePolicy =
+        source !== "invariant" && loosening.length > 0 && decision === "approve"
+          ? {
+              policy: "human",
+              source: "invariant",
+              invariant: "policy-loosening",
+            }
+          : requirements.humanAnswerRequired && policy === "agent"
+            ? { policy: "human", source: "request" }
+            : { policy, source, ...details };
       if (
         answerer.kind === "human" &&
         answerer.channel === "operator-ui" &&
@@ -993,6 +1376,17 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("approval-forbidden");
       if (answerer.kind === "agent") {
         const execution = this.#execution(answerer.executionId);
+        const binding = this.#db
+          .query<{ proposalId: string }>(
+            "SELECT proposal_id AS proposalId FROM proposal_approval_runs WHERE execution_id = ?",
+          )
+          .get(answerer.executionId);
+        // Legacy registration callers can still supply an unbound host Reviewer.
+        // Scheduled runs and newly delegated gates always use a pinned proposal.
+        const requiresBinding =
+          integration !== null ||
+          source === "rule" ||
+          source === "operator-goal";
         if (
           !permitsAgentAnswer(origin, requirements, decision) ||
           (origin.kind === "actor" &&
@@ -1002,13 +1396,8 @@ export class OrchestratorStore {
           execution.status !== "running" ||
           parseOrigin(JSON.parse(execution.requestedByJson)).kind !== "host" ||
           (task && execution.goalId !== task.goalId) ||
-          (integration &&
-            (execution.taskId !== integration.taskId ||
-              !this.#db
-                .query(
-                  "SELECT 1 FROM integration_approval_runs WHERE proposal_id = ? AND execution_id = ?",
-                )
-                .get(id, execution.id)))
+          (integration && execution.taskId !== integration.taskId) ||
+          ((requiresBinding || binding !== null) && binding?.proposalId !== id)
         )
           throw new OrchestratorStoreError("approval-forbidden");
       }
@@ -1026,17 +1415,19 @@ export class OrchestratorStore {
         id,
       );
       this.#run(
-        "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         approvalId,
         id,
         gate,
         row.digest,
-        policy,
-        source,
+        setting.policy,
+        setting.source,
         answerer.kind,
         canonicalJson(answerer),
         decision,
         at,
+        canonicalJson(setting),
+        reasonsJson,
       );
       const correlation = {
         ...(origin.kind === "actor" && origin.sessionId !== undefined
@@ -1057,8 +1448,7 @@ export class OrchestratorStore {
           approvalId,
           digest: row.digest,
           gate,
-          policy,
-          source,
+          ...setting,
           decision,
           answererKind: answerer.kind,
           ...(answerer.kind === "human" &&
@@ -1129,13 +1519,9 @@ export class OrchestratorStore {
       task.content.actor === "Executor" &&
       this.#goal(task.goalId)?.status === "active" &&
       !this.#goalIntegrationInProgress(task.goalId) &&
-      task.content.dependsOn.every((id) => {
-        const dependency = this.#task(id);
-        return (
-          dependency?.goalId === task.goalId &&
-          dependency.status === "succeeded"
-        );
-      })
+      task.content.dependsOn.every(
+        (id) => this.#taskDependency(task.goalId, id)?.status === "succeeded",
+      )
     );
   }
 
@@ -1226,9 +1612,22 @@ export class OrchestratorStore {
     });
   }
 
-  proposeIntegration(value: IntegrationContent, reviewedBy: string) {
+  proposeIntegration(
+    value: IntegrationContent,
+    reviewedBy: string,
+    diffSize?: DiffSize,
+  ) {
     const content = validateIntegrationContent(value);
     const executionId = identifier(reviewedBy);
+    if (diffSize !== undefined) {
+      integer(
+        diffSize.changedFiles,
+        content.changedPaths.length,
+        content.changedPaths.length,
+      );
+      if (diffSize.changedLines !== null)
+        integer(diffSize.changedLines, 0, Number.MAX_SAFE_INTEGER);
+    }
     return this.#write((at) => {
       const task = taskRecord(required(this.#task(content.taskId)));
       const execution = required(this.#execution(executionId));
@@ -1259,6 +1658,17 @@ export class OrchestratorStore {
         "pending",
         at,
       );
+      this.#run(
+        "INSERT INTO integration_policy_facts VALUES (?, ?, ?)",
+        row.id,
+        content.changedPaths.length,
+        diffSize?.changedLines ?? null,
+      );
+      const {
+        gate,
+        loosening: _loosening,
+        ...policy
+      } = this.#proposalGate(proposalRecord(row));
       this.#event(
         at,
         "proposal.created",
@@ -1266,6 +1676,8 @@ export class OrchestratorStore {
         row.id,
         {
           kind: "integration",
+          gate,
+          ...policy,
           digest: row.digest,
           taskId: task.id,
           goalId: task.goalId,
@@ -1545,10 +1957,50 @@ export class OrchestratorStore {
               proposal,
               gate.policy,
               gate.loosening,
+              gate.source,
             ),
           });
         }),
     );
+  }
+
+  pendingRegistrationApprovals(cursor: number, limit: number) {
+    integer(cursor, 0, Number.MAX_SAFE_INTEGER);
+    integer(limit, 1, 100);
+    return this.#read(() => {
+      const rows = this.#db
+        .query<ProposalRow & { cursor: number; previouslyReviewed: number }>(
+          `SELECT ${proposalColumns}, rowid AS cursor,
+           EXISTS (SELECT 1 FROM proposal_approval_runs WHERE proposal_id = proposals.id) AS previouslyReviewed
+         FROM proposals
+         WHERE rowid > ? AND status = 'pending' AND kind IN ('goal', 'task')
+           AND NOT EXISTS (
+             SELECT 1 FROM proposal_approval_runs a
+             JOIN executions e ON e.id = a.execution_id
+             WHERE a.proposal_id = proposals.id
+             GROUP BY a.proposal_id
+             HAVING count(*) > 1 OR max(coalesce(json_extract(e.result_json, '$.code'), ''))
+               NOT IN ('human-approval-required', 'approval-forbidden')
+           )
+         ORDER BY rowid LIMIT ?`,
+        )
+        .all(cursor, limit);
+      const ids = rows.flatMap((row) => {
+        const proposal = proposalRecord(row);
+        const { policy, source, loosening } = this.#proposalGate(proposal);
+        return permitsAgentAnswer(
+          proposal.source,
+          {
+            policy,
+            ...proposalAnswerRequirements(proposal, policy, loosening, source),
+          },
+          row.previouslyReviewed ? "approve" : "reject",
+        )
+          ? [proposal.id]
+          : [];
+      });
+      return { ids, cursor: rows.length < limit ? 0 : rows.at(-1)!.cursor };
+    });
   }
 
   canRequestIntegrationApproval(proposalId: string) {
@@ -1556,7 +2008,7 @@ export class OrchestratorStore {
       const runs = this.#db
         .query<{ status: ExecutionStatus; code: string | null }>(
           `
-          SELECT executions.status, json_extract(executions.result_json, '$.code') AS code FROM integration_approval_runs
+          SELECT executions.status, json_extract(executions.result_json, '$.code') AS code FROM proposal_approval_runs
           JOIN executions ON executions.id = execution_id WHERE proposal_id = ?
         `,
         )
@@ -1617,16 +2069,33 @@ export class OrchestratorStore {
           ? null
           : identifier(input.approvalProposalId);
       if (approvalProposalId !== null) {
-        const proposal = this.getProposalForAgentApproval(approvalProposalId);
+        const proposal = this.getProposalForAgentApproval(approvalProposalId, {
+          allowRejectOnly: true,
+        });
         if (
-          proposal.kind !== "integration" ||
           actor !== "Reviewer" ||
           mode !== "approval" ||
           origin.kind !== "host" ||
-          taskId !== proposal.content.taskId
+          goalId !==
+            (proposal.kind === "goal" ? null : proposal.content.goalId) ||
+          taskId !==
+            (proposal.kind === "integration" ? proposal.content.taskId : null)
         )
           throw new OrchestratorStoreError("context-mismatch");
-        if (!this.canRequestIntegrationApproval(approvalProposalId))
+        if (
+          proposal.kind === "integration" &&
+          !this.canRequestIntegrationApproval(approvalProposalId)
+        )
+          throw new OrchestratorStoreError("invalid-transition");
+        if (
+          proposal.kind !== "integration" &&
+          this.#db
+            .query(
+              `SELECT 1 FROM proposal_approval_runs a JOIN executions e ON e.id = a.execution_id
+           WHERE a.proposal_id = ? AND e.status IN ('queued', 'running')`,
+            )
+            .get(approvalProposalId)
+        )
           throw new OrchestratorStoreError("invalid-transition");
       }
       if (
@@ -1656,7 +2125,7 @@ export class OrchestratorStore {
       );
       if (approvalProposalId !== null)
         this.#run(
-          "INSERT INTO integration_approval_runs VALUES (?, ?)",
+          "INSERT INTO proposal_approval_runs VALUES (?, ?)",
           approvalProposalId,
           id,
         );
@@ -2242,8 +2711,17 @@ export class OrchestratorStore {
     });
   }
 
-  #proposalGate(proposal: ReturnType<typeof proposalRecord>) {
-    if (proposal.kind === "goal") return this.#goalPolicy(proposal.content);
+  #proposalGate(proposal: ReturnType<typeof proposalRecord>): Omit<
+    EffectivePolicy,
+    "policy" | "source"
+  > & {
+    gate: Gate | null;
+    policy: Policy | null;
+    source: EffectivePolicy["source"] | null;
+    loosening: Gate[];
+  } {
+    if (proposal.kind === "goal")
+      return this.#goalPolicy(proposal.content, proposal.source);
     if (proposal.status === "registered")
       return { gate: null, policy: null, source: null, loosening: [] };
     const goal = goalRecord(required(this.#goal(proposal.content.goalId)));
@@ -2254,13 +2732,66 @@ export class OrchestratorStore {
       return {
         gate: "integration" as const,
         loosening: [],
-        ...resolvePolicy("integration", {
-          ...this.#goalLayers(goal.content),
-          task: task.content.policies ?? {},
-        }),
+        ...this.#integrationPolicy(task, goal.content, proposal),
       };
     }
-    return this.#taskPolicy(proposal.content, goal.content);
+    // Resolve pending Tasks against current scope, including at decision time.
+    const inScope =
+      proposal.status !== "pending" ||
+      fitsScope(goal.content, proposal.content, this.#taskCount(goal.id)).ok;
+    return this.#taskPolicy(
+      proposal.content,
+      goal.content,
+      proposal.source,
+      inScope,
+    );
+  }
+
+  #plannerCategory(task: ReturnType<typeof taskRecord>) {
+    if (!task.content.category) return;
+    const proposal = proposalRecord(required(this.#proposal(task.proposalId)));
+    if (proposal.source.kind === "actor" && proposal.source.actor === "Planner")
+      return task.content.category;
+  }
+
+  #integrationPolicy(
+    task: ReturnType<typeof taskRecord>,
+    goal: GoalContent,
+    proposal?: Extract<
+      ReturnType<typeof proposalRecord>,
+      { kind: "integration" }
+    >,
+  ) {
+    const evidence =
+      proposal &&
+      this.#db
+        .query<DiffSize>(
+          "SELECT changed_files AS changedFiles, changed_lines AS changedLines FROM integration_policy_facts WHERE proposal_id = ?",
+        )
+        .get(proposal.id);
+    const invariant =
+      proposal &&
+      (integrationInvariant(proposal) ??
+        (!evidence && proposal.status === "pending"
+          ? "integration-symlink-evidence"
+          : undefined));
+    return this.#resolveGate(
+      "integration",
+      {
+        ...this.#goalLayers(goal),
+        task: task.content.policies ?? {},
+      },
+      {
+        taskId: task.id,
+        goalId: task.goalId,
+        invariant,
+        facts: proposal && {
+          paths: proposal.content.changedPaths,
+          category: this.#plannerCategory(task),
+          ...(evidence && { diffSize: evidence }),
+        },
+      },
+    );
   }
 
   #checkIntegrationTask(content: IntegrationContent, proposalId: string) {
@@ -2290,12 +2821,22 @@ export class OrchestratorStore {
           policy: ApprovalPolicy["policy"];
           source: ApprovalPolicy["source"];
           answererJson: string;
+          detailsJson: string | null;
         }>(
-          "SELECT gate, policy, policy_source AS source, answerer_json AS answererJson FROM approvals WHERE proposal_id = ?",
+          "SELECT gate, policy, policy_source AS source, answerer_json AS answererJson, policy_details_json AS detailsJson FROM approvals WHERE proposal_id = ?",
         )
         .get(id);
-      const { answererJson, ...recordedPolicy } = decision ?? {};
-      const policy = { ...this.#proposalGate(proposal), ...recordedPolicy };
+      const { answererJson, detailsJson } = decision ?? {};
+      const gate = this.#proposalGate(proposal);
+      const policy = decision
+        ? {
+            gate: decision.gate,
+            loosening: gate.loosening,
+            ...(detailsJson
+              ? (JSON.parse(detailsJson) as EffectivePolicy)
+              : { policy: decision.policy, source: decision.source }),
+          }
+        : gate;
       const answerer =
         includeDelegation && answererJson
           ? parseAnswerer(JSON.parse(answererJson))
@@ -2307,6 +2848,7 @@ export class OrchestratorStore {
           proposal,
           policy.policy,
           policy.loosening,
+          policy.source,
         ),
         origin: proposal.source,
         ...(answerer?.kind === "human" &&
@@ -2316,7 +2858,10 @@ export class OrchestratorStore {
   }
 
   /** Read and check the same proposal snapshot before scheduling a Reviewer. */
-  getProposalForAgentApproval(proposalId: string) {
+  getProposalForAgentApproval(
+    proposalId: string,
+    { allowRejectOnly = false }: { allowRejectOnly?: boolean } = {},
+  ) {
     const id = identifier(proposalId);
     return this.#read(() =>
       this.#db
@@ -2326,7 +2871,13 @@ export class OrchestratorStore {
             throw new OrchestratorStoreError("invalid-transition");
           if (contentDigest(proposal.content) !== proposal.digest)
             throw new OrchestratorStoreError("stale-digest");
-          if (!permitsAgentAnswer(proposal.origin, proposal, "approve"))
+          if (
+            !permitsAgentAnswer(
+              proposal.origin,
+              proposal,
+              allowRejectOnly ? "reject" : "approve",
+            )
+          )
             throw new OrchestratorStoreError("approval-forbidden");
           if (proposal.kind === "integration") {
             this.#checkIntegrationTask(proposal.content, proposal.id);
@@ -2918,6 +3469,74 @@ export class OrchestratorStore {
     );
   }
 
+  decisionHistory(limit = 20) {
+    integer(limit, 1, 200);
+    return this.#read(() => {
+      const rows = this.#db
+        .query<{
+          id: string;
+          proposalId: string;
+          gate: Gate;
+          result: Decision;
+          at: string;
+          policy: Policy;
+          source: EffectivePolicy["source"];
+          details: string | null;
+          reasons: string | null;
+          executionResult: string | null;
+          goalId: string | null;
+          taskId: string | null;
+        }>(
+          `
+        SELECT a.id, a.proposal_id AS proposalId, a.gate, a.decision AS result, a.at,
+          a.policy, a.policy_source AS source, a.policy_details_json AS details,
+          a.reasons_json AS reasons, e.result_json AS executionResult,
+          coalesce(g.id, json_extract(p.content_json, '$.goalId')) AS goalId,
+          coalesce(t.id, json_extract(p.content_json, '$.taskId')) AS taskId
+        FROM approvals a JOIN proposals p ON p.id = a.proposal_id
+        LEFT JOIN goals g ON g.proposal_id = p.id
+        LEFT JOIN tasks t ON t.proposal_id = p.id
+        LEFT JOIN executions e ON e.id = json_extract(a.answerer_json, '$.executionId')
+        WHERE a.answerer_kind = 'agent' ORDER BY a.rowid DESC LIMIT ?
+      `,
+        )
+        .all(limit);
+      let bytes = 0;
+      const history = [];
+      for (const {
+        policy,
+        source,
+        details,
+        reasons,
+        executionResult,
+        ...row
+      } of rows) {
+        const entry = {
+          ...row,
+          setting: details
+            ? (JSON.parse(details) as EffectivePolicy)
+            : { policy, source },
+          reasons: (() => {
+            const modelReasons: unknown = reasons
+              ? JSON.parse(reasons)
+              : executionResult
+                ? JSON.parse(executionResult)?.reasons
+                : undefined;
+            return Array.isArray(modelReasons)
+              ? modelReasons.filter(
+                  (reason): reason is string => typeof reason === "string",
+                )
+              : [];
+          })(),
+        };
+        bytes += Buffer.byteLength(JSON.stringify(entry)) + 1;
+        if (bytes > 768 * 1024) break;
+        history.push(entry);
+      }
+      return freeze(history);
+    });
+  }
+
   effectivePolicy(
     gate: Gate,
     context: { goalId?: string; taskId?: string } = {},
@@ -2942,11 +3561,34 @@ export class OrchestratorStore {
             id === null
               ? { defaults: this.#defaults() }
               : this.#goalLayers(goalRecord(required(this.#goal(id))).content);
+          if (validGate === "integration" && task && id !== null) {
+            const latest = this.#latestIntegrationProposalId(task.id);
+            const row = latest && this.#proposal(latest);
+            const proposal = row ? proposalRecord(row) : null;
+            return freeze(
+              this.#integrationPolicy(
+                task,
+                goalRecord(required(this.#goal(id))).content,
+                proposal?.kind === "integration" &&
+                  (task.status === "awaiting-integration" ||
+                    task.status === "succeeded" ||
+                    (task.status === "running" &&
+                      this.#integrationProgress(task.id)?.proposalId ===
+                        proposal.id))
+                  ? proposal
+                  : undefined,
+              ),
+            );
+          }
           return freeze(
-            resolvePolicy(validGate, {
-              ...layers,
-              task: task?.content.policies ?? {},
-            }),
+            this.#resolveGate(
+              validGate,
+              {
+                ...layers,
+                task: task?.content.policies ?? {},
+              },
+              id === null ? {} : { goalId: id },
+            ),
           );
         })
         .deferred(),

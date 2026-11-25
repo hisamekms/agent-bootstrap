@@ -1,9 +1,18 @@
+import { action, textElement } from "./dom.ts";
+import {
+  delegationPanel,
+  goalDelegation,
+  taskDelegation,
+} from "./delegation-panel.ts";
 import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
 import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
 import {
   estimateLabel,
+  gateLabels,
+  settingLabel,
+  type AgentDecision,
   formatDuration,
   formatTimestamp,
   formatTokens,
@@ -21,15 +30,6 @@ import {
 export function element(id: string): HTMLElement {
   const node = document.getElementById(id);
   if (!node) throw new Error(`Missing workplace element ${id}`);
-  return node;
-}
-
-function textElement<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  text: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  node.textContent = text;
   return node;
 }
 
@@ -434,14 +434,6 @@ function list<T>(items: readonly T[], row: (item: T) => Node) {
   return node;
 }
 
-function action(label: string, key: string, select: () => void) {
-  const button = textElement("button", label);
-  button.type = "button";
-  button.dataset.focusKey = key;
-  button.addEventListener("click", select);
-  return button;
-}
-
 function modelLink(
   label: string,
   title: string,
@@ -476,7 +468,11 @@ function budgetText(budgets: TaskDetail["budgets"]) {
   return `${budgets.maxExecutionMs / 1000} 秒 / ${formatTokens(budgets.maxTokens)} トークン / 再試行 ${budgets.maxRetries} 回`;
 }
 
-function goalDetail(goal: GoalDetail, selectTask: (id: string) => void) {
+function goalDetail(
+  goal: GoalDetail,
+  delegation: Node,
+  selectTask: (id: string) => void,
+) {
   const { scope } = goal;
   return [
     modelBox("Goal", [goal.title]),
@@ -493,6 +489,7 @@ function goalDetail(goal: GoalDetail, selectTask: (id: string) => void) {
     ]),
     ...(goal.description ? [modelBox("説明", [goal.description])] : []),
     modelBox("受け入れ条件", goal.acceptance),
+    delegation,
     textElement("h3", "Task"),
     goal.tasks.length
       ? list(goal.tasks, (task: TaskSummary) => {
@@ -524,7 +521,7 @@ function rejectedPaths(
   );
 }
 
-function taskDetail(task: TaskDetail) {
+function taskDetail(task: TaskDetail, delegation: Node) {
   const tokens = formatTokens(task.tokensUsed);
   const usage = task.tokensIncomplete
     ? task.tokensUsed
@@ -559,6 +556,9 @@ function taskDetail(task: TaskDetail) {
   }
   return [
     modelBox("Task", [task.title]),
+    ...(task.category
+      ? [modelBox("Planner の申告カテゴリー", [task.category])]
+      : []),
     track,
     ...(task.stage === "cancelled" ? [textElement("p", labels.cancelled)] : []),
     ...estimateText(task.estimate),
@@ -572,6 +572,7 @@ function taskDetail(task: TaskDetail) {
       ["使用トークン", `${usage} / ${formatTokens(task.budgets.maxTokens)}`],
       ["対象パス", task.paths.join(", ") || "—"],
     ]),
+    delegation,
     ...(task.failure ? [failure] : []),
     ...(task.description ? [modelBox("説明", [task.description])] : []),
     modelBox("受け入れ条件", task.acceptance),
@@ -611,7 +612,41 @@ function problemRow(problem: Problem, select: () => void) {
   return entry;
 }
 
-const tabs = ["decisions", "problems", "goals"] as const;
+function decisionHistory(
+  rows: AgentDecision[],
+  openTask: (id: string) => void,
+  openGoal: (id: string) => void,
+) {
+  return [
+    textElement("h3", "AI が判断したもの"),
+    rows.length
+      ? list(rows, (entry) => {
+          const item = document.createElement("div");
+          item.append(
+            textElement(
+              "p",
+              `${gateLabels[entry.gate]} · ${entry.result === "approve" ? "承認" : "却下"} · ${formatTimestamp(entry.at)}`,
+            ),
+            textElement("p", settingLabel(entry.setting)),
+            modelBox(
+              "Reviewer の理由",
+              entry.reasons.length ? entry.reasons : ["—"],
+            ),
+          );
+          if (entry.taskId) {
+            const id = entry.taskId;
+            item.append(action("Task の詳細", entry.id, () => openTask(id)));
+          } else if (entry.goalId) {
+            const id = entry.goalId;
+            item.append(action("Goal の詳細", entry.id, () => openGoal(id)));
+          }
+          return item;
+        })
+      : textElement("p", "AI の判断はありません。"),
+  ];
+}
+
+const tabs = ["decisions", "problems", "goals", "delegation"] as const;
 type Tab = (typeof tabs)[number];
 type View = {
   tab: Tab;
@@ -624,6 +659,11 @@ export function createHostPanel(channel: WorkplaceChannel) {
   const notice = element("inbox-notice");
   let view: View = { tab: "decisions" };
   let previous = "";
+  let previousHistory = "";
+  const savedPolicy = () => {
+    previous = "";
+    void refresh();
+  };
   let loading = false;
   let refreshNeeded = false;
   let badgesNeeded = false;
@@ -691,9 +731,10 @@ export function createHostPanel(channel: WorkplaceChannel) {
 
   function renderWork(view: View, data: unknown, contents: () => Node[]) {
     const snapshot = JSON.stringify(data);
-    if (snapshot === previous) return;
-    previous = snapshot;
     const panel = element(view.tab);
+    if (snapshot === previous || panel.querySelector("[data-policy-editing]"))
+      return;
+    previous = snapshot;
     const focused = document.activeElement;
     const focusKey =
       focused instanceof HTMLButtonElement && panel.contains(focused)
@@ -728,23 +769,30 @@ export function createHostPanel(channel: WorkplaceChannel) {
         badgesNeeded = false;
         const current = view;
         const listView = !current.goalId && !current.taskId;
-        const [items, problems, goals, goal, task] = await Promise.allSettled([
-          refreshBadges || current.tab === "decisions"
-            ? channel.request("inbox.list", {})
-            : undefined,
-          refreshBadges || (listView && current.tab === "problems")
-            ? channel.request("problem.list", {})
-            : undefined,
-          refreshBadges || (listView && current.tab === "goals")
-            ? channel.request("goal.list", {})
-            : undefined,
-          current.goalId && !current.taskId
-            ? channel.request("goal.get", { id: current.goalId })
-            : undefined,
-          current.taskId
-            ? channel.request("task.get", { id: current.taskId })
-            : undefined,
-        ] as const);
+        const [items, problems, goals, goal, task, policy, history] =
+          await Promise.allSettled([
+            refreshBadges || current.tab === "decisions"
+              ? channel.request("inbox.list", {})
+              : undefined,
+            refreshBadges || (listView && current.tab === "problems")
+              ? channel.request("problem.list", {})
+              : undefined,
+            refreshBadges || (listView && current.tab === "goals")
+              ? channel.request("goal.list", {})
+              : undefined,
+            current.goalId && !current.taskId
+              ? channel.request("goal.get", { id: current.goalId })
+              : undefined,
+            current.taskId
+              ? channel.request("task.get", { id: current.taskId })
+              : undefined,
+            current.tab === "delegation"
+              ? channel.request("policy.get", {})
+              : undefined,
+            current.tab === "decisions"
+              ? channel.request("decision.history", {})
+              : undefined,
+          ] as const);
         if (disconnected) return;
         if (items.status === "fulfilled" && items.value) {
           element("badge-decisions").textContent = String(
@@ -772,26 +820,56 @@ export function createHostPanel(channel: WorkplaceChannel) {
               ? problems
               : tab === "goals"
                 ? goals
-                : items;
+                : tab === "delegation"
+                  ? policy
+                  : items;
         notice.textContent =
           active.status === "rejected"
             ? "ホストパネルを更新できませんでした。"
             : "";
-        if (tab === "decisions") continue;
+        if (tab === "decisions") {
+          const snapshot = JSON.stringify(history);
+          if (snapshot !== previousHistory) {
+            previousHistory = snapshot;
+            element("decision-history").replaceChildren(
+              ...(history.status === "fulfilled" && history.value
+                ? decisionHistory(
+                    history.value,
+                    (taskId) => navigate({ tab: "goals", taskId }),
+                    (goalId) => navigate({ tab: "goals", goalId }),
+                  )
+                : [textElement("p", "AI の判断履歴を取得できませんでした。")]),
+            );
+          }
+          continue;
+        }
         if (active.status === "rejected") {
           renderWork(current, null, () => [
             textElement("p", "詳細または一覧を取得できませんでした。"),
           ]);
         } else if (task.status === "fulfilled" && task.value) {
           const detail = task.value;
-          renderWork(current, detail, () => taskDetail(detail));
+          renderWork(current, detail, () =>
+            taskDetail(detail, taskDelegation(detail, channel, savedPolicy)),
+          );
         } else if (goal.status === "fulfilled" && goal.value) {
           const detail = goal.value;
           renderWork(current, detail, () =>
-            goalDetail(detail, (taskId) =>
-              navigate({ tab, goalId: detail.id, taskId }),
+            goalDetail(
+              detail,
+              goalDelegation(detail, channel, savedPolicy),
+              (taskId) => navigate({ tab, goalId: detail.id, taskId }),
             ),
           );
+        } else if (
+          tab === "delegation" &&
+          policy.status === "fulfilled" &&
+          policy.value
+        ) {
+          const settings = policy.value;
+          renderWork(current, settings, () => [
+            delegationPanel(settings, channel, savedPolicy),
+          ]);
         } else if (
           tab === "goals" &&
           goals.status === "fulfilled" &&

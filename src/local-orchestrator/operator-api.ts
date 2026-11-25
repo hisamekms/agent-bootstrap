@@ -1,3 +1,9 @@
+import {
+  GOAL_POLICIES,
+  RULE_GATES,
+  TASK_POLICIES,
+  validateDelegationRules,
+} from "./delegation.ts";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { isAbsolute, join } from "node:path";
@@ -12,7 +18,14 @@ import {
   projectInbox,
   type InboxSource,
 } from "./inbox.ts";
-import { ContractError, fields, identifier, integer, oneOf } from "./model.ts";
+import {
+  ContractError,
+  fields,
+  GATES,
+  identifier,
+  integer,
+  oneOf,
+} from "./model.ts";
 import {
   goalStatuses,
   operatorGoal,
@@ -29,7 +42,11 @@ import {
   answerManyFromPanel,
   parsePanelAnswer,
 } from "./proposal-answer.ts";
-import type { StoreErrorCode } from "./store.ts";
+import {
+  OrchestratorStoreError,
+  type OrchestratorStore,
+  type StoreErrorCode,
+} from "./store.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -101,6 +118,92 @@ async function removeStaleSocket(path: string) {
   });
   if (live) throw new Error("Operator API already running");
   unlinkSync(path);
+}
+
+export async function dispatchPolicy(
+  store: OrchestratorStore,
+  method: string,
+  params: unknown,
+  scan?: CredentialScanner,
+): Promise<Reply | undefined> {
+  const origin = "operator-ui";
+  try {
+    switch (method) {
+      case "policy.get":
+        fields(params, []);
+        return { result: store.policySettings() };
+      case "decision.history": {
+        const { limit } = fields(params, ["limit"]);
+        return {
+          result: store.decisionHistory(
+            limit === undefined ? undefined : integer(limit, 1, 200),
+          ),
+        };
+      }
+      case "policy.setDefault": {
+        const { gate, policy } = fields(params, ["gate", "policy"]);
+        store.setProjectDefaults(
+          { [oneOf(gate, GATES)]: oneOf(policy, ["human", "agent"]) },
+          { kind: "operator" },
+          origin,
+        );
+        break;
+      }
+      case "policy.setRules": {
+        const { rules, expectedRevision } = fields(params, [
+          "rules",
+          "expectedRevision",
+        ]);
+        if (
+          expectedRevision !== undefined &&
+          (typeof expectedRevision !== "string" ||
+            !/^[a-f0-9]{64}$/.test(expectedRevision))
+        )
+          throw new ContractError();
+        const validated = validateDelegationRules(rules);
+        await scan?.(JSON.stringify(validated));
+        store.setRules(validated, origin, expectedRevision);
+        break;
+      }
+      case "goal.setPolicy": {
+        const { goalId, gate, value, expected } = fields(params, [
+          "goalId",
+          "gate",
+          "value",
+          "expected",
+        ]);
+        store.setGoalPolicy(
+          identifier(goalId),
+          oneOf(gate, RULE_GATES),
+          oneOf(value, GOAL_POLICIES),
+          origin,
+          expected === undefined ? undefined : oneOf(expected, GOAL_POLICIES),
+        );
+        break;
+      }
+      case "task.setIntegrationPolicy": {
+        const { taskId, value, expected } = fields(params, [
+          "taskId",
+          "value",
+          "expected",
+        ]);
+        store.setTaskIntegrationPolicy(
+          identifier(taskId),
+          oneOf(value, TASK_POLICIES),
+          origin,
+          expected === undefined ? undefined : oneOf(expected, TASK_POLICIES),
+        );
+        break;
+      }
+      default:
+        return undefined;
+    }
+    return { result: { ok: true } };
+  } catch (error) {
+    if (error instanceof ContractError) return failure("invalid-params");
+    if (error instanceof OrchestratorStoreError) return failure(error.code);
+    return failure("write-failed");
+  }
 }
 
 export async function listenOperatorApi(options: OperatorApiOptions) {
@@ -262,7 +365,10 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
           fields(params, []);
           return { result: { subscribed: true } };
         default:
-          return failure("unknown-method");
+          return (
+            (await dispatchPolicy(store, method, params, scan)) ??
+            failure("unknown-method")
+          );
       }
     } catch (error) {
       if (error instanceof ContractError) return failure("invalid-params");

@@ -82,7 +82,7 @@ export const helpTopics = {
     ],
     output:
       "The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.",
-    next: "Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI.",
+    next: "Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI. Use 任せ方 to manage delegation.",
     human:
       "Keep the URL private. Stop the workplace process to end the session.",
   },
@@ -245,7 +245,7 @@ export const helpTopics = {
       "agent-bootstrap sandbox shell --allow example.com:443 --json",
     ],
     output:
-      "Policy reports goal-registration, task-registration, and integration defaults. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.",
+      "Policy reports gate defaults, ordered rules, and Goal and Task overrides. Proposals carry the effective policy and human-answer requirement. Product VMs are offline or use the audited gateway. The operator sandbox shell uses only explicitly allowed DNS names on ports 80 and 443. It runs for up to five minutes and has no provider credentials or actor configuration.",
     next: "Review the proposed paths, verification result, digest, and policy before answering each gate.",
     human: `${humanRepo} ${humanGate} Keep API keys in Keychain. Review mount and egress grants separately.`,
   },
@@ -320,9 +320,10 @@ export const operatorOutputs = {
     next: "Check status and revise the plan if needed.",
   },
   policy: {
-    usage: "policy show | policy set <gate> <human|agent>",
-    json: "Gate-to-policy map for show. { updated: true } for set.",
-    next: "Check effective policy on individual proposals.",
+    usage:
+      "policy show | policy set <gate> <human|agent> | policy rules set --file <json> | policy goal <goalId> <task-registration|integration> <inherit|human|agent> | policy task <taskId> <rule|human|agent>",
+    json: "Gate defaults, ordered rules with recent hits, and Goal and Task overrides for show.",
+    next: "Check the effective answerer and its source on individual proposals.",
   },
   events: {
     usage: "events [--subject <id>] [--limit <1-1000>]",

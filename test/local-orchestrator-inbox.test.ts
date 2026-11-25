@@ -337,7 +337,19 @@ test("version four stores acquire seen marks without losing pending proposals", 
   state.store.close();
   const db = new Database(state.filename);
   try {
-    db.exec("DROP TABLE inbox_seen; PRAGMA user_version=4");
+    db.exec(`
+      DROP TABLE inbox_seen;
+      DROP TABLE delegation_rules;
+      DROP TABLE goal_policy;
+      DROP TABLE task_policy;
+      DROP TABLE integration_policy_facts;
+      DROP INDEX events_decisions_at;
+      ALTER TABLE project_policy DROP COLUMN explicit_json;
+      ALTER TABLE proposal_approval_runs RENAME TO integration_approval_runs;
+      ALTER TABLE approvals DROP COLUMN policy_details_json;
+      ALTER TABLE approvals DROP COLUMN reasons_json;
+      PRAGMA user_version=4;
+    `);
   } finally {
     db.close();
   }

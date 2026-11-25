@@ -653,14 +653,9 @@ test("A throwing Planner is finalized without leaking the exception or retrying 
 test("Reviewer sees only digest-bound approval files and registers an approved task", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
-  const goalId = registerGoal(store, {
-    ...goal,
-    policies: { "task-registration": "agent" },
-  });
-  const proposal = store.proposeTask(
-    { ...task, goalId, paths: ["README.md"] },
-    plannerOrigin,
-  );
+  const goalId = registerGoal(store);
+  store.setProjectDefaults({ "task-registration": "agent" }, operator);
+  const proposal = store.proposeTask({ ...task, goalId }, plannerOrigin);
   const work = runner(store, {
     context: async () => {
       throw new Error("Approval cannot read repo context");
@@ -676,7 +671,7 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
       assert.deepEqual(JSON.parse(file(plan, "proposal.json")), {
         id: proposal.id,
         kind: "task",
-        content: { ...task, goalId, paths: ["README.md"] },
+        content: { ...task, goalId },
         digest: proposal.digest,
         gate: "task-registration",
         policy: "agent",
@@ -723,7 +718,7 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
   );
 });
 
-test("Reviewer refuses human policy, including pending content tightening an agent gate", async () => {
+test("Reviewer refuses human policy and honors an explicit operator default over proposal content", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
   const work = runner(store);
@@ -741,15 +736,14 @@ test("Reviewer refuses human policy, including pending content tightening an age
     { ...goal, policies: { "goal-registration": "human" } },
     plannerOrigin,
   );
-  await assert.rejects(work.requestApproval(tightened.id), {
-    code: "approval-forbidden",
-  });
   assert.equal(
     store
       .listEvents({ limit: 10 })
       .some((event) => event.kind === "execution.queued"),
     false,
   );
+  const id = await work.requestApproval(tightened.id);
+  assert.equal(store.getExecution(id)?.status, "queued");
 });
 
 test("Reviewer cannot queue an approval for a goal that loosens integration policy", async () => {
@@ -937,4 +931,130 @@ test("Planner and approval answers with credentials fail without copying their t
   assert.equal(store.listProposals().length, 1);
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
   assert.equal(notes.length, 2);
+});
+
+test("the active scheduler delegates in-scope Task registrations in dependency order", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store);
+  store.setRules(
+    [
+      {
+        id: "docs",
+        name: "Small docs Tasks",
+        gate: "task-registration",
+        order: 0,
+        action: "agent",
+        enabled: true,
+        conditions: { maxTokens: 1000, categories: ["docs"] },
+      },
+    ],
+    "operator-ui",
+  );
+  const work = runner(store, {
+    autoApproveRegistrations: true,
+    runPlanner: async (_plan, id) =>
+      response(id, {
+        tasks: [
+          { ...task, title: "First", category: "docs" },
+          { ...task, title: "Second", category: "docs", dependsOn: ["#0"] },
+          {
+            ...task,
+            title: "Outside",
+            category: "docs",
+            paths: [".github/workflows/"],
+          },
+        ],
+      }),
+    runReviewer: async (_plan, id) =>
+      response(id, {
+        decision: "approve",
+        reasons: ["Fits the plan"],
+      }),
+  });
+  await work.requestPlanner({
+    ...goalRequest,
+    mode: "task-decomposition",
+    goalId,
+  });
+  await work.drain();
+  assert.deepEqual(
+    store.listTasks(goalId).map(({ content }) => content.title),
+    ["First", "Second"],
+  );
+  const outside = store
+    .listProposals()
+    .find(({ content }) => "title" in content && content.title === "Outside");
+  assert.ok(outside);
+  assert.partialDeepStrictEqual(store.getProposalDetails(outside.id), {
+    status: "pending",
+    policy: "human",
+    source: "invariant",
+    invariant: "scope-exception",
+  });
+  assert.equal(
+    store
+      .getHostApiStatus()
+      .recentExecutions.filter(({ actor }) => actor === "Reviewer").length,
+    2,
+  );
+  assert.deepEqual(
+    store
+      .decisionHistory()
+      .map(({ setting, reasons }) => [setting.ruleId, reasons]),
+    [
+      ["docs", ["Fits the plan"]],
+      ["docs", ["Fits the plan"]],
+    ],
+  );
+});
+
+test("the scheduler records only rejection when approval would widen model delegation", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
+  const make = () =>
+    store.proposeGoal(
+      { ...goal, policies: { integration: "agent" } },
+      plannerOrigin,
+    );
+  const awaitingHuman = make();
+  const rejected = make();
+  let nowDelegable = false;
+  let reviews = 0;
+  const work = runner(store, {
+    autoApproveRegistrations: true,
+    runReviewer: async (plan, id) => {
+      const proposal = JSON.parse(file(plan, "proposal.json"));
+      reviews++;
+      assert.deepEqual(
+        proposal.allowedDecisions,
+        nowDelegable ? undefined : ["reject"],
+      );
+      return response(id, {
+        decision: proposal.id === rejected.id ? "reject" : "approve",
+        reasons: ["Reviewed"],
+      });
+    },
+  });
+  await work.drain();
+  assert.equal(store.getProposal(awaitingHuman.id)?.status, "pending");
+  assert.equal(store.getProposal(rejected.id)?.status, "rejected");
+  assert.deepEqual(
+    store
+      .decisionHistory()
+      .map(({ proposalId, result }) => [proposalId, result]),
+    [[rejected.id, "reject"]],
+  );
+  await work.drain();
+  assert.equal(reviews, 2);
+  store.setProjectDefaults(
+    { integration: "agent" },
+    { kind: "operator" },
+    "operator-ui",
+  );
+  nowDelegable = true;
+  await work.drain();
+  assert.equal(reviews, 3);
+  assert.equal(store.getProposal(awaitingHuman.id)?.status, "approved");
 });

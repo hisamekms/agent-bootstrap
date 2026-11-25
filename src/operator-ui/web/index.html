@@ -61,6 +61,16 @@
           >
             Goal <span id="badge-goals" class="tab-count"></span>
           </button>
+          <button
+            type="button"
+            id="tab-delegation"
+            role="tab"
+            aria-selected="false"
+            aria-controls="delegation"
+            tabindex="-1"
+          >
+            任せ方
+          </button>
         </div>
         <div id="decisions" role="tabpanel" aria-labelledby="tab-decisions">
           <div id="details"></div>
@@ -70,6 +80,7 @@
             <div id="answer-results" role="status"></div>
             <p id="empty-inbox" hidden>表示する項目はありません。</p>
             <ul id="inbox-items"></ul>
+            <section id="decision-history"></section>
           </div>
         </div>
         <div
@@ -84,6 +95,13 @@
           class="work-panel"
           role="tabpanel"
           aria-labelledby="tab-goals"
+          hidden
+        ></div>
+        <div
+          id="delegation"
+          class="work-panel"
+          role="tabpanel"
+          aria-labelledby="tab-delegation"
           hidden
         ></div>
       </section>

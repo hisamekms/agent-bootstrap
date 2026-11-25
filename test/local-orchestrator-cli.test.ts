@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import { runCli } from "../src/local-orchestrator/cli.ts";
@@ -135,20 +137,26 @@ test("status reports counts and pending gates, and show and proposals include co
   assert.deepEqual(JSON.parse(rejected.stdout), []);
 });
 
-test("proposal display identifies human requirements under an inherited agent policy", async () => {
+test("proposal display identifies policy loosening and Task scope exceptions", async () => {
   using state = orchestratorFixture("local-orchestrator-cli-");
   const { store } = state;
   store.setProjectDefaults(
-    { "goal-registration": "agent", "task-registration": "agent" },
+    { "goal-registration": "agent" },
     { kind: "operator" },
   );
-  const proposal = store.proposeGoal(goal, origin);
+  const proposal = store.proposeGoal(
+    {
+      ...goal,
+      policies: { ...goal.policies, "task-registration": "agent" },
+    },
+    origin,
+  );
   const shown = await cli(state, ["show", proposal.id]);
   assert.equal(shown.code, 0);
   assert.partialDeepStrictEqual(JSON.parse(shown.stdout), {
     effectivePolicy: "agent",
     policySource: "default",
-    loosening: ["integration"],
+    loosening: ["task-registration", "integration"],
     humanApprovalRequired: true,
   });
 
@@ -169,7 +177,6 @@ test("proposal display identifies human requirements under an inherited agent po
       paths: ["src/outside.ts"],
       dependsOn: [],
       budgets: goal.scope.budgets,
-      policies: { "task-registration": "human" },
     },
     origin,
   );
@@ -181,8 +188,9 @@ test("proposal display identifies human requirements under an inherited agent po
       {
         id: task.id,
         gate: "task-registration",
-        effectivePolicy: "agent",
-        policySource: "default",
+        effectivePolicy: "human",
+        policySource: "invariant",
+        invariant: "scope-exception",
         humanAnswerRequired: true,
       },
     ],
@@ -445,7 +453,113 @@ test("policy set warns about agent approval and requires a confirmed operator up
     "goal-registration": "human",
     "task-registration": "human",
     integration: "agent",
+    rules: [],
+    overrides: { goals: [], tasks: [] },
   });
+});
+
+test("policy CLI edits ordered rules and per-Goal and per-Task overrides", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store, root } = state;
+  const proposal = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const task = store.proposeTask(
+    {
+      title: "Task",
+      description: "",
+      acceptance: ["Pass"],
+      goalId,
+      paths: ["docs/a.md"],
+      actor: "Executor",
+      profile: "base",
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    origin,
+  );
+  assert.equal(task.status, "registered");
+  if (task.status !== "registered") throw new Error("Expected a Task");
+  const file = join(root, "rules.json");
+  writeFileSync(
+    file,
+    JSON.stringify([
+      {
+        id: "docs",
+        name: "Small docs",
+        gate: "integration",
+        action: "agent",
+        enabled: true,
+        order: 0,
+        conditions: { maxChangedLines: 50 },
+      },
+    ]),
+  );
+  const rulesArgs = ["policy", "rules", "set", "--file", file];
+  assert.equal((await cli(state, rulesArgs)).code, 1);
+  assert.equal((await cli(state, rulesArgs, { isTTY: true })).code, 1);
+  assert.equal(
+    (await cli(state, rulesArgs, { isTTY: true, answer: () => "set rules" }))
+      .code,
+    0,
+  );
+  assert.equal(
+    (
+      await cli(state, ["policy", "goal", goalId!, "integration", "human"], {
+        isTTY: true,
+      })
+    ).code,
+    0,
+  );
+  assert.equal(
+    (
+      await cli(state, ["policy", "task", task.taskId, "agent"], {
+        isTTY: true,
+        answer: () => "set policy",
+      })
+    ).code,
+    0,
+  );
+  assert.equal(
+    (
+      await cli(state, [
+        "policy",
+        "goal",
+        goalId!,
+        "goal-registration",
+        "agent",
+      ])
+    ).code,
+    2,
+  );
+  writeFileSync(
+    file,
+    JSON.stringify([
+      {
+        id: "bad",
+        name: "No facts",
+        gate: "integration",
+        action: "agent",
+        enabled: true,
+        order: 0,
+        conditions: { categories: ["docs"] },
+      },
+    ]),
+  );
+  assert.equal((await cli(state, rulesArgs, { isTTY: true })).code, 1);
+  assert.partialDeepStrictEqual(
+    JSON.parse((await cli(state, ["policy", "show"])).stdout),
+    {
+      rules: [{ id: "docs", hitsLast7Days: 0 }],
+      overrides: {
+        goals: [{ goalId, gate: "integration", value: "human" }],
+        tasks: [{ taskId: task.taskId, value: "agent" }],
+      },
+    },
+  );
 });
 
 test("proposal rendering escapes terminal controls and bounds each displayed field", async () => {

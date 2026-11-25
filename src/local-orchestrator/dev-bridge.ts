@@ -11,7 +11,7 @@ const headers = {
   "Referrer-Policy": "no-referrer",
   "Cache-Control": "no-store",
 };
-const methods = new Set([
+export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "inbox.list",
   "inbox.markSeen",
   "inbox.subscribe",
@@ -19,6 +19,12 @@ const methods = new Set([
   "proposal.get",
   "proposal.answer",
   "proposal.answerMany",
+  "policy.get",
+  "policy.setDefault",
+  "policy.setRules",
+  "goal.setPolicy",
+  "task.setIntegrationPolicy",
+  "decision.history",
   "goal.list",
   "goal.get",
   "task.list",
@@ -211,7 +217,7 @@ export function startDevBridge(options: {
             !Object.hasOwn(request, "params")
           )
             throw new Error();
-          if (!methods.has(request.method)) {
+          if (!operatorBridgeMethods.has(request.method)) {
             ws.sendText(
               JSON.stringify({ id, error: { code: "unknown-method" } }),
             );

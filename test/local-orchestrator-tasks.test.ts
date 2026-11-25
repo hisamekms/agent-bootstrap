@@ -2335,7 +2335,9 @@ test(
     const f = stage3Fixture(state, { integration: "agent" });
     const proposal = await f.proposal();
     assert.equal(proposal.content.verified, false);
-    assert.equal(proposal.policy, "agent");
+    assert.equal(proposal.policy, "human");
+    assert.equal(proposal.source, "invariant");
+    assert.equal(proposal.invariant, "integration-verification");
     await assert.rejects(f.work.requestApproval(proposal.id), {
       code: "approval-forbidden",
     });
@@ -2742,3 +2744,139 @@ test(
     }
   },
 );
+
+test(
+  "integration rules use real Git counts and are outranked by Goal and Task settings",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state, undefined, "pass");
+    const proposal = await f.proposal();
+    assert.equal(proposal.source, "default");
+    const rule = {
+      id: "one-file",
+      name: "One Markdown file",
+      gate: "integration",
+      order: 0,
+      action: "agent",
+      enabled: true,
+      conditions: {
+        pathsWithin: ["docs/*.md"],
+        maxChangedFiles: 1,
+        maxChangedLines: 100,
+      },
+    };
+    store.setRules(
+      [{ ...rule, conditions: { ...rule.conditions, maxChangedLines: 0 } }],
+      "operator-ui",
+    );
+    assert.equal(store.getProposalDetails(proposal.id)?.source, "default");
+    store.setRules([rule], "operator-ui");
+    assert.partialDeepStrictEqual(store.getProposalDetails(proposal.id), {
+      policy: "agent",
+      source: "rule",
+      ruleId: rule.id,
+    });
+    store.setGoalPolicy(f.goalId, "integration", "human", "operator-ui");
+    assert.partialDeepStrictEqual(store.getProposalDetails(proposal.id), {
+      policy: "human",
+      source: "operator-goal",
+    });
+    store.setTaskIntegrationPolicy(f.taskId, "agent", "operator-ui");
+    assert.partialDeepStrictEqual(
+      store.effectivePolicy("integration", { taskId: f.taskId }),
+      { policy: "agent", source: "operator-task" },
+    );
+    store.setTaskIntegrationPolicy(f.taskId, "rule", "operator-ui");
+    store.setGoalPolicy(f.goalId, "integration", "inherit", "operator-ui");
+    assert.partialDeepStrictEqual(store.getProposalDetails(proposal.id), {
+      policy: "agent",
+      source: "rule",
+    });
+    await assert.rejects(
+      Promise.resolve().then(() =>
+        store.decide(proposal.id, {
+          digest: proposal.digest,
+          decision: "approve",
+          answerer: { kind: "human", channel: "operator-ui" },
+        }),
+      ),
+      { code: "approval-forbidden" },
+    );
+  },
+);
+
+test("a deleted symlink reserves integration for a human even with a Task override", async () => {
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  const taskId = task(store, goalId);
+  const gone = fixture({
+    async verify() {
+      return true;
+    },
+    async changes() {
+      return [{ path: "docs/link", oldMode: "120000", newMode: "000000" }];
+    },
+  });
+  store.setGoalPolicy(goalId, "integration", "agent", "operator-ui");
+  store.setTaskIntegrationPolicy(taskId, "agent", "operator-ui");
+  await runner(store, gone.executor).drain();
+  const [proposal] = store.pendingIntegrations();
+  assert.ok(proposal?.kind === "integration");
+  assert.deepEqual(proposal.content.symlinks, ["docs/link"]);
+  assert.partialDeepStrictEqual(proposal, {
+    policy: "human",
+    source: "invariant",
+    invariant: "integration-symlinks",
+  });
+  assert.partialDeepStrictEqual(
+    store.effectivePolicy("integration", { taskId }),
+    {
+      policy: "human",
+      source: "invariant",
+      invariant: "integration-symlinks",
+    },
+  );
+});
+
+test("a file-count rule still matches when Git cannot supply a line count", async () => {
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  task(store, goalId);
+  const noStat = fixture({
+    async verify() {
+      return true;
+    },
+  });
+  const rule = {
+    id: "small",
+    name: "Small change",
+    gate: "integration",
+    action: "human",
+    enabled: true,
+    order: 1,
+    conditions: { maxChangedFiles: 1 },
+  };
+  store.setRules(
+    [
+      {
+        ...rule,
+        id: "needs-lines",
+        action: "agent",
+        order: 0,
+        conditions: { maxChangedLines: 1 },
+      },
+      rule,
+    ],
+    "cli",
+  );
+  await runner(store, noStat.executor).drain();
+  assert.partialDeepStrictEqual(store.pendingIntegrations()[0], {
+    policy: "human",
+    source: "rule",
+    ruleId: rule.id,
+  });
+});

@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
-import { startDevBridge } from "../src/local-orchestrator/dev-bridge.ts";
+import {
+  operatorBridgeMethods,
+  startDevBridge,
+} from "../src/local-orchestrator/dev-bridge.ts";
 import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
 import { operatorStatus } from "../src/local-orchestrator/operator-read.ts";
 import { loadWorkplaceAssets } from "../src/operator-ui/assets.ts";
@@ -117,6 +120,20 @@ async function openWebSocket(url: URL) {
     },
   };
 }
+
+test("the delegation methods are explicitly allowlisted on the bridge", () => {
+  for (const method of [
+    "policy.get",
+    "policy.setDefault",
+    "policy.setRules",
+    "goal.setPolicy",
+    "task.setIntegrationPolicy",
+    "decision.history",
+  ])
+    assert.equal(operatorBridgeMethods.has(method), true);
+  assert.equal(operatorBridgeMethods.has("policy.reset"), false);
+  assert.equal(operatorBridgeMethods.has("draft_task"), false);
+});
 
 test("workplace assets contain no remote URLs", async () => {
   const assets = await loadWorkplaceAssets();
@@ -268,7 +285,7 @@ test(
       try {
         const client = await openWebSocket(new URL(bridge.url));
         client.authenticate();
-        for (const method of ["decision.history", "policy.set"]) {
+        for (const method of ["gate.answer", "policy.set"]) {
           client.ws.send(JSON.stringify({ id: method, method, params: {} }));
           assert.deepEqual(await client.next(), {
             id: method,
@@ -279,6 +296,12 @@ test(
           "status",
           "proposal.answer",
           "proposal.answerMany",
+          "policy.get",
+          "policy.setDefault",
+          "policy.setRules",
+          "goal.setPolicy",
+          "task.setIntegrationPolicy",
+          "decision.history",
           "goal.list",
           "goal.get",
           "task.list",

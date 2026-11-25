@@ -18,6 +18,15 @@ export const GATES = Object.freeze([
 export type Gate = (typeof GATES)[number];
 export type Policy = "human" | "agent";
 export type PolicySet = Partial<Record<Gate, Policy>>;
+export const TASK_CATEGORIES = [
+  "bugfix",
+  "docs",
+  "test",
+  "refactor",
+  "feature",
+  "chore",
+] as const;
+export type TaskCategory = (typeof TASK_CATEGORIES)[number];
 export type PolicySource = "default" | "request" | "goal" | "task";
 
 export interface Budgets {
@@ -45,6 +54,7 @@ export interface TaskContent {
   readonly description: string;
   readonly acceptance: readonly string[];
   readonly actor: "Executor" | "Researcher";
+  readonly category?: TaskCategory;
   readonly profile: ProfileName;
   readonly paths: readonly string[];
   readonly dependsOn: readonly string[];
@@ -225,7 +235,7 @@ function array<T>(
   });
 }
 
-function unique<T>(
+export function unique<T>(
   value: unknown,
   min: number,
   max: number,
@@ -327,6 +337,7 @@ export function validateTaskContent(value: unknown): TaskContent {
     ...sharedKeys,
     "goalId",
     "actor",
+    "category",
     "profile",
     "paths",
     "dependsOn",
@@ -337,6 +348,9 @@ export function validateTaskContent(value: unknown): TaskContent {
     ...shared(input),
     goalId: identifier(input.goalId),
     actor,
+    ...(Object.hasOwn(input, "category")
+      ? { category: oneOf(input.category, TASK_CATEGORIES) }
+      : {}),
     profile: oneOf(input.profile, profiles),
     paths:
       actor === "Executor"

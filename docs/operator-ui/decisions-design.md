@@ -128,6 +128,7 @@ today. The effective answerer of a gate is decided in this order:
    - an unverified integration, or one with symbolic links, needs a
      human;
    - the Concierge cannot answer its own proposals;
+   - registering a Task outside its Goal's scope needs a human answer;
    - a model's request to widen delegation needs a human;
    - discarding a Goal and exporting a branch are operator commands,
      not gates.
@@ -143,20 +144,26 @@ separate from the `policies` a model writes into proposal content and
 take precedence over them. The existing rule that a model's loosening
 needs human approval stays.
 
-**Rule conditions** use only facts the host checks itself:
+When a store migrates to schema 6, legacy defaults keep their existing
+precedence. The new default takes precedence over proposal policies for
+its gate once an operator sets it through the new API or CLI.
 
-| Condition                                  | Task registration | Integration     |
-| ------------------------------------------ | ----------------- | --------------- |
-| Paths within allowed globs                 | the planned scope | the actual diff |
-| No path in an excluded list                | the planned scope | the actual diff |
-| Token budget at most N                     | yes               | no              |
-| Changed lines at most N, files at most N   | no                | yes             |
-| Verification and review passed             | no                | always required |
-| Category the Planner gave is one of a list | narrows only      | narrows only    |
+**Rule conditions**
 
-A category is the Planner's claim. A rule may use it to narrow, but a
-rule must also hold at least one host-checked condition, so a label
-alone never delegates a decision.
+| Condition                                     | Task registration | Integration     |
+| --------------------------------------------- | ----------------- | --------------- |
+| Paths within allowed globs                    | the planned scope | the actual diff |
+| No path in an excluded list                   | the planned scope | the actual diff |
+| Planner's planned token budget (advisory) ≤ N | yes               | no              |
+| Changed lines at most N, files at most N      | no                | yes             |
+| Verification and review passed                | no                | always required |
+| Category the Planner gave is one of a list    | narrows only      | narrows only    |
+
+Path exclusions are case-insensitive and compare NFC-normalized
+patterns and paths. Allowed globs compare paths exactly.
+
+A category is the Planner's claim. A rule may use it to narrow
+delegation and must also include at least one other condition.
 
 **Panel:**
 

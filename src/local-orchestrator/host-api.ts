@@ -15,6 +15,7 @@ import {
   oneOf,
   validateGoalContent,
   validateTaskContent,
+  TASK_CATEGORIES,
 } from "./model.ts";
 import { proposalStatuses, type OrchestratorStore } from "./store.ts";
 
@@ -101,8 +102,18 @@ const tools = {
     schema({ content: contentSchema }, ["content"]),
   ],
   draft_task: [
-    "Draft a task proposal",
-    schema({ content: contentSchema }, ["content"]),
+    "Draft a task proposal. The optional category is a Planner claim.",
+    schema(
+      {
+        content: {
+          ...contentSchema,
+          properties: {
+            category: { type: "string", enum: TASK_CATEGORIES },
+          },
+        },
+      },
+      ["content"],
+    ),
   ],
   request_planner: [
     "Queue a Planner execution",

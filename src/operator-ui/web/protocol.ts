@@ -1,3 +1,14 @@
+import type {
+  DelegationRule,
+  EffectivePolicy,
+  GoalPolicy,
+  PolicyInvariant,
+  RuleGate,
+  TaskPolicy,
+  RuleConditions,
+} from "../../local-orchestrator/delegation.ts";
+import type { Gate, Policy } from "../../local-orchestrator/model.ts";
+import type { OrchestratorStore } from "../../local-orchestrator/store.ts";
 import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import type {
   goalStatuses,
@@ -32,8 +43,168 @@ export type AnswerableProposal = Extract<
   { answer: unknown }
 >["answer"];
 
+export type PolicySettings = ReturnType<OrchestratorStore["policySettings"]>;
+export type AgentDecision = ReturnType<
+  OrchestratorStore["decisionHistory"]
+>[number];
+export type SettingsReceipt = { ok: true };
+
+export const gateLabels: Record<Gate, string> = {
+  "goal-registration": "Goal の登録",
+  "task-registration": "Task の登録",
+  integration: "統合",
+};
+
+export const invariantLabels: Record<PolicyInvariant, string> = {
+  "integration-verification": "検証に合格していない統合は人が判断します。",
+  "integration-symlinks":
+    "シンボリックリンクの変更を含む統合は人が判断します。",
+  "integration-symlink-evidence":
+    "シンボリックリンクの確認記録がない統合は人が判断します。",
+  "integration-review":
+    "統合を AI に任せるにはレビューに合格している必要があります。",
+  "concierge-proposal": "Concierge の提案は人が判断します。",
+  "scope-exception": "Goal の範囲を外れる Task の登録は人が判断します。",
+  "policy-loosening": "モデルからの委任拡大は人の承認が必要です。",
+  "operator-commands":
+    "Goal の破棄とブランチのエクスポートはオペレーターが行います。",
+};
+
+export function settingLabel(setting: EffectivePolicy): string {
+  switch (setting.source) {
+    case "invariant":
+      return setting.invariant
+        ? invariantLabels[setting.invariant]
+        : "固定条件";
+    case "rule":
+      return `ルール「${setting.ruleName ?? setting.ruleId ?? "—"}」`;
+    case "operator-task":
+      return "この Task の設定";
+    case "operator-goal":
+      return "この Goal の設定";
+    case "task":
+      return "Task 提案のポリシー";
+    case "goal":
+      return "Goal 提案のポリシー";
+    case "request":
+      return "提案のポリシー";
+    case "default":
+      return "全体の既定値";
+  }
+}
+
+export function orderedRules(rules: readonly DelegationRule[]) {
+  return rules.map(
+    ({ id, name, gate, action, enabled, conditions }, order) => ({
+      id,
+      name,
+      gate,
+      action,
+      enabled,
+      conditions,
+      order,
+    }),
+  );
+}
+
+export function moveRule(
+  rules: readonly DelegationRule[],
+  index: number,
+  offset: -1 | 1,
+) {
+  const next = [...rules];
+  const neighbor = index + offset;
+  const first = next[index];
+  const second = next[neighbor];
+  if (first && second) {
+    next[index] = second;
+    next[neighbor] = first;
+  }
+  return orderedRules(next);
+}
+
+function conditionsEqual(a: RuleConditions, b: RuleConditions) {
+  const sorted = (conditions: RuleConditions) =>
+    Object.entries(conditions)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => [
+        key,
+        Array.isArray(value) ? [...value].sort() : value,
+      ]);
+  return JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
+}
+
+export function ruleChangeCanWiden(
+  before: readonly DelegationRule[],
+  after: readonly DelegationRule[],
+) {
+  for (const prior of before) {
+    const next = after.find(({ id }) => id === prior.id);
+    if (!prior.enabled || prior.action !== "human") continue;
+    if (
+      !next?.enabled ||
+      next.action !== "human" ||
+      next.gate !== prior.gate ||
+      !conditionsEqual(next.conditions, prior.conditions)
+    )
+      return true;
+    if (
+      before.some((agent) => {
+        if (
+          !agent.enabled ||
+          agent.action !== "agent" ||
+          agent.gate !== prior.gate ||
+          agent.order < prior.order
+        )
+          return false;
+        const updated = after.find(({ id }) => id === agent.id);
+        return (
+          updated?.enabled &&
+          updated.action === "agent" &&
+          updated.gate === prior.gate &&
+          updated.order < next.order
+        );
+      })
+    )
+      return true;
+  }
+  return after.some((next) => {
+    if (!next.enabled || next.action !== "agent") return false;
+    const prior = before.find(({ id }) => id === next.id);
+    return (
+      !prior?.enabled ||
+      prior.action !== "agent" ||
+      prior.gate !== next.gate ||
+      !conditionsEqual(prior.conditions, next.conditions)
+    );
+  });
+}
+
 export interface Methods {
   status: { params: Record<string, never>; result: Status };
+  "policy.get": { params: Record<string, never>; result: PolicySettings };
+  "policy.setDefault": {
+    params: { gate: Gate; policy: Policy };
+    result: SettingsReceipt;
+  };
+  "policy.setRules": {
+    params: { rules: DelegationRule[]; expectedRevision?: string };
+    result: SettingsReceipt;
+  };
+  "goal.setPolicy": {
+    params: {
+      goalId: string;
+      gate: RuleGate;
+      value: GoalPolicy;
+      expected?: GoalPolicy;
+    };
+    result: SettingsReceipt;
+  };
+  "task.setIntegrationPolicy": {
+    params: { taskId: string; value: TaskPolicy; expected?: TaskPolicy };
+    result: SettingsReceipt;
+  };
+  "decision.history": { params: { limit?: number }; result: AgentDecision[] };
   "inbox.list": {
     params: { includeResolved?: boolean };
     result: PanelInboxItem[];
