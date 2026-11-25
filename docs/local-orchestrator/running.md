@@ -78,7 +78,12 @@ slot as the TTY launcher.
 
 With `--dev-bridge`, open the private loopback URL printed at startup.
 Keep the URL private. The page shows the Concierge terminal beside a
-read-only host panel; `F6` moves focus between them. Closing the browser
+read-only host panel. **判断待ち** shows the inbox, proposal details and a
+copyable CLI command. **問題** links failures, rejected paths and budget
+overruns to their Task or Goal. **Goal** shows Task progress and estimates
+for the current plan based on completed work in this target. Task details show the stage,
+attempts, elapsed time, token usage, acceptance criteria and recent events.
+`F6` moves focus between the terminal and panel. Closing the browser
 leaves the session running. To end it, press Ctrl-C or send SIGTERM to the
 workplace process. The launcher closes the operator API and the bridge at
 shutdown. If that shutdown hangs, press Ctrl-C again to exit at once

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -25,19 +25,64 @@
         aria-valuenow="60"
       ></div>
       <section id="host" aria-labelledby="host-title" tabindex="-1">
-        <header><h2 id="host-title">Host panel</h2></header>
+        <header><h2 id="host-title">ホストパネル</h2></header>
         <div id="summary">
           <p id="connection" role="status">Connecting…</p>
-          <p id="counts" aria-live="polite"></p>
           <p id="terminal-notice" role="status"></p>
           <p id="inbox-notice" role="status"></p>
         </div>
-        <div id="details"></div>
-        <div id="inbox">
-          <h3>Inbox</h3>
-          <p id="empty-inbox" hidden>No inbox items.</p>
-          <ul id="inbox-items"></ul>
+        <div id="host-tabs" role="tablist" aria-label="ホストパネル">
+          <button
+            type="button"
+            id="tab-decisions"
+            role="tab"
+            aria-selected="true"
+            aria-controls="decisions"
+          >
+            判断待ち <span id="badge-decisions" class="tab-count"></span>
+          </button>
+          <button
+            type="button"
+            id="tab-problems"
+            role="tab"
+            aria-selected="false"
+            aria-controls="problems"
+            tabindex="-1"
+          >
+            問題 <span id="badge-problems" class="tab-count"></span>
+          </button>
+          <button
+            type="button"
+            id="tab-goals"
+            role="tab"
+            aria-selected="false"
+            aria-controls="goals"
+            tabindex="-1"
+          >
+            Goal <span id="badge-goals" class="tab-count"></span>
+          </button>
         </div>
+        <div id="decisions" role="tabpanel" aria-labelledby="tab-decisions">
+          <div id="details"></div>
+          <div id="inbox">
+            <p id="empty-inbox" hidden>表示する項目はありません。</p>
+            <ul id="inbox-items"></ul>
+          </div>
+        </div>
+        <div
+          id="problems"
+          class="work-panel"
+          role="tabpanel"
+          aria-labelledby="tab-problems"
+          hidden
+        ></div>
+        <div
+          id="goals"
+          class="work-panel"
+          role="tabpanel"
+          aria-labelledby="tab-goals"
+          hidden
+        ></div>
       </section>
     </main>
   </body>

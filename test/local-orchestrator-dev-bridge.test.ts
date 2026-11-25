@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { request } from "node:http";
 import { createServer } from "node:net";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import { startDevBridge } from "../src/local-orchestrator/dev-bridge.ts";
@@ -252,13 +253,10 @@ test(
   async () => {
     using fixture = orchestratorFixture("lo-bridge-", realpathSync("/tmp"));
     const api = join(fixture.root, "api.sock");
-    const lines = Promise.withResolvers<string>();
     const server = createServer((socket) => {
-      let received = "";
-      socket.setEncoding("utf8");
-      socket.on("data", (text: string) => {
-        received += text;
-        if (received.includes("\n")) lines.resolve(received);
+      createInterface({ input: socket }).on("line", (line) => {
+        const { id } = JSON.parse(line);
+        socket.write(JSON.stringify({ id, result: line }) + "\n");
       });
     });
     await new Promise<void>((resolve, reject) => {
@@ -270,16 +268,32 @@ test(
       try {
         const client = await openWebSocket(new URL(bridge.url));
         client.authenticate();
-        client.ws.send(
-          JSON.stringify({ id: "gate", method: "proposal.answer", params: {} }),
-        );
-        assert.deepEqual(await client.next(), {
-          id: "gate",
-          error: { code: "unknown-method" },
-        });
-        const allowed = { id: 2, method: "status", params: {} };
-        client.ws.send(JSON.stringify(allowed, null, 2));
-        assert.equal(await lines.promise, JSON.stringify(allowed) + "\n");
+        for (const method of [
+          "proposal.answer",
+          "proposal.answerMany",
+          "decision.history",
+        ]) {
+          client.ws.send(JSON.stringify({ id: method, method, params: {} }));
+          assert.deepEqual(await client.next(), {
+            id: method,
+            error: { code: "unknown-method" },
+          });
+        }
+        for (const method of [
+          "status",
+          "goal.list",
+          "goal.get",
+          "task.list",
+          "task.get",
+          "problem.list",
+        ]) {
+          const allowed = { id: method, method, params: {} };
+          client.ws.send(JSON.stringify(allowed, null, 2));
+          assert.deepEqual(await client.next(), {
+            id: method,
+            result: JSON.stringify(allowed),
+          });
+        }
       } finally {
         await bridge.close();
       }

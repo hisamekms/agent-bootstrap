@@ -1,6 +1,18 @@
 import type { InboxItem } from "../../local-orchestrator/inbox.ts";
+import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
 import type { WorkplaceChannel } from "./channel.ts";
-import { orderInbox } from "./protocol.ts";
+import {
+  estimateLabel,
+  formatDuration,
+  formatTimestamp,
+  formatTokens,
+  orderInbox,
+  type GoalDetail,
+  type GoalSummary,
+  type Problem,
+  type TaskDetail,
+  type TaskSummary,
+} from "./protocol.ts";
 
 export function element(id: string): HTMLElement {
   const node = document.getElementById(id);
@@ -24,15 +36,13 @@ const subjectLabels = {
   executionId: "Execution ID",
 } as const;
 
-export function createHostPanel(channel: WorkplaceChannel) {
+function createInboxPanel(channel: WorkplaceChannel) {
   const inbox = element("inbox-items");
   const details = element("details");
   const notice = element("inbox-notice");
   let buttons = new Map<string, HTMLButtonElement>();
   let selected: InboxItem | undefined;
   let previousItems = "";
-  let loading = false;
-  let refreshNeeded = false;
   const marking = new Set<string>();
   const observed = new Map<Element, string>();
   const visible = new IntersectionObserver(
@@ -95,13 +105,7 @@ export function createHostPanel(channel: WorkplaceChannel) {
     });
     details.append(command, copy, copyStatus);
     if (item.modelText !== undefined) {
-      const model = document.createElement("div");
-      model.className = "model-text";
-      model.append(
-        textElement("h3", "untrusted model text"),
-        textElement("pre", item.modelText),
-      );
-      details.append(model);
+      details.append(modelBox("提案", [item.modelText]));
     }
 
     if (!item.subject.proposalId) return;
@@ -164,31 +168,470 @@ export function createHostPanel(channel: WorkplaceChannel) {
     }
   }
 
-  return {
-    async refresh() {
-      refreshNeeded = true;
-      if (loading) return;
-      loading = true;
+  return { render, disconnect: () => visible.disconnect() };
+}
+
+const labels = {
+  registered: "登録",
+  running: "実行",
+  review: "レビュー",
+  "awaiting-integration": "統合待ち",
+  done: "完了",
+  failed: "失敗",
+  cancelled: "キャンセル",
+  active: "進行中",
+} as const;
+
+function modelBox(label: string, lines: readonly string[]) {
+  const box = document.createElement("div");
+  box.className = "model-text";
+  box.append(
+    textElement("small", `${label}（モデル生成）`),
+    ...lines.map((line) => textElement("pre", line)),
+  );
+  return box;
+}
+
+function facts(rows: [string, string][]) {
+  const list = document.createElement("dl");
+  for (const [label, value] of rows)
+    list.append(textElement("dt", label), textElement("dd", value));
+  return list;
+}
+
+function list<T>(items: readonly T[], row: (item: T) => Node) {
+  const node = document.createElement("ul");
+  node.className = "work-list";
+  for (const item of items) {
+    const entry = document.createElement("li");
+    entry.append(row(item));
+    node.append(entry);
+  }
+  return node;
+}
+
+function action(label: string, key: string, select: () => void) {
+  const button = textElement("button", label);
+  button.type = "button";
+  button.dataset.focusKey = key;
+  button.addEventListener("click", select);
+  return button;
+}
+
+function modelLink(
+  label: string,
+  title: string,
+  id: string,
+  select: () => void,
+) {
+  const button = action("", id, select);
+  button.className = "model-text model-link";
+  button.append(
+    textElement("small", `${label}（モデル生成）`),
+    textElement("span", title),
+  );
+  return button;
+}
+
+function progress(goal: GoalSummary) {
+  const { done, total } = goal.progress;
+  const track = document.createElement("progress");
+  track.max = total || 1;
+  track.value = done;
+  const label = `${done} / ${total} Task 完了`;
+  track.setAttribute("aria-label", label);
+  return [track, textElement("small", label), ...estimateText(goal.estimate)];
+}
+
+function estimateText(estimate: GoalSummary["estimate"]) {
+  const label = estimateLabel(estimate.remainingMs);
+  return label ? [textElement("p", label)] : [];
+}
+
+function budgetText(budgets: TaskDetail["budgets"]) {
+  return `${budgets.maxExecutionMs / 1000} 秒 / ${formatTokens(budgets.maxTokens)} トークン / 再試行 ${budgets.maxRetries} 回`;
+}
+
+function goalDetail(goal: GoalDetail, selectTask: (id: string) => void) {
+  const { scope } = goal;
+  return [
+    modelBox("Goal", [goal.title]),
+    textElement("p", labels[goal.status]),
+    ...progress(goal),
+    facts([
+      ["対象パス", scope.paths.join(", ")],
+      ["利用できるアクター", scope.actors.join(", ") || "—"],
+      ["プロファイル", scope.profiles.join(", ") || "—"],
+      ["Task 上限", String(scope.maxTasks)],
+      ["予算", budgetText(goal.budgets)],
+      ["ブランチ", goal.branch],
+      ["ベースコミット", goal.baseCommit ?? "—"],
+    ]),
+    ...(goal.description ? [modelBox("説明", [goal.description])] : []),
+    modelBox("受け入れ条件", goal.acceptance),
+    textElement("h3", "Task"),
+    goal.tasks.length
+      ? list(goal.tasks, (task: TaskSummary) => {
+          const item = document.createElement("div");
+          item.append(
+            modelLink("Task", task.title, task.id, () => selectTask(task.id)),
+            textElement("p", labels[task.stage]),
+            ...estimateText(task.estimate),
+          );
+          return item;
+        })
+      : textElement("p", "Task はありません。"),
+    ...(goal.progress.total > goal.tasks.length
+      ? [
+          textElement(
+            "p",
+            `${goal.progress.total} 件中 ${goal.tasks.length} 件を表示しています。`,
+          ),
+        ]
+      : []),
+  ];
+}
+
+function rejectedPaths(
+  paths: NonNullable<NonNullable<TaskDetail["failure"]>["rejectedPaths"]>,
+) {
+  return list(paths, ({ path, symlink }) =>
+    textElement("code", symlink ? `${path}（シンボリックリンク）` : path),
+  );
+}
+
+function taskDetail(task: TaskDetail) {
+  const tokens = formatTokens(task.tokensUsed);
+  const usage = task.tokensIncomplete
+    ? task.tokensUsed
+      ? `少なくとも ${tokens}`
+      : "不明"
+    : tokens;
+  const track = document.createElement("ol");
+  track.className = "stage-track";
+  const current = task.failure?.stage ?? task.stage;
+  for (const stage of taskStages) {
+    const failed = task.failure && stage === current;
+    const item = textElement(
+      "li",
+      failed ? `${labels[stage]}（失敗）` : labels[stage],
+    );
+    if (stage === current) item.setAttribute("aria-current", "step");
+    if (failed) item.className = "warning";
+    track.append(item);
+  }
+  const failure = document.createElement("div");
+  if (task.failure) {
+    failure.className = "warning failure";
+    failure.append(
+      textElement("h3", "失敗"),
+      textElement("code", task.failure.code),
+    );
+    if (task.failure.rejectedPaths?.length)
+      failure.append(
+        textElement("p", "拒否されたパス"),
+        rejectedPaths(task.failure.rejectedPaths),
+      );
+  }
+  return [
+    modelBox("Task", [task.title]),
+    track,
+    ...(task.stage === "cancelled" ? [textElement("p", labels.cancelled)] : []),
+    ...estimateText(task.estimate),
+    facts([
+      ["アクター", task.actor],
+      ["試行", `${task.attempt.current} / ${task.attempt.max}`],
+      [
+        "経過時間",
+        `${formatDuration(task.elapsedMs)}（上限 ${formatDuration(task.budgets.maxExecutionMs)}）`,
+      ],
+      ["使用トークン", `${usage} / ${formatTokens(task.budgets.maxTokens)}`],
+      ["対象パス", task.paths.join(", ") || "—"],
+    ]),
+    ...(task.failure ? [failure] : []),
+    ...(task.description ? [modelBox("説明", [task.description])] : []),
+    modelBox("受け入れ条件", task.acceptance),
+    textElement("h3", "最近の実行"),
+    task.executions.length
+      ? list(
+          task.executions,
+          ({ actor, mode, status, startedAt, finishedAt, tokens }) =>
+            textElement(
+              "p",
+              `${actor} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
+            ),
+        )
+      : textElement("p", "実行はありません。"),
+    textElement("h3", "最近のイベント"),
+    task.events.length
+      ? list(task.events, ({ kind, at }) =>
+          textElement("p", `${formatTimestamp(at)} · ${kind}`),
+        )
+      : textElement("p", "イベントはありません。"),
+  ];
+}
+
+function problemRow(problem: Problem, select: () => void) {
+  const entry = document.createElement("div");
+  const subject = problem.taskId ? "Task" : "Goal";
+  const detail = textElement("p", problem.detail);
+  detail.className = "warning";
+  entry.append(detail);
+  if (problem.title) entry.append(modelBox(subject, [problem.title]));
+  if ("rejectedPaths" in problem && problem.rejectedPaths)
+    entry.append(rejectedPaths(problem.rejectedPaths));
+  entry.append(textElement("p", formatTimestamp(problem.at)));
+  const key = problem.executionId ?? problem.taskId ?? problem.goalId;
+  if (key && (problem.taskId || problem.goalId))
+    entry.append(action(`${subject} の詳細`, `${problem.kind}:${key}`, select));
+  return entry;
+}
+
+const tabs = ["decisions", "problems", "goals"] as const;
+type Tab = (typeof tabs)[number];
+type View = {
+  tab: Tab;
+  goalId?: string;
+  taskId?: string;
+};
+
+export function createHostPanel(channel: WorkplaceChannel) {
+  const inbox = createInboxPanel(channel);
+  const notice = element("inbox-notice");
+  let view: View = { tab: "decisions" };
+  let previous = "";
+  let loading = false;
+  let refreshNeeded = false;
+  let badgesNeeded = false;
+  let disconnected = false;
+
+  function navigate(next: View) {
+    view = next;
+    previous = "";
+    for (const tab of tabs) {
+      const selected = tab === view.tab;
+      const button = element(`tab-${tab}`);
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      element(tab).hidden = !selected;
+    }
+    if (view.tab !== "decisions") {
+      const panel = element(view.tab);
+      const details = view.goalId || view.taskId;
+      panel.replaceChildren(
+        ...breadcrumb(view),
+        textElement("p", "読み込み中…"),
+      );
+      if (details)
+        panel.querySelector("button")?.focus({ preventScroll: true });
+      panel.scrollTop = 0;
+    }
+    void refresh();
+  }
+
+  for (const [index, tab] of tabs.entries()) {
+    const button = element(`tab-${tab}`);
+    button.addEventListener("click", () => navigate({ tab }));
+    button.addEventListener("keydown", (event) => {
+      const next = {
+        ArrowLeft: (index + tabs.length - 1) % tabs.length,
+        ArrowRight: (index + 1) % tabs.length,
+        Home: 0,
+        End: tabs.length - 1,
+      }[event.key];
+      const target = next === undefined ? undefined : tabs[next];
+      if (!target) return;
+      event.preventDefault();
+      navigate({ tab: target });
+      element(`tab-${target}`).focus();
+    });
+  }
+
+  function breadcrumb({ tab, goalId, taskId }: View) {
+    if (!goalId && !taskId) return [];
+    const nav = document.createElement("nav");
+    nav.className = "breadcrumb";
+    nav.setAttribute("aria-label", "パンくずリスト");
+    nav.append(
+      action(tab === "goals" ? "Goal 一覧" : "問題", "back-list", () => {
+        navigate({ tab });
+        element(`tab-${tab}`).focus();
+      }),
+    );
+    if (taskId && goalId)
+      nav.append(
+        action("Goal 詳細", "back-goal", () => navigate({ tab, goalId })),
+      );
+    return [nav];
+  }
+
+  function renderWork(view: View, data: unknown, contents: () => Node[]) {
+    const snapshot = JSON.stringify(data);
+    if (snapshot === previous) return;
+    previous = snapshot;
+    const panel = element(view.tab);
+    const focused = document.activeElement;
+    const focusKey =
+      focused instanceof HTMLButtonElement && panel.contains(focused)
+        ? focused.dataset.focusKey
+        : undefined;
+    panel.replaceChildren(...breadcrumb(view), ...contents());
+    if (focusKey) {
+      const replacement = [...panel.querySelectorAll("button")].find(
+        (button) => button.dataset.focusKey === focusKey,
+      );
+      (replacement ?? element(`tab-${view.tab}`)).focus({
+        preventScroll: true,
+      });
+    }
+  }
+
+  async function refresh(updateBadges = true) {
+    if (
+      disconnected ||
+      document.hidden ||
+      channel.socket.readyState !== WebSocket.OPEN
+    )
+      return;
+    refreshNeeded = true;
+    badgesNeeded ||= updateBadges;
+    if (loading) return;
+    loading = true;
+    try {
       do {
         refreshNeeded = false;
-        const [status, items] = await Promise.allSettled([
-          channel.request("status", {}),
-          channel.request("inbox.list", {}),
-        ]);
-        if (status.status === "fulfilled") {
-          const { goals, tasks } = status.value.counts;
-          element("counts").textContent = `Goals ${goals} · Tasks ${tasks}`;
+        const refreshBadges = badgesNeeded;
+        badgesNeeded = false;
+        const current = view;
+        const listView = !current.goalId && !current.taskId;
+        const [items, problems, goals, goal, task] = await Promise.allSettled([
+          refreshBadges || current.tab === "decisions"
+            ? channel.request("inbox.list", {})
+            : undefined,
+          refreshBadges || (listView && current.tab === "problems")
+            ? channel.request("problem.list", {})
+            : undefined,
+          refreshBadges || (listView && current.tab === "goals")
+            ? channel.request("goal.list", {})
+            : undefined,
+          current.goalId && !current.taskId
+            ? channel.request("goal.get", { id: current.goalId })
+            : undefined,
+          current.taskId
+            ? channel.request("task.get", { id: current.taskId })
+            : undefined,
+        ] as const);
+        if (disconnected) return;
+        if (items.status === "fulfilled" && items.value) {
+          element("badge-decisions").textContent = String(
+            items.value.filter(
+              ({ weight, state }) =>
+                weight === "action" && state !== "resolved",
+            ).length,
+          );
+          if (view.tab === "decisions") inbox.render(items.value);
         }
-        if (items.status === "fulfilled") render(items.value);
+        if (problems.status === "fulfilled" && problems.value)
+          element("badge-problems").textContent = String(problems.value.length);
+        if (goals.status === "fulfilled" && goals.value)
+          element("badge-goals").textContent = String(
+            goals.value.filter(({ status }) => status === "active").length,
+          );
+        if (current !== view) continue;
+
+        const { tab, goalId, taskId } = current;
+        const active = taskId
+          ? task
+          : goalId
+            ? goal
+            : tab === "problems"
+              ? problems
+              : tab === "goals"
+                ? goals
+                : items;
         notice.textContent =
-          status.status === "rejected" || items.status === "rejected"
-            ? "Could not refresh host status or inbox."
+          active.status === "rejected"
+            ? "ホストパネルを更新できませんでした。"
             : "";
-      } while (refreshNeeded);
+        if (tab === "decisions") continue;
+        if (active.status === "rejected") {
+          renderWork(current, null, () => [
+            textElement("p", "詳細または一覧を取得できませんでした。"),
+          ]);
+        } else if (task.status === "fulfilled" && task.value) {
+          const detail = task.value;
+          renderWork(current, detail, () => taskDetail(detail));
+        } else if (goal.status === "fulfilled" && goal.value) {
+          const detail = goal.value;
+          renderWork(current, detail, () =>
+            goalDetail(detail, (taskId) =>
+              navigate({ tab, goalId: detail.id, taskId }),
+            ),
+          );
+        } else if (
+          tab === "goals" &&
+          goals.status === "fulfilled" &&
+          goals.value
+        ) {
+          const rows = goals.value;
+          renderWork(current, rows, () =>
+            rows.length
+              ? [
+                  list(rows, (goal) => {
+                    const item = document.createElement("div");
+                    item.append(
+                      modelLink("Goal", goal.title, goal.id, () =>
+                        navigate({ tab, goalId: goal.id }),
+                      ),
+                      textElement("p", labels[goal.status]),
+                      ...progress(goal),
+                    );
+                    return item;
+                  }),
+                ]
+              : [textElement("p", "Goal はありません。")],
+          );
+        } else if (
+          tab === "problems" &&
+          problems.status === "fulfilled" &&
+          problems.value
+        ) {
+          const rows = problems.value;
+          renderWork(current, rows, () =>
+            rows.length
+              ? [
+                  list(rows, (problem) =>
+                    problemRow(problem, () => {
+                      if (problem.taskId)
+                        navigate({ tab, taskId: problem.taskId });
+                      else if (problem.goalId)
+                        navigate({ tab, goalId: problem.goalId });
+                    }),
+                  ),
+                ]
+              : [textElement("p", "問題はありません。")],
+          );
+        }
+      } while (refreshNeeded && !document.hidden);
+    } finally {
       loading = false;
-    },
+    }
+  }
+
+  let poll = 0;
+  const interval = window.setInterval(
+    () => void refresh(++poll % 4 === 0),
+    5000,
+  );
+  const becameVisible = () => void refresh();
+  document.addEventListener("visibilitychange", becameVisible);
+  return {
+    refresh,
     disconnect() {
-      visible.disconnect();
+      disconnected = true;
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", becameVisible);
+      inbox.disconnect();
     },
   };
 }

@@ -12,8 +12,17 @@ import {
   projectInbox,
   type InboxSource,
 } from "./inbox.ts";
-import { ContractError, fields, identifier, integer } from "./model.ts";
-import { operatorProposal, operatorStatus } from "./operator-read.ts";
+import { ContractError, fields, identifier, integer, oneOf } from "./model.ts";
+import {
+  goalStatuses,
+  operatorGoal,
+  operatorGoalList,
+  operatorProblems,
+  operatorProposal,
+  operatorStatus,
+  operatorTask,
+  operatorTaskList,
+} from "./operator-read.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -166,14 +175,20 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   async function dispatch(method: string, params: unknown): Promise<Reply> {
     try {
       switch (method) {
-        case "inbox.list": {
+        case "inbox.list":
+        case "problem.list": {
           const { includeResolved } = fields(params, ["includeResolved"]);
           if (
             includeResolved !== undefined &&
             typeof includeResolved !== "boolean"
           )
             throw new ContractError();
-          return { result: project(includeResolved) };
+          return {
+            result:
+              method === "inbox.list"
+                ? project(includeResolved)
+                : operatorProblems(store, includeResolved),
+          };
         }
         case "inbox.markSeen": {
           const { ids } = fields(params, ["ids"]);
@@ -189,6 +204,27 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         case "status":
           fields(params, []);
           return { result: operatorStatus(store) };
+        case "goal.list": {
+          const { status } = fields(params, ["status"]);
+          return {
+            result: operatorGoalList(
+              store,
+              status === undefined ? undefined : oneOf(status, goalStatuses),
+            ),
+          };
+        }
+        case "goal.get":
+        case "task.get": {
+          const { id } = fields(params, ["id"]);
+          const read = method === "goal.get" ? operatorGoal : operatorTask;
+          const result = read(store, identifier(id));
+          return result ? { result } : failure("not-found");
+        }
+        case "task.list": {
+          const { goalId } = fields(params, ["goalId"]);
+          const result = operatorTaskList(store, identifier(goalId));
+          return result ? { result } : failure("not-found");
+        }
         case "proposal.get": {
           const { id } = fields(params, ["id"]);
           const proposal = await operatorProposal(
@@ -254,8 +290,12 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
               try {
                 if (message.method === "inbox.subscribe")
                   subscribedSnapshot = inboxSnapshot(project(true));
-                else if (message.method !== "inbox.markSeen")
-                  await scan?.(JSON.stringify(reply.result));
+                else if (message.method !== "inbox.markSeen") {
+                  const serialized = JSON.stringify(reply.result);
+                  if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
+                    reply = failure("read-failed");
+                  else await scan?.(serialized);
+                }
               } catch {
                 reply = failure("read-failed");
               }

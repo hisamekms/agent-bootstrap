@@ -29,6 +29,7 @@ export interface InboxRow {
   resolved: 0 | 1;
   code: string | null;
   rejectedCount: number | null;
+  rejectedPathsJson: string | null;
   canRetry: 0 | 1;
 }
 

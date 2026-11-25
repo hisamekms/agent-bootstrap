@@ -1,13 +1,26 @@
 import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import type {
+  goalStatuses,
+  operatorGoal,
+  operatorGoalList,
+  operatorProblems,
   operatorProposal,
   operatorStatus,
+  operatorTask,
+  operatorTaskList,
 } from "../../local-orchestrator/operator-read.ts";
 
 export type Proposal = NonNullable<
   Awaited<ReturnType<typeof operatorProposal>>
 >;
 export type Status = ReturnType<typeof operatorStatus>;
+export type GoalSummary = ReturnType<typeof operatorGoalList>[number];
+export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>>;
+export type TaskSummary = NonNullable<
+  ReturnType<typeof operatorTaskList>
+>[number];
+export type TaskDetail = NonNullable<ReturnType<typeof operatorTask>>;
+export type Problem = ReturnType<typeof operatorProblems>[number];
 
 export interface Methods {
   status: { params: Record<string, never>; result: Status };
@@ -18,6 +31,14 @@ export interface Methods {
   };
   "inbox.markSeen": { params: { ids: string[] }; result: { marked: number } };
   "proposal.get": { params: { id: string }; result: Proposal };
+  "goal.list": {
+    params: { status?: (typeof goalStatuses)[number] };
+    result: GoalSummary[];
+  };
+  "goal.get": { params: { id: string }; result: GoalDetail };
+  "task.list": { params: { goalId: string }; result: TaskSummary[] };
+  "task.get": { params: { id: string }; result: TaskDetail };
+  "problem.list": { params: { includeResolved?: boolean }; result: Problem[] };
   "concierge.attach": {
     params: Record<string, never>;
     result: { replay: string };
@@ -74,4 +95,41 @@ export function orderInbox<T extends Pick<InboxItem, "weight">>(
     ...items.filter(({ weight }) => weight === "action"),
     ...items.filter(({ weight }) => weight === "info"),
   ];
+}
+
+export function estimateLabel(remainingMs: number | null) {
+  if (remainingMs === null || remainingMs <= 0) return "";
+  const minutes = Math.max(1, Math.round(remainingMs / 60_000));
+  return `あと約 ${minutes} 分（現時点の計画では）`;
+}
+
+const localTime = new Intl.DateTimeFormat("ja-JP", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+export function formatTimestamp(at: string | null, now = Date.now()) {
+  if (at === null) return "—";
+  const timestamp = Date.parse(at);
+  if (!Number.isFinite(timestamp)) return "—";
+  const age = now - timestamp;
+  if (age >= 0 && age < 86_400_000) {
+    const minutes = Math.floor(age / 60_000);
+    return minutes === 0 ? "たった今" : `${minutes} 分前`;
+  }
+  return localTime.format(timestamp);
+}
+
+export function formatDuration(ms: number) {
+  const minutes = Math.floor(ms / 60_000);
+  return minutes === 0 ? "1 分未満" : `${minutes} 分`;
+}
+
+const tokenCount = new Intl.NumberFormat("ja-JP");
+
+export function formatTokens(tokens: number | null) {
+  return tokens === null ? "—" : tokenCount.format(tokens);
 }
