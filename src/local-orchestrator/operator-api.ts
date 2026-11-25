@@ -315,7 +315,8 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
               try {
                 if (message.method === "inbox.subscribe")
                   subscribedSnapshot = inboxSnapshot(project(true));
-                // Decision receipts carry fixed codes and IDs screened before writing.
+                // Decision receipts carry fixed codes and IDs (screened before
+                // writing for answerMany; the caller's own ID for answer).
                 else if (
                   message.method !== "inbox.markSeen" &&
                   message.method !== "proposal.answer" &&

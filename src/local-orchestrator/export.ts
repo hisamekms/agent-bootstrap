@@ -206,6 +206,10 @@ const queries = {
         delegated,
         agent: delegated ? "claude-code" : null,
         session: delegated ? label(delegate?.session) : null,
+        channel:
+          row.answerer_kind === "human" && answerer.channel === "operator-ui"
+            ? "operator-ui"
+            : null,
         execution_id:
           row.answerer_kind === "agent" ? label(answerer.executionId) : null,
       };
