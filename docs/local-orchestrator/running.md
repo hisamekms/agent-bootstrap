@@ -77,11 +77,15 @@ serves the operator API on the target's private Unix socket. It accepts
 slot as the TTY launcher.
 
 With `--dev-bridge`, open the private loopback URL printed at startup.
-Keep the URL private. The page displays a placeholder until the UI bundle
-is available. Closing the browser leaves the session running. To end it,
-press Ctrl-C or send SIGTERM to the workplace process. The launcher closes
-the operator API and the bridge at shutdown. Use the operator CLI with the
-same target to answer gates.
+Keep the URL private. The page shows the Concierge terminal beside a
+read-only host panel; `F6` moves focus between them. Closing the browser
+leaves the session running. To end it, press Ctrl-C or send SIGTERM to the
+workplace process. The launcher closes the operator API and the bridge at
+shutdown. If that shutdown hangs, press Ctrl-C again to exit at once
+without cleanup, then run `agent-bootstrap doctor`. A third Ctrl-C kills
+the launcher. The launcher also stops when the workplace command ends for
+any reason, including SIGKILL. Use the operator CLI with the same target to
+answer gates.
 
 ## Work on another repository
 

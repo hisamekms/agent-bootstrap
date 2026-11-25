@@ -88,14 +88,28 @@ function launchSession(
         ...args,
       ],
       {
-        stdio: json ? [0, 2, 2] : "inherit",
+        stdio: forwardSignals
+          ? ["inherit", "inherit", "inherit", "pipe"]
+          : json
+            ? [0, 2, 2]
+            : "inherit",
+        // The launcher stops when this lifeline closes, so it cannot outlive
+        // this CLI even after SIGKILL.
+        ...(forwardSignals && {
+          env: { ...process.env, AGENT_BOOTSTRAP_LIFELINE_FD: "3" },
+        }),
         // Route terminal signals through this CLI without interrupting the
         // launcher's backend cleanup subprocesses in the same process group.
         ...(forwardSignals ? { detached: true } : {}),
       },
     );
-    const interrupt = () => child.kill("SIGINT");
-    const terminate = () => child.kill("SIGTERM");
+    // The launcher stops cleanly on the first signal and exits at once on
+    // the second. A third one kills it, in case it no longer responds.
+    let forwarded = 0;
+    const forward = (signal: NodeJS.Signals) =>
+      child.kill(++forwarded > 2 ? "SIGKILL" : signal);
+    const interrupt = () => forward("SIGINT");
+    const terminate = () => forward("SIGTERM");
     if (forwardSignals) {
       process.on("SIGINT", interrupt);
       process.on("SIGTERM", terminate);

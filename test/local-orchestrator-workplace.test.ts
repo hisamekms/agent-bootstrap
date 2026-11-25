@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadWorkplaceAssets } from "../src/operator-ui/assets.ts";
-import { runWorkplace } from "../src/local-orchestrator/workplace.ts";
+import {
+  runWorkplace,
+  workplaceStop,
+} from "../src/local-orchestrator/workplace.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 test(
@@ -76,3 +80,52 @@ test(
     assert.equal(existsSync(join(root, "operator", "api.sock")), false);
   },
 );
+
+test("the first stop signal aborts and a second one exits at once", () => {
+  const signals = new EventEmitter();
+  const exits: number[] = [];
+  const stop = workplaceStop(signals, (code) => exits.push(code));
+  assert.equal(stop.signal.aborted, false);
+  signals.emit("SIGINT");
+  assert.equal(stop.signal.aborted, true);
+  assert.equal(stop.exitCode, 130);
+  assert.deepEqual(exits, []);
+  signals.emit("SIGTERM");
+  assert.deepEqual(exits, [143]);
+  stop.dispose();
+  assert.equal(signals.listenerCount("SIGINT"), 0);
+  assert.equal(signals.listenerCount("SIGTERM"), 0);
+  assert.equal(signals.listenerCount("SIGHUP"), 0);
+});
+
+test("a closed lifeline stops the workplace as SIGTERM does", () => {
+  const signals = new EventEmitter();
+  const emitter = new EventEmitter();
+  const lifeline = Object.assign(emitter, {
+    destroyed: false,
+    destroy() {
+      lifeline.destroyed = true;
+      emitter.emit("close");
+    },
+  });
+  const stop = workplaceStop(signals, () => assert.fail(), lifeline);
+  lifeline.emit("close");
+  assert.equal(stop.signal.aborted, true);
+  assert.equal(stop.exitCode, 143);
+  stop.dispose();
+  assert.equal(lifeline.destroyed, true);
+});
+
+test("disposing the stop control does not count as a stop", () => {
+  const signals = new EventEmitter();
+  const emitter = new EventEmitter();
+  const lifeline = Object.assign(emitter, {
+    destroy() {
+      emitter.emit("close");
+    },
+  });
+  const stop = workplaceStop(signals, () => assert.fail(), lifeline);
+  stop.dispose();
+  assert.equal(stop.signal.aborted, false);
+  assert.equal(stop.exitCode, undefined);
+});
