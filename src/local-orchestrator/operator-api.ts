@@ -351,7 +351,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       }
     }, pollMs);
     timer.unref();
-    return { close };
+    return { path, close };
   } catch (error) {
     await close();
     throw error;

@@ -26,7 +26,13 @@ import {
   parseConciergeArgs,
   snapshotConciergeRepo,
   startConcierge,
+  type ConciergeOptions,
 } from "../../src/local-orchestrator/concierge.ts";
+import {
+  parseWorkplaceArgs,
+  runWorkplace,
+} from "../../src/local-orchestrator/workplace.ts";
+import { loadWorkplaceAssets } from "../../src/local-orchestrator/workplace-assets.ts";
 import {
   loadClaudeConfig,
   resolveClaudeModel,
@@ -154,6 +160,46 @@ export function conciergeFailure(stage: string, error: unknown): string {
 }
 
 async function main(args: readonly string[]) {
+  if (args[0] === "workplace") {
+    let flags: ReturnType<typeof parseWorkplaceArgs>;
+    try {
+      flags = parseWorkplaceArgs(args.slice(1));
+    } catch {
+      throw new Error("Run agent-bootstrap help workplace for usage.");
+    }
+    const controller = new AbortController();
+    let signalExitCode: number | undefined;
+    const stop = (code: number) => {
+      signalExitCode ??= code;
+      controller.abort();
+    };
+    const interrupt = () => stop(130);
+    const terminate = () => stop(143);
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", terminate);
+    let stage = "resolve target";
+    try {
+      await launchConcierge(
+        flags,
+        (next) => {
+          stage = next;
+        },
+        {
+          signal: controller.signal,
+          devBridge: flags.devBridge,
+        },
+      );
+    } catch (error) {
+      if (!controller.signal.aborted || error !== controller.signal.reason)
+        throw new Error(conciergeFailure(stage, error));
+    } finally {
+      process.off("SIGINT", interrupt);
+      process.off("SIGTERM", terminate);
+      if (signalExitCode !== undefined) process.exitCode = signalExitCode;
+    }
+    return;
+  }
+
   let flags: ReturnType<typeof parseConciergeArgs>;
   try {
     flags = parseConciergeArgs(args);
@@ -193,6 +239,7 @@ async function main(args: readonly string[]) {
 async function launchConcierge(
   flags: ReturnType<typeof parseConciergeArgs>,
   setStage: (stage: string) => void,
+  workplace?: { signal: AbortSignal; devBridge: boolean },
 ) {
   const { LO_CLAUDE_BINARY } = process.env;
   const target = await resolveTarget(flags.target ?? bootstrapCheckout);
@@ -347,6 +394,7 @@ async function launchConcierge(
   const terminate = () => void stopOperator("SIGTERM");
   setStage("open state");
   try {
+    workplace?.signal.throwIfAborted();
     if (!volumeShell)
       store = OrchestratorStore.open(join(directory, "state.db"));
     console.log(`Audit database ${displayedAuditPath}`);
@@ -388,8 +436,9 @@ async function launchConcierge(
       return;
     }
     if (!store) throw new Error("Concierge state unavailable");
+    const host = observed.host;
     setStage("open operator API");
-    operator = await listenOperatorApi({
+    const apiOptions = {
       store,
       stateDirectory: directory,
       target: repoRoot,
@@ -400,39 +449,67 @@ async function launchConcierge(
           baseImage,
         ),
       ...(scan ? { scan } : {}),
-    });
-    process.on("SIGINT", interrupt);
-    process.on("SIGTERM", terminate);
-    setStage("launch or clean up session");
-    const result = await startConcierge(
-      {
-        host: observed.host,
-        store,
-        snapshot: snapshotConciergeRepo,
-        ...(scan ? { scan } : {}),
-        install,
-        auth,
-        config: effective.config,
-        baseImage,
-        note: (message) => console.error(message),
-        ...(verificationConfig
-          ? { verification: configuredVerification(verificationConfig) }
-          : {}),
-      },
-      {
-        ...options,
-        repoRoot,
-        target,
-        onSession: (id) => {
-          sessionId = id;
-          console.log(`Concierge session ${id}`);
+    };
+    const launchSession = (
+      sessionOptions: Pick<ConciergeOptions, "terminal" | "signal"> = {},
+    ) => {
+      setStage("launch or clean up session");
+      return startConcierge(
+        {
+          host,
+          store: apiOptions.store,
+          snapshot: snapshotConciergeRepo,
+          ...(scan ? { scan } : {}),
+          install,
+          auth,
+          config: effective.config,
+          baseImage,
+          note: (message) => console.error(message),
+          ...(verificationConfig
+            ? { verification: configuredVerification(verificationConfig) }
+            : {}),
         },
-      },
-    );
+        {
+          ...options,
+          ...sessionOptions,
+          repoRoot,
+          target,
+          onSession: (id) => {
+            sessionId = id;
+            console.log(`Concierge session ${id}`);
+          },
+        },
+      );
+    };
+    let result: Awaited<ReturnType<typeof startConcierge>>;
+    if (workplace) {
+      workplace.signal.throwIfAborted();
+      result = await runWorkplace(
+        apiOptions,
+        (terminal) => launchSession({ terminal, signal: workplace.signal }),
+        workplace.devBridge
+          ? {
+              loadAssets: loadWorkplaceAssets,
+              printUrl: (url) => process.stdout.write(`${url}\n`),
+            }
+          : undefined,
+      );
+    } else {
+      operator = await listenOperatorApi(apiOptions);
+      process.on("SIGINT", interrupt);
+      process.on("SIGTERM", terminate);
+      result = await launchSession();
+    }
     console.log(
       `Concierge outcome ${result.outcome}, exit code ${result.exitCode ?? "unavailable"}`,
     );
-    if (result.outcome !== "ok" || result.exitCode !== 0) process.exitCode = 1;
+    if (workplace)
+      process.exitCode =
+        result.exitCode === 0 && result.outcome !== "ok"
+          ? 1
+          : (result.exitCode ?? 1);
+    else if (result.outcome !== "ok" || result.exitCode !== 0)
+      process.exitCode = 1;
   } finally {
     credential = "";
     const closed = await Promise.allSettled([
@@ -467,7 +544,7 @@ async function launchConcierge(
     process.off("SIGTERM", terminate);
     if (closed.some(({ status }) => status === "rejected")) {
       console.error("concierge-shutdown-failed");
-      process.exitCode = 1;
+      process.exitCode ||= 1;
     }
   }
 }

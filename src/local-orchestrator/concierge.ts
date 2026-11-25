@@ -35,8 +35,10 @@ import { MICROSANDBOX_LIMITS } from "../microsandbox.ts";
 import {
   INTERACTIVE_MAX_LIFETIME_MS,
   type SandboxFile,
+  type TerminalAttachment,
   type TerminalCommand,
   type TerminalExit,
+  type TerminalSink,
 } from "../sandbox-runtime.ts";
 import type {
   ReviewerPlan,
@@ -55,6 +57,7 @@ import {
 } from "./claude-config.ts";
 import { orchestratorMcp, SECRET_EXECUTOR_SHELL } from "./claude-policy.ts";
 import { HostApiServer } from "./host-api.ts";
+import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
 import { gitCommit } from "./model.ts";
 import { ActorRunner } from "./runner.ts";
 import { secretVariable, withActorSecret } from "./secret-launch.ts";
@@ -103,7 +106,10 @@ type ConciergeHost = Pick<
       plan: ConciergePlan,
       id: string,
       use: (terminal: {
-        attach(command: TerminalCommand): Promise<TerminalExit>;
+        attach(
+          command: TerminalCommand,
+          sink?: TerminalSink,
+        ): Promise<TerminalExit | TerminalAttachment>;
       }) => Promise<void>,
     ): ReturnType<TrustedHost["runConcierge"]>;
   };
@@ -138,6 +144,8 @@ export interface ConciergeOptions {
   readonly continue?: boolean;
   readonly lifetimeMs?: number;
   readonly onSession?: (sessionId: string) => void;
+  readonly terminal?: ConciergeTerminalHub;
+  readonly signal?: AbortSignal;
 }
 
 export function parseConciergeMode(value: unknown): PermissionMode {
@@ -541,6 +549,7 @@ export async function startConcierge(
   };
 
   try {
+    options.signal?.throwIfAborted();
     options.onSession?.(sessionId);
     const snapshot = await deps.snapshot(
       repoRoot,
@@ -550,6 +559,7 @@ export async function startConcierge(
       target,
     );
     snapshotDir = snapshot.dir;
+    options.signal?.throwIfAborted();
     store.recordSessionSnapshot(sessionId, snapshot.commit);
     const context = await conciergeContext(snapshot, target?.isDefault);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
@@ -687,7 +697,9 @@ export async function startConcierge(
         },
       },
     });
+    options.signal?.throwIfAborted();
     await host.prepareConciergeVolume(stateVolume);
+    options.signal?.throwIfAborted();
     if (tasks) {
       scheduleDrain();
       // Operator decisions can arrive from another process via state.db.
@@ -711,13 +723,36 @@ export async function startConcierge(
       },
       invocationId,
       async (terminal) => {
+        options.signal?.throwIfAborted();
+        if (options.terminal) {
+          const attachment = await terminal.attach(
+            {
+              ...command,
+              ...(options.signal ? { signal: options.signal } : {}),
+            },
+            { cols: 120, rows: 36, data: options.terminal.data },
+          );
+          if (!("terminal" in attachment))
+            throw new Error("Concierge PTY attachment unavailable");
+          options.terminal.start(attachment);
+          ({ exitCode } = await attachment.finished);
+          return;
+        }
         console.error(
           "Guest output reaches this terminal. Disable OSC 52 clipboard access before use.",
         );
-        ({ exitCode } = await terminal.attach(command));
+        const exit = await terminal.attach(command);
+        if (!("exitCode" in exit))
+          throw new Error("Concierge TTY exit unavailable");
+        ({ exitCode } = exit);
       },
     ));
-    if (mode === "auto" && exitCode !== null && exitCode !== 0)
+    if (
+      !options.terminal &&
+      mode === "auto" &&
+      exitCode !== null &&
+      exitCode !== 0
+    )
       console.error(
         "Concierge exited in auto mode. Check the CLI message above for an auto-mode rejection, then retry with --mode default if needed.",
       );
@@ -767,9 +802,13 @@ export async function startConcierge(
   return { sessionId, outcome, exitCode, ...(code ? { code } : {}) };
 }
 
-export function parseConciergeArgs(args: readonly string[]) {
+export function parseConciergeArgs(
+  args: readonly string[],
+  allowDevBridge = false,
+) {
   let run = false;
   let resume = false;
+  let devBridge = false;
   let target: string | undefined;
   let claudeAuth: ClaudeAuthMode | undefined;
   let volumeShell: string | undefined;
@@ -777,6 +816,8 @@ export function parseConciergeArgs(args: readonly string[]) {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--run" && !run) run = true;
     else if (args[i] === "--continue" && !resume) resume = true;
+    else if (args[i] === "--dev-bridge" && allowDevBridge && !devBridge)
+      devBridge = true;
     else if (args[i] === "--claude-auth" && claudeAuth === undefined)
       claudeAuth = parseClaudeAuthMode(args[++i]);
     else if (args[i] === "--volume-shell" && volumeShell === undefined) {
@@ -796,6 +837,7 @@ export function parseConciergeArgs(args: readonly string[]) {
     mode: mode ?? "auto",
     continue: resume,
     target,
+    ...(devBridge ? { devBridge } : {}),
     ...(claudeAuth ? { claudeAuth } : {}),
     ...(volumeShell ? { volumeShell } : {}),
   };

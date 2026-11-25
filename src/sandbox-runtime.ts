@@ -99,6 +99,8 @@ export interface TerminalCommand {
   readonly argv: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly workdir?: "/repo" | "/state" | "/";
+  /** Host cancellation for an attached terminal. */
+  readonly signal?: AbortSignal;
 }
 
 export interface TerminalSink {

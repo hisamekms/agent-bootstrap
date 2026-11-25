@@ -31,6 +31,7 @@ import {
   startConcierge,
   type ConciergeDeps,
 } from "../src/local-orchestrator/concierge.ts";
+import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import type { ExecutionRequester } from "../src/local-orchestrator/host-api.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
 import { MICROSANDBOX_LIMITS } from "../src/microsandbox.ts";
@@ -73,6 +74,90 @@ async function fixture<T>(
 }
 
 const snapshotCommit = "a".repeat(40);
+
+for (const cancelled of [false, true]) {
+  test(
+    cancelled
+      ? "workplace cancellation ends the Concierge attachment and session"
+      : "workplace feeds filtered PTY output to the hub and reports the Concierge exit",
+    { timeout: 5000 },
+    async () => {
+      await fixture(async (repoRoot, store, target) => {
+        const hub = createConciergeTerminalHub();
+        const controller = new AbortController();
+        const exitCode = cancelled ? null : 7;
+        const finished = Promise.withResolvers<{ exitCode: number | null }>();
+        const result = await startConcierge(
+          {
+            store,
+            config: { version: 1 },
+            baseImage: ALPINE_3_23.reference,
+            auth,
+            install,
+            snapshot: async () => ({
+              dir: await mkdtemp(join(repoRoot, "snapshot-")),
+              commit: snapshotCommit,
+              files: [],
+            }),
+            async listen() {
+              return { async close() {} };
+            },
+            host: {
+              async prepareConciergeVolume() {
+                return { reused: false };
+              },
+              async runConcierge(_plan, id, use) {
+                const session = use({
+                  async attach(command, sink) {
+                    assert.equal(command.signal, controller.signal);
+                    assert.ok(sink);
+                    assert.deepEqual([sink.cols, sink.rows], [120, 36]);
+                    sink.data(Buffer.from("hello\x1b]52;c;hidden\x07!"));
+                    command.signal.addEventListener(
+                      "abort",
+                      () => {
+                        finished.resolve({ exitCode: null });
+                      },
+                      { once: true },
+                    );
+                    return {
+                      terminal: { write() {}, resize() {} },
+                      finished: finished.promise,
+                    };
+                  },
+                });
+                await new Promise<void>((resolve) => setImmediate(resolve));
+                try {
+                  assert.equal(hub.status, "ready");
+                  assert.equal(
+                    hub.attach(() => {}),
+                    Buffer.from("hello!").toString("base64"),
+                  );
+                  if (cancelled) controller.abort();
+                } finally {
+                  if (!cancelled || !controller.signal.aborted)
+                    finished.resolve({ exitCode });
+                  await session;
+                }
+                return { id, outcome: "failed" };
+              },
+              async runPlanner() {
+                throw new Error("unexpected Planner");
+              },
+              async runReviewer() {
+                throw new Error("unexpected Reviewer");
+              },
+            },
+          },
+          { repoRoot, target, model, terminal: hub, signal: controller.signal },
+        );
+        assert.equal(result.exitCode, exitCode);
+        assert.equal(hub.status, "terminal-exited");
+        assert.equal(store.isActiveConciergeSession(result.sessionId), false);
+      });
+    },
+  );
+}
 
 const failures = [
   "start",

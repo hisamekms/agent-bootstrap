@@ -83,6 +83,27 @@ Describe the desired Goal in the Concierge and inspect proposals from a second h
 **Human involvement**  
 The operator starts the session and reviews provider access and costs. The operator updates local main, pushes branches, and opens pull requests.
 
+## workplace
+
+Start the Concierge and the target's operator API for a separate client.
+
+**Prerequisites**  
+A registered target and passing Concierge launch prerequisites.
+
+```sh
+agent-bootstrap --target /path/to/project workplace
+agent-bootstrap workplace --target /path/to/project --dev-bridge
+```
+
+**Expected output**  
+The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.
+
+**Next action**  
+Open the printed URL when using the development bridge. Use the operator CLI to answer gates.
+
+**Human involvement**  
+Keep the URL private. Stop the workplace process to end the session.
+
 ## goals
 
 Use the Concierge to draft Goals and Tasks, then inspect their progress through the operator CLI.
@@ -370,6 +391,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|external>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap setup [--target <path>] [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
 - `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
+- `agent-bootstrap workplace --target <path> [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--dev-bridge]` → Text output with the optional loopback URL.
 - `agent-bootstrap sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]` → A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.
 - `agent-bootstrap project add <path> [--name <name>] | project list | project show <name> | project move <name> <path> | project remove <name> | project approve <name>` → Project record, list of records, or a confirmation object.
 - `agent-bootstrap config edit [--project <name>]` → { edited: true } after the editor exits and file validation succeeds.

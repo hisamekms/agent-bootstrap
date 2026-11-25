@@ -40,6 +40,7 @@ import {
 import { VolumeError, Volume } from "../volumes/volume.ts";
 import { resolveTarget } from "../local-orchestrator/target.ts";
 import { parseConciergeArgs } from "../local-orchestrator/concierge.ts";
+import { parseWorkplaceArgs } from "../local-orchestrator/workplace.ts";
 import {
   exitCodes,
   helpTopics,
@@ -69,23 +70,55 @@ export interface BootstrapIo extends CliIo {
   approvalTTY?: boolean;
   confirmProject?(question: string): Promise<string | undefined>;
   launch?(root: string, args: string[], json: boolean): Promise<boolean>;
+  launchWorkplace?(root: string, args: string[]): Promise<number>;
 }
 
-function launch(root: string, args: string[], json: boolean): Promise<boolean> {
+function launchSession(
+  root: string,
+  args: string[],
+  json: boolean,
+  forwardSignals = false,
+): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(
       process.execPath,
       [
         "--no-env-file",
         join(root, "spike/local-orchestrator/concierge.ts"),
-        "--run",
         ...args,
       ],
-      { stdio: json ? [0, 2, 2] : "inherit" },
+      {
+        stdio: json ? [0, 2, 2] : "inherit",
+        // Route terminal signals through this CLI without interrupting the
+        // launcher's backend cleanup subprocesses in the same process group.
+        ...(forwardSignals ? { detached: true } : {}),
+      },
     );
-    child.once("error", () => resolve(false));
-    child.once("close", (code) => resolve(code === 0));
+    const interrupt = () => child.kill("SIGINT");
+    const terminate = () => child.kill("SIGTERM");
+    if (forwardSignals) {
+      process.on("SIGINT", interrupt);
+      process.on("SIGTERM", terminate);
+      process.on("SIGHUP", terminate);
+    }
+    child.once("error", () => resolve(1));
+    child.once("close", (code, signal) => {
+      process.off("SIGINT", interrupt);
+      process.off("SIGTERM", terminate);
+      process.off("SIGHUP", terminate);
+      resolve(
+        code ?? (signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 1),
+      );
+    });
   });
+}
+
+async function launch(root: string, args: string[], json: boolean) {
+  return (await launchSession(root, ["--run", ...args], json)) === 0;
+}
+
+function launchWorkplace(root: string, args: string[]) {
+  return launchSession(root, ["workplace", ...args], false, true);
 }
 
 function includeJson(argv: readonly string[]) {
@@ -130,7 +163,7 @@ export async function runBootstrap(
   root: string,
   io: BootstrapIo,
   host: Host = systemHost,
-): Promise<Exit> {
+): Promise<number> {
   const { args, json } = includeJson(argv);
   const print = (value: unknown) => io.stdout.write(`${escapedJson(value)}\n`);
   const hint = (next: string) => io.stderr.write(`next: ${next}\n`);
@@ -150,9 +183,14 @@ export async function runBootstrap(
     );
 
   const globalAuth = args[0] === "--claude-auth" ? args.splice(0, 2) : [];
+  const leadingWorkplaceTarget =
+    args[0] === "--target" && args[2] === "workplace" ? args.splice(0, 2) : [];
   const [command = "help", ...commandArgs] = args;
-  const rest = [...commandArgs, ...globalAuth];
-  if (globalAuth.length && !["doctor", "concierge"].includes(command))
+  const rest = [...commandArgs, ...globalAuth, ...leadingWorkplaceTarget];
+  if (
+    globalAuth.length &&
+    !["doctor", "concierge", "workplace"].includes(command)
+  )
     return usage();
   try {
     if (command === "help" || command === "--help" || command === "-h") {
@@ -569,6 +607,31 @@ export async function runBootstrap(
       if (json) print({ status: "ok", next });
       else hint(next);
       return 0;
+    }
+
+    if (command === "workplace") {
+      if (json) return usage();
+      let flags: ReturnType<typeof parseWorkplaceArgs>;
+      try {
+        flags = parseWorkplaceArgs(rest);
+      } catch {
+        return usage();
+      }
+      const { first } = await doctor(
+        root,
+        host,
+        flags.target,
+        true,
+        flags.claudeAuth,
+      );
+      if (first)
+        return fail(
+          3,
+          "Workplace prerequisites are missing.",
+          first.fix.join(" && ") ||
+            "Run agent-bootstrap doctor with the same target.",
+        );
+      return await (io.launchWorkplace ?? launchWorkplace)(root, rest);
     }
 
     let index = 0;

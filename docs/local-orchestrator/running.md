@@ -65,6 +65,24 @@ The default Claude Code permission mode is `auto`. If Claude Code reports
 that it cannot start in that mode, rerun with `--mode default`. The launcher
 also accepts `--mode acceptEdits` and `--mode plan`.
 
+## Start the operator workplace
+
+```sh
+agent-bootstrap workplace --target /path/to/project --dev-bridge
+```
+
+The workplace starts an audited Concierge in a host-managed terminal and
+serves the operator API on the target's private Unix socket. It accepts
+`--continue`, `--mode`, and `--claude-auth` and shares the same session
+slot as the TTY launcher.
+
+With `--dev-bridge`, open the private loopback URL printed at startup.
+Keep the URL private. The page displays a placeholder until the UI bundle
+is available. Closing the browser leaves the session running. To end it,
+press Ctrl-C or send SIGTERM to the workplace process. The launcher closes
+the operator API and the bridge at shutdown. Use the operator CLI with the
+same target to answer gates.
+
 ## Work on another repository
 
 Run the launcher and operator CLI from agent-bootstrap. Use the same
