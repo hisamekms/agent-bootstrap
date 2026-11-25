@@ -1,5 +1,6 @@
 import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
+import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
 import {
   estimateLabel,
@@ -7,9 +8,12 @@ import {
   formatTimestamp,
   formatTokens,
   orderInbox,
+  type AnswerableProposal,
   type GoalDetail,
   type GoalSummary,
+  type PanelInboxItem,
   type Problem,
+  type Proposal,
   type TaskDetail,
   type TaskSummary,
 } from "./protocol.ts";
@@ -36,10 +40,17 @@ const subjectLabels = {
   executionId: "Execution ID",
 } as const;
 
-function createInboxPanel(channel: WorkplaceChannel) {
+function createInboxPanel(channel: WorkplaceChannel, refresh: () => void) {
   const inbox = element("inbox-items");
   const details = element("details");
   const notice = element("inbox-notice");
+  const batch = element("answer-batch");
+  const confirmation = element("answer-confirmation");
+  const results = element("answer-results");
+  const chosen = new Map<string, string>();
+  let proposals: AnswerableProposal[] = [];
+  let controls: (() => void)[] = [];
+  let answering = false;
   let buttons = new Map<string, HTMLButtonElement>();
   let selected: InboxItem | undefined;
   let previousItems = "";
@@ -117,17 +128,179 @@ function createInboxPanel(channel: WorkplaceChannel) {
       });
       kind.textContent = proposal.kind;
       field("Pinned digest", proposal.digest);
+      if (proposal.diffStat !== null)
+        field("変更規模", "").append(textElement("pre", proposal.diffStat));
       proposalInfo.remove();
+      return proposal;
     } catch {
       proposalInfo.textContent = "Could not load the proposal.";
     }
   }
 
-  function render(items: InboxItem[]) {
+  const batchButton = action("", "approve-batch", () => {
+    const approved = proposals.filter(
+      ({ id, digest }) => chosen.get(id) === digest,
+    );
+    if (approved.length >= 2) confirm(approved, "approve");
+  });
+  batch.append(batchButton);
+
+  function updateControls() {
+    for (const update of controls) update();
+    batchButton.hidden = chosen.size < 2;
+    batchButton.disabled = answering;
+    batchButton.textContent = `選んだ ${chosen.size} 件をまとめて承認`;
+  }
+  updateControls();
+
+  function confirm(
+    pinned: AnswerableProposal[],
+    decision: PanelAnswer["decision"],
+    selectedPreview?: Promise<Proposal | undefined>,
+  ) {
+    if (answering) return;
+    const label =
+      decision === "reject"
+        ? "却下"
+        : pinned.length === 1 && pinned[0]?.kind === "integration"
+          ? "承認して統合"
+          : "承認";
+    const submit = action("確定", "submit-answer", () => void send());
+    const cancel = action("やめる", "cancel-answer", () =>
+      confirmation.replaceChildren(),
+    );
+    const previews: Promise<boolean>[] = [];
+    confirmation.replaceChildren(
+      textElement("h3", `${label}の確認`),
+      list(pinned, ({ id, kind, title, digest, agentGates }) => {
+        const node = document.createElement("div");
+        node.append(
+          textElement(
+            "p",
+            `${kind} · ${id.slice(0, 8)} · ${digest.slice(0, 12)}`,
+          ),
+        );
+        if (title !== null) node.append(modelBox("タイトル", [title]));
+        if (decision === "approve" && agentGates.length > 0) {
+          const warning = textElement(
+            "p",
+            `この提案には AI へ判断を委任する設定が含まれます（${agentGates.join("、")}）。`,
+          );
+          warning.className = "warning";
+          node.append(warning);
+        }
+        if (decision === "approve" && kind === "integration") {
+          const stat = textElement("pre", "変更規模を読み込み中…");
+          stat.setAttribute("role", "status");
+          node.append(stat);
+          previews.push(loadDiffStat(id, digest, stat));
+        }
+        return node;
+      }),
+      submit,
+      cancel,
+    );
+    if (previews.length) {
+      submit.disabled = true;
+      void Promise.all(previews).then((ready) => {
+        submit.disabled = !ready.every(Boolean);
+      });
+    }
+    cancel.focus();
+
+    async function loadDiffStat(id: string, digest: string, stat: HTMLElement) {
+      try {
+        const proposal = await (selectedPreview ??
+          channel.request("proposal.get", { id }));
+        if (proposal && proposal.digest !== digest) {
+          stat.textContent = answerError("stale-digest");
+          if (stat.isConnected) refresh();
+          return false;
+        }
+        if (proposal && proposal.status !== "pending") {
+          stat.textContent = answerError("invalid-transition");
+          if (stat.isConnected) refresh();
+          return false;
+        }
+        if (proposal?.diffStat != null) {
+          stat.textContent = proposal.diffStat;
+          return true;
+        }
+      } catch {
+        // Keep confirmation disabled when the pinned diff is unavailable.
+      }
+      stat.textContent = "変更規模を取得できませんでした。";
+      return false;
+    }
+
+    async function send() {
+      if (answering) return;
+      answering = true;
+      submit.disabled = cancel.disabled = true;
+      updateControls();
+      results.replaceChildren();
+      const answers = pinned.map(({ id, digest }) => ({
+        id,
+        digest,
+        decision,
+      }));
+      try {
+        const outcomes =
+          answers.length === 1 && answers[0]
+            ? [await channel.request("proposal.answer", answers[0])]
+            : await channel.request("proposal.answerMany", { answers });
+        results.replaceChildren(
+          list(outcomes, (outcome) =>
+            textElement(
+              "span",
+              `${outcome.id.slice(0, 8)} · ${"ok" in outcome ? `${label}を記録しました。` : answerError(outcome.error.code)}`,
+            ),
+          ),
+        );
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "write-failed";
+        results.textContent = answerError(code);
+      } finally {
+        for (const { id } of answers) chosen.delete(id);
+        answering = false;
+        confirmation.replaceChildren();
+        updateControls();
+        refresh();
+      }
+    }
+  }
+
+  function answerError(code: string) {
+    switch (code) {
+      case "stale-digest":
+        return "提案が変更されました。一覧を更新しています。";
+      case "invalid-transition":
+        return "この提案はすでに判断待ちではありません。";
+      case "approval-forbidden":
+        return "現在のポリシーではパネルから回答できません。";
+      case "not-found":
+        return "提案が見つかりません。";
+      default:
+        return `回答の結果を確認できませんでした（${code}）。`;
+    }
+  }
+
+  function render(items: PanelInboxItem[]) {
     const snapshot = JSON.stringify(items);
     if (snapshot === previousItems) return;
     previousItems = snapshot;
     const ordered = orderInbox(items);
+    proposals = ordered.flatMap((item) =>
+      "answer" in item ? [item.answer] : [],
+    );
+    const approvable = new Map(
+      proposals
+        .filter(({ approve }) => approve)
+        .map(({ id, digest }) => [id, digest]),
+    );
+    for (const [id, digest] of chosen)
+      if (approvable.get(id) !== digest) chosen.delete(id);
+    controls = [];
     const focused = [...buttons].find(
       ([, button]) => button === document.activeElement,
     );
@@ -149,11 +322,62 @@ function createInboxPanel(channel: WorkplaceChannel) {
         textElement("small", item.weight === "action" ? "Action" : "Info"),
         button,
       );
+      if ("answer" in item) {
+        const proposal = item.answer;
+        const group = document.createElement("div");
+        group.className = "answer-controls";
+        if (proposal.approve) {
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.setAttribute(
+            "aria-label",
+            `${item.title} をまとめて承認する項目に追加`,
+          );
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) chosen.set(proposal.id, proposal.digest);
+            else chosen.delete(proposal.id);
+            updateControls();
+          });
+          controls.push(() => {
+            checkbox.checked = chosen.get(proposal.id) === proposal.digest;
+            checkbox.disabled =
+              answering || (!checkbox.checked && chosen.size >= 20);
+          });
+          group.append(checkbox);
+        }
+        const actions = [
+          ...(proposal.approve
+            ? [
+                action(
+                  proposal.kind === "integration" ? "承認して統合" : "承認",
+                  "approve",
+                  () => {
+                    confirm([proposal], "approve", select(item));
+                  },
+                ),
+              ]
+            : []),
+          ...(proposal.reject
+            ? [
+                action("却下", "reject", () => {
+                  void select(item);
+                  confirm([proposal], "reject");
+                }),
+              ]
+            : []),
+        ];
+        controls.push(() => {
+          for (const button of actions) button.disabled = answering;
+        });
+        group.append(...actions);
+        row.append(group);
+      }
       buttons.set(item.id, button);
       if (item.state === "open") observed.set(button, item.id);
       return row;
     });
     inbox.replaceChildren(...rows);
+    updateControls();
     element("empty-inbox").hidden = rows.length !== 0;
     for (const button of observed.keys()) visible.observe(button);
     if (focused)
@@ -396,7 +620,7 @@ type View = {
 };
 
 export function createHostPanel(channel: WorkplaceChannel) {
-  const inbox = createInboxPanel(channel);
+  const inbox = createInboxPanel(channel, () => void refresh());
   const notice = element("inbox-notice");
   let view: View = { tab: "decisions" };
   let previous = "";

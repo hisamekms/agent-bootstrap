@@ -99,7 +99,7 @@ agent-bootstrap workplace --target /path/to/project --dev-bridge
 The launcher prints the session ID and audit database path. With --dev-bridge it also prints a private loopback URL.
 
 **Next action**  
-Open the printed URL when using the development bridge. Use the operator CLI to answer gates.
+Open the printed URL when using the development bridge. Answer eligible gates in the host panel or use the operator CLI.
 
 **Human involvement**  
 Keep the URL private. Stop the workplace process to end the session.

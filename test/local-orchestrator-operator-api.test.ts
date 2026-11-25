@@ -18,15 +18,22 @@ import { test } from "node:test";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import type { TerminalExit } from "../src/sandbox-runtime.ts";
 import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
+import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
 import {
   operatorGoal,
   operatorGoalList,
+  operatorInbox,
   operatorProblems,
   operatorStatus,
   operatorTask,
   operatorTaskList,
 } from "../src/local-orchestrator/operator-read.ts";
+import {
+  answerFromPanel,
+  answerManyFromPanel,
+  parsePanelAnswer,
+} from "../src/local-orchestrator/proposal-answer.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 const goal = {
@@ -41,6 +48,185 @@ const goal = {
     budgets: { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 500 },
   },
 };
+
+test("operator API answers return per-item errors in order and audit the panel origin", async () => {
+  using fixture = orchestratorFixture("lo-op-answer-");
+  const { root, store } = fixture;
+  const origin = { kind: "operator" } as const;
+  const propose = () => {
+    const { id, digest } = store.proposeGoal(goal, origin);
+    return { id, digest };
+  };
+  const first = propose();
+  const second = propose();
+  const stale = { ...first, digest: "0".repeat(64), decision: "approve" };
+  assert.deepEqual(
+    await answerFromPanel(store, root, parsePanelAnswer(stale)),
+    { id: first.id, error: { code: "stale-digest" } },
+  );
+  const approve = { ...first, decision: "approve" };
+  const missing = { ...approve, id: "missing" };
+  const screened: unknown[] = [];
+  assert.deepEqual(
+    await answerManyFromPanel(
+      store,
+      root,
+      {
+        answers: [
+          stale,
+          approve,
+          missing,
+          approve,
+          { ...second, decision: "reject" },
+        ],
+      },
+      async (source) => {
+        screened.push(JSON.parse(String(source)));
+      },
+    ),
+    [
+      { id: first.id, error: { code: "stale-digest" } },
+      { id: first.id, ok: true },
+      { id: "missing", error: { code: "not-found" } },
+      { id: first.id, error: { code: "invalid-transition" } },
+      { id: second.id, ok: true },
+    ],
+  );
+  assert.partialDeepStrictEqual(screened, [
+    [first.id, first.id, "missing", first.id, second.id],
+    { content: { title: goal.title } },
+    { id: second.id, digest: second.digest, status: "pending" },
+  ]);
+  assert.equal(store.getProposal(first.id)?.status, "approved");
+  assert.equal(store.getProposal(second.id)?.status, "rejected");
+  for (const [proposal, decision] of [
+    [first, "approve"],
+    [second, "reject"],
+  ] as const) {
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: proposal.id, limit: 1 })[0],
+      {
+        kind: "proposal.decided",
+        data: {
+          digest: proposal.digest,
+          decision,
+          answererKind: "human",
+          origin: { kind: "operator", channel: "operator-ui" },
+        },
+      },
+    );
+  }
+  const third = propose();
+  const pending = { ...third, decision: "approve" };
+  for (const invalid of [
+    { ...pending, delegate: {} },
+    { ...pending, choice: "option" },
+    { ...pending, decision: "abstain" },
+    { ...pending, digest: "a".repeat(12) },
+    { ...pending, id: "invalid id" },
+  ]) {
+    assert.throws(
+      () => parsePanelAnswer(invalid),
+      /Invalid local orchestrator input/,
+    );
+    await assert.rejects(
+      answerManyFromPanel(store, root, { answers: [pending, invalid] }),
+      /Invalid local orchestrator input/,
+    );
+  }
+  for (const answers of [[], Array(21).fill(pending)])
+    await assert.rejects(
+      answerManyFromPanel(store, root, { answers }),
+      /Invalid local orchestrator input/,
+    );
+  await assert.rejects(
+    answerManyFromPanel(
+      store,
+      root,
+      { answers: [pending, missing] },
+      async () => {
+        throw new Error("screening failed");
+      },
+    ),
+    /screening failed/,
+  );
+  assert.equal(store.getProposal(third.id)?.status, "pending");
+});
+
+test("operator API enforces decision-specific human requirements under an agent policy", async () => {
+  using fixture = orchestratorFixture("lo-op-answer-policy-");
+  const { root, store } = fixture;
+  const host = { kind: "host" } as const;
+  const operator = { kind: "operator" } as const;
+  store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+  const normal = store.proposeGoal(goal, host);
+  // An approval widening policy requires a human. A rejection may still be delegated.
+  const loosening = store.proposeGoal(
+    { ...goal, policies: { integration: "agent" } },
+    host,
+  );
+  const answer = (
+    proposal: { id: string; digest: string },
+    decision: "approve" | "reject",
+  ) =>
+    answerFromPanel(store, root, {
+      id: proposal.id,
+      digest: proposal.digest,
+      decision,
+    });
+  for (const decision of ["approve", "reject"] as const)
+    assert.deepEqual(await answer(normal, decision), {
+      id: normal.id,
+      error: { code: "approval-forbidden" },
+    });
+  const inbox = operatorInbox(
+    store,
+    projectInbox({ store, target: "/fixture" }),
+  );
+  assert.equal(
+    "answer" in inbox.find(({ subject }) => subject.proposalId === normal.id)!,
+    false,
+  );
+  assert.partialDeepStrictEqual(
+    inbox.find(({ subject }) => subject.proposalId === loosening.id),
+    {
+      answer: {
+        approve: true,
+        reject: false,
+        digest: loosening.digest,
+        title: goal.title,
+        agentGates: ["integration"],
+      },
+    },
+  );
+  assert.deepEqual(await answer(loosening, "reject"), {
+    id: loosening.id,
+    error: { code: "approval-forbidden" },
+  });
+  assert.deepEqual(await answer(loosening, "approve"), {
+    id: loosening.id,
+    ok: true,
+  });
+  assert.equal(store.getProposal(normal.id)?.status, "pending");
+
+  store.setProjectDefaults({ "goal-registration": "human" }, operator);
+  assert.deepEqual(
+    await answerFromPanel(
+      store,
+      root,
+      {
+        id: normal.id,
+        digest: normal.digest,
+        decision: "approve",
+      },
+      async () => {
+        store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+      },
+    ),
+    { id: normal.id, error: { code: "approval-forbidden" } },
+  );
+  assert.equal(store.getProposal(normal.id)?.status, "pending");
+});
 
 function socketFixture() {
   const state = orchestratorFixture("lo-op-", realpathSync("/tmp"));
@@ -154,7 +340,17 @@ test(
       );
       assert.deepEqual(
         (await request("proposal.answer", { secret: "never returned" })).error,
-        { code: "unknown-method" },
+        { code: "invalid-params" },
+      );
+      assert.deepEqual(
+        (
+          await request("proposal.answer", {
+            id,
+            digest: "0".repeat(64),
+            decision: "approve",
+          })
+        ).error,
+        { code: "stale-digest" },
       );
       assert.deepEqual(
         (await request("inbox.list", { includeResolved: "yes" })).error,
@@ -164,7 +360,10 @@ test(
         (await request("inbox.markSeen", { ids: Array(201).fill(item) })).error,
         { code: "invalid-params" },
       );
-      assert.equal((await request("inbox.list")).result[0].id, item);
+      assert.partialDeepStrictEqual((await request("inbox.list")).result[0], {
+        id: item,
+        answer: { id, digest, approve: true, reject: true },
+      });
       assert.deepEqual((await request("inbox.subscribe")).result, {
         subscribed: true,
       });
@@ -178,11 +377,11 @@ test(
         params: { ids: [item] },
       });
       assert.equal((await request("inbox.list")).result[0].state, "seen");
-      store.decide(id, {
-        decision: "reject",
-        digest,
-        answerer: { kind: "human" },
-      });
+      assert.deepEqual(
+        (await request("proposal.answer", { id, digest, decision: "reject" }))
+          .result,
+        { id, ok: true },
+      );
       assert.deepEqual(await reply(), {
         method: "inbox.changed",
         params: { ids: [item] },
@@ -192,6 +391,22 @@ test(
         (await request("inbox.list", { includeResolved: true })).result[0]
           .state,
         "resolved",
+      );
+      const batchClient = await operatorClient(path, "");
+      const next = store.proposeGoal(goal, { kind: "operator" });
+      assert.deepEqual(
+        (
+          await batchClient.request("proposal.answerMany", {
+            answers: [
+              { id, digest, decision: "approve" },
+              { id: next.id, digest: next.digest, decision: "approve" },
+            ],
+          })
+        ).result,
+        [
+          { id, error: { code: "invalid-transition" } },
+          { id: next.id, ok: true },
+        ],
       );
     } finally {
       await api.close();
@@ -504,10 +719,10 @@ function readFixture(store: ReturnType<typeof orchestratorFixture>["store"]) {
   }
   const review = startReview(reviewed);
 
-  function finishReviewed(taskId = reviewed, reviewId = review) {
+  function proposeReviewed(taskId = reviewed, reviewId = review) {
     const pin = { base, candidate: "b".repeat(40), digest: "c".repeat(64) };
     store.finishExecution(reviewId, "succeeded", { review: "pass", pin });
-    const integration = store.proposeIntegration(
+    return store.proposeIntegration(
       {
         taskId,
         goalId: goalId!,
@@ -518,6 +733,9 @@ function readFixture(store: ReturnType<typeof orchestratorFixture>["store"]) {
       },
       reviewId,
     );
+  }
+  function finishReviewed(taskId = reviewed, reviewId = review) {
+    const integration = proposeReviewed(taskId, reviewId);
     approve(integration);
     const { approvalId } = store.approvedIntegration(integration.id);
     store.beginIntegration(integration.id, integration.digest, approvalId);
@@ -531,9 +749,56 @@ function readFixture(store: ReturnType<typeof orchestratorFixture>["store"]) {
     execution,
     rejectedPaths,
     startReview,
+    proposeReviewed,
     finishReviewed,
   };
 }
+
+test("operator integration answers honor the human invariant and the CLI diff precondition", async () => {
+  using fixture = orchestratorFixture("lo-op-integration-answer-");
+  const { root, store } = fixture;
+  store.setProjectDefaults({ integration: "agent" }, { kind: "operator" });
+  const { reviewed, proposeReviewed } = readFixture(store);
+  const { id, digest, humanAnswerRequired } = proposeReviewed();
+  assert.equal(humanAnswerRequired, true);
+  const items = operatorInbox(
+    store,
+    projectInbox({ store, target: "/fixture" }),
+  );
+  assert.partialDeepStrictEqual(
+    items.find(({ subject }) => subject.proposalId === id),
+    {
+      answer: {
+        kind: "integration",
+        approve: true,
+        reject: true,
+        title: "Reviewed Task",
+      },
+    },
+  );
+  const scan = async () => {};
+  assert.deepEqual(
+    await answerFromPanel(
+      store,
+      root,
+      { id, digest, decision: "approve" },
+      scan,
+    ),
+    { id, error: { code: "write-failed" } },
+  );
+  assert.equal(store.getProposal(id)?.status, "pending");
+  assert.equal(store.nextApprovedIntegration(), undefined);
+  assert.deepEqual(
+    await answerFromPanel(
+      store,
+      root,
+      { id, digest, decision: "reject" },
+      scan,
+    ),
+    { id, ok: true },
+  );
+  assert.equal(store.getTask(reviewed)?.status, "failed");
+});
 
 test("operator read projections use scoped durable Task state and safe metadata", () => {
   using state = orchestratorFixture("lo-op-read-");

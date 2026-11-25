@@ -98,9 +98,8 @@ New methods on the Unix socket:
 - Each HTTP request must carry `Host: 127.0.0.1:<port>`. The WebSocket
   upgrade must also carry `Origin: http://127.0.0.1:<port>`. Anything
   else gets 403 before any work.
-- One WebSocket relays only `inbox.*`, `status`, `proposal.get` and the
-  `concierge.*` methods. A gate-answer method is refused even after it
-  exists.
+- One WebSocket relays an explicit allowlist of operator API methods.
+  Under Q1, that list includes `proposal.answer` and `proposal.answerMany`.
 - Responses carry `Content-Security-Policy: default-src 'none';
 script-src 'self'; style-src 'self'; connect-src 'self'; img-src
 'self'; font-src 'self'; base-uri 'none'; form-action 'none';
@@ -167,7 +166,8 @@ host side (P1–P5) can be built and tested without them.
 
 ## Out of scope for phase 2
 
-- Answering gates from the UI.
+- Answering gates from the UI was deferred to
+  [decisions step 2](decisions-design.md#order-of-work).
 - Notifications, badges and Touch ID.
 - Diffs in the host panel. They need a size and escaping design of their
   own.

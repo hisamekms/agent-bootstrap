@@ -267,7 +267,8 @@ function prepareTool(
       const content = validateGoalContent(input.content);
       return () => ({
         ...store.proposeGoal(content, origin),
-        message: "The operator approves this proposal with the host CLI.",
+        message:
+          "The operator can answer this proposal in the host panel or with the host CLI.",
       });
     }
     case "draft_task": {
@@ -277,7 +278,8 @@ function prepareTool(
         return receipt.status === "pending"
           ? {
               ...receipt,
-              message: "The operator approves this proposal with the host CLI.",
+              message:
+                "The operator can answer this proposal in the host panel or with the host CLI.",
             }
           : receipt;
       };

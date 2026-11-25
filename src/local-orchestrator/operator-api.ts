@@ -17,12 +17,19 @@ import {
   goalStatuses,
   operatorGoal,
   operatorGoalList,
+  operatorInbox,
   operatorProblems,
   operatorProposal,
   operatorStatus,
   operatorTask,
   operatorTaskList,
 } from "./operator-read.ts";
+import {
+  answerFromPanel,
+  answerManyFromPanel,
+  parsePanelAnswer,
+} from "./proposal-answer.ts";
+import type { StoreErrorCode } from "./store.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -34,15 +41,13 @@ interface OperatorApiOptions extends InboxSource {
 
 type RequestId = string | number;
 type ErrorCode =
+  | StoreErrorCode
   | "invalid-request"
   | "invalid-params"
   | "unknown-method"
-  | "not-found"
   | "terminal-unavailable"
   | "terminal-exited"
-  | "terminal-read-only"
-  | "read-failed"
-  | "write-failed";
+  | "terminal-read-only";
 type Reply = { result: unknown } | { error: { code: ErrorCode } };
 type Client = {
   subscribedSnapshot?: Map<string, string>;
@@ -117,7 +122,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   const clients = new Map<Socket, Client>();
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const project = (includeResolved = false) =>
-    projectInbox(options, { includeResolved });
+    operatorInbox(store, projectInbox(options, { includeResolved }));
 
   function terminalRequest(
     method: string,
@@ -235,6 +240,24 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
           );
           return proposal ? { result: proposal } : failure("not-found");
         }
+        case "proposal.answer": {
+          const result = await answerFromPanel(
+            store,
+            stateDirectory,
+            parsePanelAnswer(params),
+            scan,
+          );
+          return "error" in result ? { error: result.error } : { result };
+        }
+        case "proposal.answerMany":
+          return {
+            result: await answerManyFromPanel(
+              store,
+              stateDirectory,
+              params,
+              scan,
+            ),
+          };
         case "inbox.subscribe":
           fields(params, []);
           return { result: { subscribed: true } };
@@ -244,7 +267,9 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
     } catch (error) {
       if (error instanceof ContractError) return failure("invalid-params");
       return failure(
-        method === "inbox.markSeen" ? "write-failed" : "read-failed",
+        method === "inbox.markSeen" || method === "proposal.answerMany"
+          ? "write-failed"
+          : "read-failed",
       );
     }
   }
@@ -290,7 +315,13 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
               try {
                 if (message.method === "inbox.subscribe")
                   subscribedSnapshot = inboxSnapshot(project(true));
-                else if (message.method !== "inbox.markSeen") {
+                // Decision receipts carry fixed codes and IDs (screened before
+                // writing for answerMany; the caller's own ID for answer).
+                else if (
+                  message.method !== "inbox.markSeen" &&
+                  message.method !== "proposal.answer" &&
+                  message.method !== "proposal.answerMany"
+                ) {
                   const serialized = JSON.stringify(reply.result);
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
                     reply = failure("read-failed");

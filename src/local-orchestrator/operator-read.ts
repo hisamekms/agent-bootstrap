@@ -1,8 +1,8 @@
 import { escapeTerminalControls } from "./analysis.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { MAX_REVISIONS } from "../integration-journal.ts";
-import { inboxLimit } from "./inbox.ts";
-import { goalBranch } from "./model.ts";
+import { inboxLimit, type InboxItem } from "./inbox.ts";
+import { GATES, goalBranch } from "./model.ts";
 import {
   goalEstimate,
   meanTaskWallTime,
@@ -13,7 +13,7 @@ import {
 } from "./operator-estimates.ts";
 import { readPathViolations } from "./path-violations.ts";
 import { candidateDiffStat } from "./tasks.ts";
-import type { OrchestratorStore } from "./store.ts";
+import { permitsPanelAnswer, type OrchestratorStore } from "./store.ts";
 
 type ProposalDetails = NonNullable<
   ReturnType<OrchestratorStore["getProposalDetails"]>
@@ -68,6 +68,37 @@ export function operatorStatus(store: OrchestratorStore) {
     recentExecutions,
     recentTasks,
   };
+}
+
+export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
+  return items.map((item) => {
+    const id = item.subject.proposalId;
+    if (!id || item.weight !== "action" || item.state === "resolved")
+      return item;
+    const proposal = store.getProposalDetails(id);
+    if (proposal?.status !== "pending") return item;
+    const approve = permitsPanelAnswer(proposal.origin, proposal, "approve");
+    const reject = permitsPanelAnswer(proposal.origin, proposal, "reject");
+    if (!approve && !reject) return item;
+    const title =
+      proposal.kind === "integration"
+        ? store.getTask(proposal.content.taskId)?.content.title
+        : proposal.content.title;
+    const policies =
+      proposal.kind === "integration" ? undefined : proposal.content.policies;
+    return {
+      ...item,
+      answer: {
+        id,
+        kind: proposal.kind,
+        digest: proposal.digest,
+        title: title === undefined ? null : escapeTerminalControls(title),
+        agentGates: GATES.filter((gate) => policies?.[gate] === "agent"),
+        approve,
+        reject,
+      },
+    };
+  });
 }
 
 export async function operatorProposal(

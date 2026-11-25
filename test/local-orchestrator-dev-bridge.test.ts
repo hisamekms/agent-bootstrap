@@ -248,7 +248,7 @@ test(
 );
 
 test(
-  "bridge refuses methods locally without forwarding to the Unix socket",
+  "bridge relays panel decisions and rejects methods outside the allowlist",
   { timeout: 5000 },
   async () => {
     using fixture = orchestratorFixture("lo-bridge-", realpathSync("/tmp"));
@@ -268,11 +268,7 @@ test(
       try {
         const client = await openWebSocket(new URL(bridge.url));
         client.authenticate();
-        for (const method of [
-          "proposal.answer",
-          "proposal.answerMany",
-          "decision.history",
-        ]) {
+        for (const method of ["decision.history", "policy.set"]) {
           client.ws.send(JSON.stringify({ id: method, method, params: {} }));
           assert.deepEqual(await client.next(), {
             id: method,
@@ -281,6 +277,8 @@ test(
         }
         for (const method of [
           "status",
+          "proposal.answer",
+          "proposal.answerMany",
           "goal.list",
           "goal.get",
           "task.list",

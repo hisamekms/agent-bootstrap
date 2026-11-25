@@ -17,6 +17,8 @@ const methods = new Set([
   "inbox.subscribe",
   "status",
   "proposal.get",
+  "proposal.answer",
+  "proposal.answerMany",
   "goal.list",
   "goal.get",
   "task.list",

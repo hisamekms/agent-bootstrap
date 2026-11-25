@@ -56,7 +56,8 @@ type HumanDelegate = {
   authorization: string;
 };
 export type Answerer =
-  | { kind: "human"; delegate?: HumanDelegate }
+  | { kind: "human"; delegate?: HumanDelegate; channel?: never }
+  | { kind: "human"; channel: "operator-ui"; delegate?: never }
   | { kind: "agent"; executionId: string; model: string };
 
 type Binding = string | number | null;
@@ -78,7 +79,7 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   ) => Connection;
 };
 
-type ErrorCode =
+export type StoreErrorCode =
   | "open-failed"
   | "closed"
   | "write-failed"
@@ -104,8 +105,8 @@ type ErrorCode =
   | "integration-uncertain";
 
 export class OrchestratorStoreError extends Error {
-  readonly code: ErrorCode;
-  constructor(code: ErrorCode) {
+  readonly code: StoreErrorCode;
+  constructor(code: StoreErrorCode) {
     super(
       code === "session-busy"
         ? "Local orchestrator is busy. If the launcher stopped, use the operator CLI reconcile command."
@@ -248,9 +249,19 @@ export function parseHumanDelegate(value: unknown): HumanDelegate {
 }
 
 function parseAnswerer(value: unknown): Answerer {
-  const input = fields(value, ["kind", "delegate", "executionId", "model"]);
+  const input = fields(value, [
+    "kind",
+    "delegate",
+    "channel",
+    "executionId",
+    "model",
+  ]);
   if (input.kind === "human") {
-    fields(input, ["kind", "delegate"]);
+    fields(input, ["kind", "delegate", "channel"]);
+    if (Object.hasOwn(input, "channel")) {
+      fields(input, ["kind", "channel"]);
+      return { kind: "human", channel: oneOf(input.channel, ["operator-ui"]) };
+    }
     return {
       kind: "human",
       ...(Object.hasOwn(input, "delegate") && {
@@ -404,6 +415,18 @@ function permitsAgentAnswer(
     !humanAnswerRequired &&
     !(decision === "approve" && humanApprovalRequired) &&
     !(origin.kind === "actor" && origin.actor === "Concierge")
+  );
+}
+
+export function permitsPanelAnswer(
+  origin: Origin,
+  requirements: Parameters<typeof permitsAgentAnswer>[1],
+  decision: Decision,
+): boolean {
+  // The panel handles decisions reserved to a human, including gate invariants.
+  return (
+    requirements.policy !== null &&
+    !permitsAgentAnswer(origin, requirements, decision)
   );
 }
 
@@ -958,15 +981,20 @@ export class OrchestratorStore {
       if (integration) this.#checkIntegrationTask(integration, id);
       const task = proposal.kind === "task" ? proposal.content : undefined;
       const origin = proposal.source;
+      const requirements = {
+        policy,
+        ...proposalAnswerRequirements(proposal, policy, loosening),
+      };
+      if (
+        answerer.kind === "human" &&
+        answerer.channel === "operator-ui" &&
+        !permitsPanelAnswer(origin, requirements, decision)
+      )
+        throw new OrchestratorStoreError("approval-forbidden");
       if (answerer.kind === "agent") {
         const execution = this.#execution(answerer.executionId);
-        const requirements = proposalAnswerRequirements(
-          proposal,
-          policy,
-          loosening,
-        );
         if (
-          !permitsAgentAnswer(origin, { policy, ...requirements }, decision) ||
+          !permitsAgentAnswer(origin, requirements, decision) ||
           (origin.kind === "actor" &&
             origin.executionId === answerer.executionId) ||
           execution?.actor !== "Reviewer" ||
@@ -1033,6 +1061,10 @@ export class OrchestratorStore {
           source,
           decision,
           answererKind: answerer.kind,
+          ...(answerer.kind === "human" &&
+            answerer.channel && {
+              origin: { kind: "operator", channel: answerer.channel },
+            }),
           ...(answerer.kind === "human" &&
             answerer.delegate && {
               delegated: true,

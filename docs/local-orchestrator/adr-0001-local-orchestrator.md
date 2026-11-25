@@ -286,7 +286,8 @@ pushes and PRs to `main`. See [Stage 3](stage3.md).
 
 - The host owns scheduling, scope checks and lifecycle state for local work.
   The model roles operate within grants issued by the host.
-- The operator answers gates with a `human` policy through the host CLI.
+- The operator answers human decisions through the host CLI or the
+  [operator panel](../operator-ui/decisions-design.md#q1-the-panel-answers-gates).
   Opting into `agent` approval can speed up autonomous development loops.
   A compromised or mistaken approval execution can approve bad work.
   Mechanical checks, digest binding, time and retry limits, and the audit bound that risk.

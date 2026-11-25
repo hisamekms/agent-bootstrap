@@ -412,7 +412,8 @@ test("handles split UTF-8 and exercises each tool against the real store", async
     gate: "goal-registration",
     policy: "human",
     loosening: [],
-    message: "The operator approves this proposal with the host CLI.",
+    message:
+      "The operator can answer this proposal in the host panel or with the host CLI.",
   });
   const pending = await client.call("list_proposals", { status: "pending" });
   assert.deepEqual(pending.data, [
