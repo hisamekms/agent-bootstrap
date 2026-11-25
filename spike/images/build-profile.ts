@@ -302,6 +302,7 @@ async function main(): Promise<void> {
     stage = "lock update";
     const lockPath = join(root, PROFILE_LOCK_PATH);
     let existing: ProfileLock = { version: 1, profiles: {} };
+    let order: string[] = [];
     let text: string | undefined;
     try {
       text = await readFile(lockPath, "utf8");
@@ -323,15 +324,26 @@ async function main(): Promise<void> {
         !plain(raw.profiles)
       )
         throw new Error("Profile lock is malformed");
+      order = Object.keys(raw.profiles);
       const others = { ...raw, profiles: { ...raw.profiles } };
       delete others.profiles[profile];
       existing = parseProfileLock(JSON.stringify(others));
     }
     const entry = lockEntry(profile, digest, packages);
+    // Keep the checked-in order so a rebuild changes only its own entry.
+    const updated: Record<string, unknown> = {
+      ...existing.profiles,
+      [profile]: entry,
+    };
+    const profiles = Object.fromEntries(
+      [...new Set([...order, ...Object.keys(updated)])]
+        .filter((name) => name in updated)
+        .map((name) => [name, updated[name]]),
+    );
     const lock = {
       version: 1,
       ...(existing.base ? { base: existing.base } : {}),
-      profiles: { ...existing.profiles, [profile]: entry },
+      profiles,
     };
     await mkdir(join(root, "images"), { recursive: true });
     await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
