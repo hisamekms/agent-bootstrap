@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { loadConfig } from "../config/layers.ts";
+import { loadConfig, readLayer } from "../config/layers.ts";
+import { resolveMsbHome } from "../config/msb-home.ts";
 import { buildSandboxPlan } from "../image-build-sandbox.ts";
 import { ALPINE_3_23, recipeFor } from "../image-recipes.ts";
 import { resolveConfigTarget } from "../local-orchestrator/target.ts";
@@ -15,6 +16,7 @@ import {
   hostChecks,
   imageStatus,
   msb,
+  msbHomeCheck,
   configureClaude,
   provisionKeychain,
   readLock,
@@ -91,14 +93,21 @@ export async function applySetup(
       "Setup changes require --allow-network.",
       "Review agent-bootstrap setup before explicitly authorizing network access.",
     );
-  const { checks, home } = await hostChecks(root, host);
-  const blocked = checks.find(({ status }) => status !== "ok");
-  if (blocked || !home)
+  const checks = await hostChecks(root, host);
+  const resolvedHome = await resolveMsbHome(
+    host.env,
+    readLayer("user", undefined, host.env),
+  );
+  const blocked = [...checks, msbHomeCheck(resolvedHome)].find(
+    ({ status }) => status !== "ok",
+  );
+  if (blocked || !("path" in resolvedHome))
     throw new SetupError(
       "Setup prerequisites are missing.",
       blocked?.fix.join(" && ") || "Run agent-bootstrap doctor.",
       3,
     );
+  const home = resolvedHome.path;
 
   const candidates = new Set<string>();
   for (const item of plan.artifacts) {
@@ -115,7 +124,7 @@ export async function applySetup(
     if (status === "wrong" || status === "skipped")
       throw new SetupError(
         "Local image inspection could not confirm a pinned digest.",
-        "Run agent-bootstrap doctor and inspect MSB_HOME before retrying.",
+        "Run agent-bootstrap doctor and inspect the Microsandbox home before retrying.",
       );
     return status === "missing";
   }
@@ -151,7 +160,7 @@ export async function applySetup(
     )
       throw new SetupError(
         "A pinned base image could not be pulled and verified.",
-        "Check the image reference and MSB_HOME with agent-bootstrap doctor.",
+        "Check the image reference and Microsandbox home with agent-bootstrap doctor.",
       );
     pulled.push(reference);
   }

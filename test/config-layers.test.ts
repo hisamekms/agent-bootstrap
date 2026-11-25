@@ -76,6 +76,46 @@ function commitDeclaration(repo: string, contents?: string, mode = 0o644) {
 
 const verification = (arg: string) => ({ profile: "bun", argv: ["bun", arg] });
 
+test("Microsandbox home is an absolute path in user configuration only", (t) => {
+  const { repo, env } = fixture(t);
+  const project = addProject(repo, undefined, env);
+  const directory = projectConfigDirectory(project.name, env);
+  const config = { version: 1, microsandbox: { home: "/private/msb" } };
+  writePrivateConfig(userConfigPath(env), configRoot(env), config);
+  assert.deepEqual(
+    loadConfig(env, directory).config.microsandbox,
+    config.microsandbox,
+  );
+  assert.equal(loadConfig(env, directory).sources["microsandbox.home"], "user");
+
+  for (const home of [42, "", "~/.msb", "relative"])
+    assert.throws(
+      () => parseConfig({ version: 1, microsandbox: { home } }, "user"),
+      /microsandbox\.home.*absolute path string/,
+    );
+  assert.throws(
+    () =>
+      parseConfig(
+        { version: 1, microsandbox: { ...config.microsandbox, extra: true } },
+        "user",
+      ),
+    /microsandbox.*unknown or disallowed key/,
+  );
+
+  commitDeclaration(repo, JSON.stringify(config));
+  assert.throws(() => readDeclaration(project), {
+    message:
+      /Invalid project declaration .*microsandbox.*images, volumes and VM state.*trusted input/,
+    next: /Review \.agent-bootstrap\/project\.json on main/,
+  });
+  writePrivateConfig(join(directory, "local.json"), configRoot(env), config);
+  assert.throws(() => loadConfig(env, directory), {
+    message:
+      /Invalid local configuration .*microsandbox.*images, volumes and VM state.*trusted input/,
+    next: /agent-bootstrap config edit --project sample/,
+  });
+});
+
 test("C1/C3/C4: only pinned approval grants a declaration; values stay out of its preview", async (t) => {
   const { repo, env } = fixture(t);
   const project = addProject(repo, undefined, env);

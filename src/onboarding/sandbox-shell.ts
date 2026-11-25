@@ -1,5 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
+import { readLayer } from "../config/layers.ts";
+import { requireMsbHome } from "../config/msb-home.ts";
 import { EgressPolicy, type HostPort } from "../egress-policy.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { userStateDirectory } from "../local-orchestrator/claude-config.ts";
@@ -112,10 +114,10 @@ export async function runSandboxShell(
   { plan, directory, profiles }: Awaited<ReturnType<typeof sandboxShellPlan>>,
   command?: TerminalCommand,
 ) {
-  const requestedHome = host.env.MSB_HOME;
-  if (!requestedHome || !isAbsolute(requestedHome))
-    throw new Error("MSB_HOME required");
-  const home = await realpath(requestedHome);
+  const home = await requireMsbHome(
+    host.env,
+    readLayer("user", undefined, host.env),
+  );
   const tool = await host.command(
     "mise",
     [...MISE_FLAGS, "where", MSB_TOOL],

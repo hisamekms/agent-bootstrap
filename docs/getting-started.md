@@ -14,14 +14,14 @@ bun install --frozen-lockfile --ignore-scripts && bun link
 agent-bootstrap doctor --json
 ```
 
-Follow the first required fix. The pinned Microsandbox command uses mise. Set
-`MSB_HOME` to an existing absolute directory whose real path is at most
-40 bytes.
+Follow the first required fix. The pinned Microsandbox command uses mise.
+Create the default home at `$HOME/.msb`. The directory's real path must fit
+in 40 bytes. Set `microsandbox.home` with `agent-bootstrap config edit` to
+use a different absolute path. A nonempty `MSB_HOME` overrides both.
 
 ```sh
 mise --no-config --no-env --no-hooks install microsandbox@0.7.16
 mkdir -p "$HOME/.msb"
-export MSB_HOME="$HOME/.msb"
 agent-bootstrap setup --json
 agent-bootstrap setup --allow-network
 ```
@@ -124,7 +124,7 @@ agent-bootstrap --target "$target" export-goal-branch "$goal_id"
 
 Inspect the exported branch. The operator pushes, opens the PR, and
 integrates into `main`. Use `concierge --continue` with the same target and
-`MSB_HOME` to continue a conversation.
+Microsandbox home to continue a conversation.
 
 ## 3. Inspect audit evidence
 

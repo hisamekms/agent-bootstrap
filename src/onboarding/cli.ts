@@ -9,6 +9,7 @@ import {
   writePrivateConfig,
 } from "../config/layers.ts";
 import { ConfigError, invalid } from "../config/messages.ts";
+import { MsbHomeError, requireMsbHome } from "../config/msb-home.ts";
 import { migrate } from "../config/migrate.ts";
 import {
   addProject,
@@ -204,7 +205,11 @@ export async function runBootstrap(
           );
         return report.pass ? 0 : 1;
       } catch (error) {
-        if (error instanceof ConfigError || error instanceof ClaudeConfigError)
+        if (
+          error instanceof ConfigError ||
+          error instanceof ClaudeConfigError ||
+          error instanceof MsbHomeError
+        )
           throw error;
         return fail(
           1,
@@ -369,11 +374,13 @@ export async function runBootstrap(
             );
         }
         return 0;
-      } catch {
+      } catch (error) {
+        if (error instanceof ConfigError || error instanceof MsbHomeError)
+          throw error;
         return fail(
           1,
           "Sandbox shell could not be prepared or run.",
-          "Check the profile, MSB_HOME, mount directories and audit path. See agent-bootstrap help troubleshoot.",
+          "Check the profile, Microsandbox home, mount directories and audit path. See agent-bootstrap help troubleshoot.",
         );
       }
     }
@@ -478,13 +485,14 @@ export async function runBootstrap(
             "Run agent-bootstrap volume shell from a TTY.",
           );
         const target = await resolveTarget(path, root, host.env);
-        const { config } = loadConfig(host.env, target.configDirectory);
+        const { config, user } = loadConfig(host.env, target.configDirectory);
         if (!Object.hasOwn(config.mounts ?? {}, name))
           invalid(
             "mounts",
             "The selected mount is undefined.",
             "Select a mount from the effective configuration.",
           );
+        await requireMsbHome(host.env, user);
         const launchArgs = ["--volume-shell", name];
         if (path) launchArgs.push("--target", path);
         if (!(await (io.launch ?? launch)(root, launchArgs, false)))
@@ -632,7 +640,8 @@ export async function runBootstrap(
     hint(output.next);
     return 0;
   } catch (error) {
-    if (error instanceof ConfigError) return fail(1, error.message, error.next);
+    if (error instanceof ConfigError || error instanceof MsbHomeError)
+      return fail(1, error.message, error.next);
     if (error instanceof ClaudeConfigError)
       return fail(
         1,

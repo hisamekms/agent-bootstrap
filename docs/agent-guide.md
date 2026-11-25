@@ -40,11 +40,10 @@ The operator updates local main, pushes branches, and opens pull requests.
 Stage SHA-256-pinned guest artifacts and build the locked Concierge and Bun images.
 
 **Prerequisites**  
-Use doctor to prepare Bun, mise, Microsandbox 0.7.16, installed checkout dependencies, and a short absolute MSB_HOME.
+Use doctor to prepare Bun, mise, Microsandbox 0.7.16, checkout dependencies, and a Microsandbox home with an absolute real path of at most 40 bytes. The default is $HOME/.msb. Override it with microsandbox.home in the user config or with MSB_HOME, which takes precedence.
 
 ```sh
 mkdir -p "$HOME/.msb"
-export MSB_HOME="$HOME/.msb"
 mise --no-config --no-env --no-hooks install microsandbox@0.7.16
 agent-bootstrap setup --json
 agent-bootstrap setup --allow-network

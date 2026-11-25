@@ -547,6 +547,9 @@ test("volume CLI reports a named fault without exposing configuration values", a
 
 test("volume shell requires a TTY and resolves the named mount before launching", async (t) => {
   const { env, root, definition } = fixture(t);
+  const home = mkdtempSync(join(realpathSync("/tmp"), "ab-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  env.HOME = home;
   const repo = initConfigRepo(join(root, "project"));
   addProject(repo, undefined, env);
   writePrivateConfig(userConfigPath(env), configRoot(env), {
@@ -574,7 +577,13 @@ test("volume shell requires a TTY and resolves the named mount before launching"
   const host = { ...systemHost, env };
   const shell = ["volume", "shell", "example", "--target", repo];
   assert.equal(await runBootstrap(shell, repo, io, host), 1);
+  assert.equal(
+    await runBootstrap(shell, repo, { ...io, conciergeTTY: true }, host),
+    1,
+  );
+  assert.ok(output.includes(`next: mkdir -p ${join(home, ".msb")}\n`));
   assert.equal(launches, 0);
+  mkdirSync(join(home, ".msb"));
   assert.equal(
     await runBootstrap(shell, repo, { ...io, conciergeTTY: true }, host),
     0,

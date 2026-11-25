@@ -1,6 +1,6 @@
 import type { LocalActorHarnesses } from "../actors.ts";
 import { execFile, spawn } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { userInfo } from "node:os";
 import {
@@ -11,8 +11,15 @@ import {
   type ClaudeAuthMode,
 } from "../local-orchestrator/claude-config.ts";
 import { Volume, VolumeError } from "../volumes/volume.ts";
-import { loadConfig, missing, privatePath } from "../config/layers.ts";
+import {
+  loadConfig,
+  missing,
+  privatePath,
+  readLayer,
+  type Layer,
+} from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
+import { resolveMsbHome, type MsbHomeResolution } from "../config/msb-home.ts";
 import { hasSecretTestPass } from "../local-orchestrator/secret-test-record.ts";
 import { CLAUDE_CODE } from "../claude-code.ts";
 import {
@@ -49,7 +56,7 @@ import {
 export type Status = "ok" | "missing" | "wrong" | "skipped";
 
 export interface Check {
-  effective?: Pick<ReturnType<typeof loadConfig>, "sources">;
+  effective?: { sources: Record<string, Layer | Layer[] | "env" | "default"> };
   id: string;
   status: Status;
   detail: string;
@@ -124,7 +131,6 @@ export const provisionKeychain =
   'security add-generic-password -s agent-bootstrap-claude -a "$(id -un)" -w';
 export const configureClaude = ["agent-bootstrap config edit"];
 const setup = "agent-bootstrap setup --allow-network";
-const msbHomeFix = ['mkdir -p "$HOME/.msb"', 'export MSB_HOME="$HOME/.msb"'];
 
 export function check(
   id: string,
@@ -142,6 +148,24 @@ export function check(
     needsNetwork: status !== "ok" && needsNetwork,
     needsHuman: status !== "ok" && needsHuman,
   };
+}
+
+export function msbHomeCheck(home: MsbHomeResolution): Check {
+  const source = `(source: ${home.source})`;
+  return "path" in home
+    ? check(
+        "msb-home",
+        "ok",
+        `The Microsandbox home is an accessible directory ${source}.`,
+      )
+    : check(
+        "msb-home",
+        home.status,
+        `${home.detail} ${source}`,
+        home.fix,
+        false,
+        true,
+      );
 }
 
 export function readLock(root: string): Promise<ProfileLock> {
@@ -259,30 +283,6 @@ export async function hostChecks(root: string, host: Host) {
     ),
   );
 
-  const candidate = env.MSB_HOME;
-  const realHome =
-    candidate && isAbsolute(candidate)
-      ? await realpath(candidate).catch(() => undefined)
-      : undefined;
-  const home =
-    realHome &&
-    Buffer.byteLength(realHome) <= 40 &&
-    (await stat(realHome).catch(() => undefined))?.isDirectory()
-      ? realHome
-      : undefined;
-  checks.push(
-    check(
-      "msb-home",
-      !candidate ? "missing" : home ? "ok" : "wrong",
-      home
-        ? "MSB_HOME is an accessible absolute directory within 40 bytes."
-        : "Set MSB_HOME to an existing absolute directory at most 40 bytes after realpath.",
-      msbHomeFix,
-      false,
-      true,
-    ),
-  );
-
   const manifest = JSON.parse(
     await readFile(join(root, "package.json"), "utf8"),
   ) as {
@@ -312,7 +312,7 @@ export async function hostChecks(root: string, host: Host) {
       true,
     ),
   );
-  return { checks, home };
+  return checks;
 }
 
 export async function doctor(
@@ -322,7 +322,7 @@ export async function doctor(
   concierge = false,
   override?: ClaudeAuthMode,
 ) {
-  const { checks, home } = await hostChecks(root, host);
+  const checks = await hostChecks(root, host);
   const required = new Set(checks.map(({ id }) => id));
   function add(item: Check, isRequired = true) {
     checks.push(item);
@@ -402,20 +402,6 @@ export async function doctor(
       );
       const drift = driftWarning(target.project, layers.approved);
       if (drift) add(check("configuration-drift", "skipped", drift), false);
-      if (!concierge && path !== undefined) {
-        const { sources } = layers;
-        add(
-          {
-            ...check(
-              "effective-configuration",
-              "ok",
-              "Effective configuration with its layer sources.",
-            ),
-            effective: { sources },
-          },
-          false,
-        );
-      }
       verifyProfile = layers.config.verification?.profile;
       const valid =
         !verifyProfile ||
@@ -450,6 +436,44 @@ export async function doctor(
             false,
             true,
           ),
+    );
+  }
+
+  let resolvedHome: MsbHomeResolution | undefined;
+  try {
+    const user = layers?.user ?? readLayer("user", undefined, host.env);
+    resolvedHome = await resolveMsbHome(host.env, user);
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+  }
+  const home =
+    resolvedHome && "path" in resolvedHome ? resolvedHome.path : undefined;
+  if (resolvedHome) add(msbHomeCheck(resolvedHome));
+  else
+    add(
+      check(
+        "msb-home",
+        "skipped",
+        "Correct the user configuration to check the Microsandbox home.",
+      ),
+      false,
+    );
+  if (!concierge && layers && resolvedHome) {
+    add(
+      {
+        ...check(
+          "effective-configuration",
+          "ok",
+          "Effective configuration with its sources.",
+        ),
+        effective: {
+          sources: {
+            ...layers.sources,
+            "microsandbox.home": resolvedHome.source,
+          },
+        },
+      },
+      false,
     );
   }
 
@@ -528,9 +552,9 @@ export async function doctor(
         status === "ok"
           ? "Local image digest matches."
           : status === "skipped"
-            ? "Local image inspection requires pinned Microsandbox and a valid MSB_HOME."
+            ? "Local image inspection requires pinned Microsandbox and a valid home directory."
             : status === "missing"
-              ? "Pinned reference could not be inspected in MSB_HOME."
+              ? "Pinned reference could not be inspected in the Microsandbox home."
               : "Local image did not report the locked digest.",
         [
           name === "base" || defaultProfiles.some((profile) => profile === name)
