@@ -3,6 +3,7 @@ import { loadConfig, readLayer } from "../config/layers.ts";
 import { resolveMsbHome } from "../config/msb-home.ts";
 import { buildSandboxPlan } from "../image-build-sandbox.ts";
 import { ALPINE_3_23, recipeFor } from "../image-recipes.ts";
+import { escapeTerminalControls } from "../local-orchestrator/analysis.ts";
 import { resolveConfigTarget } from "../local-orchestrator/target.ts";
 import { offlineMiseEnv } from "../mise-tools.ts";
 import {
@@ -77,6 +78,19 @@ export class SetupError extends Error {
     this.next = next;
     this.code = code;
   }
+}
+
+/** The last lines of a build's diagnostics, with control characters
+ * escaped so they cannot drive the operator's terminal. */
+export function buildOutputTail(stderr: string | undefined): string {
+  const lines = (stderr ?? "")
+    .split("\n")
+    .map((line) => escapeTerminalControls(line).slice(0, 400))
+    .filter((line) => line.trim() !== "")
+    .slice(-20);
+  return lines.length
+    ? `\nBuild output (last lines):\n${lines.join("\n")}`
+    : "";
 }
 
 export const authorizedAgentWarning =
@@ -184,7 +198,8 @@ export async function applySetup(
     );
     if (result.code !== 0 || (await imageStatus(host, home, image)) !== "ok")
       throw new SetupError(
-        "A profile build failed or differs from the checked-in digest.",
+        "A profile build failed or differs from the checked-in digest." +
+          buildOutputTail(result.stderr),
         `Inspect the ${name} build audit at ${build.auditPath} and its pinned inputs before retrying. See agent-bootstrap help setup.`,
       );
     built.push(name);

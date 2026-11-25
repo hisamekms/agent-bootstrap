@@ -614,14 +614,26 @@ describe("agent-bootstrap", () => {
     const plan = await setupPlan(root, false, host.env);
     const original = await readFile(join(root, lockFile), "utf8");
     const command = host.command;
-    host.command = (file, args, env, timeout) => {
-      if (args.includes("--locked"))
-        images.set(plan.images.profiles[0]!.image, "sha256:" + "f".repeat(64));
-      return command(file, args, env, timeout);
+    host.command = async (file, args, env, timeout) => {
+      if (!args.includes("--locked")) return command(file, args, env, timeout);
+      images.set(plan.images.profiles[0]!.image, "sha256:" + "f".repeat(64));
+      await command(file, args, env, timeout);
+      return {
+        code: 1,
+        stdout: "",
+        stderr: `${"noise\n".repeat(30)}Image build stopped at profile lock.\nBuild differs \u001b]52;c;aGk=\u0007from the lock\n`,
+      };
     };
     await assert.rejects(
       applySetup(root, host, { ...plan, artifacts: [] }, true),
-      new RegExp("differs from the checked-in digest"),
+      (error: Error) => {
+        assert.match(error.message, /differs from the checked-in digest/);
+        assert.match(error.message, /Image build stopped at profile lock\./);
+        assert.match(error.message, /\\u001b\]52/);
+        assert.doesNotMatch(error.message, /\u001b/);
+        assert.equal(error.message.match(/noise/g)?.length, 18);
+        return true;
+      },
     );
     assert.deepEqual(
       calls
