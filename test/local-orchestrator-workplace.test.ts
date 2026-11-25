@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadWorkplaceAssets } from "../src/local-orchestrator/workplace-assets.ts";
+import { loadWorkplaceAssets } from "../src/operator-ui/assets.ts";
 import { runWorkplace } from "../src/local-orchestrator/workplace.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 

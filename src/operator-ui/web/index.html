@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workplace</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <main id="workplace">
+      <section id="conversation" aria-labelledby="concierge-title">
+        <header><h1 id="concierge-title">Concierge</h1></header>
+        <div id="terminal"></div>
+      </section>
+      <div
+        id="divider"
+        role="separator"
+        tabindex="0"
+        aria-label="Concierge width"
+        aria-orientation="vertical"
+        aria-controls="conversation"
+        aria-valuemin="20"
+        aria-valuemax="80"
+        aria-valuenow="60"
+      ></div>
+      <section id="host" aria-labelledby="host-title" tabindex="-1">
+        <header><h2 id="host-title">Host panel</h2></header>
+        <div id="summary">
+          <p id="connection" role="status">Connecting…</p>
+          <p id="counts" aria-live="polite"></p>
+          <p id="terminal-notice" role="status"></p>
+          <p id="inbox-notice" role="status"></p>
+        </div>
+        <div id="details"></div>
+        <div id="inbox">
+          <h3>Inbox</h3>
+          <p id="empty-inbox" hidden>No inbox items.</p>
+          <ul id="inbox-items"></ul>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

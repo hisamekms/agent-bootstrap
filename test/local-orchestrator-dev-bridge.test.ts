@@ -8,7 +8,7 @@ import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-
 import { startDevBridge } from "../src/local-orchestrator/dev-bridge.ts";
 import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
 import { operatorStatus } from "../src/local-orchestrator/operator-read.ts";
-import { loadWorkplaceAssets } from "../src/local-orchestrator/workplace-assets.ts";
+import { loadWorkplaceAssets } from "../src/operator-ui/assets.ts";
 import type { TerminalExit } from "../src/sandbox-runtime.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 

@@ -28,6 +28,7 @@ const address = "127.0.0.1";
 
 type Client = {
   timer?: ReturnType<typeof setTimeout>;
+  pending?: boolean;
   socket?: Socket;
   rejected?: boolean;
 };
@@ -39,7 +40,6 @@ type WebSocket = {
 };
 type Server = {
   port: number;
-  pendingWebSockets: number;
   upgrade(
     request: Request,
     options: { data: Client; headers: HeadersInit },
@@ -51,6 +51,7 @@ declare const Bun: {
     hostname: string;
     port: number;
     development: boolean;
+    error(error: Error): Response;
     fetch(request: Request, server: Server): Response | undefined;
     websocket: {
       maxPayloadLength: number;
@@ -73,6 +74,14 @@ export function startDevBridge(options: {
   ).toString("hex");
   const expected = Buffer.from(token);
   const connections = new Set<Socket>();
+  // Count only connections that have not authenticated yet, so they cannot
+  // take the slots of the operator's authenticated page.
+  let unauthenticated = 0;
+  function settle(ws: WebSocket) {
+    if (!ws.data.pending) return;
+    ws.data.pending = false;
+    unauthenticated--;
+  }
 
   function authenticate(message: string) {
     try {
@@ -108,6 +117,7 @@ export function startDevBridge(options: {
   }
 
   function reject(ws: WebSocket, code: number) {
+    settle(ws);
     ws.data.rejected = true;
     ws.close(code);
   }
@@ -116,6 +126,9 @@ export function startDevBridge(options: {
     hostname: address,
     port: 0,
     development: false,
+    error() {
+      return new Response(null, { status: 500, headers });
+    },
     fetch(request, server) {
       const host = `${address}:${server.port}`;
       if (request.headers.get("host") !== host)
@@ -129,7 +142,7 @@ export function startDevBridge(options: {
       if (request.method !== "GET")
         return new Response(null, { status: 405, headers });
       if (upgrade) {
-        if (server.pendingWebSockets >= 16)
+        if (unauthenticated >= 16)
           return new Response(null, { status: 503, headers });
         if (server.upgrade(request, { data: {}, headers })) return;
         return new Response(null, { status: 400, headers });
@@ -148,6 +161,8 @@ export function startDevBridge(options: {
       closeOnBackpressureLimit: true,
       idleTimeout: 0,
       open(ws) {
+        ws.data.pending = true;
+        unauthenticated++;
         ws.data.timer = setTimeout(() => reject(ws, 1008), authTimeoutMs);
       },
       message(ws, message) {
@@ -166,6 +181,7 @@ export function startDevBridge(options: {
             return;
           }
           clearTimeout(ws.data.timer);
+          settle(ws);
           ws.data.socket = relay(ws);
           connections.add(ws.data.socket);
           return;
@@ -218,6 +234,7 @@ export function startDevBridge(options: {
         socket.write(line + "\n");
       },
       close(ws) {
+        settle(ws);
         clearTimeout(ws.data.timer);
         ws.data.socket?.destroy();
       },

@@ -32,7 +32,7 @@ import {
   parseWorkplaceArgs,
   runWorkplace,
 } from "../../src/local-orchestrator/workplace.ts";
-import { loadWorkplaceAssets } from "../../src/local-orchestrator/workplace-assets.ts";
+import { loadWorkplaceAssets } from "../../src/operator-ui/assets.ts";
 import {
   loadClaudeConfig,
   resolveClaudeModel,
