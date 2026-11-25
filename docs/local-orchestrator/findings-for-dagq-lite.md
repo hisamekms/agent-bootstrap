@@ -174,3 +174,45 @@ and integration.
   _Lesson:_ when a boundary changes, run every profile's full build path
   once, and give no-network stages no network instead of an empty
   allowlist.
+
+## 2026-11-25: operator UI phase 2 (#43 to #47)
+
+- **A table of escape sequences missed real holes.** Three review rounds
+  of the terminal filter found a raw `0x9c` that ended a string, a `BEL`
+  that ended DCS and APC as well as OSC, and one stray byte that stopped
+  all later output. A fourth claim was a false positive.
+  _Lesson:_ state the filter's output invariant (valid UTF-8, no C1,
+  every ESC starts a complete CSI) and test it with random input and
+  random chunking, not only with known sequences.
+- **The terminal widget did not run under the strict CSP.** xterm 6
+  inserts `<style>` elements, which `style-src 'self'` blocks. The bundle
+  now swaps them for constructed stylesheets in the pinned version and
+  fails at startup if the code it replaces moves. The rule "no `http:` in
+  the bundle" also hit XML namespace strings that are never fetched.
+  _Lesson:_ check a UI dependency under the real CSP in a real browser
+  before adopting it. Enforce "no remote loads" with the CSP; a text scan
+  of the bundle is only a second layer.
+- **Only the real agent showed a broken layout.** The default terminal
+  font drew block and box characters 1.67 cells wide on macOS, so the
+  agent's banner broke. Tests with a plain shell passed; the operator
+  saw it on the first real run.
+  _Lesson:_ set the terminal font explicitly and include the real
+  agent's startup screen in the manual check.
+- **A detached launcher outlived its parent.** The workplace launcher
+  runs in its own session so the CLI can forward signals. When the CLI
+  was killed with SIGKILL, the launcher kept the agent session running
+  until its lifetime limit. A second Ctrl-C did nothing while shutdown
+  hung.
+  _Lesson:_ give every detached child a lifeline pipe from its parent
+  and stop when it closes; escalate on repeated signals.
+- **The implementer could not run browser or socket checks.** Its
+  sandbox could not bind sockets or start a headless browser. The lead
+  checked the page with a small harness that put `/bin/sh` behind the
+  real terminal hub and bridge and drove Chrome over its debugging
+  protocol.
+  _Lesson:_ keep a fake-agent harness for UI work so anyone can check
+  the page without starting a VM.
+- **Discarding a Goal is now one recorded operation** (#44). The
+  operator previews the private ref, types a confirmation, and the host
+  rechecks that the Goal is idle, deletes the ref by compare-and-swap,
+  closes the Goal and records the event under one lock.
