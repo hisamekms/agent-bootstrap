@@ -112,3 +112,33 @@ and integration.
   commit.
   _Lesson:_ give the implementer an environment that can run the full
   acceptance suite, or make the split explicit in the workflow.
+
+## 2026-11-25: operator UI phase 1 (#36 to #38)
+
+- **Tests the implementer could not run hid a wrong assertion.** The
+  operator API's socket tests never ran in the implementing agent's
+  sandbox. One compared a JSON reply with an object that held
+  `undefined` fields and had never passed.
+  _Lesson:_ a report that tests were "affected by the sandbox" means
+  they are unverified; the lead runs them before review.
+- **A host socket left by a crashed launcher blocked the next start.**
+  The first version refused to start when the socket path existed.
+  _Lesson:_ any host listener replaces a stale socket that refuses
+  connections and refuses a live one.
+- **Model text next to a host command reads like a command.** Escaping
+  control characters was not enough: a Task title could hold a
+  plausible fake `approve` command on the same line.
+  _Lesson:_ print model text last, quoted and labeled, never between
+  host-written parts.
+- **Stable ids can leak the names they hash.** Self-test item ids were
+  hashes of low-entropy variable names, so the Concierge could confirm
+  guesses.
+  _Lesson:_ ids shown to an agent are opaque or keyed with a host
+  secret.
+- **The egress gateway can fail to start on a port collision.** It
+  takes an ephemeral TCP port for DNS and then binds UDP to the same
+  number. If another process holds that UDP port, the bind fails with
+  `EADDRINUSE` and the gateway does not start. A verification run hit
+  this once.
+  _Lesson:_ when two protocols must share a port, retry with a new port
+  on collision, or let each listener choose its own port.
