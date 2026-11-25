@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as asyncFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { afterEach, beforeEach } from "node:test";
+import test from "node:test";
 import { ExportResultCode, type ExportResult } from "@opentelemetry/core";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
@@ -27,24 +27,14 @@ import {
 const filename = "2026-11-23-0001.jsonl";
 const now = () => new Date("2026-11-23T00:00:00Z");
 const resource = resourceFromAttributes({ "service.name": "agent-bootstrap" });
-let root: string;
-
-beforeEach(() => {
-  root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "otlp-files-")));
-});
-
-afterEach(() => {
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-function signalDir(signal: string): string {
+function signalDir(root: string, signal: string): string {
   return join(root, "telemetry", signal);
 }
 
-function readLines(signal: string) {
-  assert.deepEqual(fs.readdirSync(signalDir(signal)), [filename]);
+function readLines(root: string, signal: string) {
+  assert.deepEqual(fs.readdirSync(signalDir(root, signal)), [filename]);
   const lines = fs
-    .readFileSync(join(signalDir(signal), filename), "utf8")
+    .readFileSync(join(signalDir(root, signal), filename), "utf8")
     .split("\n");
   assert.equal(lines.pop(), "");
   return lines.map((line) => JSON.parse(line));
@@ -83,6 +73,10 @@ function interceptOpen(
 }
 
 test("the SDKs write one OTLP request per export and publish on shutdown", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const exporters = createOtlpFileExporters(root, { writerOptions: { now } });
   const tracerProvider = new TracerProvider({
     resource,
@@ -108,7 +102,9 @@ test("the SDKs write one OTLP request per export and publish on shutdown", async
     loggerProvider.getLogger("obs-test").emit({ body: "network.decided" });
 
     await tracerProvider.forceFlush();
-    assert.ok(fs.existsSync(join(signalDir("traces"), `${filename}.partial`)));
+    assert.ok(
+      fs.existsSync(join(signalDir(root, "traces"), `${filename}.partial`)),
+    );
   } finally {
     await Promise.all([
       tracerProvider.shutdown(),
@@ -117,7 +113,7 @@ test("the SDKs write one OTLP request per export and publish on shutdown", async
     ]);
   }
 
-  const spans = readLines("traces").map(
+  const spans = readLines(root, "traces").map(
     (request) => request.resourceSpans[0].scopeSpans[0].spans[0],
   );
   assert.deepEqual(
@@ -128,7 +124,7 @@ test("the SDKs write one OTLP request per export and publish on shutdown", async
     assert.match(span.traceId, /^[a-f0-9]{32}$/u);
     assert.match(span.spanId, /^[a-f0-9]{16}$/u);
   }
-  const [metricRequest] = readLines("metrics");
+  const [metricRequest] = readLines(root, "metrics");
   const metrics = metricRequest.resourceMetrics[0].scopeMetrics[0].metrics;
   assert.equal(
     metrics.find((m: { name: string }) => m.name === "execution.duration")
@@ -140,7 +136,7 @@ test("the SDKs write one OTLP request per export and publish on shutdown", async
       .sum.dataPoints[0].asInt,
     0,
   );
-  const [logRequest] = readLines("logs");
+  const [logRequest] = readLines(root, "logs");
   assert.equal(
     logRequest.resourceLogs[0].scopeLogs[0].logRecords[0].body.stringValue,
     "network.decided",
@@ -149,6 +145,10 @@ test("the SDKs write one OTLP request per export and publish on shutdown", async
 });
 
 test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const diagnostics: string[] = [];
   let elapsed = 0;
   let diskFull = true;
@@ -195,7 +195,7 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
   tracerProvider.getTracer("obs-test").startSpan("execution").end();
   await tracerProvider.forceFlush();
   await tracerProvider.shutdown();
-  assert.equal(readLines("traces").length, 1);
+  assert.equal(readLines(root, "traces").length, 1);
 
   diskFull = false;
   const meterProvider = new MeterProvider({
@@ -207,7 +207,7 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
   exporters.registerDroppedCounter(meterProvider.getMeter("obs-test"));
   await meterProvider.shutdown();
   assert.equal(exporters.dropped, 3);
-  assert.deepEqual(fs.readdirSync(signalDir("metrics")).sort(), [
+  assert.deepEqual(fs.readdirSync(signalDir(root, "metrics")).sort(), [
     `${filename}.partial`,
     "2026-11-23-0002.jsonl.partial",
     "2026-11-23-0003.jsonl.partial",
@@ -215,7 +215,7 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
   ]);
   const recovered = JSON.parse(
     fs.readFileSync(
-      join(signalDir("metrics"), "2026-11-23-0004.jsonl"),
+      join(signalDir(root, "metrics"), "2026-11-23-0004.jsonl"),
       "utf8",
     ),
   );
@@ -225,11 +225,15 @@ test("ENOSPC drops metrics, rate-limits diagnostics, and leaves traces working",
 });
 
 test("refuses a symlinked signal directory when the SDK first exports", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const diagnostics: string[] = [];
   const target = join(root, "target");
   fs.mkdirSync(target);
   fs.mkdirSync(join(root, "telemetry"));
-  fs.symlinkSync(target, signalDir("logs"));
+  fs.symlinkSync(target, signalDir(root, "logs"));
   const exporters = createOtlpFileExporters(root, {
     writeDiagnostic: (line) => diagnostics.push(line),
   });
@@ -243,6 +247,10 @@ test("refuses a symlinked signal directory when the SDK first exports", async ()
 });
 
 test("serialization and shutdown failures are counted without exposing raw errors", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const diagnostics: string[] = [];
   const exporters = createOtlpFileExporters(root, {
     writeDiagnostic(line) {
@@ -277,13 +285,17 @@ test("serialization and shutdown failures are counted without exposing raw error
     "obs.telemetry.dropped signal=traces kind=serialization-failed\n",
     "obs.telemetry.dropped signal=traces kind=disk-full\n",
   ]);
-  assert.deepEqual(fs.readdirSync(signalDir("traces")), [
+  assert.deepEqual(fs.readdirSync(signalDir(root, "traces")), [
     `${filename}.partial`,
   ]);
   await exportOnce(exporters.traces, [], ExportResultCode.FAILED);
 });
 
 test("charges final and partial files across signals and leaves the audit outside the budget", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const auditDir = join(root, "audit");
   fs.mkdirSync(auditDir);
   const auditFile = join(auditDir, filename);
@@ -292,10 +304,15 @@ test("charges final and partial files across signals and leaves the audit outsid
   const first = createOtlpFileExporters(root, { writerOptions: { now } });
   await exportOnce(first.traces, [], ExportResultCode.SUCCESS);
   await first.traces.shutdown();
-  const finalBytes = fs.statSync(join(signalDir("traces"), filename)).size;
+  const finalBytes = fs.statSync(
+    join(signalDir(root, "traces"), filename),
+  ).size;
 
-  fs.mkdirSync(signalDir("logs"));
-  fs.writeFileSync(join(signalDir("logs"), `${filename}.partial`), "pending");
+  fs.mkdirSync(signalDir(root, "logs"));
+  fs.writeFileSync(
+    join(signalDir(root, "logs"), `${filename}.partial`),
+    "pending",
+  );
   const budget = finalBytes * 2 + Buffer.byteLength("pending");
   const capped = createOtlpFileExporters(root, {
     maxTotalBytes: budget,
@@ -311,14 +328,18 @@ test("charges final and partial files across signals and leaves the audit outsid
   assert.equal(capped.dropped, 1);
   await Promise.all([capped.traces.shutdown(), capped.metrics.shutdown()]);
   assert.equal(
-    fs.statSync(join(signalDir("traces"), "2026-11-23-0002.jsonl")).size,
+    fs.statSync(join(signalDir(root, "traces"), "2026-11-23-0002.jsonl")).size,
     finalBytes,
   );
-  assert.deepEqual(fs.readdirSync(signalDir("metrics")), []);
+  assert.deepEqual(fs.readdirSync(signalDir(root, "metrics")), []);
   assert.equal(fs.readFileSync(auditFile, "utf8"), "a".repeat(4096));
 });
 
 test("bounds the queue while a write stalls and flushes accepted exports on shutdown", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "otlp-files-"),
+  );
+  const root = temp.path;
   const stalled = Promise.withResolvers<void>();
   const entered = Promise.withResolvers<void>();
   const diagnostics: string[] = [];
@@ -350,5 +371,5 @@ test("bounds the queue while a write stalls and flushes accepted exports on shut
     stalled.resolve();
     await Promise.all([...accepted, shutdown]);
   }
-  assert.equal(readLines("logs").length, MAX_PENDING_EXPORTS);
+  assert.equal(readLines(root, "logs").length, MAX_PENDING_EXPORTS);
 });

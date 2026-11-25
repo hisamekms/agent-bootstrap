@@ -8,11 +8,11 @@ import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  mkdtempDisposableSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
-  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -21,7 +21,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, beforeEach, test } from "node:test";
+import { test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
 import { CLAUDE_WORKER_USAGE_MARKER } from "../src/claude-code.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
@@ -51,6 +51,10 @@ import {
   type TaskExecutor,
   type TaskFlow,
 } from "../src/local-orchestrator/tasks.ts";
+import {
+  openTestStore,
+  orchestratorFixture,
+} from "./local-orchestrator-fixture.ts";
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   Database: new (path: string) => {
@@ -79,29 +83,23 @@ const pin = {
 const flags = { kind: "human", decision: "approve" } as const;
 const origin = { kind: "operator" } as const;
 const planner = { kind: "actor", actor: "Planner" } as const;
-let root: string;
-let filename: string;
-let store: OrchestratorStore;
+type TaskState = ReturnType<typeof orchestratorFixture>;
 
-beforeEach(() => {
-  root = mkdtempSync(join(realpathSync(tmpdir()), "lo-tasks-"));
-  filename = join(root, "state.db");
-  store = OrchestratorStore.open(filename);
-});
-afterEach(() => {
-  store.close();
-  rmSync(root, { force: true, recursive: true });
-});
+const gitTestOptions = { timeout: 30_000 };
 
-function approve(proposal: { id: string; digest: string }) {
+function approve(
+  store: OrchestratorStore,
+  proposal: { id: string; digest: string },
+) {
   return store.decide(proposal.id, {
     decision: flags.decision,
     answerer: { kind: flags.kind },
     digest: proposal.digest,
   });
 }
-function goal(policies?: PolicySet) {
+function goal(store: OrchestratorStore, policies?: PolicySet) {
   return approve(
+    store,
     store.proposeGoal(
       {
         title: "Goal",
@@ -120,7 +118,11 @@ function goal(policies?: PolicySet) {
     ),
   ).goalId!;
 }
-function task(goalId: string, overrides: Partial<TaskContent> = {}) {
+function task(
+  store: OrchestratorStore,
+  goalId: string,
+  overrides: Partial<TaskContent> = {},
+) {
   const draft = store.proposeTask(
     {
       goalId,
@@ -136,7 +138,9 @@ function task(goalId: string, overrides: Partial<TaskContent> = {}) {
     },
     planner,
   );
-  return draft.status === "registered" ? draft.taskId : approve(draft).taskId!;
+  return draft.status === "registered"
+    ? draft.taskId
+    : approve(store, draft).taskId!;
 }
 
 function fixture(overrides: Partial<TaskFlow> = {}) {
@@ -176,6 +180,7 @@ function fixture(overrides: Partial<TaskFlow> = {}) {
 }
 
 function runner(
+  store: OrchestratorStore,
   tasks: TaskExecutor,
   overrides: Partial<ConstructorParameters<typeof ActorRunner>[0]> = {},
 ) {
@@ -195,15 +200,17 @@ function runner(
   });
 }
 
-function failure(taskId: string) {
+function failure(store: OrchestratorStore, taskId: string) {
   return store.listEvents({ subjectId: taskId, limit: 1 })[0]?.data;
 }
 
 test("drain serializes actors, bounds the queue and waits for integrated dependencies", async () => {
-  const goalId = goal();
-  const first = task(goalId);
-  const dependent = task(goalId, { dependsOn: [first] });
-  const independent = task(goalId);
+  using state = orchestratorFixture("lo-tasks-");
+  const { filename, store } = state;
+  const goalId = goal(store);
+  const first = task(store, goalId);
+  const dependent = task(store, goalId, { dependsOn: [first] });
+  const independent = task(store, goalId);
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   let calls = 0;
@@ -228,7 +235,7 @@ test("drain serializes actors, bounds the queue and waits for integrated depende
       return { ...pin, review: "pass" };
     },
   });
-  const work = runner(executor, { limits: { maxQueued: 1 } });
+  const work = runner(store, executor, { limits: { maxQueued: 1 } });
   const drain = work.drain();
   await entered.promise;
   assert.equal(work.drain(), drain);
@@ -243,7 +250,7 @@ test("drain serializes actors, bounds the queue and waits for integrated depende
   const proposal = store
     .pendingIntegrations(goalId)
     .find((row) => row.kind === "integration" && row.content.taskId === first)!;
-  approve(proposal);
+  approve(store, proposal);
   await work.drain();
   assert.equal(store.getTask(dependent)?.status, "registered");
   // Stage 3 owns this transition. Seed its outcome to test Stage 2 scheduling.
@@ -256,10 +263,12 @@ test("drain serializes actors, bounds the queue and waits for integrated depende
 });
 
 test("pass creates one digest-bound human proposal with correlated executions", async () => {
-  const goalId = goal();
-  const taskId = task(goalId);
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  const taskId = task(store, goalId);
   const { executor, calls, executions } = fixture();
-  const work = runner(executor);
+  const work = runner(store, executor);
   await work.drain();
   await work.drain();
   assert.deepEqual(calls, ["worker", "review"]);
@@ -307,12 +316,14 @@ test("pass creates one digest-bound human proposal with correlated executions", 
   await assert.rejects(work.requestApproval(proposal.id), {
     code: "approval-forbidden",
   });
-  assert.equal(approve(proposal).status, "approved");
+  assert.equal(approve(store, proposal).status, "approved");
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
 });
 
 test("agent policy requests dedicated approval with the candidate diff under the task timeout", async () => {
-  const taskId = task(goal({ integration: "agent" }), {
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const taskId = task(store, goal(store, { integration: "agent" }), {
     budgets: { ...budgets, maxExecutionMs: 1234 },
   });
   const { executor } = fixture({
@@ -321,7 +332,7 @@ test("agent policy requests dedicated approval with the candidate diff under the
     },
   });
   let approvalId: string | undefined;
-  const work = runner(executor, {
+  const work = runner(store, executor, {
     async runReviewer(plan, id) {
       approvalId = id;
       assert.equal(plan.command.timeoutMs, 1234);
@@ -375,8 +386,12 @@ test("agent policy requests dedicated approval with the candidate diff under the
 });
 
 test("revision and path violations share the retry cap", async () => {
-  const goalId = goal();
-  const revised = task(goalId, { budgets: { ...budgets, maxRetries: 1 } });
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  const revised = task(store, goalId, {
+    budgets: { ...budgets, maxRetries: 1 },
+  });
   let checked = 0;
   const { executor, calls } = fixture({
     async changes() {
@@ -393,22 +408,24 @@ test("revision and path violations share the retry cap", async () => {
       return { ...pin, review: "revise" };
     },
   });
-  await runner(executor).drain();
+  await runner(store, executor).drain();
   assert.deepEqual(calls, ["worker", "reject", "revise", "review"]);
   assert.equal(store.getTask(revised)?.attempts, 2);
-  assert.deepEqual(failure(revised), {
+  assert.deepEqual(failure(store, revised), {
     status: "failed",
     code: "revision-limit",
   });
-  const denied = task(goalId, { budgets: { ...budgets, maxRetries: 0 } });
+  const denied = task(store, goalId, {
+    budgets: { ...budgets, maxRetries: 0 },
+  });
   const other = fixture({
     async changes() {
       return [{ path: "docs-other/a.md", newMode: "100644" }];
     },
   });
-  await runner(other.executor).drain();
+  await runner(store, other.executor).drain();
   assert.deepEqual(other.calls, ["worker", "reject"]);
-  assert.deepEqual(failure(denied), {
+  assert.deepEqual(failure(store, denied), {
     status: "failed",
     code: "path-violation",
   });
@@ -416,9 +433,12 @@ test("revision and path violations share the retry cap", async () => {
 });
 
 test("review concerns and timeouts still stop the task", async () => {
-  const goalId = goal();
-  const concerned = task(goalId);
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  const concerned = task(store, goalId);
   await runner(
+    store,
     fixture({
       async review(_id, observed) {
         observed.tokens = 0;
@@ -426,13 +446,14 @@ test("review concerns and timeouts still stop the task", async () => {
       },
     }).executor,
   ).drain();
-  assert.deepEqual(failure(concerned), {
+  assert.deepEqual(failure(store, concerned), {
     status: "failed",
     code: "review-concern",
   });
 
-  const timedOut = task(goalId);
+  const timedOut = task(store, goalId);
   await runner(
+    store,
     fixture({
       async worker(_id, _revise, observed) {
         observed.outcome = "timed-out";
@@ -440,7 +461,10 @@ test("review concerns and timeouts still stop the task", async () => {
       },
     }).executor,
   ).drain();
-  assert.deepEqual(failure(timedOut), { status: "failed", code: "timed-out" });
+  assert.deepEqual(failure(store, timedOut), {
+    status: "failed",
+    code: "timed-out",
+  });
   assert.partialDeepStrictEqual(store.getHostApiStatus().recentExecutions[0], {
     status: "timed-out",
     usage: "unavailable",
@@ -449,7 +473,9 @@ test("review concerns and timeouts still stop the task", async () => {
 });
 
 test("crossing the Task token budget emits one advisory and allows verification, review and approval", async () => {
-  const taskId = task(goal({ integration: "agent" }));
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const taskId = task(store, goal(store, { integration: "agent" }));
   const { executor, calls } = fixture({
     async worker(_id, _revision, observed) {
       observed.tokens = 51;
@@ -472,7 +498,7 @@ test("crossing the Task token budget emits one advisory and allows verification,
       return { ...pin, review: "pass" };
     },
   });
-  const work = runner(executor, {
+  const work = runner(store, executor, {
     async runReviewer(_plan, id) {
       calls.push("approve");
       return {
@@ -546,7 +572,12 @@ function command(
   return result.stdout;
 }
 
-function goalBaseFixture(recordBase = true, policies?: PolicySet) {
+function goalBaseFixture(
+  state: TaskState,
+  recordBase = true,
+  policies?: PolicySet,
+) {
+  const { root, filename, store } = state;
   const repoRoot = join(root, "source");
   const env = configEnv(root);
   const directory = projectStateDirectory("source", env);
@@ -560,7 +591,7 @@ function goalBaseFixture(recordBase = true, policies?: PolicySet) {
   addProject(repoRoot, undefined, env);
   mkdirSync(bare, { recursive: true, mode: 0o700 });
   const base = git(["rev-parse", "HEAD"]);
-  const goalId = goal(policies);
+  const goalId = goal(store, policies);
   const ref = `refs/heads/${goalBranch(goalId)}`;
   bareGit(["init", "--bare", "--template="]);
   git(["push", bare, `${base}:${ref}`]);
@@ -624,712 +655,792 @@ function goalBaseFixture(recordBase = true, policies?: PolicySet) {
   };
 }
 
-test("update-goal-base confirms current local main, imports it and records the new base", async () => {
-  const f = goalBaseFixture();
-  const taskId = task(f.goalId);
-  assert.ok(store.claimTask(taskId));
-  store.failTask(taskId, "review-concern");
-  const before = store.getTask(taskId);
-  const nonTTY = await f.cli(f.args, false);
-  assert.equal(nonTTY.code, 1);
-  assert.match(nonTTY.stderr.join(""), /requires a terminal/);
-  assert.deepEqual(nonTTY.questions, []);
-  const wrong = await f.cli(f.args, true, () => "yes");
-  assert.match(wrong.stderr.join(""), /Confirmation did not match/);
-  assert.equal(f.head(), f.base);
-  assert.deepEqual(f.events(), []);
-
-  const result = await f.cli(f.args);
-  assert.equal(result.code, 0, result.stderr.join(""));
-  assert.deepEqual(result.questions, [`Type "${f.phrase}" to confirm: `]);
-  assert.equal(f.head(), f.next);
-  assert.equal(f.bareGit(["show", `${f.ref}:on-new-main`]), "new main");
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
-  assert.deepEqual(
-    f.events().map(({ data }) => data),
-    [{ from: f.base, to: f.next }],
-  );
-  const shown = await f.cli(["show", f.goalId], false);
-  assert.equal(JSON.parse(shown.stdout.join("")).baseCommit, f.next);
-  assert.deepEqual(store.getTask(taskId), before);
-  const retry = await f.cli(
-    ["retry-task", taskId],
-    true,
-    () => `retry-task ${taskId}`,
-  );
-  assert.equal(retry.code, 0, retry.stderr.join(""));
-  assert.equal(store.getTask(taskId)?.retries, 1);
-});
-
-test("update-goal-base records the Goal branch head as the previous base for a legacy Goal", async () => {
-  const f = goalBaseFixture(false);
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
-  assert.equal(store.getGoal(f.goalId)?.planningCommit, null);
-
-  const result = await f.cli(f.args);
-  assert.equal(result.code, 0, result.stderr.join(""));
-  assert.deepEqual(JSON.parse(result.stdout[0]!), {
-    goalId: f.goalId,
-    from: f.base,
-    to: f.next,
-  });
-  assert.equal(f.head(), f.next);
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
-  assert.deepEqual(
-    f.events().map(({ data }) => data),
-    [{ from: f.base, to: f.next, legacyBase: true }],
-  );
-});
-
-test("update-goal-base refuses a legacy Goal with a rejected integration proposal", async () => {
-  const f = goalBaseFixture(false);
-  const taskId = task(f.goalId);
-  const content = {
-    ...pin,
-    goalId: f.goalId,
-    taskId,
-    branch: goalBranch(f.goalId),
-    changedPaths: ["docs/a.md"],
-    symlinks: [],
-    review: { result: "pass", notes: "Good" },
-  };
-  const db = new Database(filename);
-  try {
-    // Seed the proposal alone to exercise the proposal check independently
-    // of the Task status history normally recorded alongside it.
-    db.query(
-      `INSERT INTO proposals VALUES (?, 'integration', ?, ?, '{"kind":"host"}', 'rejected', ?, ?)`,
-    ).run(
-      randomUUID(),
-      JSON.stringify(content),
-      contentDigest(content),
-      new Date().toISOString(),
-      new Date().toISOString(),
-    );
-    const refused = await f.cli(f.args);
-    assert.equal(refused.code, 1);
-    assert.deepEqual(refused.stderr, [
-      "Goal base update refused (ineligible).\n",
-    ]);
-    assert.deepEqual(refused.questions, []);
-    assert.deepEqual(f.events(), []);
+test(
+  "update-goal-base confirms current local main, imports it and records the new base",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = goalBaseFixture(state);
+    const taskId = task(store, f.goalId);
+    assert.ok(store.claimTask(taskId));
+    store.failTask(taskId, "review-concern");
+    const before = store.getTask(taskId);
+    const nonTTY = await f.cli(f.args, false);
+    assert.equal(nonTTY.code, 1);
+    assert.match(nonTTY.stderr.join(""), /requires a terminal/);
+    assert.deepEqual(nonTTY.questions, []);
+    const wrong = await f.cli(f.args, true, () => "yes");
+    assert.match(wrong.stderr.join(""), /Confirmation did not match/);
     assert.equal(f.head(), f.base);
-    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
-  } finally {
-    db.close();
-  }
-});
+    assert.deepEqual(f.events(), []);
 
-test("update-goal-base rechecks legacy history after confirmation", async () => {
-  const f = goalBaseFixture(false);
-  const taskId = task(f.goalId);
-  const db = new Database(filename);
-  try {
-    const refused = await f.cli(f.args, true, () => {
+    const result = await f.cli(f.args);
+    assert.equal(result.code, 0, result.stderr.join(""));
+    assert.deepEqual(result.questions, [`Type "${f.phrase}" to confirm: `]);
+    assert.equal(f.head(), f.next);
+    assert.equal(f.bareGit(["show", `${f.ref}:on-new-main`]), "new main");
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
+    assert.deepEqual(
+      f.events().map(({ data }) => data),
+      [{ from: f.base, to: f.next }],
+    );
+    const shown = await f.cli(["show", f.goalId], false);
+    assert.equal(JSON.parse(shown.stdout.join("")).baseCommit, f.next);
+    assert.deepEqual(store.getTask(taskId), before);
+    const retry = await f.cli(
+      ["retry-task", taskId],
+      true,
+      () => `retry-task ${taskId}`,
+    );
+    assert.equal(retry.code, 0, retry.stderr.join(""));
+    assert.equal(store.getTask(taskId)?.retries, 1);
+  },
+);
+
+test(
+  "update-goal-base records the Goal branch head as the previous base for a legacy Goal",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = goalBaseFixture(state, false);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+    assert.equal(store.getGoal(f.goalId)?.planningCommit, null);
+
+    const result = await f.cli(f.args);
+    assert.equal(result.code, 0, result.stderr.join(""));
+    assert.deepEqual(JSON.parse(result.stdout[0]!), {
+      goalId: f.goalId,
+      from: f.base,
+      to: f.next,
+    });
+    assert.equal(f.head(), f.next);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.next);
+    assert.deepEqual(
+      f.events().map(({ data }) => data),
+      [{ from: f.base, to: f.next, legacyBase: true }],
+    );
+  },
+);
+
+test(
+  "update-goal-base refuses a legacy Goal with a rejected integration proposal",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { filename, store } = state;
+    const f = goalBaseFixture(state, false);
+    const taskId = task(store, f.goalId);
+    const content = {
+      ...pin,
+      goalId: f.goalId,
+      taskId,
+      branch: goalBranch(f.goalId),
+      changedPaths: ["docs/a.md"],
+      symlinks: [],
+      review: { result: "pass", notes: "Good" },
+    };
+    const db = new Database(filename);
+    try {
+      // Seed the proposal alone to exercise the proposal check independently
+      // of the Task status history normally recorded alongside it.
       db.query(
-        `INSERT INTO events VALUES (?, ?, 'task.status', 'task', ?, NULL, NULL, '{"status":"awaiting-integration","code":null}')`,
-      ).run(randomUUID(), new Date().toISOString(), taskId);
+        `INSERT INTO proposals VALUES (?, 'integration', ?, ?, '{"kind":"host"}', 'rejected', ?, ?)`,
+      ).run(
+        randomUUID(),
+        JSON.stringify(content),
+        contentDigest(content),
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+      const refused = await f.cli(f.args);
+      assert.equal(refused.code, 1);
+      assert.deepEqual(refused.stderr, [
+        "Goal base update refused (ineligible).\n",
+      ]);
+      assert.deepEqual(refused.questions, []);
+      assert.deepEqual(f.events(), []);
+      assert.equal(f.head(), f.base);
+      assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  "update-goal-base rechecks legacy history after confirmation",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { filename, store } = state;
+    const f = goalBaseFixture(state, false);
+    const taskId = task(store, f.goalId);
+    const db = new Database(filename);
+    try {
+      const refused = await f.cli(f.args, true, () => {
+        db.query(
+          `INSERT INTO events VALUES (?, ?, 'task.status', 'task', ?, NULL, NULL, '{"status":"awaiting-integration","code":null}')`,
+        ).run(randomUUID(), new Date().toISOString(), taskId);
+        return f.phrase;
+      });
+      assert.equal(refused.code, 1);
+      assert.deepEqual(refused.stderr, [
+        "Goal base update refused (ineligible).\n",
+      ]);
+      assert.equal(f.head(), f.base);
+      assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+      assert.deepEqual(f.events(), []);
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  "update-goal-base refuses ineligible Goal and Task states with a fixed message",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { filename, store } = state;
+    const f = goalBaseFixture(state);
+    const taskId = task(store, f.goalId);
+    const db = new Database(filename);
+    async function refused(args = f.args) {
+      const result = await f.cli(args);
+      assert.equal(result.code, 1);
+      assert.deepEqual(result.stderr, [
+        "Goal base update refused (ineligible).\n",
+      ]);
+      assert.deepEqual(result.questions, []);
+    }
+    try {
+      await refused(["update-goal-base", randomUUID()]);
+      await refused(["update-goal-base", goal(store)]);
+      db.query("UPDATE goals SET status = 'done' WHERE id = ?").run(f.goalId);
+      await refused();
+      db.query("UPDATE goals SET status = 'active' WHERE id = ?").run(f.goalId);
+      for (const status of ["running", "awaiting-integration", "succeeded"]) {
+        db.query("UPDATE tasks SET status = ? WHERE id = ?").run(
+          status,
+          taskId,
+        );
+        await refused();
+      }
+      db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(
+        taskId,
+      );
+      const { executor } = fixture();
+      await runner(store, executor).drain();
+      assert.equal(store.pendingIntegrations(f.goalId).length, 1);
+      db.query("UPDATE tasks SET status = 'failed' WHERE id = ?").run(taskId);
+      await refused();
+      assert.deepEqual(f.events(), []);
+      assert.equal(f.head(), f.base);
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  "update-goal-base refuses a Task claim or ref change during confirmation",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = goalBaseFixture(state);
+    const taskId = task(store, f.goalId);
+    const claimed = await f.cli(f.args, true, () => {
+      assert.ok(store.claimTask(taskId));
       return f.phrase;
     });
-    assert.equal(refused.code, 1);
-    assert.deepEqual(refused.stderr, [
+    assert.deepEqual(claimed.stderr, [
       "Goal base update refused (ineligible).\n",
     ]);
     assert.equal(f.head(), f.base);
-    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
-    assert.deepEqual(f.events(), []);
-  } finally {
-    db.close();
-  }
-});
-
-test("update-goal-base refuses ineligible Goal and Task states with a fixed message", async () => {
-  const f = goalBaseFixture();
-  const taskId = task(f.goalId);
-  const db = new Database(filename);
-  async function refused(args = f.args) {
-    const result = await f.cli(args);
-    assert.equal(result.code, 1);
-    assert.deepEqual(result.stderr, [
-      "Goal base update refused (ineligible).\n",
+    store.failTask(taskId, "review-concern");
+    const changedMain = await f.cli(f.args, true, () => {
+      f.git(["update-ref", "refs/heads/main", f.base, f.next]);
+      return f.phrase;
+    });
+    assert.deepEqual(changedMain.stderr, [
+      "Goal base update refused (stale-base).\n",
     ]);
-    assert.deepEqual(result.questions, []);
-  }
-  try {
-    await refused(["update-goal-base", randomUUID()]);
-    await refused(["update-goal-base", goal()]);
-    db.query("UPDATE goals SET status = 'done' WHERE id = ?").run(f.goalId);
-    await refused();
-    db.query("UPDATE goals SET status = 'active' WHERE id = ?").run(f.goalId);
-    for (const status of ["running", "awaiting-integration", "succeeded"]) {
-      db.query("UPDATE tasks SET status = ? WHERE id = ?").run(status, taskId);
-      await refused();
-    }
-    db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(taskId);
-    const { executor } = fixture();
-    await runner(executor).drain();
-    assert.equal(store.pendingIntegrations(f.goalId).length, 1);
-    db.query("UPDATE tasks SET status = 'failed' WHERE id = ?").run(taskId);
-    await refused();
-    assert.deepEqual(f.events(), []);
     assert.equal(f.head(), f.base);
-  } finally {
-    db.close();
-  }
-});
+    f.git(["update-ref", "refs/heads/main", f.next, f.base]);
+    f.git(["push", f.bare, `${f.next}:refs/heads/next`]);
+    const changed = await f.cli(f.args, true, () => {
+      f.bareGit(["update-ref", f.ref, f.next, f.base]);
+      return f.phrase;
+    });
+    assert.deepEqual(changed.stderr, [
+      "Goal base update refused (stale-base).\n",
+    ]);
+    assert.equal(f.head(), f.next);
+    const stale = await f.cli(f.args);
+    assert.deepEqual(stale.stderr, [
+      "Goal base update refused (stale-base).\n",
+    ]);
+    assert.deepEqual(stale.questions, []);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+    assert.deepEqual(f.events(), []);
+  },
+);
 
-test("update-goal-base refuses a Task claim or ref change during confirmation", async () => {
-  const f = goalBaseFixture();
-  const taskId = task(f.goalId);
-  const claimed = await f.cli(f.args, true, () => {
-    assert.ok(store.claimTask(taskId));
-    return f.phrase;
-  });
-  assert.deepEqual(claimed.stderr, [
-    "Goal base update refused (ineligible).\n",
-  ]);
-  assert.equal(f.head(), f.base);
-  store.failTask(taskId, "review-concern");
-  const changedMain = await f.cli(f.args, true, () => {
-    f.git(["update-ref", "refs/heads/main", f.base, f.next]);
-    return f.phrase;
-  });
-  assert.deepEqual(changedMain.stderr, [
-    "Goal base update refused (stale-base).\n",
-  ]);
-  assert.equal(f.head(), f.base);
-  f.git(["update-ref", "refs/heads/main", f.next, f.base]);
-  f.git(["push", f.bare, `${f.next}:refs/heads/next`]);
-  const changed = await f.cli(f.args, true, () => {
-    f.bareGit(["update-ref", f.ref, f.next, f.base]);
-    return f.phrase;
-  });
-  assert.deepEqual(changed.stderr, [
-    "Goal base update refused (stale-base).\n",
-  ]);
-  assert.equal(f.head(), f.next);
-  const stale = await f.cli(f.args);
-  assert.deepEqual(stale.stderr, ["Goal base update refused (stale-base).\n"]);
-  assert.deepEqual(stale.questions, []);
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
-  assert.deepEqual(f.events(), []);
-});
-
-test("Goal branch CAS refuses a different head installed immediately before Git prepares the update", async () => {
-  const f = goalBaseFixture();
-  const winner = f.git(["commit-tree", `${f.base}^{tree}`, "-m", "winner"]);
-  f.git([
-    "push",
-    f.bare,
-    `${winner}:refs/heads/winner`,
-    `${f.next}:refs/heads/next`,
-  ]);
-  const binary = join(root, "racing-git");
-  writeFileSync(
-    binary,
-    `#!/bin/sh
+test(
+  "Goal branch CAS refuses a different head installed immediately before Git prepares the update",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const f = goalBaseFixture(state);
+    const winner = f.git(["commit-tree", `${f.base}^{tree}`, "-m", "winner"]);
+    f.git([
+      "push",
+      f.bare,
+      `${winner}:refs/heads/winner`,
+      `${f.next}:refs/heads/next`,
+    ]);
+    const binary = join(root, "racing-git");
+    writeFileSync(
+      binary,
+      `#!/bin/sh
 case " $* " in
   *" update-ref --stdin "*) /usr/bin/git "$1" update-ref ${f.ref} ${winner} ${f.base} || exit 1 ;;
 esac
 exec /usr/bin/git "$@"
 `,
-    { mode: 0o700 },
-  );
-  const git = new LocalGitIntegration({
-    binary,
-    repository: f.bare,
-    stagingRoot: join(f.directory, "worktrees"),
-    branch: goalBranch(f.goalId),
-  });
-  await assert.rejects(
-    store.updateGoalBase(f.goalId, f.base, f.next, () =>
-      git.updateGoalBranch(f.base, f.next),
-    ),
-    { code: "stale-base" },
-  );
-  assert.equal(f.head(), winner);
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
-  assert.deepEqual(f.events(), []);
-});
+      { mode: 0o700 },
+    );
+    const git = new LocalGitIntegration({
+      binary,
+      repository: f.bare,
+      stagingRoot: join(f.directory, "worktrees"),
+      branch: goalBranch(f.goalId),
+    });
+    await assert.rejects(
+      store.updateGoalBase(f.goalId, f.base, f.next, () =>
+        git.updateGoalBranch(f.base, f.next),
+      ),
+      { code: "stale-base" },
+    );
+    assert.equal(f.head(), winner);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+    assert.deepEqual(f.events(), []);
+  },
+);
 
-test("update-goal-base reports recording failure after a successful ref move", async () => {
-  const f = goalBaseFixture();
-  const db = new Database(filename);
-  try {
-    db.exec(`
+test(
+  "update-goal-base reports recording failure after a successful ref move",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { filename, store } = state;
+    const f = goalBaseFixture(state);
+    const db = new Database(filename);
+    try {
+      db.exec(`
       CREATE TRIGGER deny_base_update BEFORE INSERT ON events
       WHEN NEW.kind = 'goal.base-updated'
       BEGIN SELECT RAISE(ABORT, 'audit failure'); END
     `);
-    const result = await f.cli(f.args);
-    assert.equal(result.code, 1);
-    assert.match(
-      result.stderr.join(""),
-      /branch update completed.*recording.*failed/,
-    );
-    assert.equal(f.head(), f.next);
-    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
-    assert.deepEqual(f.events(), []);
-  } finally {
-    db.close();
-  }
-});
+      const result = await f.cli(f.args);
+      assert.equal(result.code, 1);
+      assert.match(
+        result.stderr.join(""),
+        /branch update completed.*recording.*failed/,
+      );
+      assert.equal(f.head(), f.next);
+      assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+      assert.deepEqual(f.events(), []);
+    } finally {
+      db.close();
+    }
+  },
+);
 
-test("real Git composes tree mode, path rejection, verification, review and operator CLI", async () => {
-  const repoRoot = join(root, "source");
-  mkdirSync(repoRoot);
-  const git = (args: string[]) =>
-    String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
-  git(["init", "--template=", "--initial-branch=main"]);
-  mkdirSync(join(repoRoot, "docs"));
-  writeFileSync(join(repoRoot, "docs", "a.md"), "before\n");
-  git(["add", "."]);
-  git(["commit", "-m", "initial"]);
-  const base = git(["rev-parse", "HEAD"]);
-  git(["checkout", "-b", "work"]);
-  writeFileSync(join(repoRoot, "only-on-work"), "ignored\n");
-  git(["add", "."]);
-  git(["commit", "-m", "work only"]);
-  const advancedMain = git([
-    "commit-tree",
-    base + "^{tree}",
-    "-p",
-    base,
-    "-m",
-    "main advanced",
-  ]);
-  git(["update-ref", "refs/heads/main", advancedMain, base]);
+test(
+  "real Git composes tree mode, path rejection, verification, review and operator CLI",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, filename, store } = state;
+    const repoRoot = join(root, "source");
+    mkdirSync(repoRoot);
+    const git = (args: string[]) =>
+      String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
+    git(["init", "--template=", "--initial-branch=main"]);
+    mkdirSync(join(repoRoot, "docs"));
+    writeFileSync(join(repoRoot, "docs", "a.md"), "before\n");
+    git(["add", "."]);
+    git(["commit", "-m", "initial"]);
+    const base = git(["rev-parse", "HEAD"]);
+    git(["checkout", "-b", "work"]);
+    writeFileSync(join(repoRoot, "only-on-work"), "ignored\n");
+    git(["add", "."]);
+    git(["commit", "-m", "work only"]);
+    const advancedMain = git([
+      "commit-tree",
+      base + "^{tree}",
+      "-p",
+      base,
+      "-m",
+      "main advanced",
+    ]);
+    git(["update-ref", "refs/heads/main", advancedMain, base]);
 
-  const env = configEnv(root);
-  addProject(repoRoot, undefined, env);
-  const target = await resolveTarget(repoRoot, root, env);
-  const { directory } = target;
-  await prepareTargetDirectory(target.bootstrapRoot, directory, env);
-  const scratch = join(root, "scratch");
-  mkdirSync(join(scratch, "docs"), { recursive: true });
-  writeFileSync(join(scratch, "docs", "a.md"), "after\n");
-  const link = join(scratch, "docs", "link");
-  symlinkSync("../README.md", link);
-  const attack = "`printf INJECTED` $(printf INJECTED) ' \"";
-  const goalId = goal();
-  const taskId = task(goalId, {
-    description: attack,
-    budgets: { ...budgets, maxExecutionMs: 125_000 },
-  });
-  const calls: string[] = [];
-  const invocationIds: string[] = [];
-  const executor = createTaskExecutor({
-    store,
-    snapshotCommit: base,
-    repoRoot,
-    directory,
-    worker: () =>
-      claudeRoleHarness({
-        auth: { mode: "api-key", credential: "host-secret" },
-        model,
-        tools: [],
-        reportWorkerUsage: true,
+    const env = configEnv(root);
+    addProject(repoRoot, undefined, env);
+    const target = await resolveTarget(repoRoot, root, env);
+    const { directory } = target;
+    await prepareTargetDirectory(target.bootstrapRoot, directory, env);
+    const scratch = join(root, "scratch");
+    mkdirSync(join(scratch, "docs"), { recursive: true });
+    writeFileSync(join(scratch, "docs", "a.md"), "after\n");
+    const link = join(scratch, "docs", "link");
+    symlinkSync("../README.md", link);
+    const attack = "`printf INJECTED` $(printf INJECTED) ' \"";
+    const goalId = goal(store);
+    const taskId = task(store, goalId, {
+      description: attack,
+      budgets: { ...budgets, maxExecutionMs: 125_000 },
+    });
+    const calls: string[] = [];
+    const invocationIds: string[] = [];
+    const executor = createTaskExecutor({
+      store,
+      snapshotCommit: base,
+      repoRoot,
+      directory,
+      worker: () =>
+        claudeRoleHarness({
+          auth: { mode: "api-key", credential: "host-secret" },
+          model,
+          tools: [],
+          reportWorkerUsage: true,
+        }),
+      reviewer: harness,
+      verification: configuredVerification({
+        profile: "base",
+        argv: ["test", "-f", "docs/passed"],
       }),
-    reviewer: harness,
-    verification: configuredVerification({
-      profile: "base",
-      argv: ["test", "-f", "docs/passed"],
-    }),
-    host: {
-      async runWorker(plan, id, _context, options) {
-        assert.equal(plan.command.timeoutMs, 125_000);
-        assert.match(
-          plan.command.argv[2]!,
-          /head -c 65537 \/tmp\/claude-out\.json >&2/,
-        );
-        options?.onWorkerStderr?.(
-          Buffer.from(
-            "diagnostic\n" +
-              CLAUDE_WORKER_USAGE_MARKER +
+      host: {
+        async runWorker(plan, id, _context, options) {
+          assert.equal(plan.command.timeoutMs, 125_000);
+          assert.match(
+            plan.command.argv[2]!,
+            /head -c 65537 \/tmp\/claude-out\.json >&2/,
+          );
+          options?.onWorkerStderr?.(
+            Buffer.from(
+              "diagnostic\n" +
+                CLAUDE_WORKER_USAGE_MARKER +
+                JSON.stringify({
+                  result: "x".repeat(10_000),
+                  usage: {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_input_tokens: 2,
+                    cache_creation_input_tokens: 3,
+                  },
+                }),
+            ),
+            id!,
+          );
+          assert.equal(
+            plan.command.argv.some(
+              (arg, i) => i !== 4 && arg.includes("INJECTED"),
+            ),
+            false,
+          );
+          assert.ok(plan.command.argv[4]?.includes("INJECTED"));
+          invocationIds.push(id!);
+          if (calls.length === 1) {
+            unlinkSync(link);
+            symlinkSync("a.md", link);
+          }
+          if (calls.length > 0) {
+            const note = plan.sandbox.readOnlyFiles?.find(
+              ({ path }) => path === "review-notes.txt",
+            );
+            assert.match(
+              Buffer.from(note!.bytes).toString(),
+              calls.at(-1) === "verification"
+                ? /verification suite failed/
+                : /outside the Task/,
+            );
+          }
+          if (calls.at(-1) === "verification") {
+            assert.deepEqual(store.pendingIntegrations(goalId), []);
+            writeFileSync(join(scratch, "docs", "passed"), "");
+          }
+          calls.push("worker");
+          return {
+            id: id!,
+            outcome: "ok",
+            artifacts: {
+              files: [],
+              tree: Buffer.from(
+                command("/usr/bin/tar", scratch, [
+                  "--format",
+                  "ustar",
+                  "-cf",
+                  "-",
+                  "docs",
+                ]),
+              ),
+            },
+          };
+        },
+        async runVerification(plan, id) {
+          calls.push("verification");
+          invocationIds.push(id!);
+          assert.ok(plan.sandbox.repository);
+          assert.equal(plan.sandbox.profile, "base");
+          assert.equal(plan.command.timeoutMs, 125_000);
+          const [binary, ...args] = plan.command.argv;
+          const { tree } = plan.sandbox.repository;
+          const workspace = mkdtempSync(join(root, "verify-"));
+          const unpacked = spawnSync("/usr/bin/tar", ["-xf", tree], {
+            cwd: workspace,
+          });
+          assert.equal(unpacked.status, 0, String(unpacked.stderr));
+          const response = command(binary!, workspace, args);
+          return {
+            id: id!,
+            outcome: "ok",
+            response: Buffer.from(response),
+          };
+        },
+        async runReviewer(plan, id) {
+          calls.push("review");
+          invocationIds.push(id!);
+          assert.equal(plan.command.timeoutMs, 125_000);
+          const [instructions, data, noteLimit, contract] =
+            plan.command.argv[4]!.split("\n");
+          assert.match(
+            instructions!,
+            /\/review\/candidate\.diff and \/review\/candidate\.message/,
+          );
+          assert.match(instructions!, /Do not edit anything/);
+          assert.doesNotMatch(
+            plan.command.argv[4]!,
+            /\/workspace|commit message|review-notes|\/tmp\/agent-bootstrap/,
+          );
+          assert.deepEqual(JSON.parse(data!), {
+            title: "Task",
+            description: attack,
+            acceptance: ["Valid docs"],
+            paths: ["docs/"],
+          });
+          assert.equal(
+            noteLimit,
+            "Keep revision notes within 2048 UTF-8 bytes.",
+          );
+          assert.equal(
+            contract,
+            'Reply with only one JSON object, no code fences, no other text: {"review":"pass"} or {"review":"revise","notes":"..."} with notes at most 1500 characters.',
+          );
+          assert.ok(plan.command.argv[4]!.endsWith(contract!));
+          assert.ok(
+            plan.sandbox.readOnlyFiles?.find(
+              (file) => file.path === "candidate.diff",
+            ),
+          );
+          return {
+            id: id!,
+            outcome: "ok",
+            response: Buffer.from(
               JSON.stringify({
-                result: "x".repeat(10_000),
+                result:
+                  '  ```json\n{"review":"pass","notes":"Looks good"}\n```\n',
                 usage: {
-                  input_tokens: 1,
-                  output_tokens: 1,
-                  cache_read_input_tokens: 2,
-                  cache_creation_input_tokens: 3,
+                  input_tokens: 5,
+                  output_tokens: 6,
+                  cache_read_input_tokens: 1,
+                  cache_creation_input_tokens: 1,
                 },
               }),
-          ),
-          id!,
-        );
-        assert.equal(
-          plan.command.argv.some(
-            (arg, i) => i !== 4 && arg.includes("INJECTED"),
-          ),
-          false,
-        );
-        assert.ok(plan.command.argv[4]?.includes("INJECTED"));
-        invocationIds.push(id!);
-        if (calls.length === 1) {
-          unlinkSync(link);
-          symlinkSync("a.md", link);
-        }
-        if (calls.length > 0) {
-          const note = plan.sandbox.readOnlyFiles?.find(
-            ({ path }) => path === "review-notes.txt",
-          );
-          assert.match(
-            Buffer.from(note!.bytes).toString(),
-            calls.at(-1) === "verification"
-              ? /verification suite failed/
-              : /outside the Task/,
-          );
-        }
-        if (calls.at(-1) === "verification") {
-          assert.deepEqual(store.pendingIntegrations(goalId), []);
-          writeFileSync(join(scratch, "docs", "passed"), "");
-        }
-        calls.push("worker");
-        return {
-          id: id!,
-          outcome: "ok",
-          artifacts: {
-            files: [],
-            tree: Buffer.from(
-              command("/usr/bin/tar", scratch, [
-                "--format",
-                "ustar",
-                "-cf",
-                "-",
-                "docs",
-              ]),
             ),
-          },
-        };
+          };
+        },
       },
-      async runVerification(plan, id) {
-        calls.push("verification");
-        invocationIds.push(id!);
-        assert.ok(plan.sandbox.repository);
-        assert.equal(plan.sandbox.profile, "base");
-        assert.equal(plan.command.timeoutMs, 125_000);
-        const [binary, ...args] = plan.command.argv;
-        const { tree } = plan.sandbox.repository;
-        const workspace = mkdtempSync(join(root, "verify-"));
-        const unpacked = spawnSync("/usr/bin/tar", ["-xf", tree], {
-          cwd: workspace,
-        });
-        assert.equal(unpacked.status, 0, String(unpacked.stderr));
-        const response = command(binary!, workspace, args);
-        return {
-          id: id!,
-          outcome: "ok",
-          response: Buffer.from(response),
-        };
-      },
-      async runReviewer(plan, id) {
-        calls.push("review");
-        invocationIds.push(id!);
-        assert.equal(plan.command.timeoutMs, 125_000);
-        const [instructions, data, noteLimit, contract] =
-          plan.command.argv[4]!.split("\n");
-        assert.match(
-          instructions!,
-          /\/review\/candidate\.diff and \/review\/candidate\.message/,
-        );
-        assert.match(instructions!, /Do not edit anything/);
-        assert.doesNotMatch(
-          plan.command.argv[4]!,
-          /\/workspace|commit message|review-notes|\/tmp\/agent-bootstrap/,
-        );
-        assert.deepEqual(JSON.parse(data!), {
-          title: "Task",
-          description: attack,
-          acceptance: ["Valid docs"],
-          paths: ["docs/"],
-        });
-        assert.equal(noteLimit, "Keep revision notes within 2048 UTF-8 bytes.");
-        assert.equal(
-          contract,
-          'Reply with only one JSON object, no code fences, no other text: {"review":"pass"} or {"review":"revise","notes":"..."} with notes at most 1500 characters.',
-        );
-        assert.ok(plan.command.argv[4]!.endsWith(contract!));
-        assert.ok(
-          plan.sandbox.readOnlyFiles?.find(
-            (file) => file.path === "candidate.diff",
-          ),
-        );
-        return {
-          id: id!,
-          outcome: "ok",
-          response: Buffer.from(
-            JSON.stringify({
-              result:
-                '  ```json\n{"review":"pass","notes":"Looks good"}\n```\n',
-              usage: {
-                input_tokens: 5,
-                output_tokens: 6,
-                cache_read_input_tokens: 1,
-                cache_creation_input_tokens: 1,
-              },
-            }),
-          ),
-        };
-      },
-    },
-  });
-  await runner(executor).drain();
-  assert.deepEqual(
-    calls,
-    ["worker", "worker", "verification", "worker", "verification", "review"],
-    JSON.stringify(failure(taskId)),
-  );
-  const [proposal] = store.pendingIntegrations(goalId);
-  assert.ok(proposal?.kind === "integration");
-  assert.partialDeepStrictEqual(proposal.content, {
-    base,
-    taskId,
-    changedPaths: ["docs/a.md", "docs/link", "docs/passed"],
-    symlinks: ["docs/link"],
-    verified: true,
-    review: { notes: "Looks good" },
-  });
-  assert.equal(git(["rev-parse", "main"]), advancedMain);
-  assert.equal(store.getGoal(goalId)?.baseCommit, base);
-  assert.partialDeepStrictEqual(
-    store.listEvents({ subjectId: goalId, limit: 1 })[0],
-    {
-      kind: "goal.base-pinned",
-      data: { baseCommit: base },
-    },
-  );
-  const branch = String(
-    command(
-      "/usr/bin/git",
-      join(directory, "repository.git"),
-      ["rev-parse", goalBranch(goalId)],
-      "utf8",
-    ),
-  ).trim();
-  assert.equal(branch, base);
-  assert.deepEqual(
-    invocationIds.map((id) => store.getExecution(id)?.status),
-    ["failed", "succeeded", "failed", "succeeded", "succeeded", "succeeded"],
-  );
-
-  for (const index of [2, 4]) {
-    assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
+    });
+    await runner(store, executor).drain();
+    assert.deepEqual(
+      calls,
+      ["worker", "worker", "verification", "worker", "verification", "review"],
+      JSON.stringify(failure(store, taskId)),
+    );
+    const [proposal] = store.pendingIntegrations(goalId);
+    assert.ok(proposal?.kind === "integration");
+    assert.partialDeepStrictEqual(proposal.content, {
+      base,
       taskId,
-      actor: "Reviewer",
-      mode: "verification",
-      result: { tokens: 0 },
+      changedPaths: ["docs/a.md", "docs/link", "docs/passed"],
+      symlinks: ["docs/link"],
+      verified: true,
+      review: { notes: "Looks good" },
     });
-  }
-  for (const index of [0, 1, 3]) {
-    assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
-      result: {
-        tokens: 6,
-        usage: { input: 1, output: 1, cacheRead: 2, cacheCreation: 3 },
-      },
-    });
-  }
-  assert.partialDeepStrictEqual(store.getExecution(invocationIds[5]!), {
-    result: {
-      tokens: 13,
-      usage: { input: 5, output: 6, cacheRead: 1, cacheCreation: 1 },
-    },
-  });
-  assert.equal(store.taskTokens(taskId), 31);
-  let output = "";
-  const io = {
-    stdin: new PassThrough(),
-    stdout: {
-      write(text: string) {
-        output += text;
-      },
-    },
-    stderr: { write() {} },
-    isTTY: true,
-    prompt: () => `approve ${proposal.digest.slice(0, 12)}`,
-  };
-  assert.equal(
-    await runCli(["--db", filename, "show", goalId], io, root, env),
-    0,
-  );
-  assert.equal(JSON.parse(output).baseCommit, base);
-  output = "";
-  assert.equal(
-    await runCli(["--db", filename, "show", taskId], io, root, env),
-    0,
-  );
-  assert.partialDeepStrictEqual(JSON.parse(output), {
-    budgetTokens: 31,
-    totalTokens: 31,
-  });
-  output = "";
-  assert.equal(
-    await runCli(["--db", filename, "show", proposal.id], io, root, env),
-    1,
-  );
-  assert.equal(
-    await runCli(
-      ["--db", filename, "--target", repoRoot, "show", proposal.id],
-      io,
-      root,
-      env,
-    ),
-    0,
-  );
-  assert.deepEqual(JSON.parse(output).content.changedPaths, [
-    "docs/a.md",
-    "docs/link",
-    "docs/passed",
-  ]);
-  assert.match(JSON.parse(output).diffStat, /docs\/a\.md/);
-  assert.equal(
-    await runCli(
-      ["--db", filename, "--target", repoRoot, "approve", proposal.id],
-      io,
-      root,
-      env,
-    ),
-    0,
-  );
-  assert.equal(store.getProposal(proposal.id)?.status, "approved");
-  assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
-
-  assert.equal(
-    await runCli(
-      ["--db", filename, "--target", repoRoot, "export-goal-branch", goalId],
+    assert.equal(git(["rev-parse", "main"]), advancedMain);
+    assert.equal(store.getGoal(goalId)?.baseCommit, base);
+    assert.partialDeepStrictEqual(
+      store.listEvents({ subjectId: goalId, limit: 1 })[0],
       {
-        ...io,
-        prompt: () => `export-goal-branch ${goalId} ${base.slice(0, 12)}`,
+        kind: "goal.base-pinned",
+        data: { baseCommit: base },
       },
-      root,
-      env,
-    ),
-    0,
-  );
-  assert.equal(git(["rev-parse", goalBranch(goalId)]), base);
-  assert.equal(existsSync(join(repoRoot, ".local")), false);
+    );
+    const branch = String(
+      command(
+        "/usr/bin/git",
+        join(directory, "repository.git"),
+        ["rev-parse", goalBranch(goalId)],
+        "utf8",
+      ),
+    ).trim();
+    assert.equal(branch, base);
+    assert.deepEqual(
+      invocationIds.map((id) => store.getExecution(id)?.status),
+      ["failed", "succeeded", "failed", "succeeded", "succeeded", "succeeded"],
+    );
 
-  command("/usr/bin/git", join(directory, "repository.git"), [
-    "update-ref",
-    "refs/heads/" + goalBranch(goalId),
-    proposal.content.candidate,
-    base,
-  ]);
-  await assert.rejects(executor.open(store.getTask(taskId)!), {
-    message: "goal-base-mismatch",
-  });
-
-  renameSync(join(repoRoot, ".git"), join(root, "retired-git"));
-  const pinned = await snapshotConciergeRepo(
-    repoRoot,
-    randomUUID(),
-    base,
-    true,
-    target,
-  );
-  assert.equal(pinned.commit, base);
-  assert.equal(
-    readFileSync(join(pinned.dir, "docs", "a.md"), "utf8"),
-    "before\n",
-  );
-});
-
-test("strict review concerns retain raw answers and operator retries start fresh journals", async () => {
-  const repoRoot = join(root, "source");
-  const directory = join(root, "runtime");
-  mkdirSync(repoRoot);
-  mkdirSync(directory, { mode: 0o700 });
-  const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
-  git(["init", "--template=", "--initial-branch=main"]);
-  const docs = join(repoRoot, "docs");
-  mkdirSync(docs);
-  const file = join(docs, "a.md");
-  writeFileSync(file, "before\n");
-  git(["add", "."]);
-  git(["commit", "-m", "initial"]);
-  writeFileSync(file, "after\n");
-  const tree = Buffer.from(
-    command("/usr/bin/tar", repoRoot, [
-      "--format",
-      "ustar",
-      "-cf",
-      "-",
-      "docs",
-    ]),
-  );
-  const taskId = task(goal());
-  const prose = 'Here is the verdict: {"review":"pass"}'.padEnd(4094, "x");
-  const longNotes = JSON.stringify({
-    review: "revise",
-    notes: "é".repeat(1100),
-  });
-  const answers = [prose + "😀", longNotes, '\n```\n{"review":"pass"}\n```  '];
-  const reviewerIds: string[] = [];
-  const claudeResult = (result: string) =>
-    JSON.stringify({
-      result,
-      usage: {
-        input_tokens: 1,
-        output_tokens: 1,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0,
+    for (const index of [2, 4]) {
+      assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
+        taskId,
+        actor: "Reviewer",
+        mode: "verification",
+        result: { tokens: 0 },
+      });
+    }
+    for (const index of [0, 1, 3]) {
+      assert.partialDeepStrictEqual(store.getExecution(invocationIds[index]!), {
+        result: {
+          tokens: 6,
+          usage: { input: 1, output: 1, cacheRead: 2, cacheCreation: 3 },
+        },
+      });
+    }
+    assert.partialDeepStrictEqual(store.getExecution(invocationIds[5]!), {
+      result: {
+        tokens: 13,
+        usage: { input: 5, output: 6, cacheRead: 1, cacheCreation: 1 },
       },
     });
-  const executor = createTaskExecutor({
-    store,
-    repoRoot,
-    directory,
-    worker: () => harness,
-    reviewer: harness,
-    host: {
-      async runWorker(_plan, id, _context, options) {
-        options?.onWorkerStderr?.(
-          Buffer.from("\n" + CLAUDE_WORKER_USAGE_MARKER + claudeResult("done")),
-          id!,
-        );
-        return { id: id!, outcome: "ok", artifacts: { files: [], tree } };
+    assert.equal(store.taskTokens(taskId), 31);
+    let output = "";
+    const io = {
+      stdin: new PassThrough(),
+      stdout: {
+        write(text: string) {
+          output += text;
+        },
       },
-      async runReviewer(_plan, id) {
-        const answer = answers[reviewerIds.length]!;
-        reviewerIds.push(id!);
-        return {
-          id: id!,
-          outcome: "ok",
-          response: Buffer.from(claudeResult(answer)),
-        };
+      stderr: { write() {} },
+      isTTY: true,
+      prompt: () => `approve ${proposal.digest.slice(0, 12)}`,
+    };
+    assert.equal(
+      await runCli(["--db", filename, "show", goalId], io, root, env),
+      0,
+    );
+    assert.equal(JSON.parse(output).baseCommit, base);
+    output = "";
+    assert.equal(
+      await runCli(["--db", filename, "show", taskId], io, root, env),
+      0,
+    );
+    assert.partialDeepStrictEqual(JSON.parse(output), {
+      budgetTokens: 31,
+      totalTokens: 31,
+    });
+    output = "";
+    assert.equal(
+      await runCli(["--db", filename, "show", proposal.id], io, root, env),
+      1,
+    );
+    assert.equal(
+      await runCli(
+        ["--db", filename, "--target", repoRoot, "show", proposal.id],
+        io,
+        root,
+        env,
+      ),
+      0,
+    );
+    assert.deepEqual(JSON.parse(output).content.changedPaths, [
+      "docs/a.md",
+      "docs/link",
+      "docs/passed",
+    ]);
+    assert.match(JSON.parse(output).diffStat, /docs\/a\.md/);
+    assert.equal(
+      await runCli(
+        ["--db", filename, "--target", repoRoot, "approve", proposal.id],
+        io,
+        root,
+        env,
+      ),
+      0,
+    );
+    assert.equal(store.getProposal(proposal.id)?.status, "approved");
+    assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+
+    assert.equal(
+      await runCli(
+        ["--db", filename, "--target", repoRoot, "export-goal-branch", goalId],
+        {
+          ...io,
+          prompt: () => `export-goal-branch ${goalId} ${base.slice(0, 12)}`,
+        },
+        root,
+        env,
+      ),
+      0,
+    );
+    assert.equal(git(["rev-parse", goalBranch(goalId)]), base);
+    assert.equal(existsSync(join(repoRoot, ".local")), false);
+
+    command("/usr/bin/git", join(directory, "repository.git"), [
+      "update-ref",
+      "refs/heads/" + goalBranch(goalId),
+      proposal.content.candidate,
+      base,
+    ]);
+    await assert.rejects(executor.open(store.getTask(taskId)!), {
+      message: "goal-base-mismatch",
+    });
+
+    renameSync(join(repoRoot, ".git"), join(root, "retired-git"));
+    const pinned = await snapshotConciergeRepo(
+      repoRoot,
+      randomUUID(),
+      base,
+      true,
+      target,
+    );
+    assert.equal(pinned.commit, base);
+    assert.equal(
+      readFileSync(join(pinned.dir, "docs", "a.md"), "utf8"),
+      "before\n",
+    );
+  },
+);
+
+test(
+  "strict review concerns retain raw answers and operator retries start fresh journals",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const repoRoot = join(root, "source");
+    const directory = join(root, "runtime");
+    mkdirSync(repoRoot);
+    mkdirSync(directory, { mode: 0o700 });
+    const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
+    git(["init", "--template=", "--initial-branch=main"]);
+    const docs = join(repoRoot, "docs");
+    mkdirSync(docs);
+    const file = join(docs, "a.md");
+    writeFileSync(file, "before\n");
+    git(["add", "."]);
+    git(["commit", "-m", "initial"]);
+    writeFileSync(file, "after\n");
+    const tree = Buffer.from(
+      command("/usr/bin/tar", repoRoot, [
+        "--format",
+        "ustar",
+        "-cf",
+        "-",
+        "docs",
+      ]),
+    );
+    const taskId = task(store, goal(store));
+    const prose = 'Here is the verdict: {"review":"pass"}'.padEnd(4094, "x");
+    const longNotes = JSON.stringify({
+      review: "revise",
+      notes: "é".repeat(1100),
+    });
+    const answers = [
+      prose + "😀",
+      longNotes,
+      '\n```\n{"review":"pass"}\n```  ',
+    ];
+    const reviewerIds: string[] = [];
+    const claudeResult = (result: string) =>
+      JSON.stringify({
+        result,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      });
+    const executor = createTaskExecutor({
+      store,
+      repoRoot,
+      directory,
+      worker: () => harness,
+      reviewer: harness,
+      host: {
+        async runWorker(_plan, id, _context, options) {
+          options?.onWorkerStderr?.(
+            Buffer.from(
+              "\n" + CLAUDE_WORKER_USAGE_MARKER + claudeResult("done"),
+            ),
+            id!,
+          );
+          return { id: id!, outcome: "ok", artifacts: { files: [], tree } };
+        },
+        async runReviewer(_plan, id) {
+          const answer = answers[reviewerIds.length]!;
+          reviewerIds.push(id!);
+          return {
+            id: id!,
+            outcome: "ok",
+            response: Buffer.from(claudeResult(answer)),
+          };
+        },
+        async runVerification() {
+          throw new Error("unexpected verification");
+        },
       },
-      async runVerification() {
-        throw new Error("unexpected verification");
-      },
-    },
-  });
-  const work = runner(executor);
-  for (const [index, rawAnswer] of [prose, longNotes].entries()) {
+    });
+    const work = runner(store, executor);
+    for (const [index, rawAnswer] of [prose, longNotes].entries()) {
+      await work.drain();
+      assert.deepEqual(failure(store, taskId), {
+        status: "failed",
+        code: "review-concern",
+      });
+      assert.partialDeepStrictEqual(store.getExecution(reviewerIds[index]!), {
+        status: "failed",
+        result: { review: "concern", rawAnswer },
+      });
+      store.retryTask(taskId, index);
+    }
     await work.drain();
-    assert.deepEqual(failure(taskId), {
-      status: "failed",
-      code: "review-concern",
+    assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
+    const lastReview = store.getExecution(reviewerIds[2]!);
+    assert.partialDeepStrictEqual(lastReview, {
+      status: "succeeded",
+      result: { review: "pass" },
     });
-    assert.partialDeepStrictEqual(store.getExecution(reviewerIds[index]!), {
-      status: "failed",
-      result: { review: "concern", rawAnswer },
-    });
-    store.retryTask(taskId, index);
-  }
-  await work.drain();
-  assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
-  const lastReview = store.getExecution(reviewerIds[2]!);
-  assert.partialDeepStrictEqual(lastReview, {
-    status: "succeeded",
-    result: { review: "pass" },
-  });
-  assert.equal(Object.hasOwn(lastReview?.result as object, "rawAnswer"), false);
-  assert.equal(store.taskTokens(taskId), 12);
-  assert.equal(store.getExecution(reviewerIds[0]!)?.status, "failed");
-});
+    assert.equal(
+      Object.hasOwn(lastReview?.result as object, "rawAnswer"),
+      false,
+    );
+    assert.equal(store.taskTokens(taskId), 12);
+    assert.equal(store.getExecution(reviewerIds[0]!)?.status, "failed");
+  },
+);
 
 test("opens a populated Stage 1 database and migrates its proposal and task checks", async () => {
-  filename = join(root, "stage1.db");
+  using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "lo-tasks-"));
+  const filename = join(temp.path, "stage1.db");
   writeFileSync(filename, "", { mode: 0o600 });
   const db = new Database(filename);
   db.exec(`PRAGMA application_id=0x4c4f5231;
@@ -1441,14 +1552,14 @@ test("opens a populated Stage 1 database and migrates its proposal and task chec
   );
   assert.throws(() => db.exec("UPDATE proposals SET kind = 'integration'"));
   db.close();
-  store.close();
-  store = OrchestratorStore.open(filename);
+  using migrated = openTestStore(filename);
+  const { store } = migrated;
   assert.equal(store.getExecution("old-execution")?.taskId, taskId);
-  await runner(fixture().executor).drain();
+  await runner(store, fixture().executor).drain();
   assert.equal(store.getTask(taskId)?.status, "awaiting-integration");
   assert.equal(store.pendingIntegrations(goalId).length, 1);
   store.close();
-  store = OrchestratorStore.open(filename);
+  using _reopened = openTestStore(filename);
   const upgraded = new Database(filename);
   assert.deepEqual(upgraded.query("PRAGMA foreign_key_check").all(), []);
   assert.throws(() =>
@@ -1461,21 +1572,25 @@ test("opens a populated Stage 1 database and migrates its proposal and task chec
 });
 
 test("out-of-scope symlink targets fail before review and in-scope links require a human", async () => {
-  const goalId = goal({ integration: "agent" });
-  const denied = task(goalId, { budgets: { ...budgets, maxRetries: 0 } });
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store, { integration: "agent" });
+  const denied = task(store, goalId, {
+    budgets: { ...budgets, maxRetries: 0 },
+  });
   const unsafe = fixture({
     async changes() {
       return [{ path: "docs/link", newMode: "120000", target: "../README.md" }];
     },
   });
-  await runner(unsafe.executor).drain();
+  await runner(store, unsafe.executor).drain();
   assert.deepEqual(unsafe.calls, ["worker", "reject"]);
-  assert.deepEqual(failure(denied), {
+  assert.deepEqual(failure(store, denied), {
     status: "failed",
     code: "path-violation",
   });
 
-  task(goalId);
+  task(store, goalId);
   const safe = fixture({
     async verify() {
       return true;
@@ -1484,7 +1599,7 @@ test("out-of-scope symlink targets fail before review and in-scope links require
       return [{ path: "docs/sub/link", newMode: "120000", target: "../a.md" }];
     },
   });
-  const work = runner(safe.executor);
+  const work = runner(store, safe.executor);
   await work.drain();
   const [proposal] = store.pendingIntegrations();
   assert.ok(proposal?.kind === "integration");
@@ -1514,18 +1629,20 @@ test("out-of-scope symlink targets fail before review and in-scope links require
       { code: "approval-forbidden" },
     );
   }
-  assert.equal(approve(proposal).status, "approved");
+  assert.equal(approve(store, proposal).status, "approved");
 });
 
 test("missing Task usage is advisory and retries reset the window but preserve history", async () => {
-  const goalId = goal();
-  const unknown = task(goalId);
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const goalId = goal(store);
+  const unknown = task(store, goalId);
   const missing = fixture({
     async worker() {
       return pin;
     },
   });
-  await runner(missing.executor).drain();
+  await runner(store, missing.executor).drain();
   assert.equal(store.getTask(unknown)?.status, "awaiting-integration");
   assert.deepEqual(missing.calls, ["review"]);
   assert.partialDeepStrictEqual(store.taskUsage(unknown), {
@@ -1540,8 +1657,8 @@ test("missing Task usage is advisory and retries reset the window but preserve h
     usage: "unavailable",
   });
 
-  const rerunGoal = goal({ integration: "agent" });
-  const rerun = task(rerunGoal);
+  const rerunGoal = goal(store, { integration: "agent" });
+  const rerun = task(store, rerunGoal);
   assert.ok(store.claimTask(rerun));
   const prior = store.createExecution({
     actor: "Executor",
@@ -1564,7 +1681,7 @@ test("missing Task usage is advisory and retries reset the window but preserve h
       return pin;
     },
   });
-  const work = runner(next.executor, {
+  const work = runner(store, next.executor, {
     async runReviewer(_plan, id) {
       return {
         id,
@@ -1598,7 +1715,9 @@ test("missing Task usage is advisory and retries reset the window but preserve h
 });
 
 test("a late completion contributes to its original retry window", () => {
-  const taskId = task(goal());
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const taskId = task(store, goal(store));
   const begin = () => {
     const { id } = store.createExecution({
       actor: "Executor",
@@ -1656,14 +1775,16 @@ test("a late completion contributes to its original retry window", () => {
 });
 
 test("a failed integration approval allows one retry even with missing usage", async () => {
-  const taskId = task(goal({ integration: "agent" }));
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const taskId = task(store, goal(store, { integration: "agent" }));
   const { executor } = fixture({
     async verify() {
       return true;
     },
   });
   const calls: string[] = [];
-  const work = runner(executor, {
+  const work = runner(store, executor, {
     async runReviewer(_plan, id) {
       calls.push(id);
       return {
@@ -1717,19 +1838,21 @@ test("a failed integration approval allows one retry even with missing usage", a
 });
 
 test("approval keeps usage when a human answers while the Reviewer runs", async () => {
-  const taskId = task(goal({ integration: "agent" }));
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
+  const taskId = task(store, goal(store, { integration: "agent" }));
   const { executor } = fixture({
     async verify() {
       return true;
     },
   });
   let approvalId: string | undefined;
-  const work = runner(executor, {
+  const work = runner(store, executor, {
     async runReviewer(_plan, id) {
       approvalId = id;
       const [proposal] = store.pendingIntegrations();
       assert.ok(proposal);
-      assert.equal(approve(proposal).status, "approved");
+      assert.equal(approve(store, proposal).status, "approved");
       return {
         id,
         outcome: "ok",
@@ -1762,12 +1885,14 @@ test("approval keeps usage when a human answers while the Reviewer runs", async 
 });
 
 function stage3Fixture(
+  state: TaskState,
   policies?: PolicySet,
   verification?: "pass" | "deny-integration",
-  runnerOverrides?: Parameters<typeof runner>[1],
+  runnerOverrides?: Parameters<typeof runner>[2],
 ) {
-  const f = goalBaseFixture(true, policies);
-  const taskId = task(f.goalId);
+  const { root, store } = state;
+  const f = goalBaseFixture(state, true, policies);
+  const taskId = task(store, f.goalId);
   const scratch = join(root, "candidate");
   mkdirSync(join(scratch, "docs"), { recursive: true });
   let workers = 0;
@@ -1832,7 +1957,7 @@ function stage3Fixture(
     join(f.directory, "integrations", taskId),
     taskId,
   );
-  const work = runner(executor, runnerOverrides);
+  const work = runner(store, executor, runnerOverrides);
   return {
     ...f,
     taskId,
@@ -1852,109 +1977,132 @@ function stage3Fixture(
         );
       assert.ok(
         proposal?.kind === "integration",
-        JSON.stringify(failure(taskId)),
+        JSON.stringify(failure(store, taskId)),
       );
       return proposal;
     },
   };
 }
 
-test("integrates a verified approval and uses its committed head for a dependent", async () => {
-  const f = stage3Fixture(undefined, "pass");
-  const dependent = task(f.goalId, { dependsOn: [f.taskId] });
-  const proposal = await f.proposal();
-  assert.equal(proposal.content.verified, true);
-  assert.equal(store.getTask(dependent)?.status, "registered");
+test(
+  "integrates a verified approval and uses its committed head for a dependent",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state, undefined, "pass");
+    const dependent = task(store, f.goalId, { dependsOn: [f.taskId] });
+    const proposal = await f.proposal();
+    assert.equal(proposal.content.verified, true);
+    assert.equal(store.getTask(dependent)?.status, "registered");
 
-  approve(proposal);
-  await f.work.drain();
-  assert.equal(f.verifications(), 3); // Review both pins and integrate the first.
-  assert.equal(f.head(), proposal.content.candidate);
-  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
-  const event = store.listEvents({ subjectId: f.taskId, limit: 1 })[0];
-  assert.equal(event?.kind, "task.integrated");
-  assert.deepEqual(event?.data, {
-    proposalId: proposal.id,
-    branch: goalBranch(f.goalId),
-    base: f.base,
-    head: proposal.content.candidate,
-  });
-  const [approval] = store.listEvents({ subjectId: proposal.id, limit: 1 });
-  assert.ok(approval);
-  const decision = (await f.journal.read()).find(
-    ({ kind }) => kind === "human.decided",
-  );
-  assert.ok(decision?.kind === "human.decided");
-  assert.equal(decision.answererKind, "human");
-  assert.equal(decision.delegated, false);
-  assert.equal(
-    decision.approvalId,
-    (approval.data as { approvalId: string }).approvalId,
-  );
-  const [next] = store.pendingIntegrations();
-  assert.ok(next?.kind === "integration");
-  assert.equal(next.content.taskId, dependent);
-  assert.equal(next.content.base, proposal.content.candidate);
-  assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
-  await f.work.drain();
-  assert.equal(f.verifications(), 3);
-});
+    approve(store, proposal);
+    await f.work.drain();
+    assert.equal(f.verifications(), 3); // Review both pins and integrate the first.
+    assert.equal(f.head(), proposal.content.candidate);
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+    const event = store.listEvents({ subjectId: f.taskId, limit: 1 })[0];
+    assert.equal(event?.kind, "task.integrated");
+    assert.deepEqual(event?.data, {
+      proposalId: proposal.id,
+      branch: goalBranch(f.goalId),
+      base: f.base,
+      head: proposal.content.candidate,
+    });
+    const [approval] = store.listEvents({ subjectId: proposal.id, limit: 1 });
+    assert.ok(approval);
+    const decision = (await f.journal.read()).find(
+      ({ kind }) => kind === "human.decided",
+    );
+    assert.ok(decision?.kind === "human.decided");
+    assert.equal(decision.answererKind, "human");
+    assert.equal(decision.delegated, false);
+    assert.equal(
+      decision.approvalId,
+      (approval.data as { approvalId: string }).approvalId,
+    );
+    const [next] = store.pendingIntegrations();
+    assert.ok(next?.kind === "integration");
+    assert.equal(next.content.taskId, dependent);
+    assert.equal(next.content.base, proposal.content.candidate);
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, f.base);
+    await f.work.drain();
+    assert.equal(f.verifications(), 3);
+  },
+);
 
-test("integration verification denial fails the Task before moving the branch", async () => {
-  const f = stage3Fixture(undefined, "deny-integration");
-  const proposal = await f.proposal();
-  approve(proposal);
-  await f.work.drain();
-  assert.equal(f.verifications(), 2);
-  assert.partialDeepStrictEqual(store.getExecution(f.verificationIds[1]!), {
-    taskId: f.taskId,
-    mode: "verification",
-    status: "failed",
-    result: {
-      code: "verification-failed",
-      phase: "integration",
-      tokens: 0,
-      costUsd: null,
-    },
-  });
-  assert.equal(f.head(), f.base);
-  assert.deepEqual(failure(f.taskId), {
-    status: "failed",
-    code: "verification",
-  });
-});
+test(
+  "integration verification denial fails the Task before moving the branch",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state, undefined, "deny-integration");
+    const proposal = await f.proposal();
+    approve(store, proposal);
+    await f.work.drain();
+    assert.equal(f.verifications(), 2);
+    assert.partialDeepStrictEqual(store.getExecution(f.verificationIds[1]!), {
+      taskId: f.taskId,
+      mode: "verification",
+      status: "failed",
+      result: {
+        code: "verification-failed",
+        phase: "integration",
+        tokens: 0,
+        costUsd: null,
+      },
+    });
+    assert.equal(f.head(), f.base);
+    assert.deepEqual(failure(store, f.taskId), {
+      status: "failed",
+      code: "verification",
+    });
+  },
+);
 
-test("a deterministic M5 decision failure leaves the Goal schedulable", async () => {
-  const f = stage3Fixture();
-  const proposal = await f.proposal();
-  const dependent = task(f.goalId);
-  const events = await f.journal.read();
-  await f.journal.append(events.length, { kind: "denied", reason: "evidence" });
-  approve(proposal);
-  await f.work.drain();
-  assert.deepEqual(failure(f.taskId), {
-    status: "failed",
-    code: "integration-evidence",
-  });
-  assert.equal(f.head(), f.base);
-  assert.equal(store.getTask(dependent)?.status, "awaiting-integration");
-  assert.equal((await f.journal.read()).at(-1)?.kind, "denied");
-});
+test(
+  "a deterministic M5 decision failure leaves the Goal schedulable",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state);
+    const proposal = await f.proposal();
+    const dependent = task(store, f.goalId);
+    const events = await f.journal.read();
+    await f.journal.append(events.length, {
+      kind: "denied",
+      reason: "evidence",
+    });
+    approve(store, proposal);
+    await f.work.drain();
+    assert.deepEqual(failure(store, f.taskId), {
+      status: "failed",
+      code: "integration-evidence",
+    });
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getTask(dependent)?.status, "awaiting-integration");
+    assert.equal((await f.journal.read()).at(-1)?.kind, "denied");
+  },
+);
 
 test("runner skips raced integrations and processes another Goal in the same drain", async () => {
+  using state = orchestratorFixture("lo-tasks-");
+  const { store } = state;
   const codes = [
     "invalid-transition",
     "goal-inactive",
     "integration-uncertain",
   ] as const;
-  for (let i = 0; i <= codes.length; i++) task(goal());
+  for (let i = 0; i <= codes.length; i++) task(store, goal(store));
   const { executor } = fixture();
-  await runner(executor).drain();
+  await runner(store, executor).drain();
   const proposals = store.pendingIntegrations();
   assert.equal(proposals.length, codes.length + 1);
-  for (const proposal of proposals) approve(proposal);
+  for (const proposal of proposals) approve(store, proposal);
   const calls: string[] = [];
-  await runner({
+  await runner(store, {
     ...executor,
     async integrate(id) {
       calls.push(id);
@@ -1970,94 +2118,114 @@ test("runner skips raced integrations and processes another Goal in the same dra
   );
 });
 
-test("a verified agent approval records the agent answer in M5", async () => {
-  const f = stage3Fixture({ integration: "agent" }, "pass", {
-    async runReviewer(_plan, id) {
-      return {
-        id,
-        outcome: "ok",
-        response: Buffer.from(
-          JSON.stringify({
-            result: '{"decision":"approve","reasons":[]}',
-          }),
-        ),
-      };
-    },
-  });
-  await f.work.drain();
-  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
-  assert.partialDeepStrictEqual(
-    (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
-    { answererKind: "agent", delegated: false },
-  );
-});
-
-test("a legacy unverified proposal can be approved and integrated without a rewrite", async () => {
-  const f = stage3Fixture();
-  const proposal = await f.proposal();
-  const { verified: _verified, ...content } = proposal.content;
-  const digest = contentDigest(content);
-  const db = new Database(filename);
-  try {
-    db.query(
-      "UPDATE proposals SET content_json = ?, digest = ? WHERE id = ?",
-    ).run(JSON.stringify(content), digest, proposal.id);
-  } finally {
-    db.close();
-  }
-  approve({ id: proposal.id, digest });
-  await f.work.drain();
-  assert.equal(f.verifications(), 0);
-  assert.equal(f.head(), proposal.content.candidate);
-  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
-});
-
-test("unverified integration refuses an agent answer and accepts a delegated human", async () => {
-  const f = stage3Fixture({ integration: "agent" });
-  const proposal = await f.proposal();
-  assert.equal(proposal.content.verified, false);
-  assert.equal(proposal.policy, "agent");
-  await assert.rejects(f.work.requestApproval(proposal.id), {
-    code: "approval-forbidden",
-  });
-  const approval = store.createExecution({
-    actor: "Reviewer",
-    mode: "approval",
-    taskId: f.taskId,
-    requestedBy: { kind: "host" },
-  });
-  store.startExecution(approval.id);
-  assert.throws(
-    () =>
-      store.decide(proposal.id, {
-        decision: "approve",
-        digest: proposal.digest,
-        answerer: { kind: "agent", executionId: approval.id, model },
-      }),
-    { code: "approval-forbidden" },
-  );
-  store.finishExecution(approval.id, "failed", { code: "approval-forbidden" });
-  store.decide(proposal.id, {
-    decision: "approve",
-    digest: proposal.digest,
-    answerer: {
-      kind: "human",
-      delegate: {
-        agent: "claude-code",
-        session: "session-1",
-        authorization: "operator approved",
+test(
+  "a verified agent approval records the agent answer in M5",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state, { integration: "agent" }, "pass", {
+      async runReviewer(_plan, id) {
+        return {
+          id,
+          outcome: "ok",
+          response: Buffer.from(
+            JSON.stringify({
+              result: '{"decision":"approve","reasons":[]}',
+            }),
+          ),
+        };
       },
-    },
-  });
-  await f.work.drain();
-  assert.equal(f.verifications(), 0);
-  assert.equal(f.head(), proposal.content.candidate);
-  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
-  assert.partialDeepStrictEqual(
-    (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
-    { answererKind: "human", delegated: true },
-  );
-});
+    });
+    await f.work.drain();
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+    assert.partialDeepStrictEqual(
+      (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
+      { answererKind: "agent", delegated: false },
+    );
+  },
+);
+
+test(
+  "a legacy unverified proposal can be approved and integrated without a rewrite",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { filename, store } = state;
+    const f = stage3Fixture(state);
+    const proposal = await f.proposal();
+    const { verified: _verified, ...content } = proposal.content;
+    const digest = contentDigest(content);
+    const db = new Database(filename);
+    try {
+      db.query(
+        "UPDATE proposals SET content_json = ?, digest = ? WHERE id = ?",
+      ).run(JSON.stringify(content), digest, proposal.id);
+    } finally {
+      db.close();
+    }
+    approve(store, { id: proposal.id, digest });
+    await f.work.drain();
+    assert.equal(f.verifications(), 0);
+    assert.equal(f.head(), proposal.content.candidate);
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+  },
+);
+
+test(
+  "unverified integration refuses an agent answer and accepts a delegated human",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state, { integration: "agent" });
+    const proposal = await f.proposal();
+    assert.equal(proposal.content.verified, false);
+    assert.equal(proposal.policy, "agent");
+    await assert.rejects(f.work.requestApproval(proposal.id), {
+      code: "approval-forbidden",
+    });
+    const approval = store.createExecution({
+      actor: "Reviewer",
+      mode: "approval",
+      taskId: f.taskId,
+      requestedBy: { kind: "host" },
+    });
+    store.startExecution(approval.id);
+    assert.throws(
+      () =>
+        store.decide(proposal.id, {
+          decision: "approve",
+          digest: proposal.digest,
+          answerer: { kind: "agent", executionId: approval.id, model },
+        }),
+      { code: "approval-forbidden" },
+    );
+    store.finishExecution(approval.id, "failed", {
+      code: "approval-forbidden",
+    });
+    store.decide(proposal.id, {
+      decision: "approve",
+      digest: proposal.digest,
+      answerer: {
+        kind: "human",
+        delegate: {
+          agent: "claude-code",
+          session: "session-1",
+          authorization: "operator approved",
+        },
+      },
+    });
+    await f.work.drain();
+    assert.equal(f.verifications(), 0);
+    assert.equal(f.head(), proposal.content.candidate);
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+    assert.partialDeepStrictEqual(
+      (await f.journal.read()).find(({ kind }) => kind === "human.decided"),
+      { answererKind: "human", delegated: true },
+    );
+  },
+);
 
 for (const mismatch of [
   "approval digest",
@@ -2066,315 +2234,357 @@ for (const mismatch of [
   "paths",
   "stale-base",
 ]) {
-  test(`approved integration refuses ${mismatch} before the M5 decision`, async () => {
-    const f = stage3Fixture();
-    const proposal = await f.proposal();
-    const events = await f.journal.read();
-    approve(proposal);
-    const db = new Database(filename);
-    try {
-      if (mismatch === "stale-base") {
-        f.git(["push", f.bare, `${f.next}:${f.ref}`]);
-      } else if (mismatch === "approval digest") {
-        db.query("UPDATE approvals SET digest = ? WHERE proposal_id = ?").run(
-          "0".repeat(64),
-          proposal.id,
-        );
-      } else {
-        const content = {
-          ...proposal.content,
-          ...(mismatch === "candidate" && { candidate: "0".repeat(40) }),
-          ...(mismatch === "base" && { base: f.next }),
-          ...(mismatch === "paths" && { changedPaths: ["docs/other.md"] }),
-        };
-        const digest = contentDigest(content);
-        db.query(
-          "UPDATE proposals SET content_json = ?, digest = ? WHERE id = ?",
-        ).run(JSON.stringify(content), digest, proposal.id);
-        db.query("UPDATE approvals SET digest = ? WHERE proposal_id = ?").run(
-          digest,
-          proposal.id,
-        );
+  test(
+    `approved integration refuses ${mismatch} before the M5 decision`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-tasks-");
+      const { filename, store } = state;
+      const f = stage3Fixture(state);
+      const proposal = await f.proposal();
+      const events = await f.journal.read();
+      approve(store, proposal);
+      const db = new Database(filename);
+      try {
+        if (mismatch === "stale-base") {
+          f.git(["push", f.bare, `${f.next}:${f.ref}`]);
+        } else if (mismatch === "approval digest") {
+          db.query("UPDATE approvals SET digest = ? WHERE proposal_id = ?").run(
+            "0".repeat(64),
+            proposal.id,
+          );
+        } else {
+          const content = {
+            ...proposal.content,
+            ...(mismatch === "candidate" && { candidate: "0".repeat(40) }),
+            ...(mismatch === "base" && { base: f.next }),
+            ...(mismatch === "paths" && { changedPaths: ["docs/other.md"] }),
+          };
+          const digest = contentDigest(content);
+          db.query(
+            "UPDATE proposals SET content_json = ?, digest = ? WHERE id = ?",
+          ).run(JSON.stringify(content), digest, proposal.id);
+          db.query("UPDATE approvals SET digest = ? WHERE proposal_id = ?").run(
+            digest,
+            proposal.id,
+          );
+        }
+      } finally {
+        db.close();
       }
-    } finally {
-      db.close();
-    }
-    await f.work.drain();
-    assert.deepEqual(await f.journal.read(), events);
-    assert.equal(f.head(), mismatch === "stale-base" ? f.next : f.base);
-    assert.deepEqual(failure(f.taskId), {
-      status: "failed",
-      code:
-        mismatch === "stale-base"
-          ? mismatch
-          : mismatch === "approval digest"
-            ? "stale-digest"
-            : "candidate-mismatch",
-    });
-  });
+      await f.work.drain();
+      assert.deepEqual(await f.journal.read(), events);
+      assert.equal(f.head(), mismatch === "stale-base" ? f.next : f.base);
+      assert.deepEqual(failure(store, f.taskId), {
+        status: "failed",
+        code:
+          mismatch === "stale-base"
+            ? mismatch
+            : mismatch === "approval digest"
+              ? "stale-digest"
+              : "candidate-mismatch",
+      });
+    },
+  );
 }
 
-test("an earlier approval cannot consume a retried Task's proposal", async () => {
-  const f = stage3Fixture();
-  const first = await f.proposal();
-  approve(first);
-  f.git(["push", f.bare, `${f.next}:${f.ref}`]);
-  await f.work.drain();
-  assert.equal(store.getTask(f.taskId)?.status, "failed");
-  f.bareGit(["update-ref", f.ref, f.base, f.next]);
-  store.retryTask(f.taskId, 0);
+test(
+  "an earlier approval cannot consume a retried Task's proposal",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { store } = state;
+    const f = stage3Fixture(state);
+    const first = await f.proposal();
+    approve(store, first);
+    f.git(["push", f.bare, `${f.next}:${f.ref}`]);
+    await f.work.drain();
+    assert.equal(store.getTask(f.taskId)?.status, "failed");
+    f.bareGit(["update-ref", f.ref, f.base, f.next]);
+    store.retryTask(f.taskId, 0);
 
-  const second = await f.proposal();
-  assert.notEqual(first.id, second.id);
-  assert.equal(store.getTask(f.taskId)?.status, "awaiting-integration");
-  assert.equal(f.head(), f.base);
-  approve(second);
-  await f.work.drain();
-  assert.equal(store.getTask(f.taskId)?.status, "succeeded");
-  assert.equal(f.head(), second.content.candidate);
-});
+    const second = await f.proposal();
+    assert.notEqual(first.id, second.id);
+    assert.equal(store.getTask(f.taskId)?.status, "awaiting-integration");
+    assert.equal(f.head(), f.base);
+    approve(store, second);
+    await f.work.drain();
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+    assert.equal(f.head(), second.content.candidate);
+  },
+);
 
 for (const updated of [false, true]) {
-  test(`an uncertain integration pauses its Goal and reconcile handles ${updated ? "an advanced ref" : "an unchanged ref"}`, async () => {
-    const f = stage3Fixture();
-    const proposal = await f.proposal();
-    const next = task(f.goalId);
-    approve(proposal);
-    const lock = join(f.bare, f.ref + ".lock");
-    writeFileSync(lock, "");
-    await f.work.drain();
-    unlinkSync(lock);
-    assert.equal(
-      (await f.journal.read()).at(-1)?.kind,
-      "integration.uncertain",
-    );
-    assert.equal(store.getTask(f.taskId)?.code, "integration-uncertain");
-    assert.equal(store.getTask(next)?.status, "registered");
+  test(
+    `an uncertain integration pauses its Goal and reconcile handles ${updated ? "an advanced ref" : "an unchanged ref"}`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-tasks-");
+      const { store } = state;
+      const f = stage3Fixture(state);
+      const proposal = await f.proposal();
+      const next = task(store, f.goalId);
+      approve(store, proposal);
+      const lock = join(f.bare, f.ref + ".lock");
+      writeFileSync(lock, "");
+      await f.work.drain();
+      unlinkSync(lock);
+      assert.equal(
+        (await f.journal.read()).at(-1)?.kind,
+        "integration.uncertain",
+      );
+      assert.equal(store.getTask(f.taskId)?.code, "integration-uncertain");
+      assert.equal(store.getTask(next)?.status, "registered");
 
-    if (updated)
-      f.bareGit(["update-ref", f.ref, proposal.content.candidate, f.base]);
-    const result = await f.cli(["reconcile"], true, () => "reconcile 1");
-    assert.equal(result.code, 0, result.stderr.join(""));
-    assert.equal(
-      store.getTask(f.taskId)?.status,
-      updated ? "succeeded" : "failed",
-    );
-    await f.work.drain();
-    assert.equal(store.getTask(next)?.status, "awaiting-integration");
-  });
+      if (updated)
+        f.bareGit(["update-ref", f.ref, proposal.content.candidate, f.base]);
+      const result = await f.cli(["reconcile"], true, () => "reconcile 1");
+      assert.equal(result.code, 0, result.stderr.join(""));
+      assert.equal(
+        store.getTask(f.taskId)?.status,
+        updated ? "succeeded" : "failed",
+      );
+      await f.work.drain();
+      assert.equal(store.getTask(next)?.status, "awaiting-integration");
+    },
+  );
 }
 
-test("export creates and fast-forwards only the local Goal ref and refuses divergence", async () => {
-  const f = stage3Fixture();
-  const proposal = await f.proposal();
-  const branch = goalBranch(f.goalId);
-  const checkout = join(root, "operator");
-  f.git(["worktree", "add", "--detach", checkout, f.base]);
-  const operator = (args: string[]) =>
-    String(command("/usr/bin/git", checkout, args, "utf8")).trim();
-  const args = ["export-goal-branch", f.goalId, "--repo", checkout];
-  const exportAt = (to: string) =>
-    f.cli(
-      args,
-      true,
-      () => `export-goal-branch ${f.goalId} ${to.slice(0, 12)}`,
+test(
+  "export creates and fast-forwards only the local Goal ref and refuses divergence",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const f = stage3Fixture(state);
+    const proposal = await f.proposal();
+    const branch = goalBranch(f.goalId);
+    const checkout = join(root, "operator");
+    f.git(["worktree", "add", "--detach", checkout, f.base]);
+    const operator = (args: string[]) =>
+      String(command("/usr/bin/git", checkout, args, "utf8")).trim();
+    const args = ["export-goal-branch", f.goalId, "--repo", checkout];
+    const exportAt = (to: string) =>
+      f.cli(
+        args,
+        true,
+        () => `export-goal-branch ${f.goalId} ${to.slice(0, 12)}`,
+      );
+    const initialHead = operator(["rev-parse", "HEAD"]);
+    const dirty = join(checkout, "operator.txt");
+    writeFileSync(dirty, "preserve me\n");
+    assert.match(
+      (await f.cli(args, false)).stderr.join(""),
+      /requires a terminal/,
     );
-  const initialHead = operator(["rev-parse", "HEAD"]);
-  const dirty = join(checkout, "operator.txt");
-  writeFileSync(dirty, "preserve me\n");
-  assert.match(
-    (await f.cli(args, false)).stderr.join(""),
-    /requires a terminal/,
-  );
-  assert.match(
-    (await f.cli(args, true, () => "yes")).stderr.join(""),
-    /Confirmation did not match/,
-  );
+    assert.match(
+      (await f.cli(args, true, () => "yes")).stderr.join(""),
+      /Confirmation did not match/,
+    );
 
-  const hook = join(f.repoRoot, ".git", "reference-transaction");
-  writeFileSync(hook, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
-  f.git(["config", "core.hooksPath", join(f.repoRoot, ".git")]);
-  const created = await exportAt(f.base);
-  assert.equal(created.code, 0, created.stderr.join(""));
-  assert.match(created.stdout.join(""), /open a pull request to main/);
-  assert.equal(operator(["rev-parse", f.ref]), f.base);
+    const hook = join(f.repoRoot, ".git", "reference-transaction");
+    writeFileSync(hook, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+    f.git(["config", "core.hooksPath", join(f.repoRoot, ".git")]);
+    const created = await exportAt(f.base);
+    assert.equal(created.code, 0, created.stderr.join(""));
+    assert.match(created.stdout.join(""), /open a pull request to main/);
+    assert.equal(operator(["rev-parse", f.ref]), f.base);
 
-  approve(proposal);
-  await f.work.drain();
-  const notes: string[] = [];
-  await assert.rejects(
-    previewGoalBranchExport(
-      store,
-      checkout,
-      f.directory,
-      f.goalId,
-      createCredentialScanner({ leakPatterns: ["Candidate 1"] }, root, (note) =>
-        notes.push(note),
-      ),
-    ),
-    { code: "credential-leak" },
-  );
-  assert.equal(notes.length, 1);
-  assert.equal(operator(["rev-parse", f.ref]), f.base);
-  const advanced = await exportAt(proposal.content.candidate);
-  assert.equal(advanced.code, 0, advanced.stderr.join(""));
-  assert.equal(operator(["show", `${branch}:docs/a.md`]), "Candidate 1");
-  assert.equal(operator(["rev-parse", f.ref]), proposal.content.candidate);
-  assert.equal(operator(["rev-parse", "HEAD"]), initialHead);
-  assert.equal(operator(["rev-parse", "main"]), f.next);
-  assert.equal(readFileSync(dirty, "utf8"), "preserve me\n");
-  assert.deepEqual(
-    store
-      .listEvents({ subjectId: f.goalId, limit: 50 })
-      .filter(({ kind }) => kind === "goal.exported")
-      .map(({ data }) => data),
-    [
-      { branch, from: f.base, to: proposal.content.candidate },
-      { branch, from: null, to: f.base },
-    ],
-  );
-
-  operator(["-c", "core.hooksPath=/dev/null", "update-ref", f.ref, f.next]);
-  const refused = await exportAt(proposal.content.candidate);
-  assert.equal(refused.code, 1);
-  assert.match(refused.stderr.join(""), /non-fast-forward/);
-  assert.equal(operator(["rev-parse", f.ref]), f.next);
-  operator(["-c", "core.hooksPath=/dev/null", "switch", branch]);
-  const checkedOut = await exportAt(proposal.content.candidate);
-  assert.equal(checkedOut.code, 1);
-  assert.match(checkedOut.stderr.join(""), /branch-checked-out/);
-});
-
-test("export refuses an unaudited private head before and after confirmation", async () => {
-  const f = stage3Fixture();
-  const proposal = await f.proposal();
-  approve(proposal);
-  await f.work.drain();
-  const head = proposal.content.candidate;
-  const args = ["export-goal-branch", f.goalId];
-  const setHead = (to: string) => f.bareGit(["update-ref", f.ref, to]);
-  const reply = () => `export-goal-branch ${f.goalId} ${head.slice(0, 12)}`;
-  const unusedDb = join(root, "unused-export.db");
-  const missingRepo = await f.cli(
-    [...args, "--repo", f.repoRoot],
-    true,
-    reply,
-    unusedDb,
-  );
-  assert.equal(missingRepo.code, 1);
-  assert.match(
-    missingRepo.stderr.join(""),
-    /custom --db, pass --target for the launcher target/,
-  );
-  assert.deepEqual(missingRepo.questions, []);
-  assert.equal(existsSync(unusedDb), false);
-
-  setHead(f.base);
-  const preview = await f.cli(args, true, reply);
-  assert.equal(preview.code, 1);
-  assert.match(preview.stderr.join(""), /export-head-mismatch/);
-  assert.deepEqual(preview.questions, []);
-
-  setHead(head);
-  const apply = await f.cli(args, true, () => {
-    setHead(f.base);
-    return reply();
-  });
-  assert.equal(apply.code, 1);
-  assert.match(apply.stderr.join(""), /export-head-mismatch/);
-  assert.equal(apply.questions.length, 1);
-  assert.equal(f.git(["for-each-ref", f.ref]), "");
-  assert.ok(
-    store
-      .listEvents({ subjectId: f.goalId, limit: 50 })
-      .every(({ kind }) => !kind.startsWith("goal.export")),
-  );
-});
-
-test("credential text in candidate content, commit messages, or review answers fails the Task", async () => {
-  const repoRoot = join(root, "repo");
-  mkdirSync(repoRoot);
-  const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
-  git(["init", "--template=", "--initial-branch=main"]);
-  mkdirSync(join(repoRoot, "docs"));
-  writeFileSync(join(repoRoot, "docs", "file"), "before\n");
-  git(["add", "."]);
-  git(["commit", "-m", "initial"]);
-  const env = configEnv(root);
-  addProject(repoRoot, undefined, env);
-  const target = await resolveTarget(repoRoot, root, env);
-  const { directory } = target;
-  await prepareTargetDirectory(target.bootstrapRoot, directory, env);
-  const scratch = join(root, "scratch");
-  mkdirSync(join(scratch, "docs"), { recursive: true });
-  const secret = "sk-ant-6XX4TbRwxwZyOuIuFZzWa5vP6KJ";
-  for (const input of ["file", "message", "review"] as const) {
+    approve(store, proposal);
+    await f.work.drain();
     const notes: string[] = [];
-    let reviews = 0;
-    const scan = createCredentialScanner({}, root, (note) => notes.push(note));
-    const executor = createTaskExecutor({
-      store,
-      repoRoot,
-      directory,
-      scan,
-      worker: () => harness,
-      reviewer: harness,
-      host: {
-        async runWorker(_, id) {
-          writeFileSync(
-            join(scratch, "docs", "file"),
-            input === "file" ? secret : "after\n",
-          );
-          return {
-            id: id!,
-            outcome: "ok",
-            artifacts: {
-              files: [],
-              tree: Buffer.from(
-                command("/usr/bin/tar", scratch, [
-                  "--format",
-                  "ustar",
-                  "-cf",
-                  "-",
-                  "docs",
-                ]),
-              ),
-              ...(input === "message" ? { message: Buffer.from(secret) } : {}),
-            },
-          };
-        },
-        async runVerification() {
-          throw new Error("Unexpected verification");
-        },
-        async runReviewer(_, id) {
-          reviews++;
-          return {
-            id: id!,
-            outcome: "ok",
-            response: Buffer.from(
-              JSON.stringify({
-                result: JSON.stringify({ review: "revise", notes: secret }),
-              }),
-            ),
-          };
-        },
-      },
-    });
-    const goalId = goal();
-    const id = task(goalId);
-    await runTask(store, executor, id, undefined, scan);
-    assert.equal(store.getTask(id)?.status, "failed");
-    assert.equal(store.pendingIntegrations(goalId).length, 0);
-    assert.deepEqual(store.listEvents({ subjectId: id, limit: 1 })[0]?.data, {
-      status: "failed",
-      code: "credential-leak",
-    });
-    assert.ok(
-      !JSON.stringify(store.listEvents({ subjectId: id, limit: 50 })).includes(
-        secret,
+    await assert.rejects(
+      previewGoalBranchExport(
+        store,
+        checkout,
+        f.directory,
+        f.goalId,
+        createCredentialScanner(
+          { leakPatterns: ["Candidate 1"] },
+          root,
+          (note) => notes.push(note),
+        ),
       ),
+      { code: "credential-leak" },
     );
-    assert.equal(reviews, input === "review" ? 1 : 0);
     assert.equal(notes.length, 1);
-  }
-});
+    assert.equal(operator(["rev-parse", f.ref]), f.base);
+    const advanced = await exportAt(proposal.content.candidate);
+    assert.equal(advanced.code, 0, advanced.stderr.join(""));
+    assert.equal(operator(["show", `${branch}:docs/a.md`]), "Candidate 1");
+    assert.equal(operator(["rev-parse", f.ref]), proposal.content.candidate);
+    assert.equal(operator(["rev-parse", "HEAD"]), initialHead);
+    assert.equal(operator(["rev-parse", "main"]), f.next);
+    assert.equal(readFileSync(dirty, "utf8"), "preserve me\n");
+    assert.deepEqual(
+      store
+        .listEvents({ subjectId: f.goalId, limit: 50 })
+        .filter(({ kind }) => kind === "goal.exported")
+        .map(({ data }) => data),
+      [
+        { branch, from: f.base, to: proposal.content.candidate },
+        { branch, from: null, to: f.base },
+      ],
+    );
+
+    operator(["-c", "core.hooksPath=/dev/null", "update-ref", f.ref, f.next]);
+    const refused = await exportAt(proposal.content.candidate);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr.join(""), /non-fast-forward/);
+    assert.equal(operator(["rev-parse", f.ref]), f.next);
+    operator(["-c", "core.hooksPath=/dev/null", "switch", branch]);
+    const checkedOut = await exportAt(proposal.content.candidate);
+    assert.equal(checkedOut.code, 1);
+    assert.match(checkedOut.stderr.join(""), /branch-checked-out/);
+  },
+);
+
+test(
+  "export refuses an unaudited private head before and after confirmation",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const f = stage3Fixture(state);
+    const proposal = await f.proposal();
+    approve(store, proposal);
+    await f.work.drain();
+    const head = proposal.content.candidate;
+    const args = ["export-goal-branch", f.goalId];
+    const setHead = (to: string) => f.bareGit(["update-ref", f.ref, to]);
+    const reply = () => `export-goal-branch ${f.goalId} ${head.slice(0, 12)}`;
+    const unusedDb = join(root, "unused-export.db");
+    const missingRepo = await f.cli(
+      [...args, "--repo", f.repoRoot],
+      true,
+      reply,
+      unusedDb,
+    );
+    assert.equal(missingRepo.code, 1);
+    assert.match(
+      missingRepo.stderr.join(""),
+      /custom --db, pass --target for the launcher target/,
+    );
+    assert.deepEqual(missingRepo.questions, []);
+    assert.equal(existsSync(unusedDb), false);
+
+    setHead(f.base);
+    const preview = await f.cli(args, true, reply);
+    assert.equal(preview.code, 1);
+    assert.match(preview.stderr.join(""), /export-head-mismatch/);
+    assert.deepEqual(preview.questions, []);
+
+    setHead(head);
+    const apply = await f.cli(args, true, () => {
+      setHead(f.base);
+      return reply();
+    });
+    assert.equal(apply.code, 1);
+    assert.match(apply.stderr.join(""), /export-head-mismatch/);
+    assert.equal(apply.questions.length, 1);
+    assert.equal(f.git(["for-each-ref", f.ref]), "");
+    assert.ok(
+      store
+        .listEvents({ subjectId: f.goalId, limit: 50 })
+        .every(({ kind }) => !kind.startsWith("goal.export")),
+    );
+  },
+);
+
+test(
+  "credential text in candidate content, commit messages, or review answers fails the Task",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const repoRoot = join(root, "repo");
+    mkdirSync(repoRoot);
+    const git = (args: string[]) => command("/usr/bin/git", repoRoot, args);
+    git(["init", "--template=", "--initial-branch=main"]);
+    mkdirSync(join(repoRoot, "docs"));
+    writeFileSync(join(repoRoot, "docs", "file"), "before\n");
+    git(["add", "."]);
+    git(["commit", "-m", "initial"]);
+    const env = configEnv(root);
+    addProject(repoRoot, undefined, env);
+    const target = await resolveTarget(repoRoot, root, env);
+    const { directory } = target;
+    await prepareTargetDirectory(target.bootstrapRoot, directory, env);
+    const scratch = join(root, "scratch");
+    mkdirSync(join(scratch, "docs"), { recursive: true });
+    const secret = "sk-ant-6XX4TbRwxwZyOuIuFZzWa5vP6KJ";
+    for (const input of ["file", "message", "review"] as const) {
+      const notes: string[] = [];
+      let reviews = 0;
+      const scan = createCredentialScanner({}, root, (note) =>
+        notes.push(note),
+      );
+      const executor = createTaskExecutor({
+        store,
+        repoRoot,
+        directory,
+        scan,
+        worker: () => harness,
+        reviewer: harness,
+        host: {
+          async runWorker(_, id) {
+            writeFileSync(
+              join(scratch, "docs", "file"),
+              input === "file" ? secret : "after\n",
+            );
+            return {
+              id: id!,
+              outcome: "ok",
+              artifacts: {
+                files: [],
+                tree: Buffer.from(
+                  command("/usr/bin/tar", scratch, [
+                    "--format",
+                    "ustar",
+                    "-cf",
+                    "-",
+                    "docs",
+                  ]),
+                ),
+                ...(input === "message"
+                  ? { message: Buffer.from(secret) }
+                  : {}),
+              },
+            };
+          },
+          async runVerification() {
+            throw new Error("Unexpected verification");
+          },
+          async runReviewer(_, id) {
+            reviews++;
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from(
+                JSON.stringify({
+                  result: JSON.stringify({ review: "revise", notes: secret }),
+                }),
+              ),
+            };
+          },
+        },
+      });
+      const goalId = goal(store);
+      const id = task(store, goalId);
+      await runTask(store, executor, id, undefined, scan);
+      assert.equal(store.getTask(id)?.status, "failed");
+      assert.equal(store.pendingIntegrations(goalId).length, 0);
+      assert.deepEqual(store.listEvents({ subjectId: id, limit: 1 })[0]?.data, {
+        status: "failed",
+        code: "credential-leak",
+      });
+      assert.ok(
+        !JSON.stringify(
+          store.listEvents({ subjectId: id, limit: 50 }),
+        ).includes(secret),
+      );
+      assert.equal(reviews, input === "review" ? 1 : 0);
+      assert.equal(notes.length, 1);
+    }
+  },
+);

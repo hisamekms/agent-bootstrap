@@ -1,16 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, test } from "node:test";
+import { test } from "node:test";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import {
   canonicalJson,
   contentDigest,
 } from "../src/local-orchestrator/model.ts";
-import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
 import { configEnv } from "./config-fixture.ts";
+import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   Database: new (filename: string) => {
@@ -50,22 +47,8 @@ const delegationFlags = [
   delegate.authorization,
 ];
 
-let folder: string;
-let filename: string;
-let store: OrchestratorStore;
-
-beforeEach(() => {
-  folder = mkdtempSync(join(realpathSync(tmpdir()), "local-orchestrator-cli-"));
-  filename = join(folder, "state.db");
-  store = OrchestratorStore.open(filename);
-});
-
-afterEach(() => {
-  store.close();
-  rmSync(folder, { recursive: true, force: true });
-});
-
 async function cli(
+  { root, filename }: ReturnType<typeof orchestratorFixture>,
   args: string[],
   {
     isTTY = false,
@@ -90,15 +73,17 @@ async function cli(
         return answer?.(question, stdout);
       },
     },
-    folder,
-    configEnv(folder),
+    root,
+    configEnv(root),
   );
   return { code, stdout, stderr, questions };
 }
 
 test("status reports counts and pending gates, and show and proposals include content and origin", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
-  const status = await cli(["status"]);
+  const status = await cli(state, ["status"]);
   assert.equal(status.code, 0);
   assert.deepEqual(JSON.parse(status.stdout), {
     counts: { goals: 0, tasks: 0, proposals: 1, pending: 1 },
@@ -117,7 +102,7 @@ test("status reports counts and pending gates, and show and proposals include co
     ],
   });
 
-  const shown = await cli(["show", id]);
+  const shown = await cli(state, ["show", id]);
   assert.equal(shown.code, 0);
   assert.partialDeepStrictEqual(JSON.parse(shown.stdout), {
     id,
@@ -129,21 +114,23 @@ test("status reports counts and pending gates, and show and proposals include co
     content: goal,
     origin,
   });
-  const pending = await cli(["proposals", "--status", "pending"]);
+  const pending = await cli(state, ["proposals", "--status", "pending"]);
   assert.equal(pending.code, 0);
   assert.deepEqual(JSON.parse(pending.stdout), [JSON.parse(shown.stdout)]);
-  const rejected = await cli(["proposals", "--status", "rejected"]);
+  const rejected = await cli(state, ["proposals", "--status", "rejected"]);
   assert.equal(rejected.code, 0);
   assert.deepEqual(JSON.parse(rejected.stdout), []);
 });
 
 test("proposal display identifies human requirements under an inherited agent policy", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   store.setProjectDefaults(
     { "goal-registration": "agent", "task-registration": "agent" },
     { kind: "operator" },
   );
   const proposal = store.proposeGoal(goal, origin);
-  const shown = await cli(["show", proposal.id]);
+  const shown = await cli(state, ["show", proposal.id]);
   assert.equal(shown.code, 0);
   assert.partialDeepStrictEqual(JSON.parse(shown.stdout), {
     effectivePolicy: "agent",
@@ -173,7 +160,7 @@ test("proposal display identifies human requirements under an inherited agent po
     },
     origin,
   );
-  const status = await cli(["status"]);
+  const status = await cli(state, ["status"]);
   assert.equal(status.code, 0);
   assert.partialDeepStrictEqual(JSON.parse(status.stdout), {
     counts: { goals: 1, tasks: 0, proposals: 2, pending: 1 },
@@ -190,6 +177,8 @@ test("proposal display identifies human requirements under an inherited agent po
 });
 
 test("show matches store details after the project policy changes", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
   store.decide(id, {
     digest,
@@ -209,7 +198,7 @@ test("show matches store details after the project policy changes", async () => 
     ...proposal
   } = details;
   assert.equal(effectivePolicy, "human");
-  const shown = await cli(["show", id]);
+  const shown = await cli(state, ["show", id]);
   assert.equal(shown.code, 0);
   assert.deepEqual(JSON.parse(shown.stdout), {
     ...proposal,
@@ -220,9 +209,11 @@ test("show matches store details after the project policy changes", async () => 
 });
 
 test("a TTY approval shows the proposal first and records a human answer bound to its digest", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
   const phrase = `approve ${digest.slice(0, 12)}`;
-  const result = await cli(["approve", id], {
+  const result = await cli(state, ["approve", id], {
     isTTY: true,
     answer(question, stdout) {
       assert.equal(question, `Type "${phrase}" to confirm: `);
@@ -244,17 +235,19 @@ test("a TTY approval shows the proposal first and records a human answer bound t
 });
 
 test("delegated approvals and rejections use the normal confirmation and display attribution", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   for (const decision of ["approve", "reject"]) {
     const { id, digest } = store.proposeGoal(goal, origin);
     const phrase = `${decision} ${digest.slice(0, 12)}`;
-    const result = await cli([decision, id, ...delegationFlags], {
+    const result = await cli(state, [decision, id, ...delegationFlags], {
       isTTY: true,
       answer: () => phrase,
     });
     assert.equal(result.code, 0);
     assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
     assert.match(result.stdout, /\nAnswer recorded as delegated\.\n$/);
-    const shown = await cli(["show", id]);
+    const shown = await cli(state, ["show", id]);
     assert.equal(shown.code, 0);
     assert.match(shown.stdout, /\\u202e/);
     assert.doesNotMatch(shown.stdout, /\u202e/u);
@@ -267,7 +260,13 @@ test("delegated approvals and rejections use the normal confirmation and display
       false,
     );
 
-    const events = await cli(["events", "--subject", id, "--limit", "1"]);
+    const events = await cli(state, [
+      "events",
+      "--subject",
+      id,
+      "--limit",
+      "1",
+    ]);
     assert.equal(events.code, 0);
     assert.partialDeepStrictEqual(JSON.parse(events.stdout)[0], {
       kind: "proposal.decided",
@@ -284,6 +283,8 @@ test("delegated approvals and rejections use the normal confirmation and display
 });
 
 test("delegation flags must be complete and valid before prompting", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id } = store.proposeGoal(goal, origin);
   for (const flags of [
     ["--on-behalf"],
@@ -308,7 +309,7 @@ test("delegation flags must be complete and valid before prompting", async () =>
     [...delegationFlags.slice(0, 4), "a".repeat(501)],
     [...delegationFlags.slice(0, 4), "line\nbreak"],
   ]) {
-    const result = await cli(["approve", id, ...flags], { isTTY: true });
+    const result = await cli(state, ["approve", id, ...flags], { isTTY: true });
     assert.equal(result.code, 2, JSON.stringify(flags));
     assert.match(result.stderr, /^Usage:/);
     assert.deepEqual(result.questions, []);
@@ -321,11 +322,13 @@ test("delegation flags must be complete and valid before prompting", async () =>
 });
 
 test("only an exact confirmation can record a decision, including rejection", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
   const before = store.listEvents({ limit: 10 });
   const phrase = `reject ${digest.slice(0, 12)}`;
   for (const answer of [` ${phrase}`, `${phrase} `, "yes", undefined]) {
-    const result = await cli(["reject", id], {
+    const result = await cli(state, ["reject", id], {
       isTTY: true,
       answer: () => answer,
     });
@@ -335,7 +338,7 @@ test("only an exact confirmation can record a decision, including rejection", as
     assert.deepEqual(store.listEvents({ limit: 10 }), before);
   }
 
-  const result = await cli(["reject", id], {
+  const result = await cli(state, ["reject", id], {
     isTTY: true,
     answer: () => phrase,
   });
@@ -344,6 +347,8 @@ test("only an exact confirmation can record a decision, including rejection", as
 });
 
 test("mutating commands refuse non-TTY input without prompting or writing", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
   const before = store.listEvents({ limit: 10 });
   for (const args of [
@@ -353,7 +358,7 @@ test("mutating commands refuse non-TTY input without prompting or writing", asyn
     ["reject", id, ...delegationFlags],
     ["policy", "set", "integration", "agent"],
   ]) {
-    const result = await cli(args, {
+    const result = await cli(state, args, {
       answer: () => `approve ${digest.slice(0, 12)}`,
     });
     assert.deepEqual(result, {
@@ -368,9 +373,11 @@ test("mutating commands refuse non-TTY input without prompting or writing", asyn
 });
 
 test("a change during confirmation fails with the stale digest message", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store, filename } = state;
   const { id, digest } = store.proposeGoal(goal, origin);
   const before = store.listEvents({ limit: 10 });
-  const result = await cli(["approve", id], {
+  const result = await cli(state, ["approve", id], {
     isTTY: true,
     answer() {
       const changed = { ...goal, title: "Changed while the operator reviewed" };
@@ -395,13 +402,18 @@ test("a change during confirmation fails with the stale digest message", async (
 });
 
 test("policy set warns about agent approval and requires a confirmed operator update", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const args = ["policy", "set", "integration", "agent"];
-  const cancelled = await cli(args, { isTTY: true, answer: () => "yes" });
+  const cancelled = await cli(state, args, {
+    isTTY: true,
+    answer: () => "yes",
+  });
   assert.equal(cancelled.code, 1);
   assert.equal(store.effectivePolicy("integration").policy, "human");
   assert.deepEqual(store.listEvents({ limit: 10 }), []);
 
-  const confirmed = await cli(args, {
+  const confirmed = await cli(state, args, {
     isTTY: true,
     answer(question, stdout) {
       assert.match(stdout, /^Warning: /);
@@ -414,7 +426,7 @@ test("policy set warns about agent approval and requires a confirmed operator up
     kind: "project.defaults-set",
     subjectId: "project",
   });
-  const shown = await cli(["policy", "show"]);
+  const shown = await cli(state, ["policy", "show"]);
   assert.equal(shown.code, 0);
   assert.deepEqual(JSON.parse(shown.stdout), {
     "goal-registration": "human",
@@ -424,6 +436,8 @@ test("policy set warns about agent approval and requires a confirmed operator up
 });
 
 test("proposal rendering escapes terminal controls and bounds each displayed field", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const { id } = store.proposeGoal(
     {
       ...goal,
@@ -435,7 +449,7 @@ test("proposal rendering escapes terminal controls and bounds each displayed fie
     },
     origin,
   );
-  const shown = await cli(["show", id]);
+  const shown = await cli(state, ["show", id]);
   assert.equal(shown.code, 0);
   for (const control of ["\x1b", "\x07", "\x9b", "\r", "\u202e", "\u2066"])
     assert.equal(shown.stdout.includes(control), false);
@@ -453,13 +467,15 @@ test("proposal rendering escapes terminal controls and bounds each displayed fie
     descriptionLine.trim().slice('"description": '.length, -1).length <= 4000,
   );
 
-  const status = await cli(["status"]);
+  const status = await cli(state, ["status"]);
   assert.equal(status.code, 0);
   assert.match(status.stdout, /Release\\u202e\\u2066 goal/);
   assert.doesNotMatch(status.stdout, /[\u202e\u2066]/u);
 });
 
 test("events filters by subject and limits the newest results", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const first = store.proposeGoal(goal, origin);
   store.proposeGoal(goal, origin);
   store.decide(first.id, {
@@ -467,19 +483,27 @@ test("events filters by subject and limits the newest results", async () => {
     decision: "reject",
     answerer: { kind: "human" },
   });
-  const result = await cli(["events", "--limit", "1", "--subject", first.id]);
+  const result = await cli(state, [
+    "events",
+    "--limit",
+    "1",
+    "--subject",
+    first.id,
+  ]);
   assert.equal(result.code, 0);
   assert.equal(JSON.parse(result.stdout).length, 1);
   assert.partialDeepStrictEqual(JSON.parse(result.stdout)[0], {
     kind: "proposal.decided",
     subjectId: first.id,
   });
-  const invalid = await cli(["events", "--limit", "1001"]);
+  const invalid = await cli(state, ["events", "--limit", "1001"]);
   assert.equal(invalid.code, 2);
   assert.match(invalid.stderr, /^Usage:/);
 });
 
 test("reconcile requires typed confirmation, audits recovery and releases exclusive start", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store, filename } = state;
   const proposal = store.proposeGoal(goal, origin);
   const { goalId } = store.decide(proposal.id, {
     digest: proposal.digest,
@@ -520,15 +544,19 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
     () => store.startSession("Concierge", "new", true),
     /use the operator CLI reconcile command/,
   );
-  const nonTTY = await cli(["reconcile"]);
+  const nonTTY = await cli(state, ["reconcile"]);
   assert.equal(nonTTY.code, 1);
   assert.equal(nonTTY.questions.length, 0);
   assert.equal(
-    (await cli(["reconcile"], { isTTY: true, answer: () => "reconcile 3" }))
-      .code,
+    (
+      await cli(state, ["reconcile"], {
+        isTTY: true,
+        answer: () => "reconcile 3",
+      })
+    ).code,
     1,
   );
-  const changed = await cli(["reconcile"], {
+  const changed = await cli(state, ["reconcile"], {
     isTTY: true,
     answer: () => {
       store.startExecution(queued.id);
@@ -543,7 +571,7 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
     db.query(
       "CREATE TRIGGER deny_reconcile BEFORE INSERT ON events WHEN NEW.kind = 'task.status' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
     ).run();
-    const blocked = await cli(["reconcile"], {
+    const blocked = await cli(state, ["reconcile"], {
       isTTY: true,
       answer: () => "reconcile 4",
     });
@@ -563,7 +591,7 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
     mode: "goal-design",
     requestedBy,
   });
-  const recovered = await cli(["reconcile"], {
+  const recovered = await cli(state, ["reconcile"], {
     isTTY: true,
     answer: () => "reconcile 5",
   });
@@ -598,7 +626,7 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
       code: "interrupted",
     },
   );
-  const empty = await cli(["reconcile"], { isTTY: true });
+  const empty = await cli(state, ["reconcile"], { isTTY: true });
   assert.equal(empty.code, 0);
   assert.deepEqual(JSON.parse(empty.stdout).reconciled, {
     sessions: [],
@@ -609,6 +637,8 @@ test("reconcile requires typed confirmation, audits recovery and releases exclus
 });
 
 test("retry-task confirms on a terminal, records retries and rejects ineligible states", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store, filename } = state;
   const proposal = store.proposeGoal(goal, origin);
   const { goalId } = store.decide(proposal.id, {
     digest: proposal.digest,
@@ -634,14 +664,14 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
   const args = ["retry-task", id];
   const phrase = `retry-task ${id}`;
   const tty = { isTTY: true, answer: () => phrase };
-  assert.equal((await cli(args, tty)).code, 1);
+  assert.equal((await cli(state, args, tty)).code, 1);
   assert.ok(store.claimTask(id));
-  assert.equal((await cli(args, tty)).code, 1);
+  assert.equal((await cli(state, args, tty)).code, 1);
   store.failTask(id, "review-concern");
-  const nonTTY = await cli(args);
+  const nonTTY = await cli(state, args);
   assert.match(nonTTY.stderr, /requires a terminal/);
   assert.deepEqual(nonTTY.questions, []);
-  const wrong = await cli(args, { ...tty, answer: () => "yes" });
+  const wrong = await cli(state, args, { ...tty, answer: () => "yes" });
   assert.equal(wrong.code, 1);
   assert.equal(store.getTask(id)?.status, "failed");
 
@@ -652,7 +682,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
         "CREATE TRIGGER deny_retry BEFORE INSERT ON events WHEN NEW.kind = 'task.retried' BEGIN SELECT RAISE(ABORT, 'audit failure'); END",
       )
       .run();
-    assert.equal((await cli(args, tty)).code, 1);
+    assert.equal((await cli(state, args, tty)).code, 1);
     assert.equal(store.getTask(id)?.status, "failed");
     assert.equal(store.getTask(id)?.retries, 0);
     auditDb.query("DROP TRIGGER deny_retry").run();
@@ -661,7 +691,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
   }
 
   for (let retries = 1; retries <= 3; retries++) {
-    const result = await cli(args, tty);
+    const result = await cli(state, args, tty);
     assert.equal(result.code, 0);
     assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
     assert.deepEqual(JSON.parse(result.stdout), {
@@ -680,7 +710,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
     assert.ok(store.claimTask(id));
     store.failTask(id, "review-concern");
   }
-  assert.match((await cli(args, tty)).stderr, /retry limit/);
+  assert.match((await cli(state, args, tty)).stderr, /retry limit/);
   assert.throws(() => store.retryTask(id, 3), { code: "task-retry-limit" });
   assert.equal(store.getTask(id)?.status, "failed");
   assert.equal(store.getTask(id)?.retries, 3);
@@ -689,7 +719,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
   try {
     for (const status of ["awaiting-integration", "succeeded", "cancelled"]) {
       db.query("UPDATE tasks SET status = ? WHERE id = ?").run(status, id);
-      assert.match((await cli(args, tty)).stderr, /Only failed Tasks/);
+      assert.match((await cli(state, args, tty)).stderr, /Only failed Tasks/);
       assert.throws(() => store.retryTask(id, 3), {
         code: "invalid-transition",
       });
@@ -701,6 +731,8 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
 });
 
 test("show-execution escapes raw reviewer answers for the terminal", async () => {
+  using state = orchestratorFixture("local-orchestrator-cli-");
+  const { store } = state;
   const proposed = store.proposeGoal(goal, origin);
   const { goalId } = store.decide(proposed.id, {
     digest: proposed.digest,
@@ -721,14 +753,14 @@ test("show-execution escapes raw reviewer answers for the terminal", async () =>
     usage: { input: 500, output: 1, cacheCreation: 0, cacheRead: 0 },
   };
   store.finishExecution(id, "failed", { rawAnswer, ...usage });
-  const result = await cli(["show-execution", id]);
+  const result = await cli(state, ["show-execution", id]);
   assert.equal(result.code, 0);
   const report = { ...usage, maxTokens: 500, overBudget: true };
   assert.partialDeepStrictEqual(JSON.parse(result.stdout), {
     result: { rawAnswer, ...report },
     tokenUsage: report,
   });
-  const status = await cli(["status"]);
+  const status = await cli(state, ["status"]);
   assert.partialDeepStrictEqual(JSON.parse(status.stdout), {
     recentExecutions: [{ id, ...report }],
   });

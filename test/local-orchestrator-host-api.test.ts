@@ -3,7 +3,6 @@ import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
@@ -12,14 +11,14 @@ import {
 import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { afterEach, beforeEach, test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   HostApiServer,
   type ExecutionRequester,
   type HostApiOptions,
 } from "../src/local-orchestrator/host-api.ts";
-import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
+import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 const budgets = { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 500 };
 const goalContent = {
@@ -45,21 +44,26 @@ const taskContent = {
   budgets,
 };
 
-let folder: string;
-let store: OrchestratorStore;
-let options: HostApiOptions;
-let server: HostApiServer | undefined;
-let sockets: Socket[];
-let plannerCalls: Parameters<ExecutionRequester["requestPlanner"]>[0][];
-
-beforeEach(() => {
+function hostFixture(t: TestContext) {
   // A short prefix leaves room for the socket on platforms with short sun_path.
-  folder = mkdtempSync("/tmp/lo-api-");
-  store = OrchestratorStore.open(join(folder, "state.sqlite"));
-  server = undefined;
-  sockets = [];
-  plannerCalls = [];
-  options = {
+  const state = orchestratorFixture("lo-api-", "/tmp");
+  const { root: folder, store } = state;
+  let server: Promise<HostApiServer> | undefined;
+  let cleaningUp = false;
+  const sockets: Socket[] = [];
+  const plannerCalls: Parameters<ExecutionRequester["requestPlanner"]>[0][] =
+    [];
+  t.after(async () => {
+    cleaningUp = true;
+    try {
+      for (const socket of sockets) socket.destroy();
+      await close();
+    } finally {
+      state[Symbol.dispose]();
+    }
+  });
+
+  const options: HostApiOptions = {
     store,
     socketPath: join(folder, "mcp.sock"),
     sessionId: store.startSession("Concierge", "test-runtime").id,
@@ -79,74 +83,86 @@ beforeEach(() => {
       },
     },
   };
-});
 
-afterEach(async () => {
-  try {
-    for (const socket of sockets) socket.destroy();
-    await server?.close();
-  } finally {
-    store.close();
-    rmSync(folder, { recursive: true, force: true });
+  async function connect() {
+    assert.ok(!cleaningUp, "Host fixture is closing");
+    const socket = createConnection(options.socketPath);
+    sockets.push(socket);
+    const closed = new Promise<void>((resolve) =>
+      socket.once("close", () => resolve()),
+    );
+    const lines = createInterface({ input: socket })[Symbol.asyncIterator]();
+    await once(socket, "connect");
+    let id = 0;
+    return {
+      socket,
+      closed,
+      async reply() {
+        const next = await lines.next();
+        assert.equal(next.done, false, "Expected a JSON-RPC response");
+        return JSON.parse(next.value);
+      },
+      async request(method: string, params?: object) {
+        socket.write(wire(method, ++id, params));
+        const reply = await this.reply();
+        assert.equal(reply.id, id);
+        assert.equal(reply.jsonrpc, "2.0");
+        return reply;
+      },
+      async call(name: string, args?: object) {
+        const { result } = await this.request("tools/call", {
+          name,
+          arguments: args,
+        });
+        assert.equal(result.content.length, 1);
+        assert.equal(result.content[0].type, "text");
+        return {
+          isError: result.isError === true,
+          data: JSON.parse(result.content[0].text),
+        };
+      },
+    };
   }
-});
+
+  async function listen(overrides: Partial<HostApiOptions> = {}) {
+    server = HostApiServer.listen({ ...options, ...overrides });
+    await server;
+    return connect();
+  }
+
+  async function close() {
+    const active = await server?.catch(() => undefined);
+    await active?.close();
+  }
+
+  function apiCalls() {
+    return store
+      .listEvents({ subjectId: options.sessionId, limit: 100 })
+      .filter(({ kind }) => kind === "host-api.call")
+      .reverse();
+  }
+
+  return {
+    folder,
+    store,
+    options,
+    plannerCalls,
+    connect,
+    listen,
+    apiCalls,
+    close,
+  };
+}
 
 function wire(method: string, id?: number, params?: object) {
   return JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
 }
 
-async function connect() {
-  const socket = createConnection(options.socketPath);
-  sockets.push(socket);
-  const closed = new Promise<void>((resolve) =>
-    socket.once("close", () => resolve()),
-  );
-  const lines = createInterface({ input: socket })[Symbol.asyncIterator]();
-  await once(socket, "connect");
-  let id = 0;
-  return {
-    socket,
-    closed,
-    async reply() {
-      const next = await lines.next();
-      assert.equal(next.done, false, "Expected a JSON-RPC response");
-      return JSON.parse(next.value);
-    },
-    async request(method: string, params?: object) {
-      socket.write(wire(method, ++id, params));
-      const reply = await this.reply();
-      assert.equal(reply.id, id);
-      assert.equal(reply.jsonrpc, "2.0");
-      return reply;
-    },
-    async call(name: string, args?: object) {
-      const { result } = await this.request("tools/call", {
-        name,
-        arguments: args,
-      });
-      assert.equal(result.content.length, 1);
-      assert.equal(result.content[0].type, "text");
-      return {
-        isError: result.isError === true,
-        data: JSON.parse(result.content[0].text),
-      };
-    },
-  };
-}
+type HostClient = Awaited<
+  ReturnType<ReturnType<typeof hostFixture>["connect"]>
+>;
 
-async function listen(overrides: Partial<HostApiOptions> = {}) {
-  server = await HostApiServer.listen({ ...options, ...overrides });
-  return connect();
-}
-
-function apiCalls() {
-  return store
-    .listEvents({ subjectId: options.sessionId, limit: 100 })
-    .filter(({ kind }) => kind === "host-api.call")
-    .reverse();
-}
-
-async function queuePlanner(client: Awaited<ReturnType<typeof connect>>) {
+async function queuePlanner(client: HostClient) {
   const { isError, data } = await client.call("request_planner", {
     mode: "goal-design",
     brief: "Plan",
@@ -162,10 +178,7 @@ function waitRequest(id: string, timeoutSeconds?: number, requestId = 100) {
   });
 }
 
-async function beginWait(
-  client: Awaited<ReturnType<typeof connect>>,
-  id: string,
-) {
+async function beginWait(client: HostClient, id: string) {
   client.socket.write(waitRequest(id) + wire("ping", 101));
   assert.deepEqual(await client.reply(), {
     jsonrpc: "2.0",
@@ -174,14 +187,15 @@ async function beginWait(
   });
 }
 
-async function waitReply(client: Awaited<ReturnType<typeof connect>>) {
+async function waitReply(client: HostClient) {
   const { id, result } = await client.reply();
   assert.equal(id, 100);
   assert.equal(result.isError, undefined);
   return JSON.parse(result.content[0].text);
 }
 
-test("negotiates MCP versions, lists scoped tools and pipelines notifications", async () => {
+test("negotiates MCP versions, lists scoped tools and pipelines notifications", async (t) => {
+  const { options, listen } = hostFixture(t);
   const client = await listen();
   assert.equal(statSync(options.socketPath).mode & 0o777, 0o600);
   for (const version of [
@@ -250,7 +264,8 @@ test("negotiates MCP versions, lists scoped tools and pipelines notifications", 
   });
 });
 
-test("accepts MCP request metadata without echoing or auditing it", async () => {
+test("accepts MCP request metadata without echoing or auditing it", async (t) => {
+  const { store, options, listen, apiCalls } = hostFixture(t);
   const client = await listen();
   const _meta = { progressToken: 1 };
   for (const args of [undefined, {}]) {
@@ -282,7 +297,8 @@ test("accepts MCP request metadata without echoing or auditing it", async () => 
   assert.ok(!JSON.stringify(events).includes("progressToken"));
 });
 
-test("rejects malformed and oversized MCP request metadata", async () => {
+test("rejects malformed and oversized MCP request metadata", async (t) => {
+  const { listen } = hostFixture(t);
   const client = await listen();
   for (const _meta of [null, [], "invalid", { text: "é".repeat(2048) }]) {
     const { result } = await client.request("tools/call", {
@@ -300,7 +316,8 @@ test("rejects malformed and oversized MCP request metadata", async () => {
   }
 });
 
-test("refuses existing paths, invalid configuration and non-Concierge sessions", async () => {
+test("refuses existing paths, invalid configuration and non-Concierge sessions", async (t) => {
+  const { folder, store, options } = hostFixture(t);
   writeFileSync(options.socketPath, "keep");
   await assert.rejects(HostApiServer.listen(options), /already exists/);
   assert.equal(readFileSync(options.socketPath, "utf8"), "keep");
@@ -325,7 +342,8 @@ test("refuses existing paths, invalid configuration and non-Concierge sessions",
   await assert.rejects(HostApiServer.listen(options), /private parent/);
 });
 
-test("rejects a second client and audits each accepted connection", async () => {
+test("rejects a second client and audits each accepted connection", async (t) => {
+  const { store, options, connect, listen, close } = hostFixture(t);
   const first = await listen();
   await first.request("ping");
   await assert.rejects(HostApiServer.listen(options), /already exists/);
@@ -336,7 +354,7 @@ test("rejects a second client and audits each accepted connection", async () => 
   await first.closed;
   const replacement = await connect();
   await replacement.request("ping");
-  await server?.close();
+  await close();
   await replacement.closed;
   assert.equal(existsSync(options.socketPath), false);
   assert.deepEqual(
@@ -353,7 +371,8 @@ test("rejects a second client and audits each accepted connection", async () => 
   );
 });
 
-test("drops oversized lines even before receiving a newline", async () => {
+test("drops oversized lines even before receiving a newline", async (t) => {
+  const { listen, apiCalls } = hostFixture(t);
   const client = await listen({ maxLineBytes: 64 });
   client.socket.write("🛠".repeat(16));
   client.socket.write("a");
@@ -361,7 +380,8 @@ test("drops oversized lines even before receiving a newline", async () => {
   assert.equal(apiCalls().length, 0);
 });
 
-test("returns fixed protocol errors and disconnects after the third", async () => {
+test("returns fixed protocol errors and disconnects after the third", async (t) => {
+  const { listen } = hostFixture(t);
   const client = await listen();
   client.socket.write('{"broken"\n42\n[]\n' + wire("ping", 10));
   for (const code of [-32700, -32600, -32600]) {
@@ -374,7 +394,8 @@ test("returns fixed protocol errors and disconnects after the third", async () =
   await client.closed;
 });
 
-test("handles split UTF-8 and exercises each tool against the real store", async () => {
+test("handles split UTF-8 and exercises each tool against the real store", async (t) => {
+  const { store, options, plannerCalls, listen, apiCalls } = hostFixture(t);
   const client = await listen();
   const draft = Buffer.from(
     wire("tools/call", 100, {
@@ -572,7 +593,8 @@ test("handles split UTF-8 and exercises each tool against the real store", async
 test(
   "wait_execution and get_execution omit operator-only diagnostics",
   { timeout: 2000 },
-  async () => {
+  async (t) => {
+    const { store, listen } = hostFixture(t);
     const client = await listen();
     const { id } = store.createExecution({
       actor: "Reviewer",
@@ -600,7 +622,8 @@ test(
 test(
   "wait_execution returns on completion and audits authorization and outcome",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { store, options, listen } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     store.startExecution(id);
@@ -643,7 +666,8 @@ test(
 test(
   "wait_execution times out with the current execution and waiting flag",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { listen, apiCalls } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     assert.deepEqual(
@@ -662,7 +686,8 @@ test(
 test(
   "wait_execution returns the current state when the session ends",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { store, options, listen } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     store.startExecution(id);
@@ -679,7 +704,8 @@ test(
 test(
   "a pipelined call is served during a wait and a second wait is denied",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { store, listen } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     client.socket.write(waitRequest(id) + waitRequest(id, 60, 102));
@@ -706,7 +732,8 @@ test(
 test(
   "disconnect ends the wait and lets the Host API close promptly",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { listen, apiCalls, close } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     await beginWait(client, id);
@@ -715,18 +742,19 @@ test(
     // Observe cancellation before closing the server, which also stops an active wait.
     for (let i = 0; i < 100 && apiCalls().length < 2; i++) await delay(10);
     assert.equal(apiCalls().at(-1)?.executionId, id);
-    await server?.close();
+    await close();
   },
 );
 
 test(
   "closing the Host API ends and audits an active wait",
   { timeout: 3000 },
-  async () => {
+  async (t) => {
+    const { listen, apiCalls, close } = hostFixture(t);
     const client = await listen();
     const id = await queuePlanner(client);
     await beginWait(client, id);
-    await server?.close();
+    await close();
     await client.closed;
     assert.equal(apiCalls().at(-1)?.executionId, id);
   },
@@ -735,7 +763,8 @@ test(
 test(
   "wait_execution rejects invalid timeouts and reports unknown IDs",
   { timeout: 2000 },
-  async () => {
+  async (t) => {
+    const { listen } = hostFixture(t);
     const client = await listen();
     for (const timeoutSeconds of [0, 61, 1.5, "1", null]) {
       assert.deepEqual(
@@ -753,7 +782,8 @@ test(
   },
 );
 
-test("returns fixed tool errors without leaking input into responses or audit", async () => {
+test("returns fixed tool errors without leaking input into responses or audit", async (t) => {
+  const { store, options, listen, apiCalls } = hostFixture(t);
   const marker = "UNIQUE-PRIVATE-MARKER";
   const failingRequester = {
     async requestPlanner() {
@@ -816,7 +846,8 @@ test("returns fixed tool errors without leaking input into responses or audit", 
   );
 });
 
-test("an ended session returns an audited denial and closes the connection", async () => {
+test("an ended session returns an audited denial and closes the connection", async (t) => {
+  const { store, options, listen, apiCalls } = hostFixture(t);
   const client = await listen();
   await client.request("ping");
   store.endSession(options.sessionId);
@@ -833,7 +864,8 @@ test("an ended session returns an audited denial and closes the connection", asy
   });
 });
 
-test("a failed authorization audit prevents reads, drafts and queueing", async () => {
+test("a failed authorization audit prevents reads, drafts and queueing", async (t) => {
+  const { store, plannerCalls, listen } = hostFixture(t);
   const client = await listen();
   await client.request("ping");
   const recordApiCall = store.recordApiCall.bind(store);
@@ -883,7 +915,8 @@ test("a failed authorization audit prevents reads, drafts and queueing", async (
   await client.closed;
 });
 
-test("an outcome audit failure reports an error and leaves the committed draft", async () => {
+test("an outcome audit failure reports an error and leaves the committed draft", async (t) => {
+  const { store, listen } = hostFixture(t);
   const client = await listen();
   const recordApiCall = store.recordApiCall.bind(store);
   store.recordApiCall = (id, event) => {
