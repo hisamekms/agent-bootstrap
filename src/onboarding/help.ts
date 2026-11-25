@@ -88,6 +88,27 @@ export const helpTopics = {
     next: "Use agent-bootstrap help approve to review gate decisions. Check status again after the runner consumes them.",
     human: humanGate,
   },
+  inbox: {
+    purpose: "Inspect operator actions and recent progress from local state.",
+    prerequisites: "A registered target.",
+    commands: [
+      `${target} inbox`,
+      `${target} inbox --all --json`,
+      `${target} watch`,
+    ],
+    output:
+      "Inbox prints current items with their state and next command. Add --all to include resolved items. Watch prints new and changed items every two seconds. Press Ctrl-C to exit.",
+    next: "Use the command shown with each item to inspect it or take action.",
+    human: humanGate,
+  },
+  watch: {
+    purpose: "Follow new and changed inbox items in a terminal or a script.",
+    prerequisites: "A registered target.",
+    commands: [`${target} watch`],
+    output: "One line per new or changed item. Press Ctrl-C to exit.",
+    next: "Use inbox --all to review recent resolved items.",
+    human: humanGate,
+  },
   approve: {
     purpose:
       "Review a pinned proposal, record an answer, and export the completed Goal branch locally.",
@@ -250,6 +271,16 @@ export const operatorOutputs = {
     usage: "status",
     json: "{ counts, pending, recentExecutions, recentTasks }",
     next: "Inspect pending proposals with show <proposalId>.",
+  },
+  inbox: {
+    usage: "inbox [--all] [--json]",
+    json: "Array of inbox items with subject IDs, state and the next command.",
+    next: "Use watch to follow new and changed items.",
+  },
+  watch: {
+    usage: "watch",
+    json: "Streams human-readable inbox lines until Ctrl-C.",
+    next: "Use inbox to inspect the current items.",
   },
   proposals: {
     usage: "proposals [--status <pending|approved|rejected|registered>]",

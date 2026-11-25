@@ -1,3 +1,4 @@
+import { projectInbox, type InboxSource } from "./inbox.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
 import { randomUUID } from "node:crypto";
@@ -51,6 +52,7 @@ export interface HostApiOptions {
   readonly requester: ExecutionRequester;
   readonly maxLineBytes?: number;
   readonly onTaskRegistered?: () => void;
+  readonly inbox?: Omit<InboxSource, "store">;
 }
 
 function schema(
@@ -69,6 +71,7 @@ const idSchema = {
 const contentSchema = { type: "object" };
 const tools = {
   status: ["Summarize local orchestrator state", schema()],
+  get_inbox: ["Read current operator inbox items", schema()],
   list_proposals: [
     "List proposals",
     schema({ status: { type: "string", enum: proposalStatuses } }),
@@ -182,6 +185,23 @@ function prepareTool(
   switch (tool) {
     case "status":
       return () => store.getHostApiStatus();
+    case "get_inbox":
+      return () =>
+        projectInbox({ store, target: "", ...options.inbox })
+          .filter(({ state }) => state === "open")
+          .map(({ id, kind, weight, subject, title, state }) => ({
+            // Self-test item ids derive from variable names; keep them opaque.
+            id: kind === "secret-test-required" ? kind : id,
+            kind,
+            weight,
+            subject,
+            // The operator sees the failure code and diagnostics on the host.
+            title:
+              kind === "task-failed"
+                ? `Task ${subject.taskId?.slice(0, 8)} failed`
+                : title,
+            state,
+          }));
     case "list_proposals": {
       const filter = Object.hasOwn(input, "status")
         ? { status: oneOf(input.status, proposalStatuses) }

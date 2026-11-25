@@ -1,3 +1,4 @@
+import type { InboxRow } from "./inbox.ts";
 import { readPathViolations, type PathViolation } from "./path-violations.ts";
 import { randomUUID } from "node:crypto";
 import { closeSync, lstatSync, openSync } from "node:fs";
@@ -132,7 +133,8 @@ type Decision = "approve" | "reject";
 type ApprovalPolicy = ReturnType<typeof resolvePolicy>;
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 4;
+const schemaVersion = 5;
+const inboxSeenSchema = "CREATE TABLE inbox_seen (id TEXT PRIMARY KEY) STRICT;";
 export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
     id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
@@ -153,6 +155,7 @@ const approvalRunColumnsSql = `
     PRIMARY KEY (proposal_id, execution_id)
   `;
 const schema = `
+  ${inboxSeenSchema}
   CREATE TABLE project_policy (
     id INTEGER PRIMARY KEY CHECK (id = 1), policies_json TEXT NOT NULL
   ) STRICT;
@@ -532,17 +535,24 @@ export class OrchestratorStore {
               `);
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
-            } else if (version !== 3 && version !== schemaVersion) {
+            } else if (
+              version !== 3 &&
+              version !== 4 &&
+              version !== schemaVersion
+            ) {
               throw new Error();
             }
-            if (version !== schemaVersion) {
+            if (version === 0 || version === 2 || version === 3) {
               connection.exec(`
                 ALTER TABLE actor_sessions ADD COLUMN snapshot_commit TEXT;
                 ALTER TABLE goals ADD COLUMN planning_commit TEXT;
                 ALTER TABLE goals ADD COLUMN base_commit TEXT;
-                PRAGMA user_version=${schemaVersion};
               `);
             }
+            if (version !== schemaVersion)
+              connection.exec(
+                `${inboxSeenSchema} PRAGMA user_version=${schemaVersion};`,
+              );
           }
         })
         .immediate();
@@ -2491,6 +2501,117 @@ export class OrchestratorStore {
         tokenUsage: this.#executionUsage(row, result),
         result,
       });
+    });
+  }
+
+  inboxRows(includeResolved: boolean, cutoff: string): InboxRow[] {
+    return this.#read(() =>
+      this.#db
+        .query<InboxRow>(
+          `
+        WITH items(kind, version, at, goalId, taskId, proposalId, executionId,
+                   modelText, resolved, code, rejectedCount, info, canRetry) AS (
+          SELECT CASE p.kind WHEN 'goal' THEN 'goal-registration'
+                    WHEN 'task' THEN 'task-registration' ELSE 'integration' END,
+                 p.id, p.created_at, json_extract(p.content_json, '$.goalId'),
+                 json_extract(p.content_json, '$.taskId'), p.id, NULL,
+                 json_extract(p.content_json, '$.title'), p.status <> 'pending', NULL, NULL, 0, 0
+          FROM proposals AS p
+          WHERE p.status <> 'registered'
+          UNION ALL
+          SELECT CASE json_extract(e.data, '$.status') WHEN 'failed' THEN 'task-failed'
+                    WHEN 'succeeded' THEN 'task-succeeded' ELSE 'task-running' END,
+                 e.id, e.at, t.goal_id, t.id, NULL, NULL, json_extract(t.content_json, '$.title'),
+                 CASE WHEN json_extract(e.data, '$.status') = 'succeeded' THEN 0 ELSE
+                   EXISTS (
+                     SELECT 1 FROM events AS later
+                     WHERE later.subject_id = t.id AND later.subject_kind = 'task'
+                       AND later.kind = 'task.status' AND later.rowid > e.rowid
+                       AND json_extract(later.data, '$.status') IN (
+                         'running', 'awaiting-integration', 'failed', 'succeeded', 'cancelled'
+                       )
+                   ) END,
+                 json_extract(e.data, '$.code'), json_array_length(e.data, '$.rejectedPaths'),
+                 json_extract(e.data, '$.status') <> 'failed',
+                 t.status = 'failed' AND (
+                   SELECT count(*) FROM events AS retry
+                   WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
+                     AND retry.subject_kind = 'task'
+                 ) < ${MAX_TASK_RETRIES}
+          FROM events AS e JOIN tasks AS t ON e.subject_id = t.id
+          WHERE e.kind = 'task.status' AND e.subject_kind = 'task'
+            AND json_extract(e.data, '$.status') IN ('failed', 'succeeded', 'running')
+            AND (json_extract(e.data, '$.status') <> 'running' OR json_extract(e.data, '$.code') IS NULL)
+          UNION ALL
+          SELECT 'execution-over-budget', x.id, x.finished_at, coalesce(x.goal_id, t.goal_id),
+                 x.task_id, NULL, x.id, NULL,
+                 coalesce(t.status IN ('succeeded', 'cancelled') OR EXISTS (
+                   SELECT 1 FROM events AS retry
+                   WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
+                     AND retry.rowid > (
+                       SELECT queued.rowid FROM events AS queued
+                       WHERE queued.subject_id = x.id AND queued.kind = 'execution.queued'
+                         AND queued.subject_kind = 'execution' LIMIT 1
+                     )
+                 ), 0),
+                 NULL, NULL, 0, 0
+          FROM executions AS x LEFT JOIN tasks AS t ON x.task_id = t.id
+            LEFT JOIN goals AS g ON x.goal_id = g.id
+          WHERE x.finished_at IS NOT NULL AND x.started_at IS NOT NULL
+            AND ((json_type(x.result_json, '$.tokens') = 'integer'
+              AND json_extract(x.result_json, '$.tokens') <= 9007199254740991
+              AND json_extract(x.result_json, '$.tokens') > coalesce(
+                json_extract(t.content_json, '$.budgets.maxTokens'),
+                json_extract(g.content_json, '$.scope.budgets.maxTokens')
+              )) OR EXISTS (
+              SELECT 1 FROM events AS budget
+              WHERE budget.subject_id = t.id AND budget.kind = 'task.budget-exceeded'
+                AND budget.execution_id = x.id
+            ))
+          UNION ALL
+          SELECT 'goal-completed', g.id, coalesce((
+                   SELECT e.at FROM events AS e WHERE e.subject_id = g.id
+                     AND e.subject_kind = 'goal' AND e.kind = 'goal.status'
+                     AND json_extract(e.data, '$.status') = 'done' ORDER BY e.rowid DESC LIMIT 1
+                 ), g.created_at),
+                 g.id, NULL, NULL, NULL, json_extract(g.content_json, '$.title'), 0, NULL, NULL, 1, 0
+          FROM goals AS g WHERE g.status = 'done'
+        )
+        SELECT kind || ':' || CASE WHEN kind IN ('task-failed', 'task-succeeded', 'task-running')
+                                   THEN taskId || ':' ELSE '' END || version AS id,
+               kind, at, goalId, taskId, proposalId, executionId, modelText, resolved, code,
+               rejectedCount, canRetry
+        FROM items WHERE (? OR NOT resolved)
+          AND (NOT info OR at >= ? OR (kind = 'task-running' AND NOT resolved))
+        ORDER BY (NOT resolved AND NOT info) DESC, at DESC, version DESC LIMIT 200
+      `,
+        )
+        .all(Number(includeResolved), cutoff),
+    );
+  }
+
+  inboxSeen(ids: readonly string[]): ReadonlySet<string> {
+    return this.#read(
+      () =>
+        new Set(
+          this.#db
+            .query<{ id: string }>(
+              "SELECT id FROM inbox_seen WHERE id IN (SELECT value FROM json_each(?))",
+            )
+            .all(JSON.stringify(ids))
+            .map(({ id }) => id),
+        ),
+    );
+  }
+
+  markInboxSeen(ids: readonly string[]): void {
+    if (!ids.length) return;
+    this.#write(() => {
+      this.#db
+        .query(
+          "INSERT OR IGNORE INTO inbox_seen SELECT value FROM json_each(?)",
+        )
+        .run(JSON.stringify(ids));
     });
   }
 

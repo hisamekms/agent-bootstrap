@@ -7,6 +7,19 @@ import {
 } from "./credential-scan.ts";
 import { readPathViolations, type PathViolation } from "./path-violations.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
+import { readFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+import { PROFILE_LOCK_PATH, parseProfileLock } from "../profile-lock.ts";
+import { ALPINE_3_23 } from "../image-recipes.ts";
+import { userStateDirectory } from "../config/layers.ts";
+import { secretTestFacts } from "./secret-test-record.ts";
+import { operatorStatus } from "./operator-read.ts";
+import {
+  changedInboxIds,
+  formatInboxItem,
+  inboxSnapshot,
+  projectInbox,
+} from "./inbox.ts";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { GitIntegrationError } from "../git-integration.ts";
@@ -71,6 +84,8 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] denials [--since <iso>] [--limit <1-1000>]
   reconcile
   status
+  inbox [--all] [--json]
+  watch
   retry-task <taskId>
   update-goal-base <goalId>
   export-goal-branch <goalId> [--target <checkout>]
@@ -87,7 +102,8 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   events [--subject <id>] [--limit <1-1000>]`;
 
 type Command =
-  | { kind: "status" | "policy-show" | "reconcile" }
+  | { kind: "status" | "policy-show" | "reconcile" | "watch" }
+  | { kind: "inbox"; all: boolean; json: boolean }
   | AnalysisCommand
   | { kind: "proposals"; status?: ProposalStatus }
   | { kind: "show"; id: string }
@@ -158,6 +174,18 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
       }
       return command;
     }
+    case "inbox":
+      if (
+        new Set(args).size === args.length &&
+        args.every((flag) => flag === "--all" || flag === "--json")
+      )
+        return {
+          kind,
+          all: args.includes("--all"),
+          json: args.includes("--json"),
+        };
+      break;
+    case "watch":
     case "status":
     case "reconcile":
       if (args.length === 0) return { kind };
@@ -301,24 +329,6 @@ function projectDefaults(store: OrchestratorStore): Record<Gate, Policy> {
   };
 }
 
-function proposalPolicy({
-  gate,
-  policy,
-  source,
-  loosening,
-  humanApprovalRequired,
-  humanAnswerRequired,
-}: ProposalDetails) {
-  return {
-    gate,
-    effectivePolicy: policy,
-    policySource: source,
-    loosening,
-    humanApprovalRequired,
-    humanAnswerRequired,
-  };
-}
-
 function displayProposal({
   policy: effectivePolicy,
   source: policySource,
@@ -347,6 +357,7 @@ async function execute(
   scan?: CredentialScanner,
   configDirectory?: string,
   env = process.env,
+  bootstrapRoot = bootstrapCheckout,
 ): Promise<0 | 1> {
   const writeCheckedJson = async (value: unknown) => {
     await scan?.(JSON.stringify(value));
@@ -519,37 +530,81 @@ async function execute(
       await writeCheckedJson({ reconciled });
       return 0;
     }
+    case "inbox":
+    case "watch": {
+      const read = () =>
+        projectInbox(
+          {
+            store,
+            target: repoRoot,
+            secretTests: () => {
+              if (!directory) return [];
+              const { config } = loadConfig(env, configDirectory);
+              if (!Object.keys(config.secretEnv ?? {}).length) return [];
+              const lock = parseProfileLock(
+                readFileSync(join(bootstrapRoot, PROFILE_LOCK_PATH), "utf8"),
+              );
+              return secretTestFacts(
+                config.secretEnv,
+                userStateDirectory(env),
+                lock.base ?? ALPINE_3_23.reference,
+              );
+            },
+          },
+          {
+            includeResolved:
+              command.kind === "watch" ||
+              (command.kind === "inbox" && command.all),
+          },
+        );
+      if (command.kind === "inbox") {
+        const items = read();
+        if (command.json || io.json) {
+          const output = JSON.stringify(items, null, 2);
+          await scan?.(output);
+          if (io.json) io.json(output);
+          else io.stdout.write(output + "\n");
+        } else {
+          const output = items.map(formatInboxItem).join("");
+          await scan?.(output);
+          if (output) io.stdout.write(output);
+        }
+        return 0;
+      }
+
+      const stop = new AbortController();
+      const interrupt = () => stop.abort();
+      process.on("SIGINT", interrupt);
+      try {
+        let previous = new Map<string, string>();
+        while (!stop.signal.aborted) {
+          const items = read();
+          const current = inboxSnapshot(items);
+          const changed = new Set(changedInboxIds(previous, current));
+          const output = items
+            .filter(
+              (item) =>
+                changed.has(item.id) &&
+                (item.state !== "resolved" || previous.has(item.id)),
+            )
+            .map(formatInboxItem)
+            .join("");
+          if (output) {
+            await scan?.(output);
+            io.stdout.write(output);
+          }
+          previous = current;
+          await delay(2000, undefined, { signal: stop.signal });
+        }
+      } catch (error) {
+        if (!stop.signal.aborted) throw error;
+      } finally {
+        process.off("SIGINT", interrupt);
+      }
+      return 0;
+    }
     case "status": {
-      const proposals = store.listProposals();
-      const goals = store.listGoals();
-      const pending = proposals
-        .filter(({ status }) => status === "pending")
-        .map((proposal) => ({
-          id: proposal.id,
-          kind: proposal.kind,
-          ...(proposal.kind === "integration"
-            ? {
-                goalId: proposal.content.goalId,
-                taskId: proposal.content.taskId,
-              }
-            : { title: proposal.content.title }),
-          ...proposalPolicy(requireProposalDetails(store, proposal.id)),
-        }));
-      const { recentExecutions, recentTasks } = store.getHostApiStatus();
-      await writeCheckedJson({
-        counts: {
-          goals: goals.length,
-          tasks: goals.reduce(
-            (count, goal) => count + store.listTasks(goal.id).length,
-            0,
-          ),
-          proposals: proposals.length,
-          pending: pending.length,
-        },
-        pending,
-        recentExecutions,
-        recentTasks,
-      });
+      await writeCheckedJson(operatorStatus(store));
       return 0;
     }
     case "proposals": {
@@ -794,6 +849,7 @@ export async function runCli(
         scan,
         target?.configDirectory,
         env,
+        bootstrapRoot,
       );
     } finally {
       store.close();

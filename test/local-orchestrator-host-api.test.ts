@@ -230,6 +230,7 @@ test("negotiates MCP versions, lists scoped tools and pipelines notifications", 
     result.tools.map((tool: { name: string }) => tool.name),
     [
       "status",
+      "get_inbox",
       "list_proposals",
       "get_proposal",
       "list_goals",
@@ -933,5 +934,82 @@ test("an outcome audit failure reports an error and leaves the committed draft",
   assert.equal(
     store.listEvents({ subjectId: draft.id, limit: 1 })[0]?.kind,
     "goal.proposed",
+  );
+});
+
+test("get_inbox returns only host summaries and audits the call", async (t) => {
+  const { store, options, listen, apiCalls } = hostFixture(t);
+  const { id, digest } = store.proposeGoal(goalContent, { kind: "operator" });
+  const decision = store.decide(id, {
+    digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const goalId = decision.goalId!;
+  store.recordGoalCommit(goalId, "a".repeat(40), "base");
+  const task = store.proposeTask({ ...taskContent, goalId }, { kind: "host" });
+  if (task.status !== "registered") throw new Error("Task was not registered");
+  const { taskId } = task;
+  assert.ok(store.claimTask(taskId));
+  store.failTask(taskId, "path-violation", [
+    { path: "private/rejected", symlink: false },
+  ]);
+  const pending = store.proposeGoal(
+    { ...goalContent, title: "private model title" },
+    { kind: "operator" },
+  );
+  const seen = store.proposeGoal(goalContent, { kind: "operator" });
+  store.markInboxSeen([`goal-registration:${seen.id}`]);
+  const client = await listen({
+    inbox: {
+      target: "/private/host/path",
+      secretTests: () => [
+        { variable: "FIXTURE_VALUE", version: "v1", passed: false },
+      ],
+    },
+  });
+  const { data, isError } = await client.call("get_inbox");
+  assert.equal(isError, false);
+  assert.deepEqual(
+    new Set(data.map(({ kind }: { kind: string }) => kind)),
+    new Set(["secret-test-required", "task-failed", "goal-registration"]),
+  );
+  for (const item of data)
+    assert.deepEqual(Object.keys(item).sort(), [
+      "id",
+      "kind",
+      "state",
+      "subject",
+      "title",
+      "weight",
+    ]);
+  assert.equal(
+    data.find(({ kind }: { kind: string }) => kind === "task-failed").title,
+    `Task ${taskId.slice(0, 8)} failed`,
+  );
+  assert.ok(
+    data.some(
+      ({ subject }: { subject: { proposalId?: string } }) =>
+        subject.proposalId === pending.id,
+    ),
+  );
+  assert.doesNotMatch(
+    JSON.stringify(data),
+    /private|path-violation|FIXTURE_VALUE/,
+  );
+  const call = apiCalls().at(-1);
+  assert.partialDeepStrictEqual(call?.data, {
+    tool: "get_inbox",
+    outcome: "ok",
+    code: "ok",
+  });
+  assert.ok(
+    store
+      .listEvents({ subjectId: options.sessionId, limit: 20 })
+      .some(
+        ({ kind, data }) =>
+          kind === "host-api.authorized" &&
+          (data as { tool?: string }).tool === "get_inbox",
+      ),
   );
 });
