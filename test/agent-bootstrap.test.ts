@@ -1,18 +1,16 @@
+import { mkdtempDisposableSync, realpathSync } from "node:fs";
 import { addProject } from "../src/config/projects.ts";
 import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, test } from "node:test";
+import { describe, test } from "node:test";
 import { createHash } from "node:crypto";
 import {
   copyFile,
   mkdir,
-  mkdtemp,
   readFile,
   readdir,
-  realpath,
-  rm,
   stat,
   symlink,
   writeFile,
@@ -40,31 +38,14 @@ import { recordSecretTestPass } from "../src/local-orchestrator/secret-test-reco
 
 const checkout = fileURLToPath(new URL("..", import.meta.url));
 const lockFile = "images/profiles.lock.json";
-const temporary: string[] = [];
-afterEach(async () => {
-  await Promise.all(
-    temporary
-      .splice(0)
-      .map((path) => rm(path, { recursive: true, force: true })),
-  );
-});
-
-async function fixture() {
-  const temp = await realpath(await mkdtemp(join(tmpdir(), "ab-cli-")));
-  temporary.push(temp);
+async function prepareFixture(temp: string) {
   await mkdir(join(temp, "images"));
   await copyFile(join(checkout, lockFile), join(temp, lockFile));
   await writeFile(join(temp, "package.json"), "{}");
   return temp;
 }
 
-async function shortHomeRoot() {
-  const root = await realpath(await mkdtemp("/tmp/ab-home-"));
-  temporary.push(root);
-  return root;
-}
-
-function fakeHost(root: string) {
+function fakeHost(root: string, settingsRoot = root) {
   const calls: Array<{
     file: string;
     args: readonly string[];
@@ -78,7 +59,7 @@ function fakeHost(root: string) {
     arch: "arm64",
     bun: "1.4.4",
     env: {
-      ...configEnv(temporary.includes(root) ? root : "/nonexistent"),
+      ...configEnv(settingsRoot),
       MSB_HOME: root,
       USER: "operator",
       LO_CLAUDE_KEYCHAIN: "claude-test",
@@ -165,7 +146,7 @@ const topics = [
 
 describe("agent-bootstrap", () => {
   test("help has stable topics, commands and exit codes", async () => {
-    const { host, calls } = fakeHost(checkout);
+    const { host, calls } = fakeHost(checkout, "/nonexistent");
     const result = await invoke(["help", "--json"], checkout, host);
     assert.equal(result.code, 0);
     const schema = JSON.parse(result.stdout);
@@ -217,7 +198,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("linked entry finds its checkout and the full help matches the checked-in guide", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const entry = join(root, "agent-bootstrap");
     await symlink(join(checkout, "bin/agent-bootstrap.ts"), entry);
     const env = { PATH: `${dirname(process.execPath)}:/usr/bin:/bin` };
@@ -230,7 +212,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("secrets test rejects invalid arguments and absent grants before host commands", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host, calls } = fakeHost(root);
     for (const args of [
       ["secrets"],
@@ -254,7 +237,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("the linked command ignores settings from the target working directory's .env", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const entry = join(root, "agent-bootstrap");
     await symlink(join(checkout, "bin/agent-bootstrap.ts"), entry);
     await writeFile(
@@ -279,7 +263,7 @@ describe("agent-bootstrap", () => {
   });
 
   test("invalid commands and refused commands use distinct exits and one JSON object", async () => {
-    const { host } = fakeHost(checkout);
+    const { host } = fakeHost(checkout, "/nonexistent");
     for (const [args, exit] of [
       [["nonesuch"], 2],
       [["help", "nonesuch"], 2],
@@ -301,7 +285,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("operator dispatch preserves existing JSON and gives a next hint", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host } = fakeHost(root);
     const args = ["--db", join(root, "state.db"), "status"];
     const result = await invoke([...args, "--json"], root, host);
@@ -316,76 +301,88 @@ describe("agent-bootstrap", () => {
     assert.ok(result.stderr.startsWith("next:"));
   });
 
-  test("doctor exposes every check status and probes Keychain metadata only", async () => {
-    const root = await fixture();
-    const { host, calls, images } = fakeHost(root);
-    const target = initConfigRepo(join(root, "target"));
-    addProject(target, undefined, host.env);
-    host.bun = "1.2.0";
-    host.env.MSB_HOME = "/tmp";
-    // /tmp resolves within the limit on macOS and Linux, unlike mkdtemp under macOS TMPDIR.
-    const lock = JSON.parse(await readFile(join(root, lockFile), "utf8"));
-    images.set(lock.profiles.bun.image, "sha256:" + "f".repeat(64));
-    const result = await invoke(
-      ["doctor", "--target", target, "--json"],
-      root,
-      host,
-    );
-    assert.equal(result.code, 3);
-    const checks = JSON.parse(result.stdout) as Array<{
-      id: string;
-      status: string;
-    }>;
-    const byId = Object.fromEntries(
-      checks.map(({ id, status }) => [id, status]),
-    );
-    assert.partialDeepStrictEqual(byId, {
-      platform: "ok",
-      bun: "wrong",
-      mise: "ok",
-      microsandbox: "ok",
-      "msb-home": "ok",
-      dependencies: "ok",
-      target: "ok",
-      "effective-configuration": "ok",
-      verification: "skipped",
-      "artifact:.local/claude-code/2.1.330/linux-arm64-musl/claude": "missing",
-      "image:base": "ok",
-      "image:bun": "wrong",
-      "image:concierge": "missing",
-      "image:db": "missing",
-      "image:browser": "missing",
-      keychain: "ok",
-      "claude-auth": "ok",
-      "claude-config-warning-1": "skipped",
-      duckdb: "ok",
-    });
-    for (const check of checks)
-      assert.deepEqual(
-        Object.keys(check).filter((key) => key !== "effective"),
-        ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
+  test(
+    "doctor exposes every check status and probes Keychain metadata only",
+    { timeout: 30_000 },
+    async () => {
+      using temp = mkdtempDisposableSync(
+        join(realpathSync(tmpdir()), "ab-cli-"),
       );
-    assert.equal(result.stderr, "next: mise install bun@1.4.4\n");
-    const security = calls.filter(({ file }) => file === "/usr/bin/security");
-    assert.deepEqual(
-      security.map(({ args }) => args),
-      [["find-generic-password", "-s", "claude-test", "-a", "operator"]],
-    );
-    assert.ok(!(result.stdout + result.stderr).includes("never display this"));
-    const inspected = calls.filter(({ args }) => args.includes("inspect"));
-    assert.equal(inspected.length, 5);
-    for (const { args, env } of inspected) {
-      assert.deepEqual(args.slice(0, MISE_MSB.length), MISE_MSB);
-      assert.equal(env?.MISE_OFFLINE, "1");
-      assert.equal(env?.MISE_NOT_FOUND_AUTO_INSTALL, "false");
-      assert.equal(env?.MISE_EXEC_AUTO_INSTALL, "false");
-    }
-  });
+      const root = await prepareFixture(temp.path);
+      const { host, calls, images } = fakeHost(root);
+      const target = initConfigRepo(join(root, "target"));
+      addProject(target, undefined, host.env);
+      host.bun = "1.2.0";
+      host.env.MSB_HOME = "/tmp";
+      // /tmp resolves within the limit on macOS and Linux, unlike mkdtemp under macOS TMPDIR.
+      const lock = JSON.parse(await readFile(join(root, lockFile), "utf8"));
+      images.set(lock.profiles.bun.image, "sha256:" + "f".repeat(64));
+      const result = await invoke(
+        ["doctor", "--target", target, "--json"],
+        root,
+        host,
+      );
+      assert.equal(result.code, 3);
+      const checks = JSON.parse(result.stdout) as Array<{
+        id: string;
+        status: string;
+      }>;
+      const byId = Object.fromEntries(
+        checks.map(({ id, status }) => [id, status]),
+      );
+      assert.partialDeepStrictEqual(byId, {
+        platform: "ok",
+        bun: "wrong",
+        mise: "ok",
+        microsandbox: "ok",
+        "msb-home": "ok",
+        dependencies: "ok",
+        target: "ok",
+        "effective-configuration": "ok",
+        verification: "skipped",
+        "artifact:.local/claude-code/2.1.330/linux-arm64-musl/claude":
+          "missing",
+        "image:base": "ok",
+        "image:bun": "wrong",
+        "image:concierge": "missing",
+        "image:db": "missing",
+        "image:browser": "missing",
+        keychain: "ok",
+        "claude-auth": "ok",
+        "claude-config-warning-1": "skipped",
+        duckdb: "ok",
+      });
+      for (const check of checks)
+        assert.deepEqual(
+          Object.keys(check).filter((key) => key !== "effective"),
+          ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
+        );
+      assert.equal(result.stderr, "next: mise install bun@1.4.4\n");
+      const security = calls.filter(({ file }) => file === "/usr/bin/security");
+      assert.deepEqual(
+        security.map(({ args }) => args),
+        [["find-generic-password", "-s", "claude-test", "-a", "operator"]],
+      );
+      assert.ok(
+        !(result.stdout + result.stderr).includes("never display this"),
+      );
+      const inspected = calls.filter(({ args }) => args.includes("inspect"));
+      assert.equal(inspected.length, 5);
+      for (const { args, env } of inspected) {
+        assert.deepEqual(args.slice(0, MISE_MSB.length), MISE_MSB);
+        assert.equal(env?.MISE_OFFLINE, "1");
+        assert.equal(env?.MISE_NOT_FOUND_AUTO_INSTALL, "false");
+        assert.equal(env?.MISE_EXEC_AUTO_INSTALL, "false");
+      }
+    },
+  );
 
   test("doctor reports the selected Microsandbox home source and fixes", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host, calls } = fakeHost(root);
-    const homeRoot = await shortHomeRoot();
+    using homeDirectory = mkdtempDisposableSync("/tmp/ab-home-");
+    const homeRoot = realpathSync(homeDirectory.path);
     const destination = join(homeRoot, "user");
     const fallback = join(homeRoot, ".msb");
     await mkdir(destination);
@@ -437,56 +434,64 @@ describe("agent-bootstrap", () => {
     assert.ok(env.fix.includes('export MSB_HOME="$HOME/.msb"'));
   });
 
-  test("doctor reports secret grants and pinned passes without showing the source", async () => {
-    const root = await fixture();
-    const { host, calls } = fakeHost(root);
-    const target = initConfigRepo(join(root, "target"));
-    addProject(target, undefined, host.env);
-    const config = {
-      version: 1,
-      claude: { auth: "external" },
-      secrets: { tool: { keychainService: "fixture-private-service" } },
-      secretEnv: {
-        TOOL_TOKEN: { secret: "tool", actors: ["Planner", "Reviewer"] },
-      },
-    };
-    const path = userConfigPath(host.env);
-    const configDir = configRoot(host.env);
-    writePrivateConfig(path, configDir, config);
-    const run = () =>
-      invoke(["doctor", "--target", target, "--json"], root, host);
-    const grant = (out: string) =>
-      JSON.parse(out).find(
-        ({ id }: { id: string }) => id === "secretEnv.TOOL_TOKEN",
+  test(
+    "doctor reports secret grants and pinned passes without showing the source",
+    { timeout: 30_000 },
+    async () => {
+      using temp = mkdtempDisposableSync(
+        join(realpathSync(tmpdir()), "ab-cli-"),
       );
-    const before = await run();
-    const missing = grant(before.stdout);
-    assert.equal(missing.status, "missing");
-    assert.match(missing.detail, /Planner, Reviewer.*Self-test/);
-    assert.match(missing.fix[0], /secrets test TOOL_TOKEN/);
-    recordSecretTestPass(userStateDirectory(host.env), "TOOL_TOKEN");
-    const after = await run();
-    assert.equal(grant(after.stdout).status, "ok");
-    assert.doesNotMatch(
-      before.stdout + after.stdout,
-      /fixture-private-service/,
-    );
-    assert.ok(!calls.some(({ file }) => file === "/usr/bin/security"));
+      const root = await prepareFixture(temp.path);
+      const { host, calls } = fakeHost(root);
+      const target = initConfigRepo(join(root, "target"));
+      addProject(target, undefined, host.env);
+      const config = {
+        version: 1,
+        claude: { auth: "external" },
+        secrets: { tool: { keychainService: "fixture-private-service" } },
+        secretEnv: {
+          TOOL_TOKEN: { secret: "tool", actors: ["Planner", "Reviewer"] },
+        },
+      };
+      const path = userConfigPath(host.env);
+      const configDir = configRoot(host.env);
+      writePrivateConfig(path, configDir, config);
+      const run = () =>
+        invoke(["doctor", "--target", target, "--json"], root, host);
+      const grant = (out: string) =>
+        JSON.parse(out).find(
+          ({ id }: { id: string }) => id === "secretEnv.TOOL_TOKEN",
+        );
+      const before = await run();
+      const missing = grant(before.stdout);
+      assert.equal(missing.status, "missing");
+      assert.match(missing.detail, /Planner, Reviewer.*Self-test/);
+      assert.match(missing.fix[0], /secrets test TOOL_TOKEN/);
+      recordSecretTestPass(userStateDirectory(host.env), "TOOL_TOKEN");
+      const after = await run();
+      assert.equal(grant(after.stdout).status, "ok");
+      assert.doesNotMatch(
+        before.stdout + after.stdout,
+        /fixture-private-service/,
+      );
+      assert.ok(!calls.some(({ file }) => file === "/usr/bin/security"));
 
-    writePrivateConfig(path, configDir, {
-      ...config,
-      egress: { Planner: ["extra.example:443"] },
-    });
-    const rejected = await run();
-    assert.match(rejected.stdout, /cannot receive added egress/);
-    assert.doesNotMatch(
-      rejected.stdout,
-      /extra\.example|fixture-private-service/,
-    );
-  });
+      writePrivateConfig(path, configDir, {
+        ...config,
+        egress: { Planner: ["extra.example:443"] },
+      });
+      const rejected = await run();
+      assert.match(rejected.stdout, /cannot receive added egress/);
+      assert.doesNotMatch(
+        rejected.stdout,
+        /extra\.example|fixture-private-service/,
+      );
+    },
+  );
 
   test("concierge returns prerequisite exit and does not launch", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host } = fakeHost(root);
     const result = await invoke(["concierge", "--json"], root, host, {
       conciergeTTY: true,
@@ -502,7 +507,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("setup plan stays offline and apply itself refuses without authorization", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host, calls } = fakeHost(root);
     const result = await invoke(["setup", "--json"], root, host);
     assert.equal(result.code, 0);
@@ -567,7 +573,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("setup refuses a mismatching build and preserves the lock", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host, calls, images } = fakeHost(root);
     host.env.MSB_HOME = "/tmp";
     const plan = await setupPlan(root, false, host.env);
@@ -592,10 +599,12 @@ describe("agent-bootstrap", () => {
   });
 
   test("setup pulls the pinned base, builds profiles in order, and skips completed work", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const { host, images, calls } = fakeHost(root);
     delete host.env.MSB_HOME;
-    const home = await shortHomeRoot();
+    using homeDirectory = mkdtempDisposableSync("/tmp/ab-home-");
+    const home = realpathSync(homeDirectory.path);
     writePrivateConfig(userConfigPath(host.env), configRoot(host.env), {
       version: 1,
       microsandbox: { home },
@@ -646,7 +655,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("a file arriving during download is preserved if it differs from the pin", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const item = {
       path: ".local/claude",
       url: "https://downloads.claude.ai/claude-code-releases/test/claude",
@@ -668,7 +678,8 @@ describe("agent-bootstrap", () => {
   });
 
   test("downloads verify the exact bytes before rename and do not grant execute permission", async () => {
-    const root = await fixture();
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
     const script = `#!/bin/sh\ntouch "${join(root, "executed")}"\n`;
     const item = {
       path: ".local/claude",
@@ -703,9 +714,11 @@ describe("agent-bootstrap", () => {
 });
 
 test("sandbox shell resolves the user home before checking protected mounts", async () => {
-  const root = await fixture();
+  using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+  const root = await prepareFixture(temp.path);
   const { host, calls } = fakeHost(root);
-  const home = await shortHomeRoot();
+  using homeDirectory = mkdtempDisposableSync("/tmp/ab-home-");
+  const home = realpathSync(homeDirectory.path);
   const missingHome = join(home, "missing");
   const tool = join(root, "tool");
   await mkdir(tool);
@@ -748,7 +761,8 @@ test("sandbox shell resolves the user home before checking protected mounts", as
 });
 
 test("sandbox shell renders a credential-free gateway plan and validates options without host commands", async () => {
-  const root = await fixture();
+  using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+  const root = await prepareFixture(temp.path);
   const { host, calls } = fakeHost(root);
   host.env.XDG_STATE_HOME = root;
   const { code, stdout } = await invoke(

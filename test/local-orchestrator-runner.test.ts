@@ -1,10 +1,7 @@
 import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, test } from "node:test";
+import { test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
 import {
   ActorRunner,
@@ -13,6 +10,7 @@ import {
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
 import { MICROSANDBOX_LIMITS } from "../src/microsandbox.ts";
 import type { ReviewerPlan, ReviewerRun } from "../src/trusted-host.ts";
+import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
 
 const budgets = { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 1000 };
 const goal = {
@@ -56,18 +54,6 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   };
 };
 
-let folder: string;
-let store: OrchestratorStore;
-
-beforeEach(() => {
-  folder = mkdtempSync(join(tmpdir(), "local-runner-"));
-  store = OrchestratorStore.open(join(folder, "state.sqlite"));
-});
-afterEach(() => {
-  store.close();
-  rmSync(folder, { recursive: true, force: true });
-});
-
 function response(id: string, answer: unknown): ReviewerRun {
   return {
     id,
@@ -89,7 +75,7 @@ function response(id: string, answer: unknown): ReviewerRun {
   };
 }
 
-function runner(overrides: Partial<RunnerDeps> = {}) {
+function runner(store: OrchestratorStore, overrides: Partial<RunnerDeps> = {}) {
   return new ActorRunner({
     store,
     model,
@@ -118,7 +104,7 @@ function file(plan: ReviewerPlan, path: string): string {
   return Buffer.from(entry.bytes).toString();
 }
 
-function registerGoal(content: unknown = goal) {
+function registerGoal(store: OrchestratorStore, content: unknown = goal) {
   const { id, digest } = store.proposeGoal(content, operator);
   const { goalId } = store.decide(id, {
     digest,
@@ -129,11 +115,13 @@ function registerGoal(content: unknown = goal) {
   return goalId;
 }
 
-function enableGoalAgentApproval() {
+function enableGoalAgentApproval(store: OrchestratorStore) {
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
 }
 
 test("Planner keeps the brief and context in files, records usage and submits a pending goal", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
   let calledId: string | undefined;
   const repoText = "Untrusted repository instruction";
   const originalSession = store.startSession(
@@ -143,7 +131,7 @@ test("Planner keeps the brief and context in files, records usage and submits a 
   const input = { ...goalRequest, sessionId: originalSession };
   const base = "a".repeat(40);
   store.recordSessionSnapshot(originalSession, base);
-  const work = runner({
+  const work = runner(store, {
     context: async (commit) => {
       assert.equal(commit, base);
       return [{ path: "src/main.ts", bytes: Buffer.from(repoText) }];
@@ -230,7 +218,7 @@ test("Planner keeps the brief and context in files, records usage and submits a 
   });
   assert.ok(goalId);
   assert.equal(store.getGoal(goalId)?.planningCommit, base);
-  const decomposition = runner({
+  const decomposition = runner(store, {
     context: async (commit) => {
       assert.equal(commit, base);
       return [];
@@ -256,12 +244,14 @@ test("Planner keeps the brief and context in files, records usage and submits a 
 });
 
 test("Planner rejects a non-base profile for an Executor with a secret grant before proposing tasks", async () => {
-  const goalId = registerGoal({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store, {
     ...goal,
     scope: { ...goal.scope, profiles: ["base", "bun"] },
   });
   const sessionId = store.startSession("Concierge", "runtime").id;
-  const work = runner({
+  const work = runner(store, {
     executorRequiresBase: true,
     runPlanner: async (plan, id) => {
       const { contract } = JSON.parse(file(plan, "request.json"));
@@ -283,12 +273,14 @@ test("Planner rejects a non-base profile for an Executor with a secret grant bef
 });
 
 test("Planner keeps using the private base when decomposing a legacy Goal", async () => {
-  const goalId = registerGoal();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store);
   const sessionId = store.startSession("Concierge", "runtime").id;
   store.recordSessionSnapshot(sessionId, "a".repeat(40));
   const base = "b".repeat(40);
   let lookups = 0;
-  const work = runner({
+  const work = runner(store, {
     canScheduleTasks: () => false,
     tasks: {
       async existingBase() {
@@ -324,13 +316,15 @@ test("Planner keeps using the private base when decomposing a legacy Goal", asyn
 });
 
 test("Planner submits decomposition in order, resolving existing IDs and registered or pending batch references", async () => {
-  const goalId = registerGoal();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store);
   const existing = store.proposeTask(
     { ...task, goalId, title: "Existing" },
     plannerOrigin,
   );
   assert.equal(existing.status, "registered");
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (plan, id) => {
       const request = JSON.parse(file(plan, "request.json"));
       assert.deepEqual(request.goal, { id: goalId, content: goal });
@@ -395,9 +389,11 @@ test("Planner submits decomposition in order, resolving existing IDs and registe
 });
 
 test("Planner retries a contract violation and validates the entire batch before submitting", async () => {
-  const goalId = registerGoal();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store);
   const calls: string[] = [];
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (_, id, context) => {
       if (calls.length)
         assert.deepEqual(context, {
@@ -426,8 +422,10 @@ test("Planner retries a contract violation and validates the entire batch before
 });
 
 test("Planner retries a failed actor invocation and succeeds", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
   let calls = 0;
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (_, id) =>
       ++calls === 1
         ? { id, outcome: "failed" }
@@ -449,11 +447,13 @@ test("Planner retries a failed actor invocation and succeeds", async () => {
 });
 
 test("Planner continues after exceeding the Goal's token reference", async () => {
-  const goalId = registerGoal({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store, {
     ...goal,
     scope: { ...goal.scope, budgets: { ...budgets, maxTokens: 10 } },
   });
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (_, id) => response(id, { tasks: [task] }),
   });
   const id = await work.requestPlanner({
@@ -470,8 +470,10 @@ test("Planner continues after exceeding the Goal's token reference", async () =>
 });
 
 test("Planner records a timeout and drains the following execution", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
   let calls = 0;
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (_, id) =>
       ++calls === 1
         ? { id, outcome: "timed-out" }
@@ -488,9 +490,11 @@ test("Planner records a timeout and drains the following execution", async () =>
 });
 
 test("Runner validates requests and bounds the shared queue before creating an execution", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
-  const work = runner({ limits: { maxQueued: 1 } });
+  const work = runner(store, { limits: { maxQueued: 1 } });
   for (const request of [
     { ...goalRequest, brief: "" },
     { ...goalRequest, brief: "x".repeat(20_001) },
@@ -517,12 +521,14 @@ test("Runner validates requests and bounds the shared queue before creating an e
 });
 
 test("Concurrent drains share one worker and serialize Planner with Reviewer", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
   const gate = Promise.withResolvers<void>();
   const started = Promise.withResolvers<void>();
   const calls: string[] = [];
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async (_, id) => {
       calls.push(id);
       started.resolve();
@@ -548,6 +554,8 @@ test("Concurrent drains share one worker and serialize Planner with Reviewer", a
 });
 
 test("Planner refuses file count, per-file size, total size and traversal before invoking the host", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
   const { files, fileBytes, workspaceBytes } = MICROSANDBOX_LIMITS;
   const cases = [
     {
@@ -575,7 +583,7 @@ test("Planner refuses file count, per-file size, total size and traversal before
   ];
   for (const { context, code } of cases) {
     let calls = 0;
-    const work = runner({
+    const work = runner(store, {
       context: async () => context,
       runPlanner: async (_, id) => {
         calls++;
@@ -593,7 +601,9 @@ test("Planner refuses file count, per-file size, total size and traversal before
 });
 
 test("Planner discards answers over 64 KiB after harness extraction", async () => {
-  const work = runner({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const work = runner(store, {
     harness: {
       harness: "claude",
       sandbox: {},
@@ -625,7 +635,9 @@ test("Planner discards answers over 64 KiB after harness extraction", async () =
 });
 
 test("A throwing Planner is finalized without leaking the exception or retrying it", async () => {
-  const work = runner({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const work = runner(store, {
     runPlanner: async () => {
       throw new Error(goalRequest.brief);
     },
@@ -639,7 +651,9 @@ test("A throwing Planner is finalized without leaking the exception or retrying 
 });
 
 test("Reviewer sees only digest-bound approval files and registers an approved task", async () => {
-  const goalId = registerGoal({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store, {
     ...goal,
     policies: { "task-registration": "agent" },
   });
@@ -647,7 +661,7 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
     { ...task, goalId, paths: ["README.md"] },
     plannerOrigin,
   );
-  const work = runner({
+  const work = runner(store, {
     context: async () => {
       throw new Error("Approval cannot read repo context");
     },
@@ -710,7 +724,9 @@ test("Reviewer sees only digest-bound approval files and registers an approved t
 });
 
 test("Reviewer refuses human policy, including pending content tightening an agent gate", async () => {
-  const work = runner();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const work = runner(store);
   const human = store.proposeGoal(goal, plannerOrigin);
   const loosened = store.proposeGoal(
     { ...goal, policies: { "goal-registration": "agent" } },
@@ -720,7 +736,7 @@ test("Reviewer refuses human policy, including pending content tightening an age
     await assert.rejects(work.requestApproval(proposal.id), {
       code: "approval-forbidden",
     });
-  enableGoalAgentApproval();
+  enableGoalAgentApproval(store);
   const tightened = store.proposeGoal(
     { ...goal, policies: { "goal-registration": "human" } },
     plannerOrigin,
@@ -737,7 +753,9 @@ test("Reviewer refuses human policy, including pending content tightening an age
 });
 
 test("Reviewer cannot queue an approval for a goal that loosens integration policy", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(
     { ...goal, policies: { integration: "agent" } },
     plannerOrigin,
@@ -745,19 +763,21 @@ test("Reviewer cannot queue an approval for a goal that loosens integration poli
   assert.equal(proposal.policy, "agent");
   assert.deepEqual(proposal.loosening, ["integration"]);
 
-  await assert.rejects(runner().requestApproval(proposal.id), {
+  await assert.rejects(runner(store).requestApproval(proposal.id), {
     code: "approval-forbidden",
   });
   assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
 });
 
 test("Reviewer refuses to queue an approval for Concierge proposals", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, {
     ...plannerOrigin,
     actor: "Concierge",
   });
-  await assert.rejects(runner().requestApproval(proposal.id), {
+  await assert.rejects(runner(store).requestApproval(proposal.id), {
     code: "approval-forbidden",
   });
   assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
@@ -765,7 +785,9 @@ test("Reviewer refuses to queue an approval for Concierge proposals", async () =
 });
 
 test("Reviewer cannot queue an approval for a task with missing dependencies", async () => {
-  const goalId = registerGoal({
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  const goalId = registerGoal(store, {
     ...goal,
     policies: { "task-registration": "agent" },
   });
@@ -776,16 +798,18 @@ test("Reviewer cannot queue an approval for a task with missing dependencies", a
   assert.equal(proposal.status, "pending");
   assert.deepEqual(proposal.reasons, ["dependsOn"]);
 
-  await assert.rejects(runner().requestApproval(proposal.id), {
+  await assert.rejects(runner(store).requestApproval(proposal.id), {
     code: "task-constraints",
   });
   assert.deepEqual(store.getHostApiStatus().recentExecutions, []);
 });
 
 test("Runner refuses responses attributed to a different host invocation", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async () => response("unrelated", { goals: [goal] }),
     runReviewer: async () =>
       response("unrelated", { decision: "approve", reasons: [] }),
@@ -806,11 +830,13 @@ test("Runner refuses responses attributed to a different host invocation", async
 });
 
 test("Runner stops draining when the store cannot audit finalization", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { filename, store } = state;
   let calls = 0;
-  const work = runner({
+  const work = runner(store, {
     runPlanner: async () => {
       calls++;
-      const db = new Database(join(folder, "state.sqlite"));
+      const db = new Database(filename);
       try {
         db.exec(`CREATE TRIGGER fail_finish BEFORE INSERT ON events
           WHEN NEW.kind = 'execution.finished'
@@ -830,9 +856,11 @@ test("Runner stops draining when the store cannot audit finalization", async () 
 });
 
 test("Reviewer rechecks policy before recording an in-flight verdict", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
-  const work = runner({
+  const work = runner(store, {
     runReviewer: async (_, id) => {
       store.setProjectDefaults({ "goal-registration": "human" }, operator);
       return response(id, { decision: "approve", reasons: [] });
@@ -854,14 +882,16 @@ test("Reviewer rechecks policy before recording an in-flight verdict", async () 
 });
 
 test("Reviewer rejects an invalid verdict without retrying or deciding the proposal", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
   let calls = 0;
   const prefix = 'Verdict: {"decision":"approve","reasons":[]}'.padEnd(
     4095,
     "x",
   );
-  const work = runner({
+  const work = runner(store, {
     runReviewer: async (_, id) => {
       calls++;
       return {
@@ -882,14 +912,14 @@ test("Reviewer rejects an invalid verdict without retrying or deciding the propo
 });
 
 test("Planner and approval answers with credentials fail without copying their text", async () => {
-  enableGoalAgentApproval();
+  using state = orchestratorFixture("local-runner-");
+  const { root, store } = state;
+  enableGoalAgentApproval(store);
   const proposal = store.proposeGoal(goal, plannerOrigin);
   const secret = "sk-ant-9ZTR5LF4_rZDsVhGdlNOCzIrUQ5";
   const notes: string[] = [];
-  const work = runner({
-    scan: createCredentialScanner({}, realpathSync(folder), (note) =>
-      notes.push(note),
-    ),
+  const work = runner(store, {
+    scan: createCredentialScanner({}, root, (note) => notes.push(note)),
     runPlanner: async (_, id) =>
       response(id, { goals: [{ ...goal, description: secret }] }),
     runReviewer: async (_, id) =>

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test, { afterEach, beforeEach } from "node:test";
+import test from "node:test";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,18 +17,6 @@ const now = () => new Date(`${day}T00:00:00Z`);
 const first = `${day}-0001.jsonl`;
 const second = `${day}-0002.jsonl`;
 const partial = `${first}.partial`;
-let root: string;
-let dir: string;
-
-beforeEach(() => {
-  root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "jsonl-files-")));
-  dir = join(root, "exports");
-});
-
-afterEach(() => {
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
 function expectCode(action: () => unknown, code: string): void {
   assert.throws(
     action,
@@ -37,6 +25,10 @@ function expectCode(action: () => unknown, code: string): void {
 }
 
 test("rotates at midnight UTC and publishes after fsync", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   let date = new Date("2026-11-23T08:59:59.999+09:00");
   const events: string[] = [];
   const writer = new JsonlWriter(dir, {
@@ -74,6 +66,10 @@ test("rotates at midnight UTC and publishes after fsync", () => {
 });
 
 test("counts UTF-8 bytes and resumes after existing final and partial files", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const line = '{"text":"é"}\n';
   const writer = new JsonlWriter(dir, {
     now,
@@ -100,6 +96,10 @@ test("counts UTF-8 bytes and resumes after existing final and partial files", ()
 });
 
 test("rejects invalid and oversized records before opening a data file", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const writer = new JsonlWriter(dir, { now, maxBytes: 32 });
   const cyclic: { self?: object } = {};
   cyclic.self = cyclic;
@@ -123,6 +123,10 @@ test("rejects invalid and oversized records before opening a data file", () => {
 });
 
 test("takes an exclusive PID lock and releases it on close", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const writer = new JsonlWriter(dir, { now });
   assert.equal(
     fs.readFileSync(join(dir, "writer.lock"), "utf8"),
@@ -135,6 +139,10 @@ test("takes an exclusive PID lock and releases it on close", () => {
 });
 
 test("keeps the partial file and PID lock when a writer exits without closing", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const modulePath = fileURLToPath(
     new URL("../src/jsonl-files.ts", import.meta.url),
   );
@@ -154,6 +162,10 @@ test("keeps the partial file and PID lock when a writer exits without closing", 
 });
 
 test("reports ENOSPC and retries in a fresh file", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   let fail = false;
   const writer = new JsonlWriter(dir, {
     now,
@@ -182,6 +194,10 @@ test("reports ENOSPC and retries in a fresh file", () => {
 });
 
 test("reports a short write and detects last lines missing their terminator", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   let short = false;
   const writer = new JsonlWriter(dir, {
     now,
@@ -212,6 +228,10 @@ test("reports a short write and detects last lines missing their terminator", ()
 });
 
 test("preserves a partial file when finalization fails", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const writer = new JsonlWriter(dir, {
     now,
     fs: {
@@ -229,8 +249,12 @@ test("preserves a partial file when finalization fails", () => {
 });
 
 test("uses private modes for created directories, data files and locks", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const root = temp.path;
   const parent = join(root, "observability");
-  dir = join(parent, "exports");
+  const dir = join(parent, "exports");
   const writer = new JsonlWriter(dir, { now });
   writer.write({ sequence: 1 });
   for (const path of [parent, dir])
@@ -242,6 +266,11 @@ test("uses private modes for created directories, data files and locks", () => {
 });
 
 test("refuses symlink and group- or world-writable output directories", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const root = temp.path;
+  const dir = join(temp.path, "exports");
   const target = join(root, "target");
   fs.mkdirSync(target, { mode: 0o700 });
   fs.symlinkSync(target, dir);
@@ -256,6 +285,10 @@ test("refuses symlink and group- or world-writable output directories", () => {
 });
 
 test("refuses unsafe ancestors before creating an output directory", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const root = temp.path;
   const parent = join(root, "parent");
   const link = join(root, "link");
   fs.mkdirSync(parent, { mode: 0o700 });
@@ -275,6 +308,11 @@ test("refuses unsafe ancestors before creating an output directory", () => {
 });
 
 test("accepts a trusted sticky ancestor and creates a private child", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const root = temp.path;
+  const dir = join(temp.path, "exports");
   fs.chmodSync(root, 0o1777);
   const writer = new JsonlWriter(dir, { now });
   writer.write({ sequence: 1 });
@@ -284,6 +322,10 @@ test("accepts a trusted sticky ancestor and creates a private child", () => {
 });
 
 test("leaves an unexpected final destination and the active partial intact", () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const writer = new JsonlWriter(dir, { now });
   writer.write({ kept: true });
   fs.writeFileSync(join(dir, first), '{"existing":true}\n');
@@ -296,6 +338,10 @@ test("leaves an unexpected final destination and the active partial intact", () 
 });
 
 test("one telemetry directory lock protects the budget across all signal writers", async () => {
+  using temp = fs.mkdtempDisposableSync(
+    join(fs.realpathSync(tmpdir()), "jsonl-files-"),
+  );
+  const dir = join(temp.path, "exports");
   const record = { value: "é" };
   const lineBytes = Buffer.byteLength(`${JSON.stringify(record)}\n`);
   const writer = new TelemetryJsonlDirectory(dir, 2 * lineBytes, { now });
