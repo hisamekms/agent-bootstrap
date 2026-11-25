@@ -1,6 +1,7 @@
 import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import {
   CLAUDE_FAILURE_CODES,
+  RETIRED_CLAUDE_FAILURE_CODES,
   validClaudeHostname,
   validService,
   type ClaudeFailureCode,
@@ -51,6 +52,11 @@ export const SECRET_LEAK_SINKS = [
   "collection",
 ] as const;
 export type SecretLeakSink = (typeof SECRET_LEAK_SINKS)[number];
+
+const storedClaudeFailureCodes = [
+  ...CLAUDE_FAILURE_CODES,
+  ...RETIRED_CLAUDE_FAILURE_CODES,
+] as const;
 
 type AuditDetail =
   | {
@@ -133,6 +139,7 @@ export type RequestClaimInput = {
 export type RequestClaim = { readonly id: string; readonly replayed: boolean };
 
 type LegacyAuditDetail =
+  | { readonly code: (typeof RETIRED_CLAUDE_FAILURE_CODES)[number] }
   | {
       readonly authMode: "config-dir";
       readonly settingsDigest: string;
@@ -831,7 +838,10 @@ function parseAuditDetail(
   ) {
     const { code } = dataFields(value, ["code"]);
     return {
-      code: enumField(code, CLAUDE_FAILURE_CODES),
+      code: enumField(
+        code,
+        stored ? storedClaudeFailureCodes : CLAUDE_FAILURE_CODES,
+      ),
     };
   }
   if (

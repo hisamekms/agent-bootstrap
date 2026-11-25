@@ -8,6 +8,7 @@ import { userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { exportAudit, exportAuditChecked } from "../../src/audit-export.ts";
+import { AuditStoreError } from "../../src/audit.ts";
 import {
   CLAUDE_CODE,
   SECRET_FILE_PACKAGES,
@@ -16,6 +17,7 @@ import {
   type ClaudeCodeAuth,
 } from "../../src/claude-code.ts";
 import { ALPINE_3_23 } from "../../src/image-recipes.ts";
+import { escapeTerminalControls } from "../../src/local-orchestrator/analysis.ts";
 import {
   conciergeCommand,
   parseConciergeArgs,
@@ -203,6 +205,7 @@ async function main(args: readonly string[]) {
       "The profile lock must include the configured Verification profile",
     );
   const auditPath = join(directory, "audit.sqlite");
+  const displayedAuditPath = escapeTerminalControls(JSON.stringify(auditPath));
   const msb = { binary, home, stagingRoot: join(directory, "sandboxes") };
   const config = parseObservabilityConfig(
     {
@@ -249,7 +252,7 @@ async function main(args: readonly string[]) {
   try {
     if (!volumeShell)
       store = OrchestratorStore.open(join(directory, "state.db"));
-    console.log(`Audit database ${JSON.stringify(auditPath)}`);
+    console.log(`Audit database ${displayedAuditPath}`);
     if (!volumeShell)
       console.log(
         target.isDefault
@@ -318,6 +321,10 @@ async function main(args: readonly string[]) {
     );
     if (result.outcome !== "ok" || result.exitCode !== 0) process.exitCode = 1;
   } catch (error) {
+    if (error instanceof AuditStoreError)
+      throw new Error(
+        `Concierge failed to ${stage} (audit store ${error.code}, path ${displayedAuditPath})\nnext: agent-bootstrap help troubleshoot`,
+      );
     if (
       error instanceof GitIntegrationError &&
       error.code === "unsafe-input-symlink"
