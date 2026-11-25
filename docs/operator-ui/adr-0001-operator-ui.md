@@ -119,10 +119,10 @@ the source of truth for counts and state.
 
 ### D8. A desktop shell wraps the same UI later
 
-Phase 1 builds the UI with web technology and the host API. Phase 2
-wraps it in a macOS shell for the menu bar, badges, native
+Phases 1 and 2 build the UI with web technology and the host API.
+Phase 3 wraps it in a macOS shell for the menu bar, badges, native
 notifications and Touch ID. The shell connects only through the Unix
-socket. The choice between Tauri and Electrobun is made in Phase 2 after
+socket. The choice between Tauri and Electrobun is made in phase 3 after
 a maturity and license check.
 
 ### D9. Record findings for dagq-lite
@@ -147,10 +147,10 @@ proved necessary. dagq-lite's interface starts from it.
 
 ## Open questions
 
-- PTY ownership: the launcher attaches the operator's TTY today. The
-  host must own the PTY to stream it. Check whether Bun provides a PTY
-  or whether a small helper is needed.
-- Which key or control moves focus between the two regions without
-  conflicting with the Concierge's own keys.
-- Whether `info` items appear in the conversation at all, or only in the
-  host panel.
+Phase 2 settles the first three; see [phase-2-design.md](phase-2-design.md).
+
+- PTY ownership: settled. Bun's `Bun.spawn` `terminal` option gives the
+  host a PTY; no helper is needed (P1, P2).
+- Focus between regions: settled. `F6` moves focus and is never sent to
+  the Concierge (P6).
+- `info` items: settled. They appear only in the host panel (P6).
