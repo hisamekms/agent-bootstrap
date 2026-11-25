@@ -107,6 +107,48 @@ Use agent-bootstrap help approve to review gate decisions. Check status again af
 **Human involvement**  
 The operator answers human-policy gates unless they explicitly delegate a terminal answer.
 
+## inbox
+
+Inspect operator actions and recent progress from local state.
+
+**Prerequisites**  
+A registered target.
+
+```sh
+agent-bootstrap --target /path/to/project inbox
+agent-bootstrap --target /path/to/project inbox --all --json
+agent-bootstrap --target /path/to/project watch
+```
+
+**Expected output**  
+Inbox prints current items with their state and next command. Add --all to include resolved items. Watch prints new and changed items every two seconds. Press Ctrl-C to exit.
+
+**Next action**  
+Use the command shown with each item to inspect it or take action.
+
+**Human involvement**  
+The operator answers human-policy gates unless they explicitly delegate a terminal answer.
+
+## watch
+
+Follow new and changed inbox items in a terminal or a script.
+
+**Prerequisites**  
+A registered target.
+
+```sh
+agent-bootstrap --target /path/to/project watch
+```
+
+**Expected output**  
+One line per new or changed item. Press Ctrl-C to exit.
+
+**Next action**  
+Use inbox --all to review recent resolved items.
+
+**Human involvement**  
+The operator answers human-policy gates unless they explicitly delegate a terminal answer.
+
 ## approve
 
 Review a pinned proposal, record an answer, and export the completed Goal branch locally.
@@ -335,6 +377,8 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap volume <init|attach|detach|status> <name> [--force for detach] | volume shell <mount> [--target <path>]` → { mounted, active, stale } for status or { status } after a completed action.
 - `agent-bootstrap secrets test <variable> [--target <path>] [--json]` → { pass, checks, counts }. Exit 1 can also return the failed check report.
 - `agent-bootstrap status` → { counts, pending, recentExecutions, recentTasks }
+- `agent-bootstrap inbox [--all] [--json]` → Array of inbox items with subject IDs, state and the next command.
+- `agent-bootstrap watch` → Streams human-readable inbox lines until Ctrl-C.
 - `agent-bootstrap proposals [--status <pending|approved|rejected|registered>]` → Array of proposals with effective policy.
 - `agent-bootstrap show <proposalId|goalId|taskId>` → One proposal, Goal, or Task object.
 - `agent-bootstrap approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]` → { preview, result } with proposal preview and recorded decision.

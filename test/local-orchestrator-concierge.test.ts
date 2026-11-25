@@ -423,6 +423,10 @@ test("Concierge guest command admits only validated options and uses a fixed rel
   assert.ok(script!.includes('["STDIO","VSOCK-CONNECT:2:5000"]'));
   assert.doesNotMatch(script!, /managed-settings/);
   assert.match(script!, /--strict-mcp-config --setting-sources ''/);
+  assert.match(
+    script!,
+    /--append-system-prompt '[^']*get_inbox[^']*Only the operator can answer gates[^']*' \\\n/,
+  );
   assert.match(script!, /exec env -i .*HOME=\/state\/home/);
   assert.ok(script!.includes("claude_config=/state/claude"));
   assert.ok(script!.includes('CLAUDE_CONFIG_DIR="$claude_config"'));

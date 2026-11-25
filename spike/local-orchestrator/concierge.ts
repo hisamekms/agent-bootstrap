@@ -1,3 +1,5 @@
+import { listenOperatorApi } from "../../src/local-orchestrator/operator-api.ts";
+import { secretTestFacts } from "../../src/local-orchestrator/secret-test-record.ts";
 import { loadConfig } from "../../src/config/layers.ts";
 import { ConfigError } from "../../src/config/messages.ts";
 import { MsbHomeError, requireMsbHome } from "../../src/config/msb-home.ts";
@@ -329,6 +331,20 @@ async function launchConcierge(
   let store: OrchestratorStore | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
   let sessionId: string | undefined;
+  let operator: Awaited<ReturnType<typeof listenOperatorApi>> | undefined;
+  let interrupted = false;
+  const stopOperator = async (signal: NodeJS.Signals) => {
+    if (interrupted) return;
+    interrupted = true;
+    await operator?.close().catch(() => {
+      console.error("operator-api-close-failed");
+    });
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", terminate);
+    process.kill(process.pid, signal);
+  };
+  const interrupt = () => void stopOperator("SIGINT");
+  const terminate = () => void stopOperator("SIGTERM");
   setStage("open state");
   try {
     if (!volumeShell)
@@ -372,6 +388,22 @@ async function launchConcierge(
       return;
     }
     if (!store) throw new Error("Concierge state unavailable");
+    setStage("open operator API");
+    operator = await listenOperatorApi({
+      store,
+      stateDirectory: directory,
+      target: repoRoot,
+      secretTests: () =>
+        secretTestFacts(
+          effective.config.secretEnv,
+          userStateDirectory(process.env),
+          baseImage,
+        ),
+      ...(scan ? { scan } : {}),
+    });
+    process.on("SIGINT", interrupt);
+    process.on("SIGTERM", terminate);
+    setStage("launch or clean up session");
     const result = await startConcierge(
       {
         host: observed.host,
@@ -404,6 +436,7 @@ async function launchConcierge(
   } finally {
     credential = "";
     const closed = await Promise.allSettled([
+      Promise.resolve().then(() => operator?.close()),
       Promise.resolve().then(() => observed?.close()),
       telemetry.shutdown(),
     ]);
@@ -430,6 +463,8 @@ async function launchConcierge(
         closed.push({ status: "rejected", reason: "store-close-failed" });
       }
     }
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", terminate);
     if (closed.some(({ status }) => status === "rejected")) {
       console.error("concierge-shutdown-failed");
       process.exitCode = 1;

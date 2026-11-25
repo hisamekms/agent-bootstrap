@@ -579,7 +579,11 @@ export async function runBootstrap(
     )
       index += args[index] === "--all-targets" ? 1 : 2;
     const operator = args[index] as keyof typeof operatorOutputs;
-    if (!Object.hasOwn(operatorOutputs, operator)) return usage();
+    if (
+      !Object.hasOwn(operatorOutputs, operator) ||
+      (operator === "watch" && json)
+    )
+      return usage();
 
     const output = operatorOutputs[operator];
     let error = "";
@@ -637,7 +641,7 @@ export async function runBootstrap(
                 ? records[0]
                 : { updated: true },
       );
-    hint(output.next);
+    if (operator !== "watch") hint(output.next);
     return 0;
   } catch (error) {
     if (error instanceof ConfigError || error instanceof MsbHomeError)

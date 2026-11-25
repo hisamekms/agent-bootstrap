@@ -1,3 +1,4 @@
+import type { SecretTestFact } from "./inbox.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -49,7 +50,7 @@ const recordPath = (
 
 const next = "Run agent-bootstrap secrets test for the granted variable.";
 
-export function secretTestCommand(variable: string, target: string): string {
+export function shellWord(target: string): string {
   let quoted = target;
   if (escapeTerminalControls(target) !== target) {
     // Use one shell word even for paths containing terminal controls.
@@ -62,7 +63,26 @@ export function secretTestCommand(variable: string, target: string): string {
   } else if (!/^[\w./-]+$/.test(target)) {
     quoted = "'" + target.replaceAll("'", "'\\''") + "'";
   }
-  return `agent-bootstrap secrets test ${variable} --target ${quoted}`;
+  return quoted;
+}
+
+export function secretTestCommand(variable: string, target: string): string {
+  return `agent-bootstrap secrets test ${variable} --target ${shellWord(target)}`;
+}
+
+export function secretTestFacts(
+  grants: object | undefined,
+  stateDirectory: string,
+  baseImage: string,
+): SecretTestFact[] {
+  const variables = Object.keys(grants ?? {});
+  if (!variables.length) return [];
+  const version = `${CLAUDE_CODE.version}:${containment(baseImage)}`;
+  return variables.map((variable) => ({
+    variable,
+    version,
+    passed: hasSecretTestPass(stateDirectory, variable, undefined, baseImage),
+  }));
 }
 
 export function hasSecretTestPass(
