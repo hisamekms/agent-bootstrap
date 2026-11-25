@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { SqliteAudit } from "./audit.ts";
+import { AuditStoreError, SqliteAudit } from "./audit.ts";
 import { EgressGateway, type EgressGatewayOptions } from "./egress-gateway.ts";
 import { EgressPolicy } from "./egress-policy.ts";
 import {
@@ -53,6 +53,21 @@ export interface ObservedHostOptions {
   ) => Promise<HostGateway>;
 }
 
+const startupMessages = {
+  "microsandbox-version-check-failed": "Microsandbox version check failed",
+  "microsandbox-version-mismatch": "Microsandbox 0.7.16 required",
+  "gateway-startup-failed": "Egress gateway startup check failed",
+} as const;
+
+export class ObservedHostStartupError extends Error {
+  readonly code: keyof typeof startupMessages;
+
+  constructor(code: keyof typeof startupMessages) {
+    super(startupMessages[code]);
+    this.code = code;
+  }
+}
+
 const runFile = promisify(execFile);
 
 async function checkVersion(msb: ObservedHostOptions["msb"]): Promise<void> {
@@ -67,10 +82,10 @@ async function checkVersion(msb: ObservedHostOptions["msb"]): Promise<void> {
       maxBuffer: 1024,
     }));
   } catch {
-    throw new Error("Microsandbox version check failed");
+    throw new ObservedHostStartupError("microsandbox-version-check-failed");
   }
   if (stdout.trim() !== "msb 0.7.16")
-    throw new Error("Microsandbox 0.7.16 required");
+    throw new ObservedHostStartupError("microsandbox-version-mismatch");
 }
 
 class ObservedRuntime extends MicrosandboxRuntime {
@@ -192,7 +207,7 @@ export async function createObservedHost({
   }
 
   try {
-    if (!audit.isV5Writable) throw new Error("Writable v7 audit required");
+    if (!audit.isV5Writable) throw new AuditStoreError("read-only");
 
     const activeObservers = config.telemetry.enabled ? [...observers] : [];
     const pendingHandles = new Map<string, SandboxHandle | undefined>();
@@ -301,10 +316,11 @@ export async function createObservedHost({
         } finally {
           await probe.close();
         }
-      } catch {
-        throw new Error("Egress gateway startup check failed");
+      } catch (error) {
+        if (error instanceof AuditStoreError) throw error;
+        throw new ObservedHostStartupError("gateway-startup-failed");
       }
-      if (!audit.isV5Writable) throw new Error("Writable v7 audit required");
+      if (!audit.isV5Writable) throw new AuditStoreError("read-only");
     }
 
     return {

@@ -130,16 +130,14 @@ function readExecution(store: OrchestratorStore, id: string) {
   const execution = store.getExecution(id);
   if (!execution) return null;
   const { status, result } = execution;
-  if (
-    result &&
-    typeof result === "object" &&
-    Object.hasOwn(result, "rawAnswer")
-  ) {
-    // Raw reviewer diagnostics are for the operator CLI.
-    const { rawAnswer: _rawAnswer, ...visible } = result as Record<
-      string,
-      unknown
-    >;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    // Keep operator diagnostics, including host paths in recovery commands, on the host.
+    const {
+      rawAnswer: _rawAnswer,
+      rejectedPaths: _rejectedPaths,
+      ...visible
+    } = result as Record<string, unknown>;
+    if (visible.code === "secret-test-required") delete visible.next;
     return { id, status, result: visible };
   }
   return { id, status, result };

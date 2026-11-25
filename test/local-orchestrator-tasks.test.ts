@@ -428,6 +428,7 @@ test("revision and path violations share the retry cap", async () => {
   assert.deepEqual(failure(store, denied), {
     status: "failed",
     code: "path-violation",
+    rejectedPaths: [{ path: "docs-other/a.md", symlink: false }],
   });
   assert.equal(store.pendingIntegrations().length, 0);
 });
@@ -1588,6 +1589,7 @@ test("out-of-scope symlink targets fail before review and in-scope links require
   assert.deepEqual(failure(store, denied), {
     status: "failed",
     code: "path-violation",
+    rejectedPaths: [{ path: "docs/link", symlink: true }],
   });
 
   task(store, goalId);

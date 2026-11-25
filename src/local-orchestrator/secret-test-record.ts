@@ -1,3 +1,4 @@
+import { escapeTerminalControls } from "./analysis.ts";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -47,6 +48,22 @@ const recordPath = (
 };
 
 const next = "Run agent-bootstrap secrets test for the granted variable.";
+
+export function secretTestCommand(variable: string, target: string): string {
+  let quoted = target;
+  if (escapeTerminalControls(target) !== target) {
+    // Use one shell word even for paths containing terminal controls.
+    const escaped = Array.from(target, (character) => {
+      if (character === "\\" || character === "'") return "\\" + character;
+      if (escapeTerminalControls(character) === character) return character;
+      return "\\U" + character.codePointAt(0)!.toString(16).padStart(8, "0");
+    }).join("");
+    quoted = "$'" + escaped + "'";
+  } else if (!/^[\w./-]+$/.test(target)) {
+    quoted = "'" + target.replaceAll("'", "'\\''") + "'";
+  }
+  return `agent-bootstrap secrets test ${variable} --target ${quoted}`;
+}
 
 export function hasSecretTestPass(
   stateDirectory: string,

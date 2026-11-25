@@ -73,6 +73,7 @@ const failureCodes = [
   "read-failed",
   "revision-limit",
   "review-concern",
+  "secret-test-required",
   "session-busy",
   "session-ended",
   "stale-base",
@@ -127,7 +128,8 @@ function eventFields(kind: unknown, data: Row) {
 }
 
 // Only project structured fields. Prompt, result and event text can contain
-// repository data, credentials or a delegated answer's authorization.
+// repository data, credentials or a delegated answer's authorization. This
+// includes rejected path names and target paths in recovery commands.
 const queries = {
   executions: {
     sql: `SELECT rowid AS sequence, id, actor, mode, goal_id, task_id, status, started_at, finished_at,

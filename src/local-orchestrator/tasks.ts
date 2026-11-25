@@ -1,6 +1,12 @@
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
+import {
+  boundedPathViolation,
+  MAX_PATH_VIOLATIONS,
+  type PathViolation,
+} from "./path-violations.ts";
+import { SecretTestRequiredError } from "./secret-launch.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir } from "node:fs/promises";
@@ -602,6 +608,18 @@ export function createTaskExecutor(options: {
   };
 }
 
+function allowsSymlinkTarget(
+  paths: readonly string[],
+  path: string,
+  target: CandidateChange["target"],
+): boolean {
+  if (target == null || posix.isAbsolute(target)) return false;
+  const normalized = posix
+    .normalize(posix.join(posix.dirname(path), target))
+    .replace(/\/$/, "");
+  return allowsPath(paths, normalized) || paths.includes(normalized + "/");
+}
+
 export async function runTask(
   store: OrchestratorStore,
   executor: TaskExecutor,
@@ -614,6 +632,7 @@ export async function runTask(
   const { budgets, paths } = task.content;
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
   let code = "host-error";
+  let rejectedPaths: PathViolation[] | undefined;
   const begin = (actor: "Executor" | "Reviewer", mode: TaskRunMode) => {
     const { id: execution } = store.createExecution({
       actor,
@@ -631,24 +650,31 @@ export async function runTask(
     run: (
       id: string,
       observed: ActorResult,
-    ) => Promise<{ value: T; code?: string; result?: object }>,
+    ) => Promise<{
+      value: T;
+      code?: string;
+      result?: Record<string, unknown> & { rejectedPaths?: PathViolation[] };
+    }>,
   ) {
     const executionId = begin(actor, mode);
     const observed: ActorResult = {};
     let completion: Awaited<ReturnType<typeof run>> | undefined;
     let failure: string | undefined;
+    let next: string | undefined;
     try {
       completion = await run(executionId, observed);
       failure = completion.code;
     } catch (error) {
       failure =
         error instanceof ClaudeRunError ||
+        error instanceof SecretTestRequiredError ||
         (error instanceof GitIntegrationError &&
           error.code === "unsafe-input-symlink")
           ? error.code
           : observed.outcome === "ok" && mode === "task"
             ? "candidate-failed"
             : "host-error";
+      if (error instanceof SecretTestRequiredError) next = error.next;
     }
     const timedOut =
       mode !== "verification" && observed.outcome === "timed-out";
@@ -669,7 +695,9 @@ export async function runTask(
         ...(failure ? { code: failure } : {}),
         ...(failure === "unsafe-input-symlink"
           ? { next: unsafeInputSymlinkNext }
-          : {}),
+          : failure === "secret-test-required" && next
+            ? { next }
+            : {}),
         ...(observed.revision === undefined
           ? {}
           : { revision: observed.revision }),
@@ -685,7 +713,12 @@ export async function runTask(
           : {}),
       },
     );
-    return { executionId, value: completion?.value, failure };
+    return {
+      executionId,
+      value: completion?.value,
+      failure,
+      rejectedPaths: completion?.result?.rejectedPaths,
+    };
   }
 
   try {
@@ -706,27 +739,39 @@ export async function runTask(
           const links = changes.filter(({ newMode }) => newMode === "120000");
           const symlinks = links.map(({ path }) => path);
           const value = { pin, changedPaths, symlinks };
-          if (
-            changedPaths.some((path) => !allowsPath(paths, path)) ||
-            links.some(({ path, target }) => {
-              if (target == null || posix.isAbsolute(target)) return true;
-              const normalized = posix
-                .normalize(posix.join(posix.dirname(path), target))
-                .replace(/\/$/, "");
-              return (
-                !allowsPath(paths, normalized) &&
-                !paths.includes(normalized + "/")
-              );
-            })
-          ) {
+          const offendingChanges: { path: string; symlink: boolean }[] = [];
+          for (const { path, newMode, target } of changes) {
+            const symlink = newMode === "120000";
+            if (
+              !allowsPath(paths, path) ||
+              (symlink && !allowsSymlinkTarget(paths, path, target))
+            ) {
+              offendingChanges.push({ path, symlink });
+              if (offendingChanges.length === MAX_PATH_VIOLATIONS) break;
+            }
+          }
+          if (offendingChanges.length) {
             await flow.reject(pin);
-            return { value, code: "path-violation" };
+            const violations = offendingChanges.map(({ path, symlink }) =>
+              boundedPathViolation(path, symlink),
+            );
+            await scan?.(
+              ...offendingChanges.map(({ path }) => path),
+              JSON.stringify(violations),
+            );
+            return {
+              value,
+              code: "path-violation",
+              result: { rejectedPaths: violations },
+            };
           }
           return { value };
         },
       );
       if (worker.failure || !worker.value) {
         code = worker.failure ?? "host-error";
+        rejectedPaths =
+          code === "path-violation" ? worker.rejectedPaths : undefined;
         if (code === "path-violation") continue;
         break;
       }
@@ -818,7 +863,11 @@ export async function runTask(
           ? error.message
           : "host-error";
   }
-  store.failTask(task.id, code);
+  store.failTask(
+    task.id,
+    code,
+    code === "path-violation" ? rejectedPaths : undefined,
+  );
 }
 
 function taskJournal(directory: string, taskId: string, retries: number) {

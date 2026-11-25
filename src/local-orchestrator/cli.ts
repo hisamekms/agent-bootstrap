@@ -5,6 +5,7 @@ import {
   recordedCredentialScanner,
   type CredentialScanner,
 } from "./credential-scan.ts";
+import { readPathViolations, type PathViolation } from "./path-violations.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -351,6 +352,14 @@ async function execute(
     await scan?.(JSON.stringify(value));
     writeJson(io, value);
   };
+  const writePathSummary = (paths: readonly PathViolation[] | undefined) => {
+    if (io.json || !paths) return;
+    const [first] = paths;
+    if (first)
+      io.stdout.write(
+        `Rejected path ${first.path}${first.symlink ? " (symlink)" : ""}${paths.length > 1 ? ` and ${paths.length - 1} more listed` : ""}\n`,
+      );
+  };
   switch (command.kind) {
     case "verification-show":
       await writeCheckedJson(readVerificationConfig(configDirectory!, env));
@@ -465,6 +474,21 @@ async function execute(
       const execution = store.getExecution(command.id);
       if (!execution) return refuse(io, "Execution was not found.");
       await writeCheckedJson(execution);
+      const result = execution.result as {
+        code?: string;
+        rejectedPaths?: unknown;
+        next?: unknown;
+      } | null;
+      if (result?.code === "path-violation")
+        writePathSummary(readPathViolations(result.rejectedPaths));
+      if (
+        !io.json &&
+        result?.code === "secret-test-required" &&
+        typeof result.next === "string"
+      )
+        io.stdout.write(
+          `next: ${escapeTerminalControls(boundField(result.next))}\n`,
+        );
       return 0;
     }
     case "reconcile": {
@@ -551,12 +575,18 @@ async function execute(
         const task = store.getTask(command.id);
         if (task) {
           const usage = store.taskUsage(task.id);
+          const rejectedPaths =
+            task.status === "failed"
+              ? store.taskPathViolations(task.id)
+              : undefined;
           await writeCheckedJson({
             ...task,
             ...usage,
             budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
+            ...(rejectedPaths && { rejectedPaths }),
           });
+          writePathSummary(rejectedPaths);
           return 0;
         }
       }
