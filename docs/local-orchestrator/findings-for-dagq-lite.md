@@ -143,3 +143,19 @@ and integration.
   new pair, up to eight times. Any other bind error still fails at once.
   _Lesson:_ when two protocols must share a port, retry with a new port
   on collision, or let each listener choose its own port.
+
+## 2026-11-25: cleanup and phase 2 design
+
+- **A tested API had no process serving it.** Phase 1 added the operator
+  socket API with tests, but no command hosts it; `inbox` and `watch`
+  read the store directly. Unit tests passed while the feature could
+  not be reached.
+  _Lesson:_ every API ships with the process that serves it and one
+  test that starts that process.
+- **A finished experiment cannot be discarded.** The end-to-end check
+  left a Goal `active` with its private branch. There is no operation to
+  close or discard a Goal. Deleting the branch by hand would leave a
+  recorded base that no longer matches, so later work on that Goal would
+  fail as stale.
+  _Lesson:_ Goals need a host-recorded discard that closes the Goal,
+  resolves its inbox items and removes its private refs together.
