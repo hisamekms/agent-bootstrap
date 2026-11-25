@@ -12,7 +12,10 @@ import {
   type SandboxRuntime,
   type SandboxSession,
   type SandboxSpec,
+  type TerminalAttachment,
   type TerminalCommand,
+  type TerminalExit,
+  type TerminalSink,
 } from "./sandbox-runtime.ts";
 
 export interface RuntimeRoute {
@@ -120,13 +123,26 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
     return owner.openSession(handle, command);
   }
 
+  attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+  ): Promise<TerminalExit>;
+  attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+    sink: TerminalSink,
+  ): Promise<TerminalAttachment>;
   async attachTerminal(
     handle: SandboxHandle,
     command: TerminalCommand,
-  ): Promise<{ exitCode: number | null }> {
+    sink?: TerminalSink,
+  ): Promise<TerminalExit | TerminalAttachment> {
     const owner = this.#owner(handle);
     if (!owner.attachTerminal) throw new SandboxRuntimeError("unsupported");
-    return owner.attachTerminal(handle, command);
+    if (sink === undefined) return owner.attachTerminal(handle, command);
+    const result = await owner.attachTerminal(handle, command, sink);
+    if (!("terminal" in result)) throw new SandboxRuntimeError("unsupported");
+    return result;
   }
 
   #volumeRuntime(): ConciergeVolumeBackend {

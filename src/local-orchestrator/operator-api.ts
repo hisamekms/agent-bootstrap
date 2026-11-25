@@ -2,6 +2,8 @@ import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { privatePath } from "../config/layers.ts";
+import { isTerminalSize } from "../sandbox-runtime.ts";
+import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import {
   changedInboxIds,
@@ -18,6 +20,7 @@ interface OperatorApiOptions extends InboxSource {
   scan?: CredentialScanner;
   maxLineBytes?: number;
   pollMs?: number;
+  terminal?: ConciergeTerminalHub;
 }
 
 type RequestId = string | number;
@@ -26,14 +29,22 @@ type ErrorCode =
   | "invalid-params"
   | "unknown-method"
   | "not-found"
+  | "terminal-unavailable"
+  | "terminal-exited"
+  | "terminal-read-only"
   | "read-failed"
   | "write-failed";
 type Reply = { result: unknown } | { error: { code: ErrorCode } };
-type Client = { subscribedSnapshot?: Map<string, string> };
+type Client = {
+  subscribedSnapshot?: Map<string, string>;
+  send: Parameters<ConciergeTerminalHub["attach"]>[0];
+  pendingBytes: number;
+};
 
 const failure = (code: ErrorCode): Reply => ({ error: { code } });
 const maxClients = 8;
 const maxPendingBytes = 1024 * 1024;
+const maxTerminalInputBytes = 16 * 1024;
 
 function requestId(value: unknown): RequestId {
   return typeof value === "number" && Number.isSafeInteger(value)
@@ -41,9 +52,18 @@ function requestId(value: unknown): RequestId {
     : identifier(value);
 }
 
-function write(socket: Socket, message: object) {
+function write(socket: Socket, client: Client, message: object) {
+  if (socket.destroyed) return Promise.resolve();
+  const line = JSON.stringify(message) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (client.pendingBytes + bytes > maxPendingBytes) {
+    socket.destroy();
+    return Promise.resolve();
+  }
+  client.pendingBytes += bytes;
   return new Promise<void>((resolve, reject) => {
-    socket.write(JSON.stringify(message) + "\n", (error) => {
+    socket.write(line, (error) => {
+      client.pendingBytes -= bytes;
       if (error) reject(error);
       else resolve();
     });
@@ -70,7 +90,7 @@ async function removeStaleSocket(path: string) {
 }
 
 export async function listenOperatorApi(options: OperatorApiOptions) {
-  const { stateDirectory, store, scan } = options;
+  const { stateDirectory, store, scan, terminal } = options;
   const maxLine = integer(options.maxLineBytes ?? 64 * 1024, 1, 1024 * 1024);
   const pollMs = integer(options.pollMs ?? 1000, 1, 60_000);
   const directory = join(stateDirectory, "operator");
@@ -89,6 +109,59 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const project = (includeResolved = false) =>
     projectInbox(options, { includeResolved });
+
+  function terminalRequest(
+    method: string,
+    params: unknown,
+    client: Client,
+  ): Reply | undefined {
+    if (
+      method !== "concierge.attach" &&
+      method !== "concierge.input" &&
+      method !== "concierge.resize"
+    )
+      return undefined;
+    if (!terminal) return failure("terminal-unavailable");
+    const status = terminal.status;
+    if (status !== "ready") return failure(status);
+    try {
+      if (method === "concierge.attach") {
+        fields(params, []);
+        return { result: { replay: terminal.attach(client.send) } };
+      }
+      if (!terminal.ownsInput(client.send))
+        return failure("terminal-read-only");
+      if (method === "concierge.input") {
+        const { data } = fields(params, ["data"]);
+        if (
+          typeof data !== "string" ||
+          data.length > 4 * Math.ceil(maxTerminalInputBytes / 3)
+        )
+          throw new ContractError();
+        const input = Buffer.from(data, "base64");
+        if (
+          input.length > maxTerminalInputBytes ||
+          input.toString("base64") !== data
+        )
+          throw new ContractError();
+        terminal.write(input);
+      } else {
+        const { cols, rows } = fields(params, ["cols", "rows"]);
+        if (
+          typeof cols !== "number" ||
+          typeof rows !== "number" ||
+          !isTerminalSize(cols, rows)
+        )
+          throw new ContractError();
+        terminal.resize(cols, rows);
+      }
+      return { result: {} };
+    } catch (error) {
+      return failure(
+        error instanceof ContractError ? "invalid-params" : "write-failed",
+      );
+    }
+  }
 
   async function dispatch(method: string, params: unknown): Promise<Reply> {
     try {
@@ -167,15 +240,25 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
             !Object.hasOwn(message, "params")
           )
             throw new ContractError();
-          reply = await dispatch(message.method, message.params);
-          if ("result" in reply) {
-            try {
-              if (message.method === "inbox.subscribe")
-                subscribedSnapshot = inboxSnapshot(project(true));
-              else if (message.method !== "inbox.markSeen")
-                await scan?.(JSON.stringify(reply.result));
-            } catch {
-              reply = failure("read-failed");
+          const terminalReply = terminalRequest(
+            message.method,
+            message.params,
+            client,
+          );
+          if (terminalReply) {
+            // Send the replay without yielding to live output first.
+            reply = terminalReply;
+          } else {
+            reply = await dispatch(message.method, message.params);
+            if ("result" in reply) {
+              try {
+                if (message.method === "inbox.subscribe")
+                  subscribedSnapshot = inboxSnapshot(project(true));
+                else if (message.method !== "inbox.markSeen")
+                  await scan?.(JSON.stringify(reply.result));
+              } catch {
+                reply = failure("read-failed");
+              }
             }
           }
         } catch {
@@ -183,7 +266,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
           invalid++;
         }
         length = 0;
-        await write(socket, { id, ...reply });
+        await write(socket, client, { id, ...reply });
         if (subscribedSnapshot) client.subscribedSnapshot = subscribedSnapshot;
         if (invalid >= 3) return;
       }
@@ -196,9 +279,16 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       socket.destroy();
       return;
     }
-    const client: Client = {};
+    const client: Client = {
+      pendingBytes: 0,
+      send: (message) =>
+        void write(socket, client, message).catch(() => socket.destroy()),
+    };
     clients.set(socket, client);
-    socket.once("close", () => clients.delete(socket));
+    socket.once("close", () => {
+      terminal?.detach(client.send);
+      clients.delete(socket);
+    });
     void serve(socket, client)
       .catch(() => {})
       .finally(() => socket.destroy());
@@ -254,12 +344,10 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         const ids = changedInboxIds(client.subscribedSnapshot, current);
         client.subscribedSnapshot = current;
         if (!ids.length) continue;
-        if (socket.writableLength >= maxPendingBytes) socket.destroy();
-        else
-          void write(socket, {
-            method: "inbox.changed",
-            params: { ids },
-          }).catch(() => socket.destroy());
+        void write(socket, client, {
+          method: "inbox.changed",
+          params: { ids },
+        }).catch(() => socket.destroy());
       }
     }, pollMs);
     timer.unref();

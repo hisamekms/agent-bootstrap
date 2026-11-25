@@ -15,6 +15,8 @@ import { createConnection } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
+import type { TerminalExit } from "../src/sandbox-runtime.ts";
 import { listenOperatorApi } from "../src/local-orchestrator/operator-api.ts";
 import { operatorStatus } from "../src/local-orchestrator/operator-read.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
@@ -115,6 +117,15 @@ test(
         assert.equal(response.id, id);
         return response;
       };
+      for (const method of [
+        "concierge.attach",
+        "concierge.input",
+        "concierge.resize",
+      ]) {
+        assert.deepEqual((await request(method)).error, {
+          code: "terminal-unavailable",
+        });
+      }
       const item = `goal-registration:${id}`;
       assert.deepEqual(
         (await request("status")).result,
@@ -218,3 +229,209 @@ test(
     assert.equal(existsSync(path), false);
   },
 );
+
+async function terminalClient(path: string) {
+  const socket = createConnection(path);
+  const reader = createInterface({ input: socket });
+  const lines = reader[Symbol.asyncIterator]();
+  await once(socket, "connect");
+  const next = async () => JSON.parse((await lines.next()).value!);
+  let seq = 0;
+  return {
+    socket,
+    reader,
+    next,
+    async request(method: string, params: object = {}) {
+      const id = ++seq;
+      socket.write(
+        JSON.stringify({ id, method: `concierge.${method}`, params }) + "\n",
+      );
+      const response = await next();
+      assert.equal(response.id, id);
+      return response;
+    },
+  };
+}
+
+test(
+  "operator API replays filtered terminal output and transfers input ownership",
+  { timeout: 5000 },
+  async () => {
+    const { state, options, path } = socketFixture();
+    using fixture = state;
+    const terminal = createConciergeTerminalHub();
+    const { promise: finished, resolve } =
+      Promise.withResolvers<TerminalExit>();
+    const inputs: Buffer[] = [];
+    const sizes: number[][] = [];
+    terminal.data(Buffer.from("y" + "x".repeat(512 * 1024)));
+    terminal.data(Buffer.from("\x1b]52;hidden\x07hello"));
+    terminal.start({
+      finished,
+      terminal: {
+        write: (data) => inputs.push(Buffer.from(data)),
+        resize: (cols, rows) => sizes.push([cols, rows]),
+      },
+    });
+    const api = await listenOperatorApi({
+      ...options,
+      store: fixture.store,
+      terminal,
+    });
+    try {
+      const first = await terminalClient(path);
+      const second = await terminalClient(path);
+      assert.deepEqual((await first.request("attach")).result, {
+        replay: Buffer.from("x".repeat(512 * 1024 - 5) + "hello").toString(
+          "base64",
+        ),
+      });
+      terminal.data(Buffer.from("\x1b]0;title\x1b\\first"));
+      assert.deepEqual(await first.next(), {
+        method: "concierge.output",
+        params: { data: Buffer.from("first").toString("base64") },
+      });
+      const input = Buffer.alloc(16 * 1024, 0xff);
+      assert.deepEqual(
+        (await first.request("input", { data: input.toString("base64") }))
+          .result,
+        {},
+      );
+      assert.deepEqual(inputs, [input]);
+      for (const data of [
+        Buffer.alloc(16 * 1024 + 1).toString("base64"),
+        "QQ=!",
+      ]) {
+        assert.deepEqual((await first.request("input", { data })).error, {
+          code: "invalid-params",
+        });
+      }
+      for (const [cols, rows] of [
+        [19, 24],
+        [501, 24],
+        [80, 4],
+        [80, 201],
+        [80.5, 24],
+      ]) {
+        assert.deepEqual(
+          (await first.request("resize", { cols, rows })).error,
+          { code: "invalid-params" },
+        );
+      }
+      assert.deepEqual((await second.request("attach")).result, {
+        replay: Buffer.from(
+          "x".repeat(512 * 1024 - 10) + "hellofirst",
+        ).toString("base64"),
+      });
+      assert.deepEqual(await first.next(), {
+        method: "concierge.notice",
+        params: { code: "input-transferred" },
+      });
+      assert.deepEqual((await first.request("input", { data: "YQ==" })).error, {
+        code: "terminal-read-only",
+      });
+      assert.deepEqual(
+        (await first.request("resize", { cols: 20, rows: 5 })).error,
+        { code: "terminal-read-only" },
+      );
+      assert.deepEqual(
+        (await second.request("resize", { cols: 20, rows: 5 })).result,
+        {},
+      );
+      assert.deepEqual(sizes, [[20, 5]]);
+      assert.deepEqual(
+        (await second.request("input", { data: "YQ==" })).result,
+        {},
+      );
+      assert.deepEqual(inputs, [input, Buffer.from("a")]);
+      terminal.data(Buffer.from("both"));
+      const output = {
+        method: "concierge.output",
+        params: { data: "Ym90aA==" },
+      };
+      assert.deepEqual(await first.next(), output);
+      assert.deepEqual(await second.next(), output);
+      resolve({ exitCode: 7 });
+      for (const client of [first, second]) {
+        assert.deepEqual(await client.next(), {
+          method: "concierge.exit",
+          params: { exitCode: 7 },
+        });
+        for (const method of ["attach", "input", "resize"]) {
+          assert.deepEqual((await client.request(method)).error, {
+            code: "terminal-exited",
+          });
+        }
+      }
+    } finally {
+      await api.close();
+    }
+  },
+);
+
+test(
+  "operator API disconnects a terminal client over the pending-output limit",
+  { timeout: 5000 },
+  async () => {
+    const { state, options, path } = socketFixture();
+    using fixture = state;
+    const terminal = createConciergeTerminalHub();
+    terminal.start({
+      finished: new Promise(() => {}),
+      terminal: { write() {}, resize() {} },
+    });
+    const api = await listenOperatorApi({
+      ...options,
+      store: fixture.store,
+      terminal,
+    });
+    try {
+      const client = await terminalClient(path);
+      assert.deepEqual((await client.request("attach")).result, { replay: "" });
+      client.reader.close();
+      client.socket.pause();
+      const closed = once(client.socket, "close");
+      const chunk = Buffer.alloc(400 * 1024, 0x78);
+      for (let i = 0; i < 8; i++) terminal.data(chunk);
+      client.socket.resume();
+      await closed;
+    } finally {
+      await api.close();
+    }
+  },
+);
+
+test("terminal hub maintains bounded filtered replay and ends the stream independently of sockets", async () => {
+  const hub = createConciergeTerminalHub();
+  const { promise: finished, resolve } = Promise.withResolvers<TerminalExit>();
+  const received: object[] = [];
+  const send = (event: object) => received.push(event);
+  const second = () => {};
+  assert.equal(hub.status, "terminal-unavailable");
+  hub.data(Buffer.alloc(512 * 1024, 0x78));
+  hub.data(Buffer.from("\x1b]8;;hidden"));
+  hub.start({ finished, terminal: { write() {}, resize() {} } });
+  assert.equal(hub.status, "ready");
+  assert.equal(
+    hub.attach(send),
+    Buffer.alloc(512 * 1024, 0x78).toString("base64"),
+  );
+  hub.data(Buffer.from("\x1b\\hi"));
+  assert.equal(
+    hub.attach(second),
+    Buffer.from("x".repeat(512 * 1024 - 2) + "hi").toString("base64"),
+  );
+  assert.equal(hub.ownsInput(send), false);
+  assert.equal(hub.ownsInput(second), true);
+  hub.detach(second);
+  assert.equal(hub.ownsInput(second), false);
+  resolve({ exitCode: 7 });
+  await finished;
+  hub.data(Buffer.from("late"));
+  assert.equal(hub.status, "terminal-exited");
+  assert.deepEqual(received, [
+    { method: "concierge.output", params: { data: "aGk=" } },
+    { method: "concierge.notice", params: { code: "input-transferred" } },
+    { method: "concierge.exit", params: { exitCode: 7 } },
+  ]);
+});

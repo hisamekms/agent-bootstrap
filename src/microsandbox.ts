@@ -20,6 +20,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { CredentialProvider } from "./credentials.ts";
 import { workerGitConfig } from "./git-integration.ts";
 import {
@@ -38,12 +39,14 @@ import {
   INTERACTIVE_MAX_LIFETIME_MS,
   isConciergeVolumeName,
   isSafeCredentialVariable,
+  isTerminalSize,
   permitsProviderHeader,
   sameProvider,
   SandboxRuntimeError,
   WORKER_MESSAGE_LIMIT,
   WORKER_MESSAGE_PATH,
   terminalEnvEntries,
+  type AttachedTerminal,
   type CollectedArtifacts,
   type CollectSpec,
   type ExecResult,
@@ -57,8 +60,83 @@ import {
   type SandboxSession,
   type SandboxSpec,
   type SandboxTool,
+  type TerminalAttachment,
   type TerminalCommand,
+  type TerminalExit,
+  type TerminalSink,
 } from "./sandbox-runtime.ts";
+
+interface BunTerminal extends AttachedTerminal {
+  close(): void;
+}
+
+const PTY_DRAIN_MS = 50;
+
+declare const Bun: {
+  spawn(
+    argv: string[],
+    options: {
+      cwd: string;
+      env: Record<string, string>;
+      terminal: {
+        cols: number;
+        rows: number;
+        data(terminal: BunTerminal, chunk: Uint8Array): void;
+      };
+    },
+  ): {
+    terminal: BunTerminal;
+    exited: Promise<number>;
+    signalCode: string | null;
+    kill(signal: NodeJS.Signals): void;
+  };
+};
+
+export function spawnAttachedTerminal(
+  argv: string[],
+  options: { cwd: string; env: Record<string, string> },
+  sink: TerminalSink,
+): TerminalAttachment & { exited: Promise<TerminalExit>; stop(): void } {
+  const { cols, rows } = sink;
+  if (!isTerminalSize(cols, rows))
+    throw new SandboxRuntimeError("invalid-input");
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn(argv, {
+      ...options,
+      terminal: { cols, rows, data: (_, chunk) => sink.data(chunk) },
+    });
+  } catch {
+    throw new SandboxRuntimeError("backend-failure");
+  }
+  const pty = child.terminal;
+  const exited = child.exited.then(
+    (code) => ({ exitCode: child.signalCode === null ? code : null }),
+    () => {
+      throw new SandboxRuntimeError("backend-failure");
+    },
+  );
+  const finished = exited.finally(async () => {
+    // PTY reads may still be queued when the child exits.
+    await delay(PTY_DRAIN_MS);
+    pty.close();
+  });
+  return {
+    terminal: {
+      write: (input) => {
+        pty.write(input);
+      },
+      resize: (cols, rows) => {
+        if (!isTerminalSize(cols, rows))
+          throw new SandboxRuntimeError("invalid-input");
+        pty.resize(cols, rows);
+      },
+    },
+    stop: () => child.kill("SIGKILL"),
+    exited,
+    finished,
+  };
+}
 
 export interface MicrosandboxConfig {
   readonly binary: string;
@@ -1211,54 +1289,74 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     }
   }
 
+  attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+  ): Promise<TerminalExit>;
+  attachTerminal(
+    handle: SandboxHandle,
+    command: TerminalCommand,
+    sink: TerminalSink,
+  ): Promise<TerminalAttachment>;
   async attachTerminal(
     handle: SandboxHandle,
     command: TerminalCommand,
-  ): Promise<{ exitCode: number | null }> {
+    sink?: TerminalSink,
+  ): Promise<TerminalExit | TerminalAttachment> {
     const state = this.#state(handle);
     if (!state.interactive) throw new SandboxRuntimeError("unsupported");
     const argv = terminalArgs(command);
     const remaining = state.deadline - performance.now();
     if (remaining <= 0) throw new SandboxRuntimeError("lifetime-expired");
-    const child = spawn(
-      this.#config.binary,
-      [
-        "exec",
-        "-t",
-        "--workdir",
-        command.workdir ?? "/repo",
-        state.id,
-        "--",
-        ...argv,
-      ],
-      { cwd: this.#config.home, env: this.#env(), stdio: "inherit" },
-    );
-    const stop = () => {
-      child.kill("SIGKILL");
-    };
+    const args = [
+      "exec",
+      "-t",
+      "--workdir",
+      command.workdir ?? "/repo",
+      state.id,
+      "--",
+      ...argv,
+    ];
+    const options = { cwd: this.#config.home, env: this.#env() };
+    const attached = sink
+      ? spawnAttachedTerminal([this.#config.binary, ...args], options, sink)
+      : undefined;
+    const child = attached
+      ? undefined
+      : spawn(this.#config.binary, args, { ...options, stdio: "inherit" });
+    const stop = attached?.stop ?? (() => child!.kill("SIGKILL"));
     let expired = false;
     const timer = setTimeout(() => {
       expired = true;
       stop();
     }, Math.ceil(remaining));
-    const finished = new Promise<{ exitCode: number | null }>(
-      (resolve, reject) => {
-        child.once("error", () =>
+    const clearDeadline = () => clearTimeout(timer);
+    void attached?.exited.then(clearDeadline, clearDeadline);
+    const exited =
+      attached?.finished ??
+      new Promise<TerminalExit>((resolve, reject) => {
+        child!.once("error", () =>
           reject(new SandboxRuntimeError("backend-failure")),
         );
-        child.once("close", (exitCode) => {
-          if (expired) reject(new SandboxRuntimeError("lifetime-expired"));
-          else resolve({ exitCode });
+        child!.once("close", (exitCode) => {
+          resolve({ exitCode });
         });
-      },
-    ).finally(() => {
-      clearTimeout(timer);
-      delete state.terminal;
-      state.busy = false;
-    });
+      });
+    const finished = exited
+      .then((result) => {
+        if (expired) throw new SandboxRuntimeError("lifetime-expired");
+        return result;
+      })
+      .finally(() => {
+        clearDeadline();
+        delete state.terminal;
+        state.busy = false;
+      });
     state.busy = true;
     state.terminal = { stop, finished };
-    return finished;
+    if (!attached) return finished;
+    void finished.catch(() => {});
+    return { terminal: attached.terminal, finished };
   }
 
   async createVolume(name: string): Promise<{ reused: boolean }> {

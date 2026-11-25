@@ -36,9 +36,11 @@ import {
   INTERACTIVE_MAX_LIFETIME_MS,
   type SandboxFile,
   type TerminalCommand,
+  type TerminalExit,
 } from "../sandbox-runtime.ts";
 import type {
   ReviewerPlan,
+  ConciergePlan,
   TrustedHost,
   TrustedHostRunOptions,
   WorkerPlan,
@@ -94,9 +96,17 @@ export interface ConciergeSnapshot {
 
 type ConciergeHost = Pick<
   TrustedHost,
-  "runConcierge" | "runPlanner" | "runReviewer" | "prepareConciergeVolume"
+  "runPlanner" | "runReviewer" | "prepareConciergeVolume"
 > &
-  Partial<Pick<TrustedHost, "runWorker" | "runVerification">>;
+  Partial<Pick<TrustedHost, "runWorker" | "runVerification">> & {
+    runConcierge(
+      plan: ConciergePlan,
+      id: string,
+      use: (terminal: {
+        attach(command: TerminalCommand): Promise<TerminalExit>;
+      }) => Promise<void>,
+    ): ReturnType<TrustedHost["runConcierge"]>;
+  };
 
 export interface ConciergeDeps {
   readonly scan?: CredentialScanner;
