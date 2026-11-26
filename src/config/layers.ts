@@ -26,7 +26,12 @@ import {
   type VerificationConfig,
 } from "../local-orchestrator/verification.ts";
 import { listProjects } from "./projects.ts";
-import { localActorHarnesses, type LocalActorHarnesses } from "../actors.ts";
+import {
+  localActorHarnesses,
+  type Harness,
+  type LocalActorHarnesses,
+} from "../actors.ts";
+import { validCodexModel } from "../codex-exec.ts";
 import { CLAUDE_MOUNT_ENV } from "../claude-code.ts";
 import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
@@ -35,7 +40,12 @@ import {
   validService,
   validateClaudeLayer,
 } from "../local-orchestrator/claude-config.ts";
-import { ConfigError, invalid, type ConfigFix } from "./messages.ts";
+import {
+  ActorConfigError,
+  ConfigError,
+  invalid,
+  type ConfigFix,
+} from "./messages.ts";
 
 export type Layer = "user" | "approved" | "local";
 export const projectName = /^[a-z][a-z0-9-]{0,47}$/;
@@ -76,6 +86,8 @@ export interface SecretEnvGrant {
 }
 export interface Config {
   version: 1;
+  actors?: { Executor?: Harness };
+  codex?: { model: string; auth: "siwc" };
   microsandbox?: { home: string };
   repositories?: { root: string };
   verification?: VerificationConfig;
@@ -250,12 +262,15 @@ function readPrivateBytes(
   key: string,
   next: string | ConfigFix,
   limit: number | undefined,
+  cleanupTemporaryFiles = true,
 ): Buffer | undefined {
   const directory = dirname(path);
   const fix = typeof next === "string" ? undefined : next;
   let fd: number;
   try {
-    privateConfigDirectory(directory, root, false, fix);
+    if (cleanupTemporaryFiles)
+      privateConfigDirectory(directory, root, false, fix);
+    else privatePath(directory, root, false, fix);
     fd = openSync(
       path,
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -280,7 +295,7 @@ function readPrivateBytes(
   try {
     let info = fstatSync(fd);
     // A writer may have published a hard link since the first cleanup.
-    if (info.isFile() && info.nlink > 1) {
+    if (cleanupTemporaryFiles && info.isFile() && info.nlink > 1) {
       privateConfigDirectory(directory, root, false, fix);
       info = fstatSync(fd);
     }
@@ -347,8 +362,16 @@ export function readPrivateConfig(
   key: string,
   next: string | ConfigFix,
   limit = maxConfigBytes,
+  options: { cleanupTemporaryFiles?: boolean } = {},
 ): unknown {
-  const bytes = readPrivateBytes(path, root, key, next, limit);
+  const bytes = readPrivateBytes(
+    path,
+    root,
+    key,
+    next,
+    limit,
+    options.cleanupTemporaryFiles,
+  );
   return bytes === undefined ? undefined : parseJson(bytes, key, next);
 }
 
@@ -453,6 +476,66 @@ export function record(
   return result;
 }
 
+function validateActorConfig(
+  raw: Record<string, unknown>,
+  allowed: boolean,
+  fix: ConfigFix,
+) {
+  for (const key of ["actors", "codex"] as const) {
+    if (!Object.hasOwn(raw, key)) continue;
+    if (!allowed)
+      throw new ActorConfigError(
+        key,
+        "This key is allowed only in user configuration or private local.json.",
+        {
+          ...fix,
+          next: `Remove ${key} from the project declaration and re-approve it. Use agent-bootstrap config edit to set it privately.`,
+        },
+      );
+    const value = raw[key];
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new ActorConfigError(key, "Expected an object.", fix);
+    const entry = value as Record<string, unknown>;
+    if (key === "actors") {
+      if (Object.keys(entry).some((actor) => actor !== "Executor"))
+        throw new ActorConfigError(
+          key,
+          "Only Executor can select a harness.",
+          fix,
+        );
+      if (
+        "Executor" in entry &&
+        entry.Executor !== "codex" &&
+        entry.Executor !== "claude"
+      )
+        throw new ActorConfigError(
+          "actors.Executor",
+          "Choose codex or claude.",
+          fix,
+        );
+    } else {
+      if (
+        Object.keys(entry).some(
+          (field) => field !== "model" && field !== "auth",
+        )
+      )
+        throw new ActorConfigError(
+          key,
+          "Only model and auth are supported.",
+          fix,
+        );
+      if (!validCodexModel(entry.model))
+        throw new ActorConfigError(
+          "codex.model",
+          "Provide a valid Codex model ID.",
+          fix,
+        );
+      if (entry.auth !== "siwc")
+        throw new ActorConfigError("codex.auth", "Choose siwc.", fix);
+    }
+  }
+}
+
 export function parseConfig(
   value: unknown,
   layer: Layer,
@@ -460,10 +543,12 @@ export function parseConfig(
 ): Config {
   const key = "$";
   const keys = ["version", "verification", "profiles", "egress"];
-  if (layer !== "approved") keys.push("claude", "mounts", "secretEnv");
+  if (layer !== "approved")
+    keys.push("claude", "mounts", "secretEnv", "actors", "codex");
   if (layer === "user")
     keys.push("volumes", "secrets", "microsandbox", "repositories");
   const raw = record(value, key, next);
+  validateActorConfig(raw, layer !== "approved", next);
   if (Object.hasOwn(raw, "microsandbox") && layer !== "user")
     invalid(
       "microsandbox",
@@ -805,9 +890,24 @@ export function mergeConfig(
     sources["repositories.root"] = "user";
   }
   const layers = { user, approved, local };
+  if (approved)
+    validateActorConfig(
+      approved as unknown as Record<string, unknown>,
+      false,
+      layerFile("approved", env, directory),
+    );
   for (const layer of ["user", "approved", "local"] as const) {
     const current = layers[layer];
     if (!current) continue;
+    if (current.actors?.Executor) {
+      config.actors = { Executor: current.actors.Executor };
+      sources["actors.Executor"] = layer;
+    }
+    if (current.codex) {
+      config.codex = current.codex;
+      sources["codex.model"] = layer;
+      sources["codex.auth"] = layer;
+    }
     if (current.verification) {
       config.verification = current.verification;
       sources.verification = layer;
@@ -893,13 +993,18 @@ export function mergeConfig(
     images.add(volume.image);
     services.add(volume.keychainService);
   }
+  const actorHarnesses: LocalActorHarnesses = {
+    ...harnesses,
+    ...config.actors,
+  };
   const entries = Object.entries(config.mounts ?? {});
   for (const [index, [name, mount]] of entries.entries()) {
     const path = `mounts.${name}`;
     const fix = layerFile(sources[path] as Layer, env, directory);
     if (
       mount.actors.some(
-        (actor) => harnesses[actor as keyof LocalActorHarnesses] !== "claude",
+        (actor) =>
+          actorHarnesses[actor as keyof LocalActorHarnesses] !== "claude",
       )
     )
       invalid(
@@ -930,8 +1035,8 @@ export function mergeConfig(
         );
     }
   }
-  validateSecretGrants(config, sources, harnesses, env, directory);
-  return { config, sources };
+  validateSecretGrants(config, sources, actorHarnesses, env, directory);
+  return { config, sources, actorHarnesses };
 }
 
 function validateSecretGrants(

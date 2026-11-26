@@ -6,7 +6,7 @@ Use a leading `--target <path>` for operator commands. Use `--all-targets` for a
 
 Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.
 
-Machine-readable errors use `{ error, next }`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.
+Machine-readable errors use `{ error, next }`. Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.
 
 - `0` Success.
 - `1` Command failed or was refused.
@@ -388,7 +388,8 @@ Provision the configured Keychain entry and authorize model API access before ru
 ## Command reference
 
 - `agent-bootstrap help [topic] [--json] | help --agent` → { topics, commands, exitCodes }
-- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|external>] [--json]` → Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.
+- `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|external>] [--json]` → Array of checks with layer sources, actor harnesses, and Sign in with ChatGPT grant presence. Exit 3 also returns the array. The next action goes to stderr.
+- `agent-bootstrap codex authorize | codex forget [--json]` → Grant management on the macOS host. Authorize requires a TTY and browser consent. JSON success is { status }.
 - `agent-bootstrap setup [--target <path>] [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
 - `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
 - `agent-bootstrap workplace --target <path> [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--dev-bridge]` → Text output with the optional loopback URL.

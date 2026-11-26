@@ -386,7 +386,11 @@ export const onboardingOutputs = {
   doctor: {
     usage:
       "doctor [--target <path>] [--claude-auth <api-key|external>] [--json]",
-    json: "Array of { id, status, detail, fix, needsNetwork, needsHuman } with layer sources on the effective-configuration check. Exit 3 also returns the array. The next action goes to stderr.",
+    json: "Array of checks with layer sources, actor harnesses, and Sign in with ChatGPT grant presence. Exit 3 also returns the array. The next action goes to stderr.",
+  },
+  codex: {
+    usage: "codex authorize | codex forget [--json]",
+    json: "Grant management on the macOS host. Authorize requires a TTY and browser consent. JSON success is { status }.",
   },
   setup: {
     usage:
@@ -469,7 +473,7 @@ export function renderAgentGuide(): string {
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",
-    "Machine-readable errors use `{ error, next }`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.",
+    "Machine-readable errors use `{ error, next }`. Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.",
     "",
     ...Object.entries(exitCodes).map(
       ([code, label]) => `- \`${code}\` ${label}.`,

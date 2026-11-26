@@ -27,6 +27,20 @@ export class ConfigError extends Error {
   }
 }
 
+export class ActorConfigError extends ConfigError {
+  readonly code = "config-invalid" as const;
+  readonly key: string;
+
+  constructor(key: string, reason: string, fix: string | ConfigFix) {
+    super(key, reason, fix);
+    this.key = key;
+  }
+
+  override doctorCheck() {
+    return { ...super.doctorCheck(), code: this.code, key: this.key };
+  }
+}
+
 export function invalid(
   key: string,
   reason: string,

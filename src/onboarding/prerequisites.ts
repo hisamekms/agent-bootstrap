@@ -55,11 +55,15 @@ import {
   artifacts,
   defaultProfiles,
 } from "./artifacts.ts";
+import { siwcGrantPresence } from "../siwc.ts";
 
 export type Status = "ok" | "missing" | "wrong" | "skipped";
 
 export interface Check {
   effective?: { sources: Record<string, Layer | Layer[] | "env" | "default"> };
+  actorHarnesses?: LocalActorHarnesses;
+  code?: string;
+  key?: string;
   id: string;
   status: Status;
   detail: string;
@@ -441,6 +445,69 @@ export async function doctor(
             false,
             true,
           ),
+    );
+  }
+  if (layers) {
+    const actorHarnesses = layers.actorHarnesses;
+    add(
+      {
+        ...check(
+          "actor-harnesses",
+          "ok",
+          Object.entries(actorHarnesses)
+            .map(([actor, harness]) => `${actor}=${harness}`)
+            .join(", "),
+        ),
+        actorHarnesses,
+      },
+      false,
+    );
+    const presence =
+      host.platform === "darwin"
+        ? await siwcGrantPresence(
+            root,
+            host.env,
+            host === systemHost ? userInfo().username : host.env.USER,
+            async (service, account) => {
+              const { code } = await host.command(
+                "/usr/bin/security",
+                ["find-generic-password", "-s", service, "-a", account],
+                { PATH: "/usr/bin:/bin" },
+              );
+              return code === 0
+                ? "present"
+                : code === 44
+                  ? "missing"
+                  : "unavailable";
+            },
+          )
+        : "unavailable";
+    add(
+      check(
+        "siwc-grant",
+        presence === "present"
+          ? "ok"
+          : presence === "missing"
+            ? "missing"
+            : presence === "pending"
+              ? "wrong"
+              : "skipped",
+        presence === "present"
+          ? "A Sign in with ChatGPT grant is present."
+          : presence === "missing"
+            ? "No Sign in with ChatGPT grant is present."
+            : presence === "pending"
+              ? "The Sign in with ChatGPT grant awaits identity verification and cannot issue tokens until a refresh verifies it."
+              : "Sign in with ChatGPT grant presence could not be checked.",
+        (presence === "missing" || presence === "pending") &&
+          actorHarnesses.Executor === "codex"
+          ? ["agent-bootstrap codex authorize"]
+          : [],
+        false,
+        (presence === "missing" || presence === "pending") &&
+          actorHarnesses.Executor === "codex",
+      ),
+      false,
     );
   }
 

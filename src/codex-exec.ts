@@ -83,9 +83,12 @@ export function codexProvider(
     : undefined;
 }
 
+export function validCodexModel(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9._-]{0,80}$/.test(value);
+}
+
 function check(options: CodexOptions): void {
-  if (!/^[a-z0-9][a-z0-9._-]{0,80}$/.test(options.model))
-    throw new Error("Invalid Codex model");
+  if (!validCodexModel(options.model)) throw new Error("Invalid Codex model");
   const endpoint = options.endpoint;
   if (endpoint.kind === "provider") {
     if (

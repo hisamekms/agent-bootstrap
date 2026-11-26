@@ -100,7 +100,8 @@ Version 1 allows only these keys:
   appear (C8).
 
 The declaration cannot contain volume definitions, mounts, secret sources
-(`secrets`), actor secret grants (`secretEnv`), or `microsandbox`.
+(`secrets`), actor secret grants (`secretEnv`), `microsandbox`, `actors`,
+or `codex`.
 
 ### C4. Approval and drift
 
@@ -149,6 +150,13 @@ Re-approval replaces only `approved.json`. It never touches `local.json`.
 volume definitions, and secret source definitions. `local.json` can refer to
 volumes and secret sources defined in the user config. `agent-bootstrap
 config edit [--project <name>]` opens the right file in `$EDITOR`.
+
+The user config and private `local.json` can set `actors.Executor` to
+`codex` or `claude`. It defaults to `claude`. The other local actors use
+Claude. The same two files accept `codex` with a `model` ID that passes
+the Codex adapter's validation and `auth` set to `siwc`. Grant data lives
+on the host under the user's state directory and in Keychain. See
+[Run the Executor on Codex](../local-orchestrator/running.md#run-the-executor-on-codex).
 
 The user config accepts `"microsandbox": { "home": "/absolute/path" }`.
 This trusted directory holds images, volumes and VM state for the whole
@@ -205,7 +213,9 @@ Keep the secret value in Keychain.
   union of the user config, approved permissions and local permissions.
 - **Single values** follow this order: local, then approved, then user.
   Version 1 has these single values: `claude.auth`, `claude.model` and
-  `verification`.
+  `verification`. For `actors.Executor` and the whole `codex` object,
+  local takes precedence over user and both keys are forbidden in
+  project declarations and approved permissions.
 - **Named entries**, such as mounts and `secretEnv` grants, are never
   merged. The same name in two layers is an error.
 - **Negation.** No layer can remove a grant from a lower layer in
@@ -238,6 +248,10 @@ next: Remove "Verification" from "egress" in ~/.config/agent-bootstrap/projects/
 
 `doctor --json` reports each such error as a check with `status`
 `wrong`, a `detail`, a `fix` and `needsHuman: true`.
+Errors for `actors` and `codex` include `code: "config-invalid"` and the
+offending `key`. Doctor reports the chosen harnesses and whether a Sign in
+with ChatGPT grant is present. The probe does not request the Keychain
+password or contact the provider.
 
 Configuration is read once, at launch. Approval and edits take effect
 at the next launch.

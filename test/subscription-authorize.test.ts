@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -16,6 +17,12 @@ import {
   runSubscription,
   verifyIdentity,
 } from "../spike/m1/subscription-authorize.ts";
+import { siwcProvider, SiwcError } from "../src/siwc.ts";
+import {
+  userStateDirectory,
+  writePrivateConfig,
+} from "../src/config/layers.ts";
+import { configEnv } from "./config-fixture.ts";
 
 test("M5 launcher arguments allow Keychain opt-in immediately after the mode flag", () => {
   assert.deepEqual(parseArgs(["--authorize-and-run-m5", "/msb", "/codex"]), {
@@ -173,6 +180,8 @@ function flow({
   saved = oldToken as string | null,
   revocationStatus = 200,
   keys,
+  onKeys = () => {},
+  jwksResponse = () => Response.json({ keys }),
 }: {
   refresh?: () => Response;
   consentAccessToken?: string;
@@ -180,6 +189,8 @@ function flow({
   saved?: string | null;
   revocationStatus?: number;
   keys?: readonly Record<string, unknown>[];
+  onKeys?: () => void;
+  jwksResponse?: () => Response;
 } = {}) {
   const events: string[] = [];
   const warnings: string[] = [];
@@ -203,7 +214,8 @@ function flow({
     },
     async request(url, body) {
       if (url === "https://auth.openai.com/.well-known/jwks.json") {
-        return Response.json({ keys });
+        onKeys();
+        return jwksResponse();
       }
       assert.ok(body);
       assert.equal(body.get("client_id"), clientId);
@@ -284,6 +296,9 @@ test("refresh accepts a signed ID token bound to the registered subject", async 
   const { keys, claims, token } = signedIdentity();
   const { deps, events } = flow({
     keys,
+    onKeys() {
+      assert.deepEqual(events, ["read", "refresh", "write"]);
+    },
     refresh: () =>
       Response.json({
         ...refreshPayload,
@@ -295,6 +310,29 @@ test("refresh accepts a signed ID token bound to the registered subject", async 
   await runSubscription(registration, deps);
   assert.deepEqual(events, ["read", "refresh", "write", "run", "kept"]);
 });
+
+for (const [failure, jwksResponse] of [
+  [
+    "transport failure",
+    () => {
+      throw new Error("fixture JWKS offline");
+    },
+  ],
+  ["HTTP 503", () => new Response(null, { status: 503 })],
+] as const) {
+  test(`refresh keeps the persisted rotation after JWKS ${failure}`, async () => {
+    const { deps, events, saved } = flow({
+      jwksResponse,
+      refresh: () =>
+        Response.json({ ...refreshPayload, id_token: "fixture-id" }),
+    });
+    await assert.rejects(runSubscription(registration, deps), {
+      code: "siwc-unavailable",
+    });
+    assert.deepEqual(events, ["read", "refresh", "write"]);
+    assert.ok(saved() === newToken);
+  });
+}
 
 for (const [label, fields, cleanupToken] of [
   ["same token", { refresh_token: oldToken }, oldToken],
@@ -315,7 +353,13 @@ for (const [label, fields, cleanupToken] of [
       refresh: () => Response.json({ ...refreshPayload, ...fields }),
     });
     await assert.rejects(runSubscription(registration, deps));
-    assert.deepEqual(events, ["read", "refresh", "revoke", "delete"]);
+    assert.deepEqual(events, [
+      "read",
+      "refresh",
+      ...(cleanupToken === newToken ? ["write"] : []),
+      "revoke",
+      "delete",
+    ]);
     assert.ok(revoked() === cleanupToken);
   });
 }
@@ -331,7 +375,7 @@ test("refresh revokes and deletes the replacement when the signed subject differ
       }),
   });
   await assert.rejects(runSubscription(registration, deps));
-  assert.deepEqual(events, ["read", "refresh", "revoke", "delete"]);
+  assert.deepEqual(events, ["read", "refresh", "write", "revoke", "delete"]);
   assert.ok(revoked() === newToken);
 });
 
@@ -388,7 +432,10 @@ for (const missing of ["clientId", "subjectHash"] as const) {
     assert.deepEqual(consentClientIds, [
       missing === "subjectHash" ? clientId : undefined,
     ]);
-    assert.match(warnings[0] ?? "", /could not be matched to this checkout/);
+    assert.match(
+      warnings[0] ?? "",
+      /could not be matched to the SIWC registration/,
+    );
   });
 }
 
@@ -462,7 +509,10 @@ test("refresh revokes the replacement and deletes the item if persistence fails"
   const { deps, events, revoked } = flow({ persistFails: true });
   await assert.rejects(
     runSubscription(registration, deps),
-    /fixture write failed/,
+    (error) =>
+      error instanceof SiwcError &&
+      error.code === "siwc-rejected" &&
+      error.next === "Run agent-bootstrap codex authorize.",
   );
   assert.deepEqual(events, ["read", "refresh", "write", "revoke", "delete"]);
   assert.ok(revoked() === newToken);
@@ -480,6 +530,195 @@ test("an absent item uses consent and stores the first token", async () => {
     "run",
     "kept",
   ]);
+});
+
+test("host authorize persists a fake consent grant and reuses the saved grant", async (t) => {
+  const root = await mkdtemp(join(realpathSync(tmpdir()), "siwc-authorize-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { deps, events, saved } = flow({ saved: null });
+  const provider = siwcProvider({
+    checkout: root,
+    env: configEnv(root),
+    keychain: () => deps.keychain,
+    request: deps.request,
+    consent: (_hostId, clientId) => deps.consent(clientId),
+  });
+  await provider.authorize();
+  assert.ok(saved() === newToken);
+  assert.deepEqual(events, ["read", "consent", "exchange", "write"]);
+  await provider.authorize();
+  assert.deepEqual(events, ["read", "consent", "exchange", "write", "read"]);
+});
+
+test("a JWKS outage requires identity verification even if the next refresh omits its ID token", async (t) => {
+  const root = await mkdtemp(
+    join(realpathSync(tmpdir()), "siwc-pending-identity-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = configEnv(root);
+  const state = userStateDirectory(env);
+  const file = join(state, "siwc", "registration.json");
+  const legacy = join(root, ".local", "siwc-smoke");
+  const legacyFile = join(legacy, "registration.json");
+  writePrivateConfig(legacyFile, legacy, registration);
+  const { keys, claims, token } = signedIdentity();
+  const { deps, events, saved } = flow({ keys });
+  const laterRotation = "fixture-later-rotation";
+  let refreshes = 0;
+  const provider = siwcProvider({
+    checkout: root,
+    env,
+    keychain: () => deps.keychain,
+    consent: (_hostId, clientId) => deps.consent(clientId),
+    async request(url, body) {
+      if (body?.get("grant_type") === "refresh_token") {
+        switch (++refreshes) {
+          case 1:
+            return Response.json({ ...refreshPayload, id_token: "fixture-id" });
+          case 2:
+            return Response.json({
+              ...refreshPayload,
+              refresh_token: laterRotation,
+            });
+          default:
+            return Response.json({
+              ...refreshPayload,
+              id_token: token(claims),
+            });
+        }
+      }
+      if (url.endsWith("/jwks.json") && refreshes === 1)
+        return new Response(null, { status: 503 });
+      return deps.request(url, body);
+    },
+  });
+
+  await assert.rejects(provider.accessToken(), { code: "siwc-unavailable" });
+  assert.ok(saved() === newToken);
+  await assert.rejects(
+    loadRegistration(legacyFile),
+    /Invalid SIWC registration/,
+  );
+  assert.equal(
+    (await loadRegistration(file))?.identityVerificationPending,
+    true,
+  );
+  await assert.rejects(provider.accessToken(), { code: "siwc-unavailable" });
+  assert.ok(saved() === laterRotation);
+  assert.deepEqual(events, ["read", "write", "read", "write"]);
+  await assert.rejects(provider.authorize(), { code: "siwc-unavailable" });
+  assert.ok(saved() === laterRotation);
+  assert.ok((await provider.accessToken()) === refreshPayload.access_token);
+  assert.ok(saved() === newToken);
+  assert.deepEqual(await loadRegistration(file), {
+    ...registration,
+    migratedFrom: legacy,
+    legacyRetired: true,
+    legacyAccountMigration: true,
+  });
+});
+
+test("new consent retires both spike commands and the legacy registration", async (t) => {
+  const root = await mkdtemp(join(realpathSync(tmpdir()), "siwc-retire-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = configEnv(root);
+  const state = userStateDirectory(env);
+  const legacy = join(root, ".local", "siwc-smoke");
+  const legacyFile = join(legacy, "registration.json");
+  writePrivateConfig(legacyFile, legacy, {
+    ...registration,
+    clientId: "old_client",
+  });
+  const { deps, events, saved, consentClientIds } = flow({ saved: null });
+  const provider = siwcProvider({
+    checkout: root,
+    env,
+    keychain: () => deps.keychain,
+    request: deps.request,
+    consent: (_hostId, clientId) => deps.consent(clientId),
+  });
+  await provider.authorize();
+  assert.deepEqual(consentClientIds, ["old_client"]);
+  assert.ok(saved() === newToken);
+  assert.deepEqual(
+    await loadRegistration(join(state, "siwc", "registration.json")),
+    {
+      ...registration,
+      migratedFrom: legacy,
+      legacyRetired: true,
+      legacyAccountMigration: true,
+    },
+  );
+  await assert.rejects(
+    loadRegistration(legacyFile),
+    /Invalid SIWC registration/,
+  );
+  const retired = (error: unknown) =>
+    error instanceof SiwcError &&
+    error.next.includes("launcher has been retired") &&
+    error.next.includes("agent-bootstrap codex authorize");
+  await assert.rejects(provider.forget({ legacy: true }), retired);
+  await assert.rejects(
+    provider.runSmoke({
+      useKeychain: true,
+      signal: new AbortController().signal,
+      run: async () => assert.fail("unexpected launcher run"),
+      onUnconfirmedRevocation() {},
+    }),
+    retired,
+  );
+  assert.deepEqual(events, ["read", "consent", "exchange", "write"]);
+  assert.equal(await provider.forget(), 0);
+  assert.ok(saved() === null);
+  assert.deepEqual(
+    await loadRegistration(join(state, "siwc", "registration.json")),
+    { ...registration, legacyRetired: true },
+  );
+  await assert.rejects(provider.forget({ legacy: true }), retired);
+});
+
+test("a missing legacy directory permits authorization and forget clears its link", async (t) => {
+  const root = await mkdtemp(
+    join(realpathSync(tmpdir()), "siwc-missing-legacy-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = configEnv(root);
+  const state = userStateDirectory(env);
+  const file = join(state, "siwc", "registration.json");
+  const legacy = join(root, ".local", "siwc-smoke");
+  writePrivateConfig(file, state, { ...registration, migratedFrom: legacy });
+  const { deps, saved } = flow({ saved: null });
+  const warnings: string[] = [];
+  const provider = siwcProvider({
+    checkout: root,
+    env,
+    keychain: () => deps.keychain,
+    request: deps.request,
+    warn: (message) => warnings.push(message),
+    async consent(_hostId, clientId) {
+      assert.equal((await loadRegistration(file))?.legacyRetired, true);
+      assert.match(
+        warnings[0]!,
+        /Do not use any moved copy of the old launcher/,
+      );
+      return deps.consent(clientId);
+    },
+  });
+
+  await provider.authorize();
+  assert.ok(saved() === newToken);
+  assert.deepEqual(await loadRegistration(file), {
+    ...registration,
+    migratedFrom: legacy,
+    legacyRetired: true,
+    legacyAccountMigration: true,
+  });
+  assert.equal(await provider.forget(), 0);
+  assert.ok(saved() === null);
+  assert.deepEqual(await loadRegistration(file), {
+    ...registration,
+    legacyRetired: true,
+  });
 });
 
 test("a run without opt-in still consents and revokes", async () => {
@@ -697,9 +936,7 @@ test("forget without a registration skips Keychain access and revocation", async
     () => assert.fail("unexpected revocation warning"),
   );
   assert.equal(exit, 0);
-  assert.deepEqual(reports, [
-    "No registration found. There is nothing to forget for this checkout.",
-  ]);
+  assert.deepEqual(reports, ["No Sign in with ChatGPT registration found."]);
 });
 
 test("forget reports unreadable registration without exposing file contents", async (t) => {
