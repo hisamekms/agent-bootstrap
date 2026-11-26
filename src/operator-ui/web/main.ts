@@ -8,9 +8,10 @@ import {
   clampSize,
   decodeBase64,
   encodeBase64,
+  statusRepository,
 } from "./protocol.ts";
 
-let token = location.hash.slice(1);
+const token = location.hash.slice(1);
 history.replaceState(history.state, "", location.pathname + location.search);
 
 const workplace = element("workplace");
@@ -19,6 +20,7 @@ const terminal = element("terminal");
 const host = element("host");
 const divider = element("divider");
 const connection = element("connection");
+const reconnect = element("connection-reconnect") as HTMLButtonElement;
 const terminalNotice = element("terminal-notice");
 
 const term = new Terminal({
@@ -189,44 +191,80 @@ function connectionState(
 element("connection-host").textContent = location.host;
 setTerminalState(terminalState);
 if (channel) {
-  connectionState("connecting", "接続しています");
-  channel.socket.addEventListener("open", () => {
-    channel.socket.send(JSON.stringify({ token }));
-    token = "";
-    void channel
-      .request("inbox.subscribe", {})
-      .then(() => {
-        connectionState("connected", "接続中");
-        return panel.refresh();
-      })
-      .catch(() => {
-        if (channel.socket.readyState === WebSocket.OPEN)
-          connectionState("disconnected", "受信項目を購読できませんでした");
-      });
-    void channel
-      .request("concierge.attach", {})
-      .then(({ replay }) => {
-        term.write(decodeBase64(replay));
-        if (terminalState === "attaching") setTerminalState("interactive");
-        fitTerminal();
-      })
-      .catch(() => {
-        if (channel.socket.readyState === WebSocket.OPEN) {
-          setTerminalState("unavailable");
-          terminalNotice.textContent = "Concierge に接続できませんでした。";
-        }
-      });
-  });
-  channel.socket.addEventListener("close", () => {
-    token = "";
-    setTerminalState("ended");
+  const workplaceChannel = channel;
+  bindSocket(workplaceChannel.socket);
+  reconnect.addEventListener("click", () => {
     panel.disconnect();
-    connectionState(
-      "disconnected",
-      "切断されました。再接続するにはホストから Workplace を開き直してください",
-    );
+    bindSocket(workplaceChannel.reconnect());
   });
+
+  function bindSocket(socket: WebSocket) {
+    const current = () =>
+      socket === workplaceChannel.socket &&
+      socket.readyState === WebSocket.OPEN;
+    reconnect.disabled = true;
+    lastSize = undefined;
+    term.reset();
+    terminalNotice.textContent = "";
+    setTerminalState("attaching");
+    connectionState("connecting", "接続しています");
+    socket.addEventListener("open", () => {
+      if (!current()) return;
+      socket.send(JSON.stringify({ token }));
+      void workplaceChannel
+        .request("inbox.subscribe", {})
+        .then(() => {
+          if (!current()) return;
+          connectionState("connected", "接続中");
+          panel.connect();
+        })
+        .catch(() => {
+          if (current())
+            connectionState("disconnected", "受信項目を購読できませんでした");
+        })
+        .finally(() => {
+          if (current()) reconnect.disabled = false;
+        });
+      void workplaceChannel
+        .request("status", {})
+        .then((status) => {
+          if (!current()) return;
+          const repository = statusRepository(status);
+          element("connection-project").textContent =
+            repository?.project ?? "—";
+          element("connection-repository").textContent =
+            repository?.repositoryPath ?? "—";
+        })
+        .catch(() => {
+          if (!current()) return;
+          element("connection-project").textContent = "取得できませんでした";
+          element("connection-repository").textContent = "—";
+        });
+      void workplaceChannel
+        .request("concierge.attach", {})
+        .then(({ replay }) => {
+          if (!current()) return;
+          term.write(decodeBase64(replay));
+          if (terminalState === "attaching") setTerminalState("interactive");
+          fitTerminal();
+        })
+        .catch(() => {
+          if (current()) {
+            setTerminalState("unavailable");
+            terminalNotice.textContent = "Concierge に接続できませんでした。";
+          }
+        });
+    });
+    socket.addEventListener("close", () => {
+      if (socket !== workplaceChannel.socket) return;
+      reconnect.disabled = false;
+      setTerminalState("unavailable");
+      panel.disconnect();
+      connectionState("disconnected", "切断されました");
+    });
+  }
 } else {
+  reconnect.disabled = true;
   connectionState("disconnected", "ホストから Workplace を開いてください");
   setTerminalState("unavailable");
 }

@@ -1,5 +1,8 @@
 import { escapeTerminalControls } from "./analysis.ts";
-import type { CredentialScanner } from "./credential-scan.ts";
+import {
+  builtInCredentialScanner,
+  type CredentialScanner,
+} from "./credential-scan.ts";
 import { MAX_REVISIONS } from "../integration-journal.ts";
 import { inboxLimit, type InboxItem } from "./inbox.ts";
 import { GATES, goalBranch } from "./model.ts";
@@ -19,6 +22,14 @@ type ProposalDetails = NonNullable<
   ReturnType<OrchestratorStore["getProposalDetails"]>
 >;
 
+function escapeMultilineText(text: string): string {
+  return text
+    .replaceAll("\r\n", "\n")
+    .split("\n")
+    .map(escapeTerminalControls)
+    .join("\n");
+}
+
 function proposalPolicy({
   gate,
   policy,
@@ -37,8 +48,8 @@ function proposalPolicy({
     ...(ruleId && { ruleId, ruleName }),
     ...(invariant && { invariant }),
     loosening,
-    humanApprovalRequired,
-    humanAnswerRequired,
+    ...(humanApprovalRequired && { humanApprovalRequired }),
+    ...(humanAnswerRequired && { humanAnswerRequired }),
   };
 }
 
@@ -112,22 +123,103 @@ export async function operatorProposal(
   id: string,
   scan?: CredentialScanner,
 ) {
-  const proposal = store.getProposalDetails(id);
+  const proposal = store.getProposalDetails(id, { includeEvidence: true });
   if (!proposal) return null;
-  const diffStat =
-    proposal.kind === "integration"
-      ? (await candidateDiffStat(stateDirectory, proposal.content, scan))
-          .split("\n")
-          .map(escapeTerminalControls)
-          .join("\n")
-      : null;
-  return {
+  const check = scan ?? builtInCredentialScanner;
+  const withheld = { withheld: true } as const;
+  async function screen(text: string, multiline = false) {
+    try {
+      await check(text);
+      return multiline
+        ? escapeMultilineText(text)
+        : escapeTerminalControls(text);
+    } catch {
+      return withheld;
+    }
+  }
+  async function screenList(text: readonly string[], multiline = false) {
+    if (!text.length) return [];
+    try {
+      await check(...text, JSON.stringify(text));
+      return text.map(multiline ? escapeMultilineText : escapeTerminalControls);
+    } catch {
+      return withheld;
+    }
+  }
+  const { ruleId, ruleName, ...policy } = proposalPolicy(proposal);
+  const common = {
     id: proposal.id,
-    kind: proposal.kind,
     status: proposal.status,
     digest: proposal.digest,
-    ...proposalPolicy(proposal),
-    diffStat,
+    ...policy,
+    ...(ruleId !== undefined && { ruleId: await screen(ruleId) }),
+    ...(ruleName !== undefined && { ruleName: await screen(ruleName) }),
+    origin:
+      proposal.origin.kind === "actor"
+        ? { kind: proposal.origin.kind, actor: proposal.origin.actor }
+        : proposal.origin,
+  };
+  if (proposal.kind === "integration") {
+    const rawStat = await candidateDiffStat(
+      stateDirectory,
+      proposal.content,
+      scan,
+    );
+    const changedPaths = await screenList(proposal.content.changedPaths);
+    // The stat repeats changed paths in Git's display format.
+    let diffStat: string | typeof withheld = withheld;
+    if (!("withheld" in changedPaths)) {
+      const escaped = escapeMultilineText(rawStat);
+      try {
+        await check(rawStat, escaped);
+        diffStat = escaped;
+      } catch {}
+    }
+    const review = proposal.pinnedReview;
+    if (!review || !proposal.budgets)
+      throw new Error("Missing integration evidence");
+    const { notes } = proposal.content.review;
+    return {
+      ...common,
+      kind: proposal.kind,
+      diffStat,
+      changedPaths,
+      changedFiles:
+        proposal.diffSize?.changedFiles ?? proposal.content.changedPaths.length,
+      changedLines: proposal.diffSize?.changedLines ?? null,
+      budgets: proposal.budgets,
+      pathViolations: [],
+      reviewExecutionId: review.executionId,
+      modelText: {
+        verdict: review.verdict,
+        findings: notes === undefined ? null : await screen(notes, true),
+      },
+    };
+  }
+  const { content } = proposal;
+  const modelText = {
+    description: await screen(content.description, true),
+    acceptance: await screenList(content.acceptance, true),
+  };
+  const registration = { ...common, diffStat: null, modelText };
+  if (proposal.kind === "goal") {
+    const { paths, ...scope } = proposal.content.scope;
+    return {
+      ...registration,
+      kind: proposal.kind,
+      ...scope,
+      paths: await screenList(paths),
+      pathViolations: [],
+    };
+  }
+  return {
+    ...registration,
+    kind: proposal.kind,
+    budgets: proposal.content.budgets,
+    paths: await screenList(proposal.content.paths),
+    pathViolations: await screenList(proposal.pathViolations ?? []),
+    actor: proposal.content.actor,
+    profile: proposal.content.profile,
   };
 }
 

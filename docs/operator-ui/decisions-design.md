@@ -67,8 +67,8 @@ carries the count, so a new decision is still visible from other tabs.
 choice?}` and `proposal.answerMany` with a list of the same. The bridge
   relays both. Each answer names the pinned digest; the host refuses a
   stale one, as the CLI does.
-- The panel asks once before each answer and shows what is being
-  approved and its digest. A batch asks once for the whole list.
+- The panel asks once before each answer and displays the proposal details.
+  A batch asks once for the whole list.
 - The host records the answer as the operator's, with origin
   `operator-ui`, the digest and the chosen alternative.
 - Only gates whose effective policy is "human" are answered here.
@@ -106,6 +106,39 @@ choice?}` and `proposal.answerMany` with a list of the same. The bridge
   they are sent, as `proposal.get` does.
 - Problems are derived from records that already exist: failed Tasks,
   out-of-scope path violations, and executions over budget.
+
+### Proposal details and connection
+
+Opening a decision card fetches `proposal.get`. The response contains
+the approval digest and the details derived from that stored proposal.
+Workplace shows host-checked paths, size, limits, origin and policy above
+`AI の記述`. The description, acceptance criteria and Reviewer findings
+are plain text. The AI verdict is a textual reference. Goal scope is
+structured and appears as paths, eligible roles and profiles, and limits.
+
+The confirmation submits the digest for the details it previews.
+Workplace keeps the digest internal. If the host reports a stale digest,
+the panel refreshes the inbox, reopens the affected card and fetches its
+details again. For integration, the Git diff has its own digest. The
+creation event names the successful, candidate-pinned Reviewer execution.
+The execution is immutable, and the proposal digest also covers the
+findings saved in the proposal row.
+
+The host screens each model field before escaping terminal controls.
+With a configured scanner, it uses the same scanner as the candidate
+diff. Otherwise it uses the built-in credential check for the new
+fields and the Git stat. A failed check replaces the field with a marker.
+If the changed paths are withheld, the display also withholds their Git
+stat. A withheld field blocks approval from Workplace. Rejection remains
+available, and the card directs the operator to the CLI to review the
+proposal. This block is a Workplace safeguard. The host does not refuse
+`proposal.answer` or `proposal.answerMany` for a proposal with withheld
+fields, because the caller is the authenticated operator.
+
+The connection settings show the project and its repository path
+relative to the configured repository root. The page keeps the bridge
+token in memory for reconnect. Reconnect uses it to open a fresh browser
+socket and subscribes to the inbox again.
 
 ### Q4. Estimates
 

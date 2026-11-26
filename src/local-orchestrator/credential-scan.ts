@@ -33,6 +33,20 @@ function builtInMatch(input: string): boolean {
   return /(?:sk-ant-|bearer\s+)[a-z0-9_./+=-]{24,}/i.test(text);
 }
 
+export const builtInCredentialScanner: CredentialScanner = async (
+  ...sources
+) => {
+  if (
+    sources.reduce((size, item) => size + item.length, 0) > 16 * 1024 * 1024 ||
+    sources.some((source) =>
+      builtInMatch(
+        typeof source === "string" ? source : new TextDecoder().decode(source),
+      ),
+    )
+  )
+    throw new ClaudeRunError("credential-leak");
+};
+
 async function customMatch(text: string[], patterns: readonly string[]) {
   return new Promise<boolean>((resolve) => {
     const worker = new Worker(
@@ -63,22 +77,14 @@ export function createCredentialScanner(
 ): CredentialScanner {
   const patterns = [...(config.leakPatterns ?? [])];
   return async (...sources) => {
-    if (
-      sources.reduce((size, item) => size + item.length, 0) <=
-      16 * 1024 * 1024
-    ) {
+    try {
+      await builtInCredentialScanner(...sources);
+      if (!patterns.length) return;
       const text = sources.map((source) =>
         typeof source === "string" ? source : new TextDecoder().decode(source),
       );
-      if (
-        !text.some(builtInMatch) &&
-        !(
-          patterns.length &&
-          (await customMatch(text, patterns).catch(() => true))
-        )
-      )
-        return;
-    }
+      if (!(await customMatch(text, patterns))) return;
+    } catch {}
 
     let message = "credential-leak evidence could not be written.";
     try {

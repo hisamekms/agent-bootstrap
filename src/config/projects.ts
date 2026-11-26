@@ -6,7 +6,9 @@ import {
   renameSync,
   realpathSync,
   rmSync,
+  statSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import {
   basename,
   dirname,
@@ -40,7 +42,7 @@ import {
   type ApprovedConfig,
   type Config,
 } from "./layers.ts";
-import { invalid, type ConfigFix } from "./messages.ts";
+import { ConfigError, invalid, type ConfigFix } from "./messages.ts";
 
 export interface Project {
   version: 1;
@@ -76,6 +78,14 @@ function line(bytes: Buffer) {
   return bytes.toString("utf8").replace(/\n$/, "");
 }
 
+function invalidWorktree(): never {
+  return invalid(
+    "project.identity",
+    "Provide an accessible Git worktree root.",
+    "Run agent-bootstrap project add <path> with a Git worktree root.",
+  );
+}
+
 export function repository(path: string) {
   try {
     const repoRoot = realpathSync(resolve(path));
@@ -92,12 +102,63 @@ export function repository(path: string) {
     const identity = realpathSync(output.slice(0, -suffix.length));
     return { identity, repoRoot };
   } catch {
-    return invalid(
-      "project.identity",
-      "Provide an accessible Git worktree root.",
-      "Run agent-bootstrap project add <path> with a Git worktree root.",
-    );
+    return invalidWorktree();
   }
+}
+
+export function repositoryWithinRoot(
+  path: string,
+  env: NodeJS.ProcessEnv,
+  ErrorType = ConfigError,
+) {
+  const configured = readLayer("user", undefined, env).repositories?.root;
+  const outsideRoot = (): never => {
+    throw new ErrorType(
+      "repositories.root",
+      "The target is outside repositories.root.",
+      "Set repositories.root in the user configuration to a directory that contains the target (agent-bootstrap config edit).",
+    );
+  };
+  const canonicalDirectory = (value: string, fail: () => never): string => {
+    try {
+      const canonical = realpathSync(value);
+      if (statSync(canonical).isDirectory()) return canonical;
+    } catch {}
+    return fail();
+  };
+  const root = canonicalDirectory(configured ?? (env.HOME || homedir()), () => {
+    throw new ErrorType(
+      "repositories.root",
+      "The repository root cannot be resolved to a directory.",
+      "Set repositories.root in the user configuration to an accessible directory (agent-bootstrap config edit).",
+    );
+  });
+  const repoRoot = canonicalDirectory(resolve(path), invalidWorktree);
+  const child =
+    process.platform === "darwin"
+      ? relative(root.toLowerCase(), repoRoot.toLowerCase())
+      : relative(root, repoRoot);
+  if (isAbsolute(child) || child === ".." || child.startsWith(".." + sep))
+    return outsideRoot();
+  const depth = child ? child.split(sep).length : 0;
+  const parts = repoRoot.split(sep);
+  const repositoryPath = depth ? parts.slice(-depth).join(sep) : ".";
+  if (process.platform === "darwin") {
+    // A case-sensitive volume can have a different directory with the same
+    // folded name. Require the candidate's ancestor to be the actual root.
+    const ancestor = parts.slice(0, parts.length - depth).join(sep) || sep;
+    let sameDirectory = false;
+    try {
+      const expected = statSync(root);
+      const actual = statSync(ancestor);
+      sameDirectory =
+        expected.dev === actual.dev && expected.ino === actual.ino;
+    } catch {}
+    if (!sameDirectory) return outsideRoot();
+  }
+  const repo = repository(repoRoot);
+  if (repo.repoRoot !== repoRoot) return invalidWorktree();
+  return { ...repo, repositoryPath };
 }
 
 export function assertExternalPaths(
@@ -219,7 +280,7 @@ export function addProject(
   name?: string,
   env = process.env,
 ): Project {
-  const repo = repository(path);
+  const repo = repositoryWithinRoot(path, env);
   assertExternalPaths(repo, env);
   const { identity, repoRoot } = repo;
   name ??= defaultProjectName(
@@ -275,7 +336,7 @@ export function moveProject(
   env = process.env,
 ): Project {
   const previous = requireProject(name, env);
-  const repo = repository(path);
+  const repo = repositoryWithinRoot(path, env);
   assertExternalPaths(repo, env);
   const { identity } = repo;
   if (

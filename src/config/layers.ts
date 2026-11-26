@@ -77,6 +77,7 @@ export interface SecretEnvGrant {
 export interface Config {
   version: 1;
   microsandbox?: { home: string };
+  repositories?: { root: string };
   verification?: VerificationConfig;
   claude?: Record<string, unknown>;
   profiles?: Profiles;
@@ -460,7 +461,8 @@ export function parseConfig(
   const key = "$";
   const keys = ["version", "verification", "profiles", "egress"];
   if (layer !== "approved") keys.push("claude", "mounts", "secretEnv");
-  if (layer === "user") keys.push("volumes", "secrets", "microsandbox");
+  if (layer === "user")
+    keys.push("volumes", "secrets", "microsandbox", "repositories");
   const raw = record(value, key, next);
   if (Object.hasOwn(raw, "microsandbox") && layer !== "user")
     invalid(
@@ -468,7 +470,14 @@ export function parseConfig(
       "The Microsandbox home holds images, volumes and VM state for the whole machine and is a trusted input allowed only in user configuration.",
       next,
     );
-  for (const field of ["claude", "mounts", "volumes", "secrets", "secretEnv"])
+  for (const field of [
+    "claude",
+    "mounts",
+    "volumes",
+    "secrets",
+    "secretEnv",
+    "repositories",
+  ])
     if (Object.hasOwn(raw, field) && !keys.includes(field))
       invalid(field, "This key is disallowed in this layer.", next);
   record(raw, key, next, keys);
@@ -478,6 +487,15 @@ export function parseConfig(
     const { home } = record(raw.microsandbox, "microsandbox", next, ["home"]);
     if (typeof home !== "string" || !isAbsolute(home))
       invalid("microsandbox.home", "Expected an absolute path string.", next);
+  }
+  if ("repositories" in raw) {
+    const { root } = record(raw.repositories, "repositories", next, ["root"]);
+    if (typeof root !== "string" || !isAbsolute(root) || root.includes("\0"))
+      invalid(
+        "repositories.root",
+        "Expected an absolute directory path.",
+        next,
+      );
   }
   if ("verification" in raw) {
     const verification = record(raw.verification, "verification", next, [
@@ -781,6 +799,10 @@ export function mergeConfig(
   if (user.microsandbox) {
     config.microsandbox = user.microsandbox;
     sources["microsandbox.home"] = "user";
+  }
+  if (user.repositories) {
+    config.repositories = user.repositories;
+    sources["repositories.root"] = "user";
   }
   const layers = { user, approved, local };
   for (const layer of ["user", "approved", "local"] as const) {

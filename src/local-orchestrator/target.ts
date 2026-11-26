@@ -15,6 +15,7 @@ import {
   listProjects,
   projectMissing,
   repository,
+  repositoryWithinRoot,
 } from "../config/projects.ts";
 import { localMainCommit } from "./tasks.ts";
 
@@ -54,15 +55,15 @@ export async function resolveTarget(
   const projects = listProjects(env);
   // Detect a moved repository addressed by its previous path.
   const requested = resolve(path ?? bootstrapRoot);
-  let found: ReturnType<typeof repository>;
+  let found: ReturnType<typeof repositoryWithinRoot>;
   try {
-    found = repository(requested);
+    found = repositoryWithinRoot(requested, env, TargetError);
     assertExternalPaths(found, env);
   } catch (error) {
+    if (error instanceof TargetError) throw error;
     const missingProject = projects.some(
       (project) =>
-        dirname(project.identity) === resolve(requested) &&
-        projectMissing(project),
+        dirname(project.identity) === requested && projectMissing(project),
     );
     if (missingProject)
       throw new TargetError(
@@ -112,6 +113,7 @@ export async function resolveTarget(
     isDefault,
     slug: project.name,
     project,
+    repositoryPath: found.repositoryPath,
     env,
     configDirectory: projectConfigDirectory(project.name, env),
     directory,
