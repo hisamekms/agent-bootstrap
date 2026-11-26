@@ -413,6 +413,20 @@ test("managed settings keep mounts outside file-tool scopes and remove shell too
   }
 });
 
+test("managed settings deny writing tools to the Concierge with or without mounts", () => {
+  for (const mounts of [[], [mount.path]]) {
+    const deny = managedClaudeSettings("Concierge", false, mounts).permissions
+      .deny;
+    for (const tool of ["Edit", "Write", "NotebookEdit", "Bash"])
+      assert.ok(deny.includes(tool), `${tool} with ${mounts.length} mounts`);
+  }
+  for (const actor of ["Executor", "Reviewer"] as const)
+    assert.equal(
+      managedClaudeSettings(actor, true).permissions.deny.includes("Edit"),
+      false,
+    );
+});
+
 test("migration converts mounts and actor egress once and refuses active attachments or leases", async (t) => {
   const { root, env, definition, volume: makeVolume } = fixture(t);
   const repo = initConfigRepo(join(root, "migration"));
