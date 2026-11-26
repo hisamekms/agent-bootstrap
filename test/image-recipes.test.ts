@@ -142,16 +142,16 @@ describe("image recipes", () => {
           "e415cdf30d41bbf4053ab52eb71c55fb9f5c3b811cd53cf22182960888186cbf",
         ],
         [
-          "libssl3-3.5.9-r0.apk",
-          "cdb3762116994f767cd1da423fa8004bd36b2e3802e3a1343786a40f00a5030e",
+          "libssl3-3.5.9-r1.apk",
+          "c6e06484ab80e8c575b4c3c0e0cea34b350d8cbd35406e59e186ee1a3e0ebedf",
         ],
         [
-          "libcrypto3-3.5.9-r0.apk",
-          "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+          "libcrypto3-3.5.9-r1.apk",
+          "719af95f8e01494aa8dd0e06e3af6d0eaf96cb816d13c52c81628e2780c1adae",
         ],
         [
-          "zstd-libs-1.5.7-r2.apk",
-          "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
+          "zstd-libs-1.6.0-r1.apk",
+          "621c9247644e398fd3d32bba10fbf68c18f05b7941f1d055c4d48311fbfa9673",
         ],
         ...readlinePins.map(({ name, sha256 }) => [name, sha256] as const),
         ...FEATURES.git.packages.map(
@@ -182,9 +182,9 @@ describe("image recipes", () => {
     const [archive] = profileFiles("bun");
     assert.deepEqual(archive, {
       name: "bun-linux-aarch64-musl.zip",
-      source: ".local/bun/1.4.4/bun-linux-aarch64-musl.zip",
+      source: ".local/bun/1.4.5/bun-linux-aarch64-musl.zip",
       sha256:
-        "57f01b02ac7113c61c935f28f38c2eab849e3c970dab21f8b640a87b1ef65009",
+        "d655765d3a0c0fdf707e27c7aa1a4f2c84f1bbc1f759db7e6e3d3c5be414396c",
     });
     const pin = FEATURES.bun.files[0] as { sha256: string };
     const original = pin.sha256;
@@ -202,7 +202,7 @@ describe("image recipes", () => {
     assert.match(script, /ln -s bun \/usr\/local\/bin\/bunx/);
     assert.deepEqual(smokeTest("bun"), {
       script: "bun --version\ngit --version >/dev/null && echo git-ok",
-      expected: ["1.4.4", "git-ok"],
+      expected: ["1.4.5", "git-ok"],
     });
     const entry = lockEntry("bun", DIGEST);
     const lock = parseProfileLock(
@@ -374,9 +374,9 @@ describe("browser recipe (Debian snapshot)", () => {
     assert.ok(update >= 0 && update < check && check < install);
     assert.deepEqual(lines.slice(update + 1, check), [
       "printf '%s  %s\\n' \\",
-      `  '0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675' '${lists}_debian_${ts}_dists_trixie_InRelease' \\`,
-      `  '6f57bff7c8bf51425b0d654b57a93a8cf83f07a6a5d6116ee766f4612336c642' '${lists}_debian_${ts}_dists_trixie-updates_InRelease' \\`,
-      `  'd0b3748b4eb57be9fe9c58b867fe6f1634863313af007d47767658a0fd7abd90' '${lists}_debian-security_${ts}_dists_trixie-security_InRelease' \\`,
+      `  'bfacad4ca61899ce20d4a0d439f29339f66541561b67506364efb88e27dee870' '${lists}_debian_${ts}_dists_trixie_InRelease' \\`,
+      `  '655abcf3a2226cfd3accdb1ef6500e1b4e02d1d3962e1eb3b2b5dd6258b1c45c' '${lists}_debian_${ts}_dists_trixie-updates_InRelease' \\`,
+      `  '092d249a34e1f705cc3038efbe16f9ae27dd6b9efc84618d2b6ffb0f1c604575' '${lists}_debian-security_${ts}_dists_trixie-security_InRelease' \\`,
     ]);
   });
 

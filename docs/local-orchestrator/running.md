@@ -18,7 +18,7 @@ for details.
   `images/profiles.lock.json` and the pinned Alpine base image in that
   Microsandbox home. The base image serves Planner runs.
 - Stage the pinned Alpine arm64 Claude CLI at
-  `.local/claude-code/2.1.330/linux-arm64-musl/claude` in this checkout,
+  `.local/claude-code/2.1.332/linux-arm64-musl/claude` in this checkout,
   or set `LO_CLAUDE_BINARY` to its absolute path. Stage the pinned Alpine
   packages under `.local/alpine/v3.23/main/aarch64/`. The filenames and
   checksums are in `src/claude-code.ts`.

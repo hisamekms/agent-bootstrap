@@ -327,7 +327,27 @@ async function main(): Promise<void> {
       order = Object.keys(raw.profiles);
       const others = { ...raw, profiles: { ...raw.profiles } };
       delete others.profiles[profile];
+      // A coordinated rebuild after a shared input changed (for example a
+      // base image) leaves the other entries stale until they are rebuilt.
+      // IMAGE_REBUILD_ALL=1 keeps them unchanged; each is still checked for
+      // shape, and the lock stays unusable until every entry is rebuilt.
+      const stale: Record<string, unknown> = {};
+      if (process.env["IMAGE_REBUILD_ALL"] === "1") {
+        for (const [name, entry] of Object.entries(others.profiles)) {
+          try {
+            parseProfileLock(
+              JSON.stringify({ ...others, profiles: { [name]: entry } }),
+            );
+          } catch (error) {
+            if (!String(error).includes(`Profile lock is stale for ${name}`))
+              throw error;
+            stale[name] = entry;
+            delete others.profiles[name];
+          }
+        }
+      }
       existing = parseProfileLock(JSON.stringify(others));
+      Object.assign(existing.profiles, stale);
     }
     const entry = lockEntry(profile, digest, packages);
     // Keep the checked-in order so a rebuild changes only its own entry.

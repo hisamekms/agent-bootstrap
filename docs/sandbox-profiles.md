@@ -17,7 +17,7 @@ which stays per adapter. Each VM still lives for one invocation.
 | `db`        | `base` plus SQLite and PostgreSQL          | Database tests and migrations               |
 | `browser`   | `db` plus headless Chromium and Playwright | End-to-end tests                            |
 | `concierge` | `base` plus socat and Git                  | Concierge MCP stdio relay and local history |
-| `bun`       | Alpine 3.23 with Bun 1.4.4 and Git         | Bun/TypeScript development and verification |
+| `bun`       | Alpine 3.23 with Bun 1.4.5 and Git         | Bun/TypeScript development and verification |
 
 Images are built ahead of time and pinned by digest, because a VM has no
 package network. The Concierge runs with networking disabled. It uses socat
@@ -191,10 +191,10 @@ dependencies. The `concierge` image smoke test runs `socat -V` and
 
 The `bun` profile gives Executors and Verification 2048 MiB and 2 CPUs
 for commands such as `bun test`. Stage the official aarch64 musl ZIP at
-`.local/bun/1.4.4/bun-linux-aarch64-musl.zip` and build
+`.local/bun/1.4.5/bun-linux-aarch64-musl.zip` and build
 `bun` with `spike/images/build-profile.ts`. The host checks the ZIP hash.
 The build VM checks the extracted binary hash before making it executable
-and adding the `bunx` symlink. The smoke test checks Bun 1.4.4 and Git.
+and adding the `bunx` symlink. The smoke test checks Bun 1.4.5 and Git.
 
 ### Build steps (Alpine)
 
@@ -233,13 +233,13 @@ and adding the `bunx` symlink. The smoke test checks Bun 1.4.4 and Git.
 
 A recipe has a base kind. `alpine` is the flow above. `debian-snapshot`
 installs with apt from a fixed `snapshot.debian.org` timestamp
-(`20261120T000000Z`) instead of host-pinned files. Features list apt package
+(`20261126T000000Z`) instead of host-pinned files. Features list apt package
 names only. The recipe digest covers the base reference, the timestamp, the
 three `InRelease` SHA-256 pins, the sorted apt names, the setup scripts and the
 limits.
 
 1. **Build VM.** Started from the pinned
-   `debian@sha256:24a01011…` with `--no-net`, `allow@dns`,
+   `debian@sha256:65d15c0a…` with `--no-net`, `allow@dns`,
    `allow@snapshot.debian.org:tcp:80`, 2048 MiB and 2 CPUs. DNS queries are
    unscoped. TCP egress is limited to the snapshot host on port 80.
 2. **Sources.** The script removes the stock `debian.sources`, writes a

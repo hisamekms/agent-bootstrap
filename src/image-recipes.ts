@@ -15,26 +15,26 @@ export const ALPINE_3_23 = {
 export const DEBIAN_TRIXIE = {
   kind: "debian-snapshot",
   reference:
-    "docker.io/library/debian@sha256:24a01011d10eba3a023bc8585b9650b8b29021240d4217c05b905e09ef4a5232",
-  snapshot: "20261120T000000Z",
+    "docker.io/library/debian@sha256:65d15c0ac2dd6639a130a05ffaf36b9d60697ef8d07125d79aecaaa9871bc97b",
+  snapshot: "20261126T000000Z",
   inRelease: [
     {
       archive: "debian",
       suite: "trixie",
       sha256:
-        "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+        "bfacad4ca61899ce20d4a0d439f29339f66541561b67506364efb88e27dee870",
     },
     {
       archive: "debian",
       suite: "trixie-updates",
       sha256:
-        "6f57bff7c8bf51425b0d654b57a93a8cf83f07a6a5d6116ee766f4612336c642",
+        "655abcf3a2226cfd3accdb1ef6500e1b4e02d1d3962e1eb3b2b5dd6258b1c45c",
     },
     {
       archive: "debian-security",
       suite: "trixie-security",
       sha256:
-        "d0b3748b4eb57be9fe9c58b867fe6f1634863313af007d47767658a0fd7abd90",
+        "092d249a34e1f705cc3038efbe16f9ae27dd6b9efc84618d2b6ffb0f1c604575",
     },
   ],
   egress: "snapshot.debian.org:80",
@@ -108,8 +108,8 @@ const READLINE_PACKAGES = [
 ] as const;
 
 const ZSTD_PACKAGE = pkg(
-  "zstd-libs-1.5.7-r2.apk",
-  "50a998e56e4bf31504996e49c1b4a23eed5e0cd4e24b8a1356a54daf1a6eabbe",
+  "zstd-libs-1.6.0-r1.apk",
+  "621c9247644e398fd3d32bba10fbf68c18f05b7941f1d055c4d48311fbfa9673",
 );
 
 const CXX_RUNTIME_PACKAGES = [
@@ -123,14 +123,14 @@ const CXX_RUNTIME_PACKAGES = [
   ),
 ] as const;
 
-export const BUN_VERSION = "1.4.4";
+export const BUN_VERSION = "1.4.5";
 const BUN_ARCHIVE = {
   name: "bun-linux-aarch64-musl.zip",
   source: `.local/bun/${BUN_VERSION}/bun-linux-aarch64-musl.zip`,
-  sha256: "57f01b02ac7113c61c935f28f38c2eab849e3c970dab21f8b640a87b1ef65009",
+  sha256: "d655765d3a0c0fdf707e27c7aa1a4f2c84f1bbc1f759db7e6e3d3c5be414396c",
 } as const satisfies PinnedFile;
 const BUN_BINARY_SHA256 =
-  "a6a3d99a48600b59597070d2d2ff8d37b65975b8aab247ee3479b1eb33d000a6";
+  "9c48986093073afec8b76a3e285303598dd2462f52748aecb65e4d94866e1ea3";
 const BUN_SETUP = `mkdir -p /usr/local/bin
 busybox unzip -p /tmp/pkgs/${BUN_ARCHIVE.name} bun-linux-aarch64-musl/bun > /usr/local/bin/bun
 printf '%s  %s\\n' '${BUN_BINARY_SHA256}' /usr/local/bin/bun | sha256sum -c -
@@ -247,8 +247,8 @@ export const FEATURES = {
         "3078398181f0955da453826965a9e184494e4d9dfd22391e28d72f7561a0ca2b",
       ),
       pkg(
-        "libexpat-2.10.0-r0.apk",
-        "f6483389ab602a351891337be7e9975106d0749d57aa5339b0725bb4051e4bc3",
+        "libexpat-2.11.0-r0.apk",
+        "9fedb90b0b9c206b0263fe3faa53860d02f2089d2edf5511406e281344d6780d",
       ),
       pkg(
         "pcre2-10.49-r0.apk",
@@ -263,12 +263,12 @@ export const FEATURES = {
         "e415cdf30d41bbf4053ab52eb71c55fb9f5c3b811cd53cf22182960888186cbf",
       ),
       pkg(
-        "libssl3-3.5.9-r0.apk",
-        "cdb3762116994f767cd1da423fa8004bd36b2e3802e3a1343786a40f00a5030e",
+        "libssl3-3.5.9-r1.apk",
+        "c6e06484ab80e8c575b4c3c0e0cea34b350d8cbd35406e59e186ee1a3e0ebedf",
       ),
       pkg(
-        "libcrypto3-3.5.9-r0.apk",
-        "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+        "libcrypto3-3.5.9-r1.apk",
+        "719af95f8e01494aa8dd0e06e3af6d0eaf96cb816d13c52c81628e2780c1adae",
       ),
       ...READLINE_PACKAGES,
     ],

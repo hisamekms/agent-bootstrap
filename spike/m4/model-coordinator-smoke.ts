@@ -21,7 +21,7 @@ const local = fileURLToPath(new URL("../../.local/", import.meta.url));
 const msbHome = process.env.MSB_HOME;
 const binary = process.argv[2];
 const codexDigest =
-  "6a95492ca9d85ee76bd9fc5a4d8f72dd98a6130d1bb409bcfc50e61573106616";
+  "28c24ad7fb3bf29c95cd66a12e72d2219f06170efefae8b02002ceb50e2866b9";
 const image =
   "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd";
 assert.ok(msbHome && isAbsolute(msbHome), "Set an absolute MSB_HOME");

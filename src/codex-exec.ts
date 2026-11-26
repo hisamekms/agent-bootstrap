@@ -10,8 +10,13 @@ import {
 
 /** The pinned official Codex CLI build for Linux arm64 guests. */
 export const CODEX = {
-  version: "0.170.0",
-  sha256: "6a95492ca9d85ee76bd9fc5a4d8f72dd98a6130d1bb409bcfc50e61573106616",
+  version: "0.172.0",
+  // Release asset; setup stages it once the Codex Executor lands.
+  archive: {
+    name: "codex-aarch64-unknown-linux-musl.tar.gz",
+    sha256: "0b99526c185a4425fe96a2214fb7b6a6a7f7c1471883b7afbebe97e15e83e79e",
+  },
+  sha256: "28c24ad7fb3bf29c95cd66a12e72d2219f06170efefae8b02002ceb50e2866b9",
   guestPath: "/tmp/codex",
   catalogPath: "/tmp/models.json",
   reviewSchemaPath: "/tmp/review-schema.json",

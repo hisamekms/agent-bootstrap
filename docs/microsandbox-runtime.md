@@ -3,7 +3,7 @@
 ## M1 implementation plan
 
 The bootstrap currently has provider-neutral agent contracts, credential-free
-unit tests, and local Microsandbox and Codex spikes. Bun 1.4.4 is the package
+unit tests, and local Microsandbox and Codex spikes. Bun 1.4.5 is the package
 manager and runner. The spike verified macOS arm64 with Microsandbox 0.7.16,
 Linux arm64 Codex 0.170.0, and a loopback-only simulated Responses provider.
 

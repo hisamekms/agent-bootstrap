@@ -89,7 +89,7 @@ pairs are:
     NOTICE text be kept if it is redistributed. The repository is MIT and
     private, so document the obligation.
 - **Compatibility check.**
-  - `test/otel-compat.test.ts` imports each package under Bun 1.4.4. It runs
+  - `test/otel-compat.test.ts` imports each package under Bun 1.4.5. It runs
     one span, one histogram and one log record through
     `InMemorySpanExporter` / `InMemoryMetricExporter` and the
     `otlp-transformer` JSON serializers. It asserts the OTLP JSON shape

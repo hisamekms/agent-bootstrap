@@ -9,11 +9,11 @@ import { SECRET_FILE_PORT, SECRET_TOOL_DIRS } from "./secret-file.ts";
 import { FEATURES } from "./image-recipes.ts";
 
 /** The pinned official Claude Code CLI build for Alpine/musl arm64 guests.
- * Checksum from https://downloads.claude.ai/claude-code-releases/2.1.330/manifest.json */
+ * Checksum from https://downloads.claude.ai/claude-code-releases/2.1.332/manifest.json */
 export const CLAUDE_CODE = {
-  version: "2.1.330",
+  version: "2.1.332",
   platform: "linux-arm64-musl",
-  sha256: "986b83557cbd428273c37f35fc08a44fc786077deeb391660884833bc581348a",
+  sha256: "122dd3751257a9e769d8c08b19d16e45f3e86c43a09e18d7182fc01c81143246",
   guestPath: "/tmp/claude",
 } as const;
 
@@ -26,7 +26,7 @@ export const CLAUDE_CODE_BUILDS = {
   alpine: { platform: "linux-arm64-musl", sha256: CLAUDE_CODE.sha256 },
   debian: {
     platform: "linux-arm64",
-    sha256: "6016f90cac783e367fb1aa97c768a2efb94a0128a5b46b70fb3d8fcbbd9dd444",
+    sha256: "50c305fcb8912851ce774429131d94ed6f84edbe3d8d0ed7a59dade5d893acc0",
   },
 } as const;
 
@@ -65,12 +65,12 @@ const SECRET_RUNTIME_PACKAGES = [
     sha256: "e415cdf30d41bbf4053ab52eb71c55fb9f5c3b811cd53cf22182960888186cbf",
   },
   {
-    name: "libssl3-3.5.9-r0.apk",
-    sha256: "cdb3762116994f767cd1da423fa8004bd36b2e3802e3a1343786a40f00a5030e",
+    name: "libssl3-3.5.9-r1.apk",
+    sha256: "c6e06484ab80e8c575b4c3c0e0cea34b350d8cbd35406e59e186ee1a3e0ebedf",
   },
   {
-    name: "libcrypto3-3.5.9-r0.apk",
-    sha256: "3b0bd7aaac36d49216f47d025f303dafb6da8d05bd258f71900d3b6156d36012",
+    name: "libcrypto3-3.5.9-r1.apk",
+    sha256: "719af95f8e01494aa8dd0e06e3af6d0eaf96cb816d13c52c81628e2780c1adae",
   },
 ] as const;
 
