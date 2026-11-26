@@ -10,7 +10,23 @@
   <body>
     <main id="workplace">
       <section id="conversation" aria-labelledby="concierge-title">
-        <header><h1 id="concierge-title">Concierge</h1></header>
+        <header>
+          <button
+            type="button"
+            class="iconbtn"
+            id="connection"
+            aria-label="接続しています"
+            title="接続しています"
+          >
+            <span
+              class="dot"
+              id="connection-dot"
+              data-state="connecting"
+              aria-hidden="true"
+            ></span>
+          </button>
+          <h1 id="concierge-title">Concierge</h1>
+        </header>
         <div id="terminal"></div>
       </section>
       <div
@@ -133,20 +149,6 @@
               >
                 <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"></path>
               </svg>
-            </button>
-            <button
-              type="button"
-              class="iconbtn"
-              id="connection"
-              aria-label="接続しています"
-              title="接続しています"
-            >
-              <span
-                class="dot"
-                id="connection-dot"
-                data-state="connecting"
-                aria-hidden="true"
-              ></span>
             </button>
           </div>
         </div>
