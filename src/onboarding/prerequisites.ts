@@ -1,3 +1,8 @@
+import {
+  codexExecutorOptions,
+  readCodexExecutor,
+  selectsCodex,
+} from "../local-orchestrator/codex-executor.ts";
 import type { LocalActorHarnesses } from "../actors.ts";
 import { execFile, spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
@@ -556,14 +561,17 @@ export async function doctor(
   if (verifyProfile && verifyProfile !== "base")
     requiredProfiles.add(verifyProfile);
   const includeSecrets = Object.keys(layers?.config.secretEnv ?? {}).length > 0;
-  const inputs = artifacts(profiles, alternate, includeSecrets);
+  const includeCodex = selectsCodex(layers?.config);
+  const inputs = artifacts(profiles, alternate, includeSecrets, includeCodex);
   const mainInputs = new Set(
     artifacts(
       concierge ? ["concierge"] : defaultProfiles,
       alternate,
       includeSecrets,
+      includeCodex,
     ).map(({ path }) => path),
   );
+  let codexBinaryReady = false;
   for (const item of inputs) {
     const custom = alternate !== undefined && item.path === alternate;
     const status =
@@ -572,31 +580,54 @@ export async function doctor(
         : await artifactStatus(
             isAbsolute(item.path) ? item.path : join(root, item.path),
             item.sha256,
+            item.archive ? 0o700 : undefined,
           );
     const fix = custom
       ? ["unset LO_CLAUDE_BINARY"]
-      : [
-          status === "wrong"
-            ? "agent-bootstrap setup --json"
-            : mainInputs.has(item.path)
-              ? setup
-              : `${setup} --profiles`,
-        ];
+      : item.archive && path !== undefined
+        ? [
+            status === "wrong"
+              ? "Review agent-bootstrap setup --json with the same --target"
+              : "Run agent-bootstrap setup --allow-network with the same --target",
+          ]
+        : [
+            status === "wrong"
+              ? "agent-bootstrap setup --json"
+              : mainInputs.has(item.path)
+                ? setup
+                : `${setup} --profiles`,
+          ];
+    if (item.archive) codexBinaryReady = status === "ok";
     add(
-      check(
-        `artifact:${custom ? "LO_CLAUDE_BINARY" : item.path}`,
-        status,
-        status === "ok"
-          ? "SHA-256 matches."
-          : status === "missing"
-            ? "Pinned file is missing."
-            : "Pinned file is unsafe, unreadable, or has the wrong SHA-256. Inspect it against the setup plan before replacing it.",
-        fix,
-        status === "missing" && !custom,
-        custom || status === "wrong",
-      ),
+      {
+        ...check(
+          `artifact:${custom ? "LO_CLAUDE_BINARY" : item.path}`,
+          status,
+          status === "ok"
+            ? "SHA-256 matches."
+            : status === "missing"
+              ? "Pinned file is missing."
+              : "Pinned file is unsafe, unreadable, or has the wrong SHA-256. Inspect it against the setup plan before replacing it.",
+          fix,
+          status === "missing" && !custom,
+          custom || status === "wrong",
+        ),
+        ...(item.archive && status !== "ok"
+          ? { code: "config-invalid", key: "codex.binary" }
+          : {}),
+      },
       mainInputs.has(item.path),
     );
+  }
+
+  if (layers && codexBinaryReady) {
+    try {
+      const options = codexExecutorOptions(layers.config);
+      if (options) await readCodexExecutor(root, options);
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      add({ ...error.doctorCheck(), id: "codex-executor" });
+    }
   }
 
   const images = {

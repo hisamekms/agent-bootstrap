@@ -1,4 +1,12 @@
 import {
+  codexAuthExitCode,
+  codexFailureActions,
+  codexProvider,
+  isCodexFailureCode,
+  siwcCodexEndpoint,
+  type CodexFailureCode,
+} from "./codex-exec.ts";
+import {
   claudeMountArgv,
   CLAUDE_MANAGED_PATH,
   claudeWorkerMessage,
@@ -49,6 +57,7 @@ import {
   isConciergeVolumeName,
   isTerminalSize,
   permitsProviderHeader,
+  sameProvider,
   SandboxRuntimeError,
   terminalEnvEntries,
   WORKER_MESSAGE_LIMIT,
@@ -100,6 +109,8 @@ import {
 } from "./sandbox-profiles.ts";
 
 type Operation = NonNullable<AuditInput["operation"]>;
+type RunFailureCode = ClaudeFailureCode | CodexFailureCode;
+
 type Outcome = NonNullable<AuditInput["outcome"]>;
 type AuditedProfile = NonNullable<AuditInput["profile"]>;
 
@@ -122,7 +133,7 @@ export interface WorkerRun {
   readonly id: string;
   readonly outcome: Outcome;
   readonly artifacts?: CollectedArtifacts;
-  readonly code?: ClaudeFailureCode;
+  readonly code?: RunFailureCode;
 }
 
 export interface ReviewerPlan {
@@ -143,7 +154,7 @@ export interface ReviewerRun {
   readonly id: string;
   readonly outcome: Outcome;
   readonly response?: Uint8Array;
-  readonly code?: ClaudeFailureCode;
+  readonly code?: RunFailureCode;
 }
 
 export interface CoordinatorSessionPlan {
@@ -654,7 +665,7 @@ export class TrustedHost {
     id: string;
     outcome: Outcome;
     value?: T;
-    code?: ClaudeFailureCode;
+    code?: RunFailureCode;
   }> {
     const attach = this.#sandbox.attachTerminal?.bind(this.#sandbox);
     const {
@@ -947,7 +958,7 @@ export class TrustedHost {
 
   async #invoke(input: Invoke): Promise<{
     outcome: Outcome;
-    code?: ClaudeFailureCode;
+    code?: RunFailureCode;
     artifacts?: CollectedArtifacts;
     response?: Uint8Array;
     value?: unknown;
@@ -974,6 +985,10 @@ export class TrustedHost {
       sandbox.claude && role !== "Verification" && role !== "Coordinator"
         ? this.#claude
         : undefined;
+    const siwcWorker =
+      role === "Worker" &&
+      !sandbox.claude &&
+      sameProvider(sandbox.provider, codexProvider(siwcCodexEndpoint));
     const actor = role === "Worker" ? "Executor" : (role as ClaudeActor);
     const shellMount = input.shellMount;
     const mounted = Object.entries(this.#claude?.mounts ?? {})
@@ -1295,7 +1310,7 @@ export class TrustedHost {
     let providerGranted = false;
     let createAuthorized = false;
     let orphanedSandbox = false;
-    let code: ClaudeFailureCode | undefined;
+    let code: RunFailureCode | undefined;
     let leaseNext: string | undefined;
     let reportedVolumeCode: ClaudeFailureCode | undefined;
     const leases: MountLease[] = [];
@@ -1635,6 +1650,13 @@ export class TrustedHost {
           orphanedSandbox =
             error instanceof SandboxRuntimeError && error.cleanupFailed;
           failure = { error };
+          if (
+            siwcWorker &&
+            error instanceof SandboxRuntimeError &&
+            isCodexFailureCode(error.code) &&
+            error.code !== "codex-auth"
+          )
+            code = error.code;
         }
         await finish("sandbox.create", handle ? "ok" : "failed");
         emit(
@@ -2019,6 +2041,15 @@ export class TrustedHost {
         };
         if (!secretFile && result) publishWorkerStderr(result);
 
+        // The guest controls this exit status. The egress audit observes TCP
+        // connections and cannot corroborate an HTTP credential rejection.
+        if (
+          siwcWorker &&
+          result?.status === "exited" &&
+          result.exitCode === codexAuthExitCode
+        )
+          code = "codex-auth";
+
         if (sandbox.claude && result && result.status === "exited") {
           const parsed =
             role === "Worker"
@@ -2179,7 +2210,9 @@ export class TrustedHost {
       finishLeases(quarantine);
       if (quarantine) report(new ClaudeRunError("volume-detached"));
       if (code && code !== reportedVolumeCode)
-        note(`next: ${leaseNext ?? claudeNext(code)}`);
+        note(
+          `next: ${leaseNext ?? (isCodexFailureCode(code) ? codexFailureActions[code] : claudeNext(code))}`,
+        );
       await append({
         kind: "invocation.finished",
         outcome,

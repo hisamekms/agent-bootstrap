@@ -28,13 +28,10 @@ for details.
 
 ## Run the Executor on Codex
 
-This change adds harness selection and host grant management. The local
-Executor switches to Codex when the runner integration lands. Concierge,
-Planner and Reviewer use Claude.
-
-Use `agent-bootstrap config edit` for the user config or
-`agent-bootstrap config edit --project <name>` for the target's private
-`local.json`. Merge these keys into the existing version 1 file.
+Concierge, Planner and Reviewer use Claude. Select Codex for the Executor
+in the user configuration with `agent-bootstrap config edit` or in the
+target's private `local.json` with `agent-bootstrap config edit --project
+<name>`. Merge these keys into the existing version 1 file.
 
 ```json
 {
@@ -44,21 +41,74 @@ Use `agent-bootstrap config edit` for the user config or
 }
 ```
 
-Run `agent-bootstrap codex authorize` from a macOS terminal and approve
-Agent Bootstrap in the browser using the eligible ChatGPT account and
-workspace. Run `agent-bootstrap doctor --target <path>` to check the
-selected harnesses and grant presence. Grant presence does not establish
-that the provider will accept a refresh.
+Choose a model in the pinned CLI's embedded catalog. Remove Executor from
+any `mounts` or `secretEnv` grant. The Executor uses the profile selected
+for the Task.
 
-To revoke the grant and remove the saved Keychain item, run
-`agent-bootstrap codex forget`. If revocation cannot be confirmed,
-disconnect Agent Bootstrap in ChatGPT settings.
+From the agent-bootstrap checkout, use the same registered target for each
+target-aware command. Review the setup plan before authorizing downloads
+and any required image builds.
 
-Open ChatGPT Settings → Usage → App limits and look for `agent-bootstrap`.
-The PoC observed the app listing. Usage attribution and the remaining
-Gate B checks for network boundaries, credential exposure and live
-refresh races are still unverified. See the
-[Sign in with ChatGPT evidence record](../codex-subscription-credential-poc.md#gate-a-and-gate-b-status).
+```sh
+target=/absolute/path/to/registered-project
+agent-bootstrap setup --target "$target" --json
+agent-bootstrap setup --target "$target" --allow-network
+agent-bootstrap codex authorize
+agent-bootstrap doctor --target "$target"
+```
+
+Setup verifies the release archive and stages the verified executable
+under `.local/codex/`. On a macOS terminal, `codex authorize` opens the
+browser for approval with an eligible ChatGPT account and workspace.
+The host saves the grant in Keychain. Doctor checks the binary, catalog and
+grant presence. Presence alone says nothing about the next refresh.
+
+Before each Executor VM starts, the host exchanges the saved grant for
+one access token. The guest sees a placeholder in
+`AGENT_BOOTSTRAP_SUBSCRIPTION_TOKEN`. Microsandbox receives the value in
+its host create process and substitutes it into the authorization header
+for `api.openai.com:443`. The guest uses the derived catalog with
+`tool_search` disabled. A run has no mid-run refresh and the Codex provider
+has request and stream retries disabled.
+
+| Code                            | Action                                                                                                                            |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `config-invalid`                | Follow `next:` to supply a model, remove a conflicting grant, stage the pinned binary, or choose a model in the verified catalog. |
+| `siwc-missing`, `siwc-rejected` | Run `agent-bootstrap codex authorize` and retry the failed Task. The Executor VM did not start.                                   |
+| `siwc-unavailable`              | Check Keychain and connectivity, then retry the Task. The Executor VM did not start.                                              |
+| `codex-auth`                    | The Executor reported that the provider rejected the credential. Inspect the execution.                                           |
+
+### Operator live check
+
+1. Complete the setup, authorization and doctor steps above for a
+   disposable registered target. Start `agent-bootstrap workplace --target
+"$target" --dev-bridge` and open its private loopback URL.
+2. Ask Concierge for a Goal with one small documentation edit using the
+   base Task profile. Approve the Goal and Task registrations as prompted.
+   Wait for the Executor and Reviewer, then inspect Task detail. Confirm
+   **Executor（Codex）** and the configured model appear on the Executor
+   run and review the candidate before deciding whether to integrate it.
+3. Inspect the same Task with `agent-bootstrap --target "$target" show
+<task-ref>`, then run `agent-bootstrap --target "$target" show-execution
+<execution-id>` for the Executor. In the host audit database printed at
+   launch, check the same invocation for `siwc-refresh` with status
+   `started` and `ok` before successful sandbox creation and scoped
+   provider egress to `api.openai.com:443`. The guest command checks the
+   exact placeholder before calling Codex, so a completed turn exercises
+   that check without displaying the environment value.
+4. Open ChatGPT Settings → Usage → App limits → Manage limits for
+   `agent-bootstrap` in the account that authorized the grant. Look for
+   current-period usage attributable to the run. The earlier PoC observed
+   the app listing. Usage attribution in this flow remains unverified.
+5. When finished testing, `agent-bootstrap codex forget` requests
+   revocation and removes the saved Keychain item. If revocation cannot be
+   confirmed, disconnect Agent Bootstrap in ChatGPT settings. With the
+   configured Executor still selected, a new test Task should fail with
+   `siwc-missing` before VM creation. Authorize again if you want to resume.
+
+Gate B remains unverified, including broader DNS, IPv6, LAN and metadata
+denial, redirect and alternate-origin behavior, all credential surfaces,
+and live refresh races. [Sign in with ChatGPT evidence record](../codex-subscription-credential-poc.md#gate-a-and-gate-b-status)
 
 ## Start or resume
 

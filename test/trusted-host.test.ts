@@ -284,6 +284,40 @@ test("read-only trace exposes an admitted operation after host process death", (
   assert.equal(recovered.events.at(-1).kind, "operation.allowed");
 });
 
+test("read-only trace keeps sandbox creation authorized when SIWC refresh is interrupted", (t) => {
+  const filename = fixture(t);
+  const invocationId = randomUUID();
+  const base = { invocationId, role: "Worker" } as const;
+  const operation = "sandbox.create";
+  const detail = { event: "siwc-refresh", status: "started" } as const;
+  const audit = new SqliteAudit(filename);
+  try {
+    audit.append({ ...base, kind: "invocation.started" });
+    audit.append({ ...base, kind: "operation.requested", operation });
+    audit.append({ ...base, kind: "operation.allowed", operation });
+    audit.append({ ...base, kind: "operation.requested", operation, detail });
+  } finally {
+    audit.close();
+  }
+  const trace = spawnSync(
+    process.execPath,
+    [
+      new URL("../src/trace.ts", import.meta.url).pathname,
+      filename,
+      invocationId,
+    ],
+    { timeout: 5000 },
+  );
+  assert.equal(trace.status, 0, trace.stderr?.toString());
+  const recovered = JSON.parse(trace.stdout.toString());
+  assert.equal(recovered.outcome, "incomplete");
+  assert.deepEqual(recovered.pendingOperation, {
+    operation,
+    effect: "unknown",
+  });
+  assert.deepEqual(recovered.events.at(-1).detail, detail);
+});
+
 test("delegate and integration receipts replay across restart and reject conflicts", (t) => {
   const filename = fixture(t);
   const taskId = randomUUID();

@@ -26,7 +26,7 @@ export type LocalActorHarnesses = Readonly<
   Record<"Concierge" | "Planner" | "Executor" | "Reviewer", Harness>
 >;
 
-// The local orchestrator uses the Claude adapter for these four actors.
+// Default harnesses for the local orchestrator.
 export const localActorHarnesses: LocalActorHarnesses = Object.freeze({
   Concierge: "claude",
   Planner: "claude",
@@ -73,6 +73,7 @@ export function guestOf(profile: ProfileName): GuestKind {
  * `reviewerOutput`), Planner prints its plan. */
 export interface RoleHarness {
   readonly harness: Harness;
+  readonly model: string;
   readonly sandbox: Pick<
     SandboxSpec,
     "tools" | "provider" | "hostTcpPort" | "profile" | "claude"
@@ -96,6 +97,7 @@ export function codexRoleHarness(
   const provider = codexProvider(options.endpoint);
   return {
     harness: "codex",
+    model: options.model,
     sandbox: {
       tools,
       ...(provider ? { provider } : {}),
@@ -133,6 +135,7 @@ export function claudeRoleHarness(options: {
     : undefined;
   return {
     harness: "claude",
+    model: options.model,
     sandbox: {
       tools: options.tools,
       claude: true,

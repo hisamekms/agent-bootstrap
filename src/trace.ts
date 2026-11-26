@@ -35,11 +35,14 @@ async function invocation(filename: string, invocationId: string) {
     const result = events.at(-1);
     const outcome =
       result?.kind === "invocation.finished" ? result.outcome : "incomplete";
+    const operation = events.findLast(
+      ({ detail }) => !detail || !("event" in detail),
+    );
     const pendingOperation =
-      result?.kind === "operation.requested"
-        ? { operation: result.operation, effect: "not-authorized" }
-        : result?.kind === "operation.allowed"
-          ? { operation: result.operation, effect: "unknown" }
+      operation?.kind === "operation.requested"
+        ? { operation: operation.operation, effect: "not-authorized" }
+        : operation?.kind === "operation.allowed"
+          ? { operation: operation.operation, effect: "unknown" }
           : undefined;
     console.log(
       escapeControls(

@@ -1,3 +1,5 @@
+import { codexFailureActions } from "../src/codex-exec.ts";
+import { operatorTask } from "../src/local-orchestrator/operator-read.ts";
 import { projectStateDirectory } from "../src/config/layers.ts";
 import { addProject } from "../src/config/projects.ts";
 import { configEnv } from "./config-fixture.ts";
@@ -2876,5 +2878,65 @@ test("a file-count rule still matches when Git cannot supply a line count", asyn
     policy: "human",
     source: "rule",
     ruleId: rule.id,
+  });
+});
+
+test("Task detail records the Codex Executor and its auth recovery action", async () => {
+  using state = orchestratorFixture("local-codex-task-");
+  const { store } = state;
+  const goalId = goal(store);
+  for (const code of Object.keys(
+    codexFailureActions,
+  ) as (keyof typeof codexFailureActions)[]) {
+    const taskId = task(store, goalId);
+    const agent = { harness: "codex", model: "fixture-model" } as const;
+    const { executor, calls } = fixture({
+      workerAgent: agent,
+      async worker(_id, _revision, observed) {
+        observed.outcome = "failed";
+        observed.code = code;
+        throw new Error("Worker did not produce an eligible change");
+      },
+    });
+    await runTask(store, executor, taskId);
+    const detail = operatorTask(store, taskId);
+    assert.equal(detail?.failure?.code, code);
+    assert.equal(detail?.failure?.next, codexFailureActions[code]);
+    const execution = detail?.executions[0];
+    assert.equal(execution?.harness, agent.harness);
+    assert.equal(execution?.model, agent.model);
+    assert.equal(execution?.status, "failed");
+    assert.deepEqual(calls, []);
+    const stored = store.getExecution(execution!.id);
+    assert.equal(stored?.harness, agent.harness);
+    assert.equal(stored?.model, agent.model);
+    assert.deepEqual(
+      store
+        .listEvents({ subjectId: execution!.id, limit: 10 })
+        .find(({ kind }) => kind === "execution.started")?.data,
+      agent,
+    );
+  }
+});
+
+test("a saved guest auth report uses the current execution guidance", () => {
+  using state = orchestratorFixture("local-codex-task-");
+  const { store } = state;
+  const taskId = task(store, goal(store));
+  assert.ok(store.claimTask(taskId));
+  const execution = store.createExecution({
+    actor: "Executor",
+    mode: "task",
+    taskId,
+    requestedBy: { kind: "host" },
+  });
+  store.startExecution(execution.id);
+  store.finishExecution(execution.id, "failed", {
+    code: "codex-auth",
+    next: "Run agent-bootstrap codex authorize, then retry the Task.",
+  });
+  assert.deepEqual(store.getExecution(execution.id)?.result, {
+    code: "codex-auth",
+    next: "The Executor reported that the provider rejected the credential. Inspect the execution.",
   });
 });

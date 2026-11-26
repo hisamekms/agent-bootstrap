@@ -606,6 +606,7 @@ test("Planner discards answers over 64 KiB after harness extraction", async () =
   const work = runner(store, {
     harness: {
       harness: "claude",
+      model: "fixture-model",
       sandbox: {},
       command: ({ prompt, timeoutMs }) => ({ argv: [prompt], timeoutMs }),
       reviewerOutput: () =>

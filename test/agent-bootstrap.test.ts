@@ -1,3 +1,4 @@
+import { CODEX, codexBinaryPath } from "../src/codex-exec.ts";
 import { mkdtempDisposableSync, realpathSync } from "node:fs";
 import { addProject } from "../src/config/projects.ts";
 import { configEnv, initConfigRepo } from "./config-fixture.ts";
@@ -794,6 +795,90 @@ describe("agent-bootstrap", () => {
       calls.every(
         ({ args }) => !args.includes("pull") && !args.includes("--locked"),
       ),
+    );
+  });
+
+  test("setup includes the pinned Codex release only when the effective harness selects it", async () => {
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
+    const { host, calls } = fakeHost(root);
+    const userFile = userConfigPath(host.env);
+    const codex = { auth: "siwc", model: "fixture-model" };
+    const plan = () => setupPlan(root, false, host.env);
+    writePrivateConfig(userFile, configRoot(host.env), { version: 1, codex });
+    assert.ok(
+      !(await plan()).artifacts.some(({ path }) => path === codexBinaryPath),
+    );
+    writePrivateConfig(userFile, configRoot(host.env), {
+      version: 1,
+      codex,
+      actors: { Executor: "codex" },
+    });
+    const item = (await plan()).artifacts.find(
+      ({ path }) => path === codexBinaryPath,
+    );
+    assert.equal(item?.sha256, CODEX.sha256);
+    assert.equal(item?.archive?.sha256, CODEX.archive.sha256);
+    assert.equal(
+      item?.url,
+      `https://github.com/openai/codex/releases/download/rust-v${CODEX.version}/${CODEX.archive.name}`,
+    );
+    assert.deepEqual(calls, []);
+  });
+
+  test("verified Codex archives stage only the pinned executable with private execute mode", async () => {
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
+    const member = CODEX.archive.member;
+    const fixture = "fixture binary";
+    await writeFile(join(root, member), fixture);
+    const archive = join(root, "fixture.tar.gz");
+    assert.equal(
+      spawnSync("/usr/bin/tar", ["-czf", archive, "-C", root, member]).status,
+      0,
+    );
+    const bytes = await readFile(archive);
+    const hash = (bytes: string | Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    const item = {
+      ...artifacts(defaultProfiles, undefined, false, true).find(
+        ({ path }) => path === codexBinaryPath,
+      )!,
+      sha256: hash(fixture),
+      archive: { member, sha256: hash(bytes) },
+    };
+    const fetchFixture = ((url: URL) =>
+      url.hostname === "github.com"
+        ? Promise.resolve(
+            new Response(null, {
+              status: 302,
+              headers: {
+                location:
+                  "https://release-assets.githubusercontent.com/fixture",
+              },
+            }),
+          )
+        : Promise.resolve(new Response(bytes))) as typeof fetch;
+    await assert.rejects(
+      fetchArtifact(
+        root,
+        { ...item, archive: { ...item.archive, sha256: "0".repeat(64) } },
+        fetchFixture,
+      ),
+      /Download checksum/,
+    );
+    await assert.rejects(
+      fetchArtifact(root, { ...item, sha256: "0".repeat(64) }, fetchFixture),
+      /binary checksum/,
+    );
+    assert.equal(
+      await artifactStatus(join(root, item.path), item.sha256),
+      "missing",
+    );
+    await fetchArtifact(root, item, fetchFixture);
+    assert.equal(
+      await artifactStatus(join(root, item.path), item.sha256, 0o700),
+      "ok",
     );
   });
 

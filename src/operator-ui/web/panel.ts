@@ -1311,7 +1311,7 @@ function rejectedPaths(
 
 function failureCard(task: TaskDetail, command: string | undefined) {
   if (!task.failure) return [];
-  const { code, rejectedPaths: paths } = task.failure;
+  const { code, next, rejectedPaths: paths } = task.failure;
   const retry = command
     ? commandControls(command, "再試行コマンドをコピー", "copy-retry", true)
     : undefined;
@@ -1326,6 +1326,7 @@ function failureCard(task: TaskDetail, command: string | undefined) {
         textElement("code", code, "grow"),
         ...(retry ? [retry.copy, retry.status] : []),
       ),
+      ...(next ? [textElement("p", next, "meta")] : []),
       ...(paths?.length
         ? [sectionTitle("拒否されたパス"), rejectedPaths(paths)]
         : []),
@@ -1407,7 +1408,14 @@ function taskDetail(
       facts([
         ...(estimate ? [["残り時間", estimate] as const] : []),
         ["対象パス", task.paths.join(", ") || "—"],
-        ["実行者", task.actor],
+        [
+          "実行者",
+          task.executions.find(
+            ({ actor, mode }) => actor === "Executor" && mode === "task",
+          )?.harness === "codex"
+            ? "Executor（Codex）"
+            : task.actor,
+        ],
         ["試行", `${task.attempt.current} / ${task.attempt.max}`],
         [
           "経過時間",
@@ -1429,10 +1437,19 @@ function taskDetail(
       sectionTitle("最近の実行"),
       ...(task.executions.length
         ? task.executions.map(
-            ({ actor, mode, status, startedAt, finishedAt, tokens }) =>
+            ({
+              actor,
+              mode,
+              status,
+              startedAt,
+              finishedAt,
+              tokens,
+              harness,
+              model,
+            }) =>
               textElement(
                 "p",
-                `${actor} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
+                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
                 "meta",
               ),
           )

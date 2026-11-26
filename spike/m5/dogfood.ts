@@ -41,6 +41,9 @@ import {
   codexProvider,
   codexTools,
   deriveCodexCatalog,
+  codexCatalogDigest,
+  codexCatalogModel,
+  siwcCodexEndpoint,
   type CodexOptions,
 } from "../../src/codex-exec.ts";
 import {
@@ -98,10 +101,7 @@ import { createTelemetry } from "../../src/telemetry.ts";
 const local = fileURLToPath(new URL("../../.local/", import.meta.url));
 const alpineImage =
   "docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd";
-const codexModel = "gpt-6.2-sol";
-const codexCatalogDigest =
-  "bc2eb145cf3f32a265102474d0c5f51a190dac97cf47b59c4dfa1c9ef0a30625";
-const codexSecretEnv = "AGENT_BOOTSTRAP_SUBSCRIPTION_TOKEN";
+const codexModel = codexCatalogModel;
 const claudeFixtureHost = "m5-anthropic.agent-bootstrap.internal";
 const claudeFixtureIp = "192.0.2.11";
 const path = "hello.txt";
@@ -630,12 +630,7 @@ async function main() {
     codexOptions = {
       endpoint: codexMock
         ? { kind: "host-service", port: codexMock.port }
-        : {
-            kind: "provider",
-            host: "api.openai.com",
-            secretEnv: codexSecretEnv,
-            name: "openai_chatgpt_plan",
-          },
+        : siwcCodexEndpoint,
       model: codexModel,
       catalog: true,
     };

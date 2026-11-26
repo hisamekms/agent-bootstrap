@@ -836,6 +836,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     managed?: string,
     mounts?: SandboxSpec["mounts"],
     secretSocket?: string,
+    invocationId?: string,
   ): Promise<void> {
     const create = async (env: Record<string, string>) => {
       if (gateway) {
@@ -878,8 +879,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     };
     const credentials = this.#config.credentials;
     if (provider && credentials)
-      await credentials.withAccessToken((token) =>
-        create({ [provider.secretEnv]: token }),
+      await credentials.withAccessToken(
+        (token) => create({ [provider.secretEnv]: token }),
+        invocationId,
       );
     else await create({});
   }
@@ -1176,6 +1178,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         managed,
         mounts,
         secretSocket,
+        invocationId,
       );
       if (stagedTree) {
         const extracted = await this.#execute(

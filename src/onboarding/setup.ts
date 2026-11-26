@@ -1,3 +1,4 @@
+import { selectsCodex } from "../local-orchestrator/codex-executor.ts";
 import { join } from "node:path";
 import { loadConfig, readLayer } from "../config/layers.ts";
 import { resolveMsbHome } from "../config/msb-home.ts";
@@ -35,7 +36,12 @@ export async function setupPlan(
   const target = await resolveConfigTarget(targetPath, root, env);
   const { config } = loadConfig(env, target?.configDirectory);
   const includeSecrets = Object.keys(config.secretEnv ?? {}).length > 0;
-  const inputs = artifacts(selected, undefined, includeSecrets);
+  const inputs = artifacts(
+    selected,
+    undefined,
+    includeSecrets,
+    selectsCodex(config),
+  );
   const profiles = selected.map((name) => {
     const entry = lock.profiles[name];
     if (!entry)
@@ -56,7 +62,11 @@ export async function setupPlan(
     artifacts: await Promise.all(
       inputs.map(async (item) => ({
         ...item,
-        status: await artifactStatus(join(root, item.path), item.sha256),
+        status: await artifactStatus(
+          join(root, item.path),
+          item.sha256,
+          item.archive ? 0o700 : undefined,
+        ),
       })),
     ),
     images: { base: lock.base ?? ALPINE_3_23.reference, profiles },
@@ -125,7 +135,11 @@ export async function applySetup(
 
   const candidates = new Set<string>();
   for (const item of plan.artifacts) {
-    const status = await artifactStatus(join(root, item.path), item.sha256);
+    const status = await artifactStatus(
+      join(root, item.path),
+      item.sha256,
+      item.archive ? 0o700 : undefined,
+    );
     if (status === "wrong")
       throw new SetupError(
         "A local artifact does not match its pin.",

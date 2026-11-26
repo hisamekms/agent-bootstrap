@@ -1,7 +1,9 @@
+import { codexProvider, siwcCodexEndpoint } from "../../src/codex-exec.ts";
+import { siwcProvider, siwcSandboxCredential } from "../../src/siwc.ts";
 import { listenOperatorApi } from "../../src/local-orchestrator/operator-api.ts";
 import { secretTestFacts } from "../../src/local-orchestrator/secret-test-record.ts";
 import { loadConfig } from "../../src/config/layers.ts";
-import { ConfigError } from "../../src/config/messages.ts";
+import { ActorConfigError, ConfigError } from "../../src/config/messages.ts";
 import { MsbHomeError, requireMsbHome } from "../../src/config/msb-home.ts";
 import { driftWarning } from "../../src/config/projects.ts";
 import { GitIntegrationError } from "../../src/git-integration.ts";
@@ -41,6 +43,7 @@ import {
   userStateDirectory,
 } from "../../src/local-orchestrator/claude-config.ts";
 import { createClaudePolicy } from "../../src/local-orchestrator/claude-policy.ts";
+import { selectsCodex } from "../../src/local-orchestrator/codex-executor.ts";
 import {
   OrchestratorStore,
   OrchestratorStoreError,
@@ -127,7 +130,12 @@ export function conciergeFailure(stage: string, error: unknown): string {
   const withCause = (code: string, next: string) =>
     `${message} (${code})\nnext: ${escapeTerminalControls(next)}`;
   if (error instanceof ConfigError)
-    return withCause("config-invalid", error.next);
+    return withCause(
+      error instanceof ActorConfigError
+        ? `${error.code}/${error.key}`
+        : "config-invalid",
+      error.next,
+    );
   if (error instanceof VolumeError)
     return withCause(`volume/${error.code}`, error.next);
   if (error instanceof MsbHomeError)
@@ -357,6 +365,16 @@ async function launchConcierge(
     volumeShell || auth.mode === "external"
       ? undefined
       : claudeCodeProvider(auth);
+  const codex =
+    !volumeShell && selectsCodex(effective.config)
+      ? codexProvider(siwcCodexEndpoint)
+      : undefined;
+  const claudeCredential = {
+    async withAccessToken<T>(consume: (token: string) => Promise<T>) {
+      if (!credential) throw new Error("Credential unavailable");
+      return consume(credential);
+    },
+  };
   setStage("read Concierge credential");
   let credential = provider
     ? await fromKeychain(effective.keychainService)
@@ -421,20 +439,37 @@ async function launchConcierge(
       msb,
       profiles,
       claude,
-      ...(effective.gatewayHosts
-        ? { gatewayHosts: effective.gatewayHosts }
-        : {}),
-      ...(provider
+      ...(codex
         ? {
-            providers: [provider],
-            credentials: {
-              async withAccessToken(consume) {
-                if (!credential) throw new Error("Credential unavailable");
-                return consume(credential);
-              },
-            },
+            gatewayHosts: [
+              ...new Set([...(effective.gatewayHosts ?? []), codex.host]),
+            ],
           }
-        : {}),
+        : effective.gatewayHosts
+          ? { gatewayHosts: effective.gatewayHosts }
+          : {}),
+      ...(codex
+        ? {
+            providerBindings: [
+              ...(provider
+                ? [{ provider, credentials: claudeCredential }]
+                : []),
+              {
+                provider: codex,
+                credentials: {
+                  withAccessToken(consume, invocationId) {
+                    if (!observed) throw new Error("Audited host unavailable");
+                    return siwcSandboxCredential(observed.audit, (hooks) =>
+                      siwcProvider({ checkout: bootstrapRoot, ...hooks }),
+                    ).withAccessToken(consume, invocationId);
+                  },
+                },
+              },
+            ],
+          }
+        : provider
+          ? { providers: [provider], credentials: claudeCredential }
+          : {}),
       observers: [telemetry],
     });
     setStage("launch or clean up session");
