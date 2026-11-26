@@ -1,7 +1,8 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { WorkplaceChannel } from "./channel.ts";
-import { createHostPanel, element } from "./panel.ts";
+import { element } from "./dom.ts";
+import { createHostPanel } from "./panel.ts";
 import {
   chunkInput,
   clampSize,
@@ -41,7 +42,7 @@ function focusOtherRegion(event: KeyboardEvent, fromTerminal: boolean) {
   event.preventDefault();
   event.stopPropagation();
   if (event.type !== "keydown" || event.repeat) return;
-  if (fromTerminal) host.focus();
+  if (fromTerminal || conversation.hidden) host.focus();
   else term.focus();
 }
 
@@ -62,7 +63,7 @@ host.addEventListener("click", () => {
     host.focus({ preventScroll: true });
 });
 
-let width = 60;
+let width = 50;
 function moveDivider(value: number) {
   width = Math.min(80, Math.max(20, Math.round(value)));
   workplace.style.setProperty("--conversation-width", `${width}%`);
@@ -91,16 +92,26 @@ divider.addEventListener("keydown", (event) => {
   moveDivider(value);
 });
 
-type TerminalState = "attaching" | "interactive" | "read-only" | "ended";
+type TerminalState =
+  "attaching" | "interactive" | "read-only" | "ended" | "unavailable";
 let terminalState: TerminalState = "attaching";
+const terminalLabels: Record<TerminalState, string> = {
+  attaching: "接続しています",
+  interactive: "入力できます",
+  "read-only": "読み取り専用",
+  ended: "終了",
+  unavailable: "未接続",
+};
 let lastSize: ReturnType<typeof clampSize> | undefined;
 
 function setTerminalState(state: TerminalState) {
   terminalState = state;
   term.options.disableStdin = state !== "interactive";
+  element("connection-terminal").textContent = terminalLabels[state];
 }
 
 function fitTerminal() {
+  if (conversation.hidden) return;
   fit.fit();
   if (!channel || terminalState !== "interactive") return;
   const size = clampSize(term.cols, term.rows);
@@ -140,8 +151,8 @@ term.onBinary((bytes) =>
   sendInput(Uint8Array.from(bytes, (byte) => byte.charCodeAt(0))),
 );
 
-function connect() {
-  const channel = new WorkplaceChannel(({ method, params }) => {
+function openChannel() {
+  return new WorkplaceChannel(({ method, params }) => {
     switch (method) {
       case "inbox.changed":
         void panel.refresh();
@@ -161,19 +172,36 @@ function connect() {
         break;
     }
   });
-  const panel = createHostPanel(channel);
+}
+const channel = token ? openChannel() : undefined;
+const panel = createHostPanel(channel);
+
+function connectionState(
+  state: "connecting" | "connected" | "disconnected",
+  label: string,
+) {
+  element("connection-dot").dataset.state = state;
+  connection.title = label;
+  connection.setAttribute("aria-label", `${label}。接続の詳細を開く`);
+  element("connection-state").textContent = label;
+}
+
+element("connection-host").textContent = location.host;
+setTerminalState(terminalState);
+if (channel) {
+  connectionState("connecting", "接続しています");
   channel.socket.addEventListener("open", () => {
     channel.socket.send(JSON.stringify({ token }));
     token = "";
     void channel
       .request("inbox.subscribe", {})
       .then(() => {
-        connection.textContent = "Connected";
+        connectionState("connected", "接続中");
         return panel.refresh();
       })
       .catch(() => {
         if (channel.socket.readyState === WebSocket.OPEN)
-          connection.textContent = "Could not subscribe to the inbox.";
+          connectionState("disconnected", "受信項目を購読できませんでした");
       });
     void channel
       .request("concierge.attach", {})
@@ -183,20 +211,109 @@ function connect() {
         fitTerminal();
       })
       .catch(() => {
-        if (channel.socket.readyState === WebSocket.OPEN)
-          terminalNotice.textContent =
-            "Could not attach the Concierge terminal.";
+        if (channel.socket.readyState === WebSocket.OPEN) {
+          setTerminalState("unavailable");
+          terminalNotice.textContent = "Concierge に接続できませんでした。";
+        }
       });
   });
   channel.socket.addEventListener("close", () => {
     token = "";
     setTerminalState("ended");
     panel.disconnect();
-    connection.textContent =
-      "Disconnected. Reopen the workplace URL to reconnect.";
+    connectionState(
+      "disconnected",
+      "切断されました。再接続するにはホストから Workplace を開き直してください",
+    );
   });
-  return channel;
+} else {
+  connectionState("disconnected", "ホストから Workplace を開いてください");
+  setTerminalState("unavailable");
 }
 
-const channel = token ? connect() : undefined;
-if (!channel) connection.textContent = "Open the workplace URL from the host.";
+const fullscreen = element("fullscreen");
+function toggleFullscreen() {
+  const full = workplace.classList.toggle("full");
+  const moveFocus =
+    full &&
+    (conversation.contains(document.activeElement) ||
+      document.activeElement === divider);
+  conversation.hidden = divider.hidden = full;
+  const label = full ? "全画面を終了" : "全画面にする";
+  fullscreen.setAttribute("aria-pressed", String(full));
+  fullscreen.setAttribute("aria-label", label);
+  fullscreen.title = `${label}（F）`;
+  if (moveFocus) fullscreen.focus();
+  if (!full) requestAnimationFrame(fitTerminal);
+}
+fullscreen.addEventListener("click", toggleFullscreen);
+document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented || event.isComposing) return;
+  if (
+    event.key === "Escape" &&
+    !conversation.contains(document.activeElement) &&
+    !document.activeElement?.closest(
+      "input, textarea, select, [contenteditable]:not([contenteditable=false])",
+    )
+  ) {
+    if (panel.closeSettings()) event.preventDefault();
+    else if (conversation.hidden) {
+      event.preventDefault();
+      toggleFullscreen();
+    }
+  }
+  if (
+    event.key.toLowerCase() !== "f" ||
+    event.repeat ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey
+  )
+    return;
+  const focus = document.activeElement;
+  if (
+    conversation.contains(focus) ||
+    focus?.closest(
+      "input, textarea, select, [contenteditable]:not([contenteditable=false])",
+    )
+  )
+    return;
+  event.preventDefault();
+  toggleFullscreen();
+});
+
+const themeKey = "workplace-theme";
+const themes = ["system", "light", "dark"] as const;
+type Theme = (typeof themes)[number];
+const systemTheme = matchMedia("(prefers-color-scheme: dark)");
+let preference: Theme = "system";
+try {
+  const saved = localStorage.getItem(themeKey);
+  if (saved === "dark" || saved === "light") preference = saved;
+} catch {
+  // The theme still works when storage is unavailable.
+}
+function applyTheme() {
+  const dark =
+    preference === "dark" || (preference === "system" && systemTheme.matches);
+  document.documentElement.classList.toggle("dark", dark);
+  document.documentElement.classList.toggle("light", !dark);
+  for (const theme of themes)
+    element(`theme-${theme}`).setAttribute(
+      "aria-pressed",
+      String(theme === preference),
+    );
+}
+for (const theme of themes) {
+  element(`theme-${theme}`).addEventListener("click", () => {
+    preference = theme;
+    applyTheme();
+    try {
+      localStorage.setItem(themeKey, theme);
+    } catch {
+      // Keep the current preference for this session.
+    }
+  });
+}
+systemTheme.addEventListener("change", applyTheme);
+applyTheme();

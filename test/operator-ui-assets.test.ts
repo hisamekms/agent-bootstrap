@@ -28,6 +28,26 @@ test("the workplace serves three self-contained assets under its strict CSP", as
     '<link rel="stylesheet" href="/app.css" />',
   ]);
   assert.doesNotMatch(html, /<style\b|\s(?:style|on[a-z]+)\s*=/i);
+  assert.match(html, /id="host-tabs" role="tablist"/);
+  assert.deepEqual(
+    [
+      ...html.matchAll(
+        /<button[^>]*id="tab-([^"]+)"[^>]*role="tab"[^>]*aria-controls="([^"]+)"/g,
+      ),
+    ].map(([, tab, panel]) => [tab, panel]),
+    [
+      ["decisions", "decisions"],
+      ["problems", "problems"],
+      ["goals", "goals"],
+    ],
+  );
+  for (const id of ["terminal-notice", "inbox-notice", "answer-results"])
+    assert.match(html, new RegExp(`id="${id}" role="status"`));
+  assert.match(
+    html,
+    /id="settings-toggle"[^>]*aria-pressed="false"[^>]*aria-controls="settings"/,
+  );
+  assert.match(html, /id="theme-system" aria-pressed="true"/);
   const js = read("/app.js", "text/javascript; charset=utf-8");
   assert.match(js, /adoptedStyleSheets/);
   assert.doesNotMatch(

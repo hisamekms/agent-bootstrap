@@ -9,7 +9,11 @@ import {
   formatDuration,
   formatTimestamp,
   formatTokens,
-  orderInbox,
+  pendingDecisions,
+  groupProblems,
+  retryCommand,
+  type PanelInboxItem,
+  type Problem,
 } from "../src/operator-ui/web/protocol.ts";
 
 test("base64 preserves all byte values and split UTF-8 sequences", () => {
@@ -93,16 +97,84 @@ test("resize uses integer dimensions within the host limits", () => {
   });
 });
 
-test("inbox ordering puts action items first and preserves host order within each weight", () => {
-  const items = [
-    { weight: "info", id: "info-1" },
-    { weight: "action", id: "action-1" },
-    { weight: "info", id: "info-2" },
-    { weight: "action", id: "action-2" },
-  ] as const;
-  assert.deepEqual(
-    orderInbox(items).map(({ id }) => id),
-    ["action-1", "action-2", "info-1", "info-2"],
+function inboxItem(
+  kind: PanelInboxItem["kind"],
+  extra: Partial<PanelInboxItem> = {},
+): PanelInboxItem {
+  return {
+    id: kind,
+    kind,
+    weight: "action",
+    state: "open",
+    title: kind,
+    at: null,
+    subject: {},
+    next: "agent-bootstrap inbox",
+    ...extra,
+  };
+}
+
+test("decision cards keep unresolved approvals and checklist actions in host order", () => {
+  const task = inboxItem("task-registration", { state: "seen" });
+  const integration = inboxItem("integration");
+  const checklist = inboxItem("secret-test-required");
+  const rows = [
+    inboxItem("task-running", { weight: "info" }),
+    task,
+    inboxItem("execution-over-budget"),
+    inboxItem("goal-registration", { state: "resolved" }),
+    integration,
+    inboxItem("task-failed"),
+    checklist,
+  ];
+  assert.deepEqual(pendingDecisions(rows), [task, integration, checklist]);
+});
+
+test("problem cards group each Task's reports and keep unrelated reports distinct", () => {
+  const failed = {
+    at: "2026-11-26T00:00:00.000Z",
+    goalId: "goal",
+    taskId: "task",
+    title: "Task",
+    kind: "task-failed",
+    code: "unknown",
+    canRetry: true,
+    detail: "Task failed",
+  } as const satisfies Problem;
+  const over = {
+    at: "2026-11-26T00:00:00.000Z",
+    goalId: "goal",
+    taskId: "task",
+    title: "Task",
+    kind: "execution-over-budget",
+    executionId: "one",
+    detail: "Budget exceeded",
+  } as const satisfies Problem;
+  const other = { ...over, taskId: null, executionId: "two" };
+  const third = { ...over, taskId: null, executionId: "three" };
+  assert.deepEqual(groupProblems([over, other, failed, third]), [
+    [over, failed],
+    [other],
+    [third],
+  ]);
+});
+
+test("the retry action copies the host's target-qualified CLI command for the same Task", () => {
+  const command = `agent-bootstrap --target '/project with spaces' retry-task task-full-id`;
+  const failure = inboxItem("task-failed", {
+    subject: { taskId: "task-full-id" },
+    next: command,
+  });
+  assert.equal(retryCommand("task-full-id", [failure]), command);
+  assert.equal(retryCommand("task", [failure]), undefined);
+  assert.equal(
+    retryCommand("task-full-id", [{ ...failure, state: "resolved" }]),
+    undefined,
   );
-  assert.equal(items[0].id, "info-1");
+  assert.equal(
+    retryCommand("task-full-id", [
+      { ...failure, next: "agent-bootstrap show task-full-id" },
+    ]),
+    undefined,
+  );
 });

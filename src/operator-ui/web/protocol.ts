@@ -9,7 +9,6 @@ import type {
 } from "../../local-orchestrator/delegation.ts";
 import type { Gate, Policy } from "../../local-orchestrator/model.ts";
 import type { OrchestratorStore } from "../../local-orchestrator/store.ts";
-import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import type {
   goalStatuses,
   operatorGoal,
@@ -280,15 +279,6 @@ export function clampSize(cols: number, rows: number) {
   return { cols: clamp(cols, 20, 500), rows: clamp(rows, 5, 200) };
 }
 
-export function orderInbox<T extends Pick<InboxItem, "weight">>(
-  items: readonly T[],
-): T[] {
-  return [
-    ...items.filter(({ weight }) => weight === "action"),
-    ...items.filter(({ weight }) => weight === "info"),
-  ];
-}
-
 export function estimateLabel(remainingMs: number | null) {
   if (remainingMs === null || remainingMs <= 0) return "";
   const minutes = Math.max(1, Math.round(remainingMs / 60_000));
@@ -324,4 +314,36 @@ const tokenCount = new Intl.NumberFormat("ja-JP");
 
 export function formatTokens(tokens: number | null) {
   return tokens === null ? "—" : tokenCount.format(tokens);
+}
+
+export function pendingDecisions(items: readonly PanelInboxItem[]) {
+  return items.filter(
+    ({ weight, state, kind }) =>
+      weight === "action" &&
+      state !== "resolved" &&
+      kind !== "task-failed" &&
+      kind !== "execution-over-budget",
+  );
+}
+
+export function groupProblems(problems: readonly Problem[]) {
+  const groups = new Map<string, Problem[]>();
+  for (const [index, problem] of problems.entries()) {
+    const key = problem.taskId ? `task:${problem.taskId}` : `problem:${index}`;
+    const group = groups.get(key);
+    if (group) group.push(problem);
+    else groups.set(key, [problem]);
+  }
+  return [...groups.values()];
+}
+
+export function retryCommand(taskId: string, items: readonly PanelInboxItem[]) {
+  // Reuse the host's shell quoting and retry eligibility for this target.
+  return items.find(
+    (item) =>
+      item.kind === "task-failed" &&
+      item.state !== "resolved" &&
+      item.subject.taskId === taskId &&
+      item.next.endsWith(` retry-task ${taskId}`),
+  )?.next;
 }

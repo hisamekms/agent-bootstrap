@@ -1,10 +1,16 @@
-import { action, textElement } from "./dom.ts";
+import {
+  action,
+  element,
+  group,
+  restoreFocus,
+  sectionTitle,
+  textElement,
+} from "./dom.ts";
 import {
   delegationPanel,
   goalDelegation,
   taskDelegation,
 } from "./delegation-panel.ts";
-import type { InboxItem } from "../../local-orchestrator/inbox.ts";
 import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
 import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
@@ -12,217 +18,328 @@ import {
   estimateLabel,
   gateLabels,
   settingLabel,
-  type AgentDecision,
   formatDuration,
   formatTimestamp,
   formatTokens,
-  orderInbox,
+  pendingDecisions,
+  groupProblems,
+  retryCommand,
+  type AgentDecision,
   type AnswerableProposal,
   type GoalDetail,
   type GoalSummary,
   type PanelInboxItem,
   type Problem,
-  type Proposal,
   type TaskDetail,
   type TaskSummary,
 } from "./protocol.ts";
 
-export function element(id: string): HTMLElement {
-  const node = document.getElementById(id);
-  if (!node) throw new Error(`Missing workplace element ${id}`);
+const labels = {
+  registered: "登録",
+  running: "実行",
+  review: "レビュー",
+  "awaiting-integration": "統合待ち",
+  done: "完了",
+  failed: "失敗",
+  cancelled: "キャンセル",
+  active: "進行中",
+} as const;
+
+const answerLabels = {
+  goal: "Goal の提案",
+  task: "Task の提案",
+  integration: "統合",
+} as const;
+const proposalLabels: Partial<Record<PanelInboxItem["kind"], string>> = {
+  "goal-registration": answerLabels.goal,
+  "task-registration": answerLabels.task,
+  integration: answerLabels.integration,
+  "secret-test-required": "シークレットの動作確認",
+} as const;
+
+function chip(label: string, tone: string) {
+  return textElement("span", label, `chip ${tone}`);
+}
+
+function displayState(state: keyof typeof labels) {
+  const tone = {
+    registered: "info",
+    running: "accent",
+    review: "accent",
+    "awaiting-integration": "warn",
+    done: "ok",
+    failed: "danger",
+    cancelled: "info",
+    active: "accent",
+  }[state];
+  return chip(labels[state], tone);
+}
+
+function aiTag() {
+  const tag = textElement("span", "AI", "aitag");
+  tag.title = "モデルが書いた文";
+  tag.setAttribute("role", "img");
+  tag.setAttribute("aria-label", "モデル生成");
+  return tag;
+}
+
+function modelTitle<K extends "h2" | "h3" | "span">(
+  tag: K,
+  value: string,
+  classes = "title",
+) {
+  return group(tag, classes, aiTag(), textElement("bdi", value));
+}
+
+function modelBox(label: string, lines: readonly string[]) {
+  return group(
+    "div",
+    "card",
+    group("h3", "section-title", aiTag(), document.createTextNode(label)),
+    ...lines.map((line) => textElement("pre", line, "model-content")),
+  );
+}
+
+function facts(rows: readonly (readonly [string, string | Node])[]) {
+  return group(
+    "dl",
+    "detail",
+    ...rows.flatMap(([label, value]) => [
+      textElement("dt", label),
+      group(
+        "dd",
+        "",
+        typeof value === "string" ? document.createTextNode(value) : value,
+      ),
+    ]),
+  );
+}
+
+function empty(message: string) {
+  return textElement("p", message, "card empty");
+}
+
+function time(at: string | null) {
+  const node = textElement("time", formatTimestamp(at));
+  if (at !== null) node.dateTime = at;
   return node;
 }
 
-const subjectLabels = {
-  goalId: "Goal ID",
-  taskId: "Task ID",
-  proposalId: "Proposal ID",
-  executionId: "Execution ID",
-} as const;
+function progress(value: number, max: number, label: string, over = false) {
+  const track = textElement(
+    "progress",
+    "",
+    over ? "progress over" : "progress",
+  );
+  track.max = max || 1;
+  track.value = value;
+  track.setAttribute("aria-label", label);
+  return track;
+}
 
-function createInboxPanel(channel: WorkplaceChannel, refresh: () => void) {
+function commandControls(
+  command: string,
+  label: string,
+  key: string,
+  show: boolean,
+) {
+  const text = textElement("pre", command, "cmd");
+  text.hidden = !show;
+  const status = textElement("span", "", "muted");
+  status.setAttribute("role", "status");
+  const copy = action(label, key, () => void copyCommand());
+  async function copyCommand() {
+    try {
+      await navigator.clipboard.writeText(command);
+      status.textContent = "コピーしました。";
+    } catch {
+      text.hidden = false;
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      status.textContent = "コマンドを選択しました。";
+    }
+  }
+  return { text, copy, status };
+}
+
+function answerError(code: string) {
+  switch (code) {
+    case "stale-digest":
+      return "提案が変更されました。一覧を更新しています。";
+    case "invalid-transition":
+      return "この提案はすでに判断待ちではありません。";
+    case "approval-forbidden":
+      return "現在のポリシーではパネルから回答できません。";
+    case "not-found":
+      return "提案が見つかりません。";
+    default:
+      return `回答の結果を確認できませんでした（${code}）。`;
+  }
+}
+
+type Watch = (
+  node: HTMLElement,
+  ids: readonly string[],
+  load?: () => void,
+) => void;
+type GoalLink = (id?: string | null) => Node[];
+
+function createInboxPanel(
+  channel: WorkplaceChannel,
+  refresh: () => void,
+  watch: Watch,
+  unwatch: (root: HTMLElement) => void,
+) {
   const inbox = element("inbox-items");
-  const details = element("details");
-  const notice = element("inbox-notice");
   const batch = element("answer-batch");
-  const confirmation = element("answer-confirmation");
   const results = element("answer-results");
   const chosen = new Map<string, string>();
+  const expanded = new Set<string>();
   let proposals: AnswerableProposal[] = [];
   let controls: (() => void)[] = [];
   let answering = false;
-  let buttons = new Map<string, HTMLButtonElement>();
-  let selected: InboxItem | undefined;
-  let previousItems = "";
-  const marking = new Set<string>();
-  const observed = new Map<Element, string>();
-  const visible = new IntersectionObserver(
-    (entries) => {
-      const ids: string[] = [];
-      for (const { target, intersectionRatio } of entries) {
-        const id = observed.get(target);
-        if (intersectionRatio < 0.1 || !id || marking.has(id)) continue;
-        marking.add(id);
-        ids.push(id);
-        visible.unobserve(target);
-      }
-      if (!ids.length) return;
-      void channel
-        .request("inbox.markSeen", { ids })
-        .catch(() => {
-          notice.textContent = "Could not mark inbox items seen.";
-        })
-        .finally(() => ids.forEach((id) => marking.delete(id)));
+  let cancelConfirmation: (() => void) | undefined;
+  let activeSubmit: HTMLButtonElement | undefined;
+  let previous = "";
+  let previewQueue = Promise.resolve();
+
+  const selection = textElement("span", "", "q");
+  const clear = action(
+    "選択を解除",
+    "clear-selection",
+    () => {
+      cancelConfirmation?.();
+      chosen.clear();
+      updateControls();
+      inbox.querySelector<HTMLElement>("input")?.focus();
     },
-    { root: element("inbox"), threshold: 0.1 },
+    "link",
   );
-
-  async function select(item: InboxItem) {
-    if (selected)
-      buttons.get(selected.id)?.setAttribute("aria-pressed", "false");
-    selected = item;
-    buttons.get(item.id)?.setAttribute("aria-pressed", "true");
-
-    const fields = document.createElement("dl");
-    function field(label: string, value: string) {
-      const content = textElement("dd", value);
-      fields.append(textElement("dt", label), content);
-      return content;
-    }
-    const proposalInfo = textElement("p", "");
-    details.replaceChildren(
-      textElement("h3", item.title),
-      fields,
-      proposalInfo,
-    );
-    const kind = field("Kind", item.kind);
-    for (const [key, label] of Object.entries(subjectLabels)) {
-      const id = item.subject[key as keyof InboxItem["subject"]];
-      if (id) field(label, id);
-    }
-
-    const command = textElement("pre", item.next);
-    const copy = textElement("button", "Copy CLI command");
-    copy.type = "button";
-    const copyStatus = textElement("p", "");
-    copyStatus.setAttribute("role", "status");
-    copy.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(item.next);
-        copyStatus.textContent = "Command copied.";
-      } catch {
-        copyStatus.textContent = "Could not copy the command.";
-      }
-    });
-    details.append(command, copy, copyStatus);
-    if (item.modelText !== undefined) {
-      details.append(modelBox("提案", [item.modelText]));
-    }
-
-    if (!item.subject.proposalId) return;
-    proposalInfo.textContent = "Loading proposal…";
-    proposalInfo.setAttribute("role", "status");
-    try {
-      const proposal = await channel.request("proposal.get", {
-        id: item.subject.proposalId,
-      });
-      kind.textContent = proposal.kind;
-      field("Pinned digest", proposal.digest);
-      if (proposal.diffStat !== null)
-        field("変更規模", "").append(textElement("pre", proposal.diffStat));
-      proposalInfo.remove();
-      return proposal;
-    } catch {
-      proposalInfo.textContent = "Could not load the proposal.";
-    }
-  }
-
-  const batchButton = action("", "approve-batch", () => {
-    const approved = proposals.filter(
-      ({ id, digest }) => chosen.get(id) === digest,
-    );
-    if (approved.length >= 2) confirm(approved, "approve");
-  });
-  batch.append(batchButton);
+  const batchButton = action(
+    "",
+    "approve-batch",
+    () => {
+      const pinned = proposals.filter(
+        ({ id, digest }) => chosen.get(id) === digest,
+      );
+      if (pinned.length >= 2) confirm(batch, pinned, "approve", batchButton);
+    },
+    "btn primary",
+  );
+  const batchActions = group("div", "actions", selection, clear, batchButton);
+  batch.append(batchActions);
 
   function updateControls() {
     for (const update of controls) update();
-    batchButton.hidden = chosen.size < 2;
-    batchButton.disabled = answering;
-    batchButton.textContent = `選んだ ${chosen.size} 件をまとめて承認`;
+    batch.hidden = chosen.size < 2;
+    clear.disabled = batchButton.disabled = answering;
+    selection.textContent = `${chosen.size} 件を選択中`;
+    batchButton.textContent = `${chosen.size} 件をまとめて承認`;
   }
-  updateControls();
 
   function confirm(
+    container: HTMLElement,
     pinned: AnswerableProposal[],
     decision: PanelAnswer["decision"],
-    selectedPreview?: Promise<Proposal | undefined>,
+    trigger: HTMLElement,
   ) {
     if (answering) return;
-    const label =
-      decision === "reject"
-        ? "却下"
-        : pinned.length === 1 && pinned[0]?.kind === "integration"
-          ? "承認して統合"
-          : "承認";
-    const submit = action("確定", "submit-answer", () => void send());
-    const cancel = action("やめる", "cancel-answer", () =>
-      confirmation.replaceChildren(),
+    cancelConfirmation?.();
+    const reject = decision === "reject";
+    const integration =
+      pinned.length === 1 && pinned[0]?.kind === "integration";
+    const label = reject ? "却下" : integration ? "承認して統合" : "承認";
+    const question = reject
+      ? "この提案を却下しますか。"
+      : pinned.length > 1
+        ? `${pinned.length} 件をまとめて承認しますか。${pinned.some(({ kind }) => kind === "integration") ? "統合を含む提案は承認すると Goal のブランチに統合されます。" : ""}`
+        : integration
+          ? "この変更を Goal のブランチに統合しますか。"
+          : "この提案を承認しますか。";
+    const review = group("div", "q", textElement("p", question));
+    if (pinned.length > 1) review.tabIndex = 0;
+    const cancel = action("戻す", "cancel-answer", () => {
+      close();
+      trigger.focus();
+    });
+    const submit = action(
+      pinned.length > 1 ? "確定" : `${label}を確定`,
+      "submit-answer",
+      () => void send(),
+      reject ? "btn danger" : "btn primary",
     );
+    const strip = group(
+      "div",
+      reject ? "confirm reject" : "confirm",
+      review,
+      cancel,
+      submit,
+    );
+    strip.setAttribute("role", "group");
+    strip.setAttribute("aria-label", "回答の確認");
+    const actions =
+      container === batch
+        ? batchActions
+        : container.querySelector<HTMLElement>(".decision-actions");
+    if (actions) actions.hidden = true;
+    container.append(strip);
+    activeSubmit = submit;
+    cancelConfirmation = close;
     const previews: Promise<boolean>[] = [];
-    confirmation.replaceChildren(
-      textElement("h3", `${label}の確認`),
-      list(pinned, ({ id, kind, title, digest, agentGates }) => {
-        const node = document.createElement("div");
-        node.append(
+    for (const proposal of pinned) {
+      const { id, kind, digest, title, agentGates } = proposal;
+      const evidence = textElement(
+        "p",
+        `${answerLabels[kind]} · ${id.slice(0, 8)} · ${digest.slice(0, 12)}`,
+        "muted",
+      );
+      if (title !== null && pinned.length > 1)
+        evidence.prepend(modelTitle("span", title, "model-content"), " · ");
+      review.append(evidence);
+      if (!reject && agentGates.length)
+        review.append(
           textElement(
             "p",
-            `${kind} · ${id.slice(0, 8)} · ${digest.slice(0, 12)}`,
+            `この提案には AI へ判断を委任する設定が含まれます（${agentGates.map((gate) => gateLabels[gate]).join("、")}）。`,
+            "warning",
           ),
         );
-        if (title !== null) node.append(modelBox("タイトル", [title]));
-        if (decision === "approve" && agentGates.length > 0) {
-          const warning = textElement(
-            "p",
-            `この提案には AI へ判断を委任する設定が含まれます（${agentGates.join("、")}）。`,
-          );
-          warning.className = "warning";
-          node.append(warning);
-        }
-        if (decision === "approve" && kind === "integration") {
-          const stat = textElement("pre", "変更規模を読み込み中…");
-          stat.setAttribute("role", "status");
-          node.append(stat);
-          previews.push(loadDiffStat(id, digest, stat));
-        }
-        return node;
-      }),
-      submit,
-      cancel,
-    );
+      if (!reject && kind === "integration") {
+        const stat = textElement("pre", "変更規模を読み込み中…");
+        stat.setAttribute("role", "status");
+        review.append(stat);
+        previews.push(loadDiffStat(id, digest, stat));
+      }
+    }
     if (previews.length) {
       submit.disabled = true;
       void Promise.all(previews).then((ready) => {
-        submit.disabled = !ready.every(Boolean);
+        if (activeSubmit === submit) submit.disabled = !ready.every(Boolean);
       });
     }
     cancel.focus();
 
+    function close() {
+      strip.remove();
+      if (actions) actions.hidden = false;
+      activeSubmit = undefined;
+      cancelConfirmation = undefined;
+    }
+
     async function loadDiffStat(id: string, digest: string, stat: HTMLElement) {
       try {
-        const proposal = await (selectedPreview ??
-          channel.request("proposal.get", { id }));
-        if (proposal && proposal.digest !== digest) {
-          stat.textContent = answerError("stale-digest");
+        const proposal = await channel.request("proposal.get", { id });
+        if (proposal.digest !== digest || proposal.status !== "pending") {
+          stat.textContent = answerError(
+            proposal.digest !== digest ? "stale-digest" : "invalid-transition",
+          );
           if (stat.isConnected) refresh();
           return false;
         }
-        if (proposal && proposal.status !== "pending") {
-          stat.textContent = answerError("invalid-transition");
-          if (stat.isConnected) refresh();
-          return false;
-        }
-        if (proposal?.diffStat != null) {
+        if (proposal.diffStat !== null) {
           stat.textContent = proposal.diffStat;
           return true;
         }
@@ -234,7 +351,7 @@ function createInboxPanel(channel: WorkplaceChannel, refresh: () => void) {
     }
 
     async function send() {
-      if (answering) return;
+      if (answering || activeSubmit !== submit || submit.disabled) return;
       answering = true;
       submit.disabled = cancel.disabled = true;
       updateControls();
@@ -250,447 +367,981 @@ function createInboxPanel(channel: WorkplaceChannel, refresh: () => void) {
             ? [await channel.request("proposal.answer", answers[0])]
             : await channel.request("proposal.answerMany", { answers });
         results.replaceChildren(
-          list(outcomes, (outcome) =>
+          ...outcomes.map((outcome) =>
             textElement(
-              "span",
-              `${outcome.id.slice(0, 8)} · ${"ok" in outcome ? `${label}を記録しました。` : answerError(outcome.error.code)}`,
+              "p",
+              `${outcome.id.slice(0, 8)} · ${
+                "ok" in outcome
+                  ? `${label}を記録しました。`
+                  : answerError(outcome.error.code)
+              }`,
+              "ok" in outcome ? "notice" : "status-error",
             ),
           ),
         );
       } catch (error) {
-        const code = error instanceof Error ? error.message : "write-failed";
-        results.textContent = answerError(code);
+        results.replaceChildren(
+          textElement(
+            "p",
+            answerError(
+              error instanceof Error ? error.message : "write-failed",
+            ),
+            "status-error",
+          ),
+        );
       } finally {
         for (const { id } of answers) chosen.delete(id);
         answering = false;
-        confirmation.replaceChildren();
+        if (activeSubmit === submit) {
+          close();
+          (pinned.length === 1 ? trigger : element("tab-decisions")).focus({
+            preventScroll: true,
+          });
+        }
         updateControls();
         refresh();
       }
     }
   }
 
-  function answerError(code: string) {
-    switch (code) {
-      case "stale-digest":
-        return "提案が変更されました。一覧を更新しています。";
-      case "invalid-transition":
-        return "この提案はすでに判断待ちではありません。";
-      case "approval-forbidden":
-        return "現在のポリシーではパネルから回答できません。";
-      case "not-found":
-        return "提案が見つかりません。";
-      default:
-        return `回答の結果を確認できませんでした（${code}）。`;
-    }
-  }
-
-  function render(items: PanelInboxItem[]) {
-    const snapshot = JSON.stringify(items);
-    if (snapshot === previousItems) return;
-    previousItems = snapshot;
-    const ordered = orderInbox(items);
-    proposals = ordered.flatMap((item) =>
-      "answer" in item ? [item.answer] : [],
+  function card(item: PanelInboxItem, goalLink: GoalLink) {
+    const answer = "answer" in item ? item.answer : undefined;
+    const name = answer?.title ?? item.modelText;
+    const reason = textElement("span", "確認が必要です。");
+    const kind = proposalLabels[item.kind] ?? item.title;
+    const top = group(
+      "div",
+      "card-top",
+      chip(kind, item.kind === "integration" || !answer ? "warn" : "accent"),
+      reason,
     );
-    const approvable = new Map(
-      proposals
-        .filter(({ approve }) => approve)
-        .map(({ id, digest }) => [id, digest]),
+    const row = textElement("li", "", "card");
+    const detail = textElement("div", "", "stack");
+    detail.hidden = !expanded.has(item.id);
+    const fields = facts([
+      ...Object.entries(item.subject),
+      ["時刻", time(item.at)],
+    ]);
+    const command = commandControls(
+      item.next,
+      "CLI コマンドをコピー",
+      `copy:${item.id}`,
+      true,
     );
-    for (const [id, digest] of chosen)
-      if (approvable.get(id) !== digest) chosen.delete(id);
-    controls = [];
-    const focused = [...buttons].find(
-      ([, button]) => button === document.activeElement,
+    const info = textElement("div", "", "stack");
+    detail.append(
+      fields,
+      info,
+      command.text,
+      group("div", "actions", command.copy, command.status),
     );
-    const current = ordered.find(({ id }) => id === selected?.id);
-    if (!current) {
-      selected = undefined;
-      details.replaceChildren();
-    }
-    visible.disconnect();
-    observed.clear();
-    buttons = new Map();
-    const rows = ordered.map((item) => {
-      const row = document.createElement("li");
-      const button = textElement("button", item.title);
-      button.type = "button";
-      button.setAttribute("aria-pressed", String(item.id === selected?.id));
-      button.addEventListener("click", () => void select(item));
-      row.append(
-        textElement("small", item.weight === "action" ? "Action" : "Info"),
-        button,
-      );
-      if ("answer" in item) {
-        const proposal = item.answer;
-        const group = document.createElement("div");
-        group.className = "answer-controls";
-        if (proposal.approve) {
-          const checkbox = document.createElement("input");
-          checkbox.type = "checkbox";
-          checkbox.setAttribute(
-            "aria-label",
-            `${item.title} をまとめて承認する項目に追加`,
-          );
-          checkbox.addEventListener("change", () => {
-            if (checkbox.checked) chosen.set(proposal.id, proposal.digest);
-            else chosen.delete(proposal.id);
-            updateControls();
-          });
-          controls.push(() => {
-            checkbox.checked = chosen.get(proposal.id) === proposal.digest;
-            checkbox.disabled =
-              answering || (!checkbox.checked && chosen.size >= 20);
-          });
-          group.append(checkbox);
+    const toggle = action(
+      "",
+      `detail:${item.id}`,
+      () => {
+        detail.hidden = !detail.hidden;
+        if (detail.hidden) expanded.delete(item.id);
+        else {
+          expanded.add(item.id);
+          void load();
         }
-        const actions = [
-          ...(proposal.approve
-            ? [
-                action(
-                  proposal.kind === "integration" ? "承認して統合" : "承認",
-                  "approve",
-                  () => {
-                    confirm([proposal], "approve", select(item));
-                  },
-                ),
-              ]
-            : []),
-          ...(proposal.reject
-            ? [
-                action("却下", "reject", () => {
-                  void select(item);
-                  confirm([proposal], "reject");
-                }),
-              ]
-            : []),
-        ];
-        controls.push(() => {
-          for (const button of actions) button.disabled = answering;
-        });
-        group.append(...actions);
-        row.append(group);
-      }
-      buttons.set(item.id, button);
-      if (item.state === "open") observed.set(button, item.id);
-      return row;
-    });
-    inbox.replaceChildren(...rows);
-    updateControls();
-    element("empty-inbox").hidden = rows.length !== 0;
-    for (const button of observed.keys()) visible.observe(button);
-    if (focused)
-      (buttons.get(focused[0]) ?? element("host")).focus({
-        preventScroll: true,
-      });
-    if (current && selected) {
-      const { state: _previousState, ...before } = selected;
-      const { state: _currentState, ...after } = current;
-      if (JSON.stringify(before) !== JSON.stringify(after))
-        void select(current);
+        updateDisclosure();
+      },
+      "link",
+    );
+    function updateDisclosure() {
+      toggle.textContent = detail.hidden ? "詳細" : "詳細を閉じる";
+      toggle.setAttribute("aria-expanded", String(!detail.hidden));
     }
+    updateDisclosure();
+    const stat = textElement("pre", "", "facts");
+    const actions = group(
+      "div",
+      "actions decision-actions",
+      toggle,
+      textElement("span", "", "spacer"),
+    );
+    const answerArea = group("div", "", actions);
+    if (answer?.approve) {
+      const checkbox = textElement("input", "", "check");
+      checkbox.type = "checkbox";
+      checkbox.dataset.focusKey = `choose:${item.id}`;
+      checkbox.setAttribute(
+        "aria-label",
+        `${name ?? kind} をまとめて承認する項目に追加`,
+      );
+      checkbox.addEventListener("change", () => {
+        cancelConfirmation?.();
+        if (checkbox.checked) chosen.set(answer.id, answer.digest);
+        else chosen.delete(answer.id);
+        updateControls();
+      });
+      controls.push(() => {
+        checkbox.checked = chosen.get(answer.id) === answer.digest;
+        checkbox.disabled =
+          answering || (!checkbox.checked && chosen.size >= 20);
+      });
+      top.prepend(checkbox);
+    }
+    if (answer) {
+      if (answer.reject) answerButton("却下", "reject", "btn secondary");
+      if (answer.approve)
+        answerButton(
+          answer.kind === "integration" ? "承認して統合" : "承認",
+          "approve",
+          "btn primary",
+        );
+    }
+    function answerButton(
+      label: string,
+      decision: PanelAnswer["decision"],
+      classes: string,
+    ) {
+      if (!answer) return;
+      const button = action(
+        label,
+        `${decision}:${item.id}`,
+        () => confirm(answerArea, [answer], decision, button),
+        classes,
+      );
+      actions.append(button);
+      controls.push(() => {
+        button.disabled = answering;
+      });
+    }
+    row.append(
+      top,
+      name ? modelTitle("h3", name) : textElement("h3", item.title, "title"),
+      ...goalLink(item.subject.goalId),
+      stat,
+      detail,
+      answerArea,
+    );
+    const id = item.subject.proposalId;
+    let requested = false;
+    async function load() {
+      if (!id || requested) return;
+      requested = true;
+      try {
+        const proposal = await channel.request("proposal.get", { id });
+        if (answer && proposal.digest !== answer.digest) {
+          reason.textContent = answerError("stale-digest");
+          refresh();
+          return;
+        }
+        const { effectivePolicy, policySource } = proposal;
+        if (effectivePolicy && policySource) {
+          const source = settingLabel({
+            policy: effectivePolicy,
+            source: policySource,
+            ...("ruleId" in proposal && {
+              ruleId: proposal.ruleId,
+              ruleName: proposal.ruleName,
+            }),
+            ...("invariant" in proposal && { invariant: proposal.invariant }),
+          });
+          reason.textContent =
+            policySource !== "invariant" &&
+            (effectivePolicy === "human" || proposal.humanAnswerRequired)
+              ? `${source} · 人の判断が必要です。`
+              : source;
+        }
+        const diff = proposal.diffStat?.trim();
+        stat.textContent = diff?.split("\n").at(-1) ?? "";
+        info.replaceChildren(
+          facts([
+            ["ダイジェスト", proposal.digest],
+            ...(diff ? [["変更規模", textElement("pre", diff)] as const] : []),
+            ...(effectivePolicy
+              ? [["判断者", effectivePolicy === "human" ? "人" : "AI"] as const]
+              : []),
+            ...(proposal.loosening
+              ? [["ポリシー", "委任範囲の拡大を含みます。"] as const]
+              : []),
+          ]),
+        );
+      } catch {
+        requested = false;
+        info.textContent = "提案の詳細を取得できませんでした。";
+      }
+    }
+    watch(
+      row,
+      item.state === "open" ? [item.id] : [],
+      id
+        ? () => {
+            previewQueue = previewQueue.then(() =>
+              row.isConnected ? load() : undefined,
+            );
+          }
+        : undefined,
+    );
+    return row;
   }
 
-  return { render, disconnect: () => visible.disconnect() };
+  return {
+    render(
+      rows: PanelInboxItem[],
+      goalLink: GoalLink,
+      goalTitle: (id?: string) => string | undefined,
+    ) {
+      const snapshot = JSON.stringify(
+        rows.map(({ state: _state, ...row }) => [
+          row,
+          goalTitle(row.subject.goalId),
+        ]),
+      );
+      if (snapshot === previous) return;
+      previous = snapshot;
+      proposals = rows.flatMap((item) =>
+        "answer" in item ? [item.answer] : [],
+      );
+      const approvable = new Map(
+        proposals
+          .filter(({ approve }) => approve)
+          .map(({ id, digest }) => [id, digest]),
+      );
+      for (const [id, digest] of chosen)
+        if (approvable.get(id) !== digest) chosen.delete(id);
+      for (const id of expanded)
+        if (!rows.some((row) => row.id === id)) expanded.delete(id);
+      controls = [];
+      restoreFocus(
+        inbox,
+        () => {
+          cancelConfirmation?.();
+          unwatch(inbox);
+          inbox.replaceChildren(...rows.map((item) => card(item, goalLink)));
+        },
+        element("tab-decisions"),
+      );
+      element("empty-inbox").hidden = rows.length !== 0;
+      updateControls();
+    },
+  };
 }
 
-const labels = {
-  registered: "登録",
-  running: "実行",
-  review: "レビュー",
-  "awaiting-integration": "統合待ち",
-  done: "完了",
-  failed: "失敗",
-  cancelled: "キャンセル",
-  active: "進行中",
-} as const;
-
-function modelBox(label: string, lines: readonly string[]) {
-  const box = document.createElement("div");
-  box.className = "model-text";
-  box.append(
-    textElement("small", `${label}（モデル生成）`),
-    ...lines.map((line) => textElement("pre", line)),
-  );
-  return box;
-}
-
-function facts(rows: [string, string][]) {
-  const list = document.createElement("dl");
-  for (const [label, value] of rows)
-    list.append(textElement("dt", label), textElement("dd", value));
-  return list;
-}
-
-function list<T>(items: readonly T[], row: (item: T) => Node) {
-  const node = document.createElement("ul");
-  node.className = "work-list";
-  for (const item of items) {
-    const entry = document.createElement("li");
-    entry.append(row(item));
-    node.append(entry);
-  }
-  return node;
-}
-
-function modelLink(
-  label: string,
-  title: string,
-  id: string,
-  select: () => void,
+function historyCards(
+  rows: AgentDecision[],
+  openSettings: () => void,
+  titleFor: (entry: AgentDecision) => string | undefined,
+  openSubject: (subject: { goalId?: string; taskId?: string }) => void,
 ) {
-  const button = action("", id, select);
-  button.className = "model-text model-link";
-  button.append(
-    textElement("small", `${label}（モデル生成）`),
-    textElement("span", title),
-  );
+  return [
+    sectionTitle("AI が判断したもの"),
+    rows.length
+      ? group(
+          "div",
+          "card",
+          ...rows.map((entry) => {
+            const approved = entry.result === "approve";
+            const title = titleFor(entry);
+            const { goalId, taskId } = entry;
+            const subject = taskId || goalId;
+            const caption = title
+              ? modelTitle("span", title, "model-content")
+              : textElement(
+                  "span",
+                  `${taskId ? "Task" : goalId ? "Goal" : "提案"} ${(subject ?? entry.proposalId).slice(0, 8)}`,
+                );
+            const link = action(
+              "",
+              `history:${entry.id}`,
+              () =>
+                openSubject({
+                  ...(goalId && { goalId }),
+                  ...(taskId && { taskId }),
+                }),
+              "link",
+            );
+            link.append(caption);
+            const names = group(
+              "span",
+              "grow",
+              document.createTextNode(`${gateLabels[entry.gate]} · `),
+              subject ? link : caption,
+              document.createTextNode(" · "),
+              action(
+                settingLabel(entry.setting),
+                `rule:${entry.id}`,
+                openSettings,
+                "link",
+              ),
+            );
+            const row = group(
+              "div",
+              "activity",
+              time(entry.at),
+              chip(
+                approved ? "AI が承認" : "AI が却下",
+                approved ? "ok" : "info",
+              ),
+              names,
+            );
+            if (!entry.reasons.length) return row;
+            const more = group(
+              "details",
+              "",
+              textElement("summary", "Reviewer の理由", "muted"),
+              modelBox("理由", entry.reasons),
+            );
+            return group("div", "", row, more);
+          }),
+        )
+      : empty("AI の判断はありません。"),
+  ];
+}
+
+function goalOverview(
+  goal: GoalSummary,
+  pending: number,
+  openDecisions?: () => void,
+) {
+  const { done, total } = goal.progress;
+  const summary = `${done} / ${total} Task 完了`;
+  const estimate = estimateLabel(goal.estimate.remainingMs);
+  return [
+    group(
+      openDecisions ? "div" : "span",
+      "rowline",
+      modelTitle(openDecisions ? "h2" : "span", goal.title, "title grow"),
+      displayState(goal.status),
+    ),
+    progress(done, total, summary),
+    group(
+      openDecisions ? "div" : "span",
+      "rowline meta",
+      textElement(
+        "span",
+        estimate ? `${summary} · ${estimate}` : summary,
+        "grow",
+      ),
+      ...(pending
+        ? [
+            openDecisions
+              ? action(
+                  `判断待ち ${pending} 件を見る ›`,
+                  "goal-decisions",
+                  openDecisions,
+                  "link",
+                )
+              : chip(`判断待ち ${pending}`, "warn"),
+          ]
+        : []),
+    ),
+  ];
+}
+
+function goalRow(goal: GoalSummary, pending: number, open: () => void) {
+  const button = action("", goal.id, open, "card goalrow");
+  button.append(...goalOverview(goal, pending));
   return button;
 }
 
-function progress(goal: GoalSummary) {
-  const { done, total } = goal.progress;
-  const track = document.createElement("progress");
-  track.max = total || 1;
-  track.value = done;
-  const label = `${done} / ${total} Task 完了`;
-  track.setAttribute("aria-label", label);
-  return [track, textElement("small", label), ...estimateText(goal.estimate)];
-}
-
-function estimateText(estimate: GoalSummary["estimate"]) {
-  const label = estimateLabel(estimate.remainingMs);
-  return label ? [textElement("p", label)] : [];
-}
-
-function budgetText(budgets: TaskDetail["budgets"]) {
-  return `${budgets.maxExecutionMs / 1000} 秒 / ${formatTokens(budgets.maxTokens)} トークン / 再試行 ${budgets.maxRetries} 回`;
+function taskRow(task: TaskSummary, open: () => void) {
+  const row = action("", task.id, open, "taskrow");
+  const estimate = estimateLabel(task.estimate.remainingMs);
+  row.append(modelTitle("span", task.title, "t"), displayState(task.stage));
+  if (estimate) row.append(textElement("span", estimate, "eta"));
+  return row;
 }
 
 function goalDetail(
   goal: GoalDetail,
+  pending: number,
   delegation: Node,
+  activity: PanelInboxItem[],
   selectTask: (id: string) => void,
+  openDecisions: () => void,
+  watch: Watch,
 ) {
-  const { scope } = goal;
-  return [
-    modelBox("Goal", [goal.title]),
-    textElement("p", labels[goal.status]),
-    ...progress(goal),
+  const scope = goal.scope;
+  const details = group(
+    "details",
+    "card",
+    textElement("summary", "Goal の詳細"),
     facts([
       ["対象パス", scope.paths.join(", ")],
       ["利用できるアクター", scope.actors.join(", ") || "—"],
       ["プロファイル", scope.profiles.join(", ") || "—"],
       ["Task 上限", String(scope.maxTasks)],
-      ["予算", budgetText(goal.budgets)],
+      [
+        "予算",
+        `${formatDuration(goal.budgets.maxExecutionMs)} / ${formatTokens(goal.budgets.maxTokens)} トークン / 再試行 ${goal.budgets.maxRetries} 回`,
+      ],
       ["ブランチ", goal.branch],
       ["ベースコミット", goal.baseCommit ?? "—"],
     ]),
     ...(goal.description ? [modelBox("説明", [goal.description])] : []),
     modelBox("受け入れ条件", goal.acceptance),
-    delegation,
-    textElement("h3", "Task"),
+  );
+  const activityLabels: Partial<Record<PanelInboxItem["kind"], string>> = {
+    "task-running": "Task の実行を開始しました。",
+    "task-succeeded": "Task が完了しました。",
+    "goal-completed": "Goal が完了しました。",
+  };
+  const recent = activity.map((item) => {
+    const row = group(
+      "div",
+      "activity",
+      time(item.at),
+      group(
+        "span",
+        "grow",
+        document.createTextNode(activityLabels[item.kind] ?? item.title),
+        ...(item.modelText
+          ? [
+              document.createTextNode(" "),
+              modelTitle("span", item.modelText, "model-content"),
+            ]
+          : []),
+      ),
+    );
+    watch(row, item.state === "open" ? [item.id] : []);
+    return row;
+  });
+  return [
+    group("header", "card", ...goalOverview(goal, pending, openDecisions)),
+    sectionTitle("Task"),
     goal.tasks.length
-      ? list(goal.tasks, (task: TaskSummary) => {
-          const item = document.createElement("div");
-          item.append(
-            modelLink("Task", task.title, task.id, () => selectTask(task.id)),
-            textElement("p", labels[task.stage]),
-            ...estimateText(task.estimate),
-          );
-          return item;
-        })
-      : textElement("p", "Task はありません。"),
+      ? group(
+          "div",
+          "card tasklist",
+          ...goal.tasks.map((task) => taskRow(task, () => selectTask(task.id))),
+        )
+      : empty("Task はありません。"),
     ...(goal.progress.total > goal.tasks.length
       ? [
           textElement(
             "p",
             `${goal.progress.total} 件中 ${goal.tasks.length} 件を表示しています。`,
+            "meta",
           ),
         ]
       : []),
+    delegation,
+    sectionTitle("最近の動き"),
+    recent.length
+      ? group("div", "card", ...recent)
+      : empty("最近の動きはありません。"),
+    details,
+  ];
+}
+
+function tokenBudget(task: TaskDetail) {
+  const tokens = task.tokensUsed;
+  const max = task.budgets.maxTokens;
+  const usage =
+    tokens === null
+      ? "不明"
+      : `${task.tokensIncomplete ? "少なくとも " : ""}${formatTokens(tokens)}`;
+  const label = `${usage} / ${formatTokens(max)} トークン`;
+  return [
+    textElement("p", label, "meta"),
+    ...(tokens === null || max === 0
+      ? []
+      : [progress(tokens, max, label, tokens > max)]),
   ];
 }
 
 function rejectedPaths(
   paths: NonNullable<NonNullable<TaskDetail["failure"]>["rejectedPaths"]>,
 ) {
-  return list(paths, ({ path, symlink }) =>
-    textElement("code", symlink ? `${path}（シンボリックリンク）` : path),
+  return group(
+    "ul",
+    "stack",
+    ...paths.map(({ path, symlink }) =>
+      group(
+        "li",
+        "",
+        textElement("code", symlink ? `${path}（シンボリックリンク）` : path),
+      ),
+    ),
   );
 }
 
-function taskDetail(task: TaskDetail, delegation: Node) {
-  const tokens = formatTokens(task.tokensUsed);
-  const usage = task.tokensIncomplete
-    ? task.tokensUsed
-      ? `少なくとも ${tokens}`
-      : "不明"
-    : tokens;
-  const track = document.createElement("ol");
-  track.className = "stage-track";
-  const current = task.failure?.stage ?? task.stage;
-  for (const stage of taskStages) {
-    const failed = task.failure && stage === current;
-    const item = textElement(
-      "li",
-      failed ? `${labels[stage]}（失敗）` : labels[stage],
-    );
-    if (stage === current) item.setAttribute("aria-current", "step");
-    if (failed) item.className = "warning";
-    track.append(item);
-  }
-  const failure = document.createElement("div");
-  if (task.failure) {
-    failure.className = "warning failure";
-    failure.append(
-      textElement("h3", "失敗"),
-      textElement("code", task.failure.code),
-    );
-    if (task.failure.rejectedPaths?.length)
-      failure.append(
-        textElement("p", "拒否されたパス"),
-        rejectedPaths(task.failure.rejectedPaths),
-      );
-  }
+function failureCard(task: TaskDetail, command: string | undefined) {
+  if (!task.failure) return [];
+  const { code, rejectedPaths: paths } = task.failure;
+  const retry = command
+    ? commandControls(command, "再試行コマンドをコピー", "copy-retry", true)
+    : undefined;
   return [
-    modelBox("Task", [task.title]),
-    ...(task.category
-      ? [modelBox("Planner の申告カテゴリー", [task.category])]
-      : []),
-    track,
-    ...(task.stage === "cancelled" ? [textElement("p", labels.cancelled)] : []),
-    ...estimateText(task.estimate),
-    facts([
-      ["アクター", task.actor],
-      ["試行", `${task.attempt.current} / ${task.attempt.max}`],
-      [
-        "経過時間",
-        `${formatDuration(task.elapsedMs)}（上限 ${formatDuration(task.budgets.maxExecutionMs)}）`,
-      ],
-      ["使用トークン", `${usage} / ${formatTokens(task.budgets.maxTokens)}`],
-      ["対象パス", task.paths.join(", ") || "—"],
-    ]),
-    delegation,
-    ...(task.failure ? [failure] : []),
-    ...(task.description ? [modelBox("説明", [task.description])] : []),
-    modelBox("受け入れ条件", task.acceptance),
-    textElement("h3", "最近の実行"),
-    task.executions.length
-      ? list(
-          task.executions,
-          ({ actor, mode, status, startedAt, finishedAt, tokens }) =>
-            textElement(
-              "p",
-              `${actor} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
-            ),
-        )
-      : textElement("p", "実行はありません。"),
-    textElement("h3", "最近のイベント"),
-    task.events.length
-      ? list(task.events, ({ kind, at }) =>
-          textElement("p", `${formatTimestamp(at)} · ${kind}`),
-        )
-      : textElement("p", "イベントはありません。"),
+    group(
+      "div",
+      "card banner-danger",
+      group(
+        "div",
+        "rowline",
+        chip("失敗", "danger"),
+        textElement("code", code, "grow"),
+        ...(retry ? [retry.copy, retry.status] : []),
+      ),
+      ...(paths?.length
+        ? [sectionTitle("拒否されたパス"), rejectedPaths(paths)]
+        : []),
+      ...(retry ? [retry.text] : []),
+    ),
   ];
 }
 
-function problemRow(problem: Problem, select: () => void) {
-  const entry = document.createElement("div");
-  const subject = problem.taskId ? "Task" : "Goal";
-  const detail = textElement("p", problem.detail);
-  detail.className = "warning";
-  entry.append(detail);
-  if (problem.title) entry.append(modelBox(subject, [problem.title]));
-  if ("rejectedPaths" in problem && problem.rejectedPaths)
-    entry.append(rejectedPaths(problem.rejectedPaths));
-  entry.append(textElement("p", formatTimestamp(problem.at)));
-  const key = problem.executionId ?? problem.taskId ?? problem.goalId;
-  if (key && (problem.taskId || problem.goalId))
-    entry.append(action(`${subject} の詳細`, `${problem.kind}:${key}`, select));
-  return entry;
-}
-
-function decisionHistory(
-  rows: AgentDecision[],
-  openTask: (id: string) => void,
-  openGoal: (id: string) => void,
+function taskDetail(
+  task: TaskDetail,
+  delegation: Node,
+  pending: PanelInboxItem | undefined,
+  openDecisions: () => void,
+  command: string | undefined,
 ) {
+  const current = task.failure?.stage ?? task.stage;
+  const currentIndex = taskStages.findIndex((stage) => stage === current);
+  const stages = group(
+    "ol",
+    "stages",
+    ...taskStages.map((stage, index) => {
+      const active = stage === current;
+      const failed = Boolean(task.failure && active);
+      const tone = failed
+        ? "fail"
+        : active
+          ? "now"
+          : index < currentIndex
+            ? "done"
+            : "";
+      const item = textElement(
+        "li",
+        failed ? `${labels[stage]}（失敗）` : labels[stage],
+        `stage ${tone}`,
+      );
+      if (active) item.setAttribute("aria-current", "step");
+      return item;
+    }),
+  );
+  stages.setAttribute("aria-label", "段階");
+  const estimate = estimateLabel(task.estimate.remainingMs);
   return [
-    textElement("h3", "AI が判断したもの"),
-    rows.length
-      ? list(rows, (entry) => {
-          const item = document.createElement("div");
-          item.append(
-            textElement(
-              "p",
-              `${gateLabels[entry.gate]} · ${entry.result === "approve" ? "承認" : "却下"} · ${formatTimestamp(entry.at)}`,
+    ...(pending
+      ? [
+          group(
+            "div",
+            "card banner-warn",
+            group(
+              "div",
+              "rowline",
+              chip("判断待ち", "warn"),
+              textElement(
+                "span",
+                "この Task の判断を待っています。",
+                "grow meta",
+              ),
+              action(
+                "判断待ちで答える",
+                "task-decision",
+                openDecisions,
+                "btn primary",
+              ),
             ),
-            textElement("p", settingLabel(entry.setting)),
-            modelBox(
-              "Reviewer の理由",
-              entry.reasons.length ? entry.reasons : ["—"],
-            ),
-          );
-          if (entry.taskId) {
-            const id = entry.taskId;
-            item.append(action("Task の詳細", entry.id, () => openTask(id)));
-          } else if (entry.goalId) {
-            const id = entry.goalId;
-            item.append(action("Goal の詳細", entry.id, () => openGoal(id)));
-          }
-          return item;
-        })
-      : textElement("p", "AI の判断はありません。"),
+          ),
+        ]
+      : []),
+    ...failureCard(task, command),
+    group(
+      "header",
+      "card",
+      group(
+        "div",
+        "rowline",
+        modelTitle("h2", task.title, "title large grow"),
+        displayState(task.stage),
+      ),
+      stages,
+      facts([
+        ...(estimate ? [["残り時間", estimate] as const] : []),
+        ["対象パス", task.paths.join(", ") || "—"],
+        ["実行者", task.actor],
+        ["試行", `${task.attempt.current} / ${task.attempt.max}`],
+        [
+          "経過時間",
+          `${formatDuration(task.elapsedMs)}（上限 ${formatDuration(task.budgets.maxExecutionMs)}）`,
+        ],
+      ]),
+      ...tokenBudget(task),
+    ),
+    delegation,
+    group(
+      "details",
+      "card",
+      textElement("summary", "Task の詳細"),
+      ...(task.category
+        ? [modelBox("Planner の申告カテゴリー", [task.category])]
+        : []),
+      ...(task.description ? [modelBox("説明", [task.description])] : []),
+      modelBox("受け入れ条件", task.acceptance),
+      sectionTitle("最近の実行"),
+      ...(task.executions.length
+        ? task.executions.map(
+            ({ actor, mode, status, startedAt, finishedAt, tokens }) =>
+              textElement(
+                "p",
+                `${actor} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
+                "meta",
+              ),
+          )
+        : [textElement("p", "実行はありません。", "meta")]),
+      sectionTitle("最近のイベント"),
+      ...(task.events.length
+        ? task.events.map(({ kind, at }) =>
+            textElement("p", `${formatTimestamp(at)} · ${kind}`, "meta"),
+          )
+        : [textElement("p", "イベントはありません。", "meta")]),
+    ),
   ];
 }
 
-const tabs = ["decisions", "problems", "goals", "delegation"] as const;
-type Tab = (typeof tabs)[number];
-type View = {
-  tab: Tab;
-  goalId?: string;
-  taskId?: string;
-};
+function problemCard(
+  rows: Problem[],
+  items: PanelInboxItem[],
+  channel: WorkplaceChannel,
+  goalLink: GoalLink,
+  select: (subject: { goalId?: string; taskId?: string }) => void,
+  watch: Watch,
+) {
+  const first = rows[0]!;
+  const { goalId, taskId } = first;
+  const model = rows.find(({ title }) => title)?.title;
+  const failed = rows.some((row) => "canRetry" in row);
+  const over = rows.filter(({ kind }) => kind === "execution-over-budget");
+  const canRetry = rows.some((row) => "canRetry" in row && row.canRetry);
+  const command = taskId && canRetry ? retryCommand(taskId, items) : undefined;
+  const matching = items.filter(
+    (item) =>
+      item.state === "open" &&
+      ((item.kind === "task-failed" &&
+        Boolean(taskId) &&
+        item.subject.taskId === taskId) ||
+        (item.kind === "execution-over-budget" &&
+          over.some(
+            (problem) => problem.executionId === item.subject.executionId,
+          ))),
+  );
+  const usage = textElement("div", "", "stack");
+  const actions = group("div", "actions", textElement("span", "", "spacer"));
+  const card = group(
+    "article",
+    "card",
+    group(
+      "div",
+      "card-top",
+      chip(failed ? "失敗" : over.length ? "予算超過" : "対象範囲外", "danger"),
+      time(first.at),
+    ),
+    model
+      ? modelTitle("h3", model)
+      : textElement("h3", taskId ?? goalId ?? "問題", "title"),
+    ...goalLink(goalId),
+    ...rows.map((row) =>
+      group(
+        "div",
+        "reason",
+        ...(row !== first
+          ? [time(row.at), document.createTextNode(" · ")]
+          : []),
+        document.createTextNode(row.detail),
+        ...("rejectedPaths" in row && row.rejectedPaths?.length
+          ? [rejectedPaths(row.rejectedPaths)]
+          : []),
+      ),
+    ),
+    usage,
+    actions,
+  );
+  if (command) {
+    const { text, copy, status } = commandControls(
+      command,
+      "再試行コマンドをコピー",
+      `retry:${taskId}`,
+      false,
+    );
+    actions.append(copy, status);
+    card.append(text);
+  }
+  if (taskId || goalId)
+    actions.append(
+      action(
+        taskId ? "Task を開く" : "Goal を開く",
+        `problem:${taskId ?? goalId}`,
+        () => select({ ...(goalId && { goalId }), ...(taskId && { taskId }) }),
+        "btn primary",
+      ),
+    );
+  watch(
+    card,
+    matching.map(({ id }) => id),
+    over.length && taskId
+      ? () => {
+          void channel
+            .request("task.get", { id: taskId })
+            .then((task) => {
+              const max = task.budgets.maxTokens;
+              const reports = over.flatMap(({ executionId }) => {
+                const tokens = task.executions.find(
+                  ({ id }) => id === executionId,
+                )?.tokens;
+                if (tokens == null) return [];
+                const label = `${formatTokens(tokens)} / ${formatTokens(max)} トークン`;
+                return [
+                  textElement(
+                    "p",
+                    `実行 ${executionId?.slice(0, 8)} · ${label}`,
+                    "meta",
+                  ),
+                  ...(max ? [progress(tokens, max, label, true)] : []),
+                ];
+              });
+              usage.append(...reports);
+              if (reports.length === 0) {
+                usage.append(
+                  sectionTitle("Task 全体のトークン使用量"),
+                  ...tokenBudget(task),
+                );
+              }
+            })
+            .catch(() => {
+              usage.textContent = "トークン使用量を取得できませんでした。";
+            });
+        }
+      : undefined,
+  );
+  return card;
+}
 
-export function createHostPanel(channel: WorkplaceChannel) {
-  const inbox = createInboxPanel(channel, () => void refresh());
+const tabs = ["decisions", "problems", "goals"] as const;
+type Tab = (typeof tabs)[number];
+type View = { tab: Tab; goalId?: string; taskId?: string };
+const settingsSections = {
+  delegation: "delegation",
+  display: "display-settings",
+  connection: "connection-settings",
+} as const;
+type SettingsSection = keyof typeof settingsSections;
+
+export function createHostPanel(channel?: WorkplaceChannel) {
   const notice = element("inbox-notice");
   let view: View = { tab: "decisions" };
-  let previous = "";
+  let settings: SettingsSection | undefined;
+  let settingsTrigger: HTMLElement | undefined;
+  let previousView = "";
+  let previousPolicy = "";
   let previousHistory = "";
-  const savedPolicy = () => {
-    previous = "";
-    void refresh();
-  };
+  let pendingFocus: string | undefined;
   let loading = false;
   let refreshNeeded = false;
   let badgesNeeded = false;
-  let disconnected = false;
+  let disconnected = !channel;
+  let items: PanelInboxItem[] = [];
+  let goals: GoalSummary[] = [];
+  let problems: Problem[][] = [];
+  let lastGoal: GoalDetail | undefined;
+  const marked = new Set<string>();
+  const observed = new WeakMap<
+    Element,
+    { ids: readonly string[]; load?: () => void }
+  >();
+  const visible = new IntersectionObserver(
+    (entries) => {
+      const ids = new Set<string>();
+      for (const { target, intersectionRatio } of entries) {
+        if (intersectionRatio < 0.1 || !target.isConnected) continue;
+        const entry = observed.get(target);
+        if (!entry) continue;
+        visible.unobserve(target);
+        entry.load?.();
+        for (const id of entry.ids) {
+          if (!marked.has(id)) ids.add(id);
+        }
+      }
+      if (!channel || disconnected || !ids.size) return;
+      for (const id of ids) marked.add(id);
+      void channel.request("inbox.markSeen", { ids: [...ids] }).catch(() => {
+        for (const id of ids) marked.delete(id);
+        notice.textContent = "受信項目を確認済みにできませんでした。";
+      });
+    },
+    { threshold: 0.1 },
+  );
+  const watch: Watch = (node, ids, load) => {
+    if (!ids.length && !load) return;
+    observed.set(node, { ids, ...(load && { load }) });
+    visible.observe(node);
+  };
+  function unwatch(root: HTMLElement) {
+    for (const node of root.querySelectorAll("*")) {
+      if (observed.has(node)) {
+        observed.delete(node);
+        visible.unobserve(node);
+      }
+    }
+  }
+  const inbox =
+    channel && createInboxPanel(channel, () => void refresh(), watch, unwatch);
 
-  function navigate(next: View) {
-    view = next;
-    previous = "";
+  function goalTitle(id?: string | null) {
+    return id === lastGoal?.id
+      ? lastGoal?.title
+      : goals.find((goal) => goal.id === id)?.title;
+  }
+
+  function goalLink(id?: string | null) {
+    if (!id) return [];
+    const title = goalTitle(id);
+    if (!title) return [];
+    const link = action(
+      "",
+      `goal:${id}`,
+      () => navigate({ tab: "goals", goalId: id }),
+      "link",
+    );
+    link.append(textElement("bdi", title), " ›");
+    return [group("div", "meta", document.createTextNode("Goal: "), link)];
+  }
+
+  function updateVisibility() {
     for (const tab of tabs) {
       const selected = tab === view.tab;
       const button = element(`tab-${tab}`);
       button.setAttribute("aria-selected", String(selected));
       button.tabIndex = selected ? 0 : -1;
-      element(tab).hidden = !selected;
+      element(tab).hidden = Boolean(settings) || !selected;
     }
-    if (view.tab !== "decisions") {
-      const panel = element(view.tab);
-      const details = view.goalId || view.taskId;
-      panel.replaceChildren(
-        ...breadcrumb(view),
-        textElement("p", "読み込み中…"),
+    element("host-tabs").hidden = Boolean(settings);
+    element("settings-back").hidden = !settings;
+    element("settings").hidden = !settings;
+    element("settings-toggle").setAttribute(
+      "aria-pressed",
+      String(Boolean(settings)),
+    );
+    for (const [key, id] of Object.entries(settingsSections)) {
+      const nav = element(`settings-${key}`);
+      if (key === settings) nav.setAttribute("aria-current", "page");
+      else nav.removeAttribute("aria-current");
+      element(id).hidden = key !== settings;
+    }
+  }
+
+  function openSettings(
+    section: SettingsSection,
+    trigger = document.activeElement,
+  ) {
+    if (!settings && trigger instanceof HTMLElement) settingsTrigger = trigger;
+    settings = section;
+    updateVisibility();
+    element(`settings-${section}`).focus();
+    if (section === "delegation" && !previousPolicy)
+      element("delegation").replaceChildren(
+        empty(disconnected ? "ホストに接続されていません。" : "読み込み中…"),
       );
-      if (details)
-        panel.querySelector("button")?.focus({ preventScroll: true });
-      panel.scrollTop = 0;
+    void refresh(false);
+  }
+
+  function closeSettings() {
+    if (!settings) return false;
+    settings = undefined;
+    updateVisibility();
+    const target =
+      settingsTrigger?.isConnected && !settingsTrigger.closest("[hidden]")
+        ? settingsTrigger
+        : element(`tab-${view.tab}`);
+    target.focus({ preventScroll: true });
+    settingsTrigger = undefined;
+    void refresh(false);
+    return true;
+  }
+  element("settings-toggle").addEventListener("click", () => {
+    if (!closeSettings()) openSettings("delegation");
+  });
+  element("connection").addEventListener("click", () =>
+    openSettings("connection"),
+  );
+  element("settings-back").addEventListener("click", closeSettings);
+  for (const key of Object.keys(settingsSections) as SettingsSection[])
+    element(`settings-${key}`).addEventListener("click", () =>
+      openSettings(key),
+    );
+
+  function breadcrumb(current: View, task?: TaskDetail, goal?: GoalDetail) {
+    if (!current.goalId && !current.taskId) return [];
+    const nav = group(
+      "nav",
+      "crumbs",
+      action(
+        "Goal 一覧",
+        "back-list",
+        () => {
+          navigate({ tab: "goals" });
+          element("tab-goals").focus();
+        },
+        "link",
+      ),
+    );
+    nav.setAttribute("aria-label", "現在地");
+    function separator() {
+      const node = textElement("span", "›");
+      node.setAttribute("aria-hidden", "true");
+      nav.append(node);
+    }
+    const goalId = task?.goalId ?? current.goalId;
+    const title = goal?.title ?? goalTitle(goalId);
+    if (current.taskId && goalId) {
+      separator();
+      const back = action(
+        "",
+        "back-goal",
+        () => navigate({ tab: "goals", goalId }),
+        "link",
+      );
+      back.append(textElement("bdi", title ?? "Goal 詳細"));
+      nav.append(back);
+    }
+    separator();
+    const here = textElement(
+      "bdi",
+      task?.title ?? title ?? (current.taskId ? "Task 詳細" : "Goal 詳細"),
+    );
+    here.setAttribute("aria-current", "page");
+    nav.append(here);
+    return [nav];
+  }
+
+  function navigate(next: View, decisionId?: string) {
+    view = next;
+    previousView = "";
+    pendingFocus = decisionId;
+    updateVisibility();
+    element(view.tab).scrollTop = 0;
+    if (view.tab !== "decisions") {
+      const contents = element(
+        view.tab === "goals" ? "goal-content" : "problem-content",
+      );
+      unwatch(contents);
+      contents.replaceChildren(
+        ...breadcrumb(view),
+        empty(disconnected ? "ホストに接続されていません。" : "読み込み中…"),
+      );
+      if (view.goalId || view.taskId) contents.querySelector("button")?.focus();
+    } else {
+      if (!focusDecision()) element("tab-decisions").focus();
     }
     void refresh();
+  }
+
+  function focusDecision() {
+    if (!pendingFocus) return false;
+    const target = Array.from(
+      element("inbox-items").querySelectorAll<HTMLButtonElement>("button"),
+    ).find((node) => node.dataset.focusKey === `detail:${pendingFocus}`);
+    if (!target) return false;
+    pendingFocus = undefined;
+    target.focus();
+    return true;
   }
 
   for (const [index, tab] of tabs.entries()) {
@@ -711,48 +1362,47 @@ export function createHostPanel(channel: WorkplaceChannel) {
     });
   }
 
-  function breadcrumb({ tab, goalId, taskId }: View) {
-    if (!goalId && !taskId) return [];
-    const nav = document.createElement("nav");
-    nav.className = "breadcrumb";
-    nav.setAttribute("aria-label", "パンくずリスト");
-    nav.append(
-      action(tab === "goals" ? "Goal 一覧" : "問題", "back-list", () => {
-        navigate({ tab });
-        element(`tab-${tab}`).focus();
-      }),
+  function renderWork(
+    data: unknown,
+    contents: () => Node[],
+    task?: TaskDetail,
+    goal?: GoalDetail,
+  ) {
+    const snapshot = JSON.stringify(data);
+    const panel = element(
+      view.tab === "goals" ? "goal-content" : "problem-content",
     );
-    if (taskId && goalId)
-      nav.append(
-        action("Goal 詳細", "back-goal", () => navigate({ tab, goalId })),
-      );
-    return [nav];
+    if (
+      snapshot === previousView ||
+      panel.querySelector("[data-policy-editing]")
+    )
+      return;
+    previousView = snapshot;
+    restoreFocus(
+      panel,
+      () => {
+        const open = panel.querySelector<HTMLDetailsElement>("details[open]");
+        unwatch(panel);
+        panel.replaceChildren(...breadcrumb(view, task, goal), ...contents());
+        const disclosure = panel.querySelector("details");
+        if (disclosure && open) disclosure.open = true;
+      },
+      element(`tab-${view.tab}`),
+    );
   }
 
-  function renderWork(view: View, data: unknown, contents: () => Node[]) {
-    const snapshot = JSON.stringify(data);
-    const panel = element(view.tab);
-    if (snapshot === previous || panel.querySelector("[data-policy-editing]"))
-      return;
-    previous = snapshot;
-    const focused = document.activeElement;
-    const focusKey =
-      focused instanceof HTMLButtonElement && panel.contains(focused)
-        ? focused.dataset.focusKey
-        : undefined;
-    panel.replaceChildren(...breadcrumb(view), ...contents());
-    if (focusKey) {
-      const replacement = [...panel.querySelectorAll("button")].find(
-        (button) => button.dataset.focusKey === focusKey,
-      );
-      (replacement ?? element(`tab-${view.tab}`)).focus({
-        preventScroll: true,
-      });
-    }
+  function savedPolicy() {
+    previousView = previousPolicy = "";
+    void refresh(false);
+  }
+
+  function badge(tab: Tab, count: number) {
+    element(`badge-${tab}`).textContent = count ? String(count) : "";
   }
 
   async function refresh(updateBadges = true) {
     if (
+      !channel ||
       disconnected ||
       document.hidden ||
       channel.socket.readyState !== WebSocket.OPEN
@@ -768,151 +1418,228 @@ export function createHostPanel(channel: WorkplaceChannel) {
         const refreshBadges = badgesNeeded;
         badgesNeeded = false;
         const current = view;
-        const listView = !current.goalId && !current.taskId;
-        const [items, problems, goals, goal, task, policy, history] =
-          await Promise.allSettled([
-            refreshBadges || current.tab === "decisions"
-              ? channel.request("inbox.list", {})
-              : undefined,
-            refreshBadges || (listView && current.tab === "problems")
-              ? channel.request("problem.list", {})
-              : undefined,
-            refreshBadges || (listView && current.tab === "goals")
-              ? channel.request("goal.list", {})
-              : undefined,
-            current.goalId && !current.taskId
-              ? channel.request("goal.get", { id: current.goalId })
-              : undefined,
-            current.taskId
-              ? channel.request("task.get", { id: current.taskId })
-              : undefined,
-            current.tab === "delegation"
-              ? channel.request("policy.get", {})
-              : undefined,
-            current.tab === "decisions"
-              ? channel.request("decision.history", {})
-              : undefined,
-          ] as const);
+        const section = settings;
+        const loadWork = !section;
+        const decisionTab = loadWork && current.tab === "decisions";
+        const problemTab = loadWork && current.tab === "problems";
+        const goalTab = loadWork && current.tab === "goals";
+        const [
+          itemResult,
+          problemResult,
+          goalResult,
+          goal,
+          task,
+          policy,
+          history,
+        ] = await Promise.allSettled([
+          refreshBadges || loadWork
+            ? channel.request("inbox.list", {})
+            : undefined,
+          refreshBadges || problemTab
+            ? channel.request("problem.list", {})
+            : undefined,
+          refreshBadges || (goalTab && !current.goalId && !current.taskId)
+            ? channel.request("goal.list", {})
+            : undefined,
+          goalTab && current.goalId && !current.taskId
+            ? channel.request("goal.get", { id: current.goalId })
+            : undefined,
+          goalTab && current.taskId
+            ? channel.request("task.get", { id: current.taskId })
+            : undefined,
+          section === "delegation"
+            ? channel.request("policy.get", {})
+            : undefined,
+          decisionTab ? channel.request("decision.history", {}) : undefined,
+        ] as const);
         if (disconnected) return;
-        if (items.status === "fulfilled" && items.value) {
-          element("badge-decisions").textContent = String(
-            items.value.filter(
-              ({ weight, state }) =>
-                weight === "action" && state !== "resolved",
-            ).length,
-          );
-          if (view.tab === "decisions") inbox.render(items.value);
+        if (itemResult.status === "fulfilled" && itemResult.value) {
+          items = itemResult.value;
+          const activeIds = new Set(items.map(({ id }) => id));
+          for (const id of marked) if (!activeIds.has(id)) marked.delete(id);
         }
-        if (problems.status === "fulfilled" && problems.value)
-          element("badge-problems").textContent = String(problems.value.length);
-        if (goals.status === "fulfilled" && goals.value)
-          element("badge-goals").textContent = String(
-            goals.value.filter(({ status }) => status === "active").length,
+        if (problemResult.status === "fulfilled" && problemResult.value)
+          problems = groupProblems(problemResult.value);
+        if (goalResult.status === "fulfilled" && goalResult.value)
+          goals = goalResult.value;
+        const pending = pendingDecisions(items);
+        badge("decisions", pending.length);
+        badge("problems", problems.length);
+        badge(
+          "goals",
+          goals.filter(({ status }) => status === "active").length,
+        );
+        const reads = [
+          itemResult,
+          problemResult,
+          goalResult,
+          goal,
+          task,
+          policy,
+          history,
+        ];
+        if (
+          reads.some(
+            (result) =>
+              result.status === "fulfilled" && result.value !== undefined,
+          )
+        )
+          element("connection-update").textContent = new Date().toLocaleString(
+            "ja-JP",
           );
-        if (current !== view) continue;
+        if (current !== view || section !== settings) continue;
+        if (reads.some(({ status }) => status === "rejected"))
+          notice.textContent = "作業の状況を一部更新できませんでした。";
+        else if (!section || section === "delegation") notice.textContent = "";
 
-        const { tab, goalId, taskId } = current;
-        const active = taskId
-          ? task
-          : goalId
-            ? goal
-            : tab === "problems"
-              ? problems
-              : tab === "goals"
-                ? goals
-                : tab === "delegation"
-                  ? policy
-                  : items;
-        notice.textContent =
-          active.status === "rejected"
-            ? "ホストパネルを更新できませんでした。"
-            : "";
-        if (tab === "decisions") {
-          const snapshot = JSON.stringify(history);
-          if (snapshot !== previousHistory) {
-            previousHistory = snapshot;
-            element("decision-history").replaceChildren(
-              ...(history.status === "fulfilled" && history.value
-                ? decisionHistory(
-                    history.value,
-                    (taskId) => navigate({ tab: "goals", taskId }),
-                    (goalId) => navigate({ tab: "goals", goalId }),
-                  )
-                : [textElement("p", "AI の判断履歴を取得できませんでした。")]),
-            );
-          }
+        if (section === "delegation") {
+          const panel = element("delegation");
+          if (policy.status === "fulfilled" && policy.value) {
+            const value = policy.value;
+            const snapshot = JSON.stringify(value);
+            if (
+              snapshot !== previousPolicy &&
+              !panel.querySelector("[data-policy-editing]")
+            ) {
+              previousPolicy = snapshot;
+              restoreFocus(
+                panel,
+                () =>
+                  panel.replaceChildren(
+                    delegationPanel(value, channel, savedPolicy),
+                  ),
+                element("settings-delegation"),
+              );
+            }
+          } else if (!previousPolicy)
+            panel.replaceChildren(empty("設定を取得できませんでした。"));
           continue;
         }
-        if (active.status === "rejected") {
-          renderWork(current, null, () => [
-            textElement("p", "詳細または一覧を取得できませんでした。"),
-          ]);
+
+        if (decisionTab) {
+          if (itemResult.status === "fulfilled") {
+            inbox?.render(pending, goalLink, goalTitle);
+            // A decision answered meanwhile never gets a card: drop the request.
+            if (!focusDecision()) pendingFocus = undefined;
+          }
+          const rows =
+            history.status === "fulfilled" ? history.value : undefined;
+          const historyTitle = (entry: AgentDecision) =>
+            entry.taskId
+              ? (lastGoal?.tasks.find(({ id }) => id === entry.taskId)?.title ??
+                problems.flat().find(({ taskId }) => taskId === entry.taskId)
+                  ?.title)
+              : goalTitle(entry.goalId);
+          const snapshot = JSON.stringify(
+            rows?.map((entry) => [entry, historyTitle(entry)]) ?? null,
+          );
+          if (snapshot !== previousHistory) {
+            previousHistory = snapshot;
+            const panel = element("decision-history");
+            restoreFocus(panel, () =>
+              panel.replaceChildren(
+                ...(rows
+                  ? historyCards(
+                      rows,
+                      () => openSettings("delegation"),
+                      historyTitle,
+                      (subject) => navigate({ tab: "goals", ...subject }),
+                    )
+                  : [empty("AI の判断履歴を取得できませんでした。")]),
+              ),
+            );
+          }
+        } else if (goal.status === "fulfilled" && goal.value) {
+          const detail = (lastGoal = goal.value);
+          const tasks = new Set(detail.tasks.map(({ id }) => id));
+          const related = (item: PanelInboxItem) =>
+            item.subject.goalId === detail.id ||
+            Boolean(item.subject.taskId && tasks.has(item.subject.taskId));
+          const decisions = pending.filter(related);
+          const activity = items.filter(
+            (item) => item.weight === "info" && related(item),
+          );
+          renderWork(
+            [
+              detail,
+              decisions,
+              activity.map(({ state: _state, ...item }) => item),
+            ],
+            () =>
+              goalDetail(
+                detail,
+                decisions.length,
+                goalDelegation(detail, channel, savedPolicy),
+                activity,
+                (taskId) =>
+                  navigate({ tab: "goals", goalId: detail.id, taskId }),
+                () => navigate({ tab: "decisions" }, decisions[0]?.id),
+                watch,
+              ),
+            undefined,
+            detail,
+          );
         } else if (task.status === "fulfilled" && task.value) {
           const detail = task.value;
-          renderWork(current, detail, () =>
-            taskDetail(detail, taskDelegation(detail, channel, savedPolicy)),
+          const decision = pending.find(
+            (item) => item.subject.taskId === detail.id,
           );
-        } else if (goal.status === "fulfilled" && goal.value) {
-          const detail = goal.value;
-          renderWork(current, detail, () =>
-            goalDetail(
-              detail,
-              goalDelegation(detail, channel, savedPolicy),
-              (taskId) => navigate({ tab, goalId: detail.id, taskId }),
-            ),
+          const command = retryCommand(detail.id, items);
+          renderWork(
+            [detail, decision?.id, command, goalTitle(detail.goalId)],
+            () =>
+              taskDetail(
+                detail,
+                taskDelegation(detail, channel, savedPolicy),
+                decision,
+                () => navigate({ tab: "decisions" }, decision?.id),
+                command,
+              ),
+            detail,
           );
-        } else if (
-          tab === "delegation" &&
-          policy.status === "fulfilled" &&
-          policy.value
-        ) {
-          const settings = policy.value;
-          renderWork(current, settings, () => [
-            delegationPanel(settings, channel, savedPolicy),
+        } else if (problemTab && problemResult.status === "fulfilled") {
+          const context = problems.map(([row]) => [
+            row && goalTitle(row.goalId),
+            row?.taskId && retryCommand(row.taskId, items),
           ]);
-        } else if (
-          tab === "goals" &&
-          goals.status === "fulfilled" &&
-          goals.value
-        ) {
-          const rows = goals.value;
-          renderWork(current, rows, () =>
-            rows.length
-              ? [
-                  list(rows, (goal) => {
-                    const item = document.createElement("div");
-                    item.append(
-                      modelLink("Goal", goal.title, goal.id, () =>
-                        navigate({ tab, goalId: goal.id }),
-                      ),
-                      textElement("p", labels[goal.status]),
-                      ...progress(goal),
-                    );
-                    return item;
-                  }),
-                ]
-              : [textElement("p", "Goal はありません。")],
-          );
-        } else if (
-          tab === "problems" &&
-          problems.status === "fulfilled" &&
-          problems.value
-        ) {
-          const rows = problems.value;
-          renderWork(current, rows, () =>
-            rows.length
-              ? [
-                  list(rows, (problem) =>
-                    problemRow(problem, () => {
-                      if (problem.taskId)
-                        navigate({ tab, taskId: problem.taskId });
-                      else if (problem.goalId)
-                        navigate({ tab, goalId: problem.goalId });
-                    }),
+          renderWork([problems, context], () =>
+            problems.length
+              ? problems.map((rows) =>
+                  problemCard(
+                    rows,
+                    items,
+                    channel,
+                    goalLink,
+                    (subject) => navigate({ tab: "goals", ...subject }),
+                    watch,
                   ),
-                ]
-              : [textElement("p", "問題はありません。")],
+                )
+              : [empty("問題はありません。")],
           );
+        } else if (
+          goalTab &&
+          !current.goalId &&
+          !current.taskId &&
+          goalResult.status === "fulfilled"
+        ) {
+          const entries = goals.map((entry) => ({
+            entry,
+            count: pending.filter(({ subject }) => subject.goalId === entry.id)
+              .length,
+          }));
+          renderWork(entries, () =>
+            entries.length
+              ? entries.map(({ entry, count }) =>
+                  goalRow(entry, count, () =>
+                    navigate({ tab: "goals", goalId: entry.id }),
+                  ),
+                )
+              : [empty("Goal はありません。")],
+          );
+        } else if (goalTab || problemTab) {
+          renderWork(null, () => [
+            empty("詳細または一覧を取得できませんでした。"),
+          ]);
         }
       } while (refreshNeeded && !document.hidden);
     } finally {
@@ -921,19 +1648,18 @@ export function createHostPanel(channel: WorkplaceChannel) {
   }
 
   let poll = 0;
-  const interval = window.setInterval(
-    () => void refresh(++poll % 4 === 0),
-    5000,
-  );
+  const interval =
+    channel && window.setInterval(() => void refresh(++poll % 4 === 0), 5000);
   const becameVisible = () => void refresh();
-  document.addEventListener("visibilitychange", becameVisible);
+  if (channel) document.addEventListener("visibilitychange", becameVisible);
   return {
     refresh,
+    closeSettings,
     disconnect() {
       disconnected = true;
       clearInterval(interval);
       document.removeEventListener("visibilitychange", becameVisible);
-      inbox.disconnect();
+      visible.disconnect();
     },
   };
 }
