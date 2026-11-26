@@ -239,12 +239,20 @@ async function goalBranchHead(
   });
 }
 
+export async function readGoalBranchHead(directory: string, goalId: string) {
+  if (!(await privateRepositoryExists(directory))) return null;
+  return goalBranchHead(localGit(directory, goalBranch(goalId)));
+}
+
 export async function previewGoalBaseUpdate(
   store: OrchestratorStore,
   repoRoot: string,
   directory: string,
-  goalId: string,
+  id: string,
 ) {
+  const goal = store.getGoal(id);
+  if (!goal) throw new OrchestratorStoreError("goal-base-ineligible");
+  const goalId = goal.id;
   const recordedBase = store.goalBaseForUpdate(goalId);
   const repository = join(directory, "repository.git");
   const git = localGit(directory, goalBranch(goalId));
@@ -278,25 +286,32 @@ export async function previewGoalBaseUpdate(
 export async function previewGoalDiscard(
   store: OrchestratorStore,
   directory: string,
-  goalId: string,
+  id: string,
+  channel: "cli" | "operator-ui" = "cli",
 ) {
+  const goal = store.getGoal(id);
+  if (!goal) throw new OrchestratorStoreError("not-found");
+  const goalId = goal.id;
   store.assertGoalDiscardable(goalId);
   const branch = goalBranch(goalId);
   const git = localGit(directory, branch);
-  const head = (await privateRepositoryExists(directory))
-    ? await goalBranchHead(git)
-    : null;
+  const head = await readGoalBranchHead(directory, goalId);
   return {
     branch,
     head,
     apply: () =>
-      store.discardGoal(goalId, head, async (expectedHead) => {
-        if (await privateRepositoryExists(directory)) {
-          await git.deleteGoalBranch(expectedHead);
-        } else if (expectedHead !== null) {
-          throw new GitIntegrationError("stale-base");
-        }
-      }),
+      store.discardGoal(
+        goalId,
+        head,
+        async (expectedHead) => {
+          if (await privateRepositoryExists(directory)) {
+            await git.deleteGoalBranch(expectedHead);
+          } else if (expectedHead !== null) {
+            throw new GitIntegrationError("stale-base");
+          }
+        },
+        channel,
+      ),
   };
 }
 
@@ -304,11 +319,12 @@ export async function previewGoalBranchExport(
   store: OrchestratorStore,
   checkout: string,
   directory: string,
-  goalId: string,
+  id: string,
   scan?: CredentialScanner,
 ) {
-  const goal = store.getGoal(goalId);
+  const goal = store.getGoal(id);
   if (!goal) throw new OrchestratorStoreError("not-found");
+  const goalId = goal.id;
   if (goal.status === "cancelled")
     throw new OrchestratorStoreError("goal-inactive");
   store.assertGoalScheduling(goalId);
@@ -555,10 +571,7 @@ export function createTaskExecutor(options: {
   }
 
   return {
-    async existingBase(goalId) {
-      if (!(await privateRepositoryExists(directory))) return null;
-      return goalBranchHead(localGit(directory, goalBranch(goalId)));
-    },
+    existingBase: (goalId) => readGoalBranchHead(directory, goalId),
     async open(task) {
       const branch = goalBranch(task.goalId);
       const git = localGit(directory, branch);

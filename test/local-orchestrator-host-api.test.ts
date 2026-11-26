@@ -422,6 +422,9 @@ test("handles split UTF-8 and exercises each tool against the real store", async
       kind: "goal",
       title: goalContent.title,
       status: "pending",
+      ref: null,
+      goalRef: null,
+      taskRef: null,
     },
   ]);
   assert.partialDeepStrictEqual(
@@ -446,14 +449,21 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   });
   assert.ok(goalId);
   assert.deepEqual((await client.call("list_goals")).data, [
-    { id: goalId, title: goalContent.title, status: "active" },
+    {
+      id: goalId,
+      ref: "G1",
+      title: goalContent.title,
+      status: "active",
+      turn: { owner: "idle", reason: { kind: "not-planned" } },
+    },
   ]);
 
   const task = await client.call("draft_task", {
-    content: { ...taskContent, goalId },
+    content: { ...taskContent, goalId: "g1" },
   });
   assert.partialDeepStrictEqual(task.data, {
     status: "registered",
+    ref: "G1-1",
     autoRegistered: true,
     reason: "in-scope",
   });
@@ -477,14 +487,16 @@ test("handles split UTF-8 and exercises each tool against the real store", async
     overBudget: false,
   };
   assert.partialDeepStrictEqual(
-    (await client.call("get_goal", { id: goalId })).data,
+    (await client.call("get_goal", { id: "g1" })).data,
     {
       id: goalId,
+      ref: "G1",
       content: goalContent,
       baseCommit,
       tasks: [
         {
           id: task.data.taskId,
+          ref: "G1-1",
           content: { ...taskContent, goalId },
           ...taskUsage,
           budgetTokens: 0,
@@ -495,7 +507,7 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   );
   const planned = await client.call("request_planner", {
     mode: "task-decomposition",
-    goalId,
+    goalId: "g1",
     brief: "Break it down",
   });
   assert.deepEqual(plannerCalls, [
@@ -512,6 +524,8 @@ test("handles split UTF-8 and exercises each tool against the real store", async
   assert.deepEqual((await client.call("get_execution", { id })).data, {
     id,
     status: "succeeded",
+    ref: "G1",
+    goalRef: "G1",
     result: { tasks: 1 },
   });
 
@@ -524,6 +538,9 @@ test("handles split UTF-8 and exercises each tool against the real store", async
       {
         id: pendingTask.data.id,
         kind: "task",
+        ref: "G1",
+        goalRef: "G1",
+        taskRef: null,
         title: "Task",
         gate: "task-registration",
         policy: "human",
@@ -535,13 +552,24 @@ test("handles split UTF-8 and exercises each tool against the real store", async
         actor: "Planner",
         mode: "task-decomposition",
         status: "succeeded",
+        ref: "G1",
+        goalRef: "G1",
+        taskRef: null,
         tokens: null,
         maxTokens: 500,
         usage: "unavailable",
       },
     ],
     recentTasks: [
-      { id: task.data.taskId, goalId, status: "registered", ...taskUsage },
+      {
+        id: task.data.taskId,
+        goalId,
+        goalRef: "G1",
+        taskRef: "G1-1",
+        ref: "G1-1",
+        status: "registered",
+        ...taskUsage,
+      },
     ],
   });
   const calls = apiCalls();
@@ -805,7 +833,12 @@ test("returns fixed tool errors without leaking input into responses or audit", 
     await client.call(marker),
     await client.call("status", { note: marker }),
     await client.call("draft_goal", { content: { title: marker } }),
-    await client.call("get_goal", { id: marker }),
+    await client.call("get_goal", { id: "g99" }),
+    await client.call("request_planner", {
+      mode: "replanning",
+      goalId: "g99",
+      brief: marker,
+    }),
     await client.call("draft_task", {
       content: { ...taskContent, goalId: marker },
     }),
@@ -822,7 +855,8 @@ test("returns fixed tool errors without leaking input into responses or audit", 
       "invalid-arguments",
       "invalid-arguments",
       "not-found",
-      "tool-failed",
+      "not-found",
+      "not-found",
       "invalid-arguments",
       "tool-failed",
     ],
@@ -834,6 +868,7 @@ test("returns fixed tool errors without leaking input into responses or audit", 
       "denied",
       "denied",
       "denied",
+      "error",
       "error",
       "error",
       "denied",
@@ -984,9 +1019,12 @@ test("get_inbox returns only host summaries and audits the call", async (t) => {
       "title",
       "weight",
     ]);
-  assert.equal(
-    data.find(({ kind }: { kind: string }) => kind === "task-failed").title,
-    `Task ${taskId.slice(0, 8)} failed`,
+  assert.partialDeepStrictEqual(
+    data.find(({ kind }: { kind: string }) => kind === "task-failed"),
+    {
+      title: `Task ${taskId.slice(0, 8)} failed`,
+      subject: { goalId, taskId, ref: "G1-1", goalRef: "G1", taskRef: "G1-1" },
+    },
   );
   assert.ok(
     data.some(

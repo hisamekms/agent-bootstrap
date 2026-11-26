@@ -17,6 +17,7 @@ import type {
   operatorInbox,
   operatorProblems,
   operatorProposal,
+  operatorActivity,
   operatorStatus,
   operatorTask,
   operatorTaskList,
@@ -33,7 +34,9 @@ type Repository = { project: string; repositoryPath: string };
 export type Status = ReturnType<typeof operatorStatus> &
   (Repository | { project?: never; repositoryPath?: never });
 export type GoalSummary = ReturnType<typeof operatorGoalList>[number];
-export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>>;
+export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
+  head: string | null;
+};
 export type TaskSummary = NonNullable<
   ReturnType<typeof operatorTaskList>
 >[number];
@@ -229,6 +232,26 @@ export interface Methods {
     params: { status?: (typeof goalStatuses)[number] };
     result: GoalSummary[];
   };
+  "activity.get": {
+    params: Record<string, never>;
+    result: ReturnType<typeof operatorActivity>;
+  };
+  "activity.subscribe": {
+    params: Record<string, never>;
+    result: { subscribed: true };
+  };
+  "task.retry": {
+    params: { id: string; expectedRetries: number };
+    result: ReturnType<OrchestratorStore["retryTask"]>;
+  };
+  "goal.discard": {
+    params: { id: string; confirm: string; expectedHead: string | null };
+    result: { id: string; ref: string; status: "cancelled" };
+  };
+  "concierge.draft": {
+    params: { text: string };
+    result: { characters: number };
+  };
   "goal.get": { params: { id: string }; result: GoalDetail };
   "task.list": { params: { goalId: string }; result: TaskSummary[] };
   "task.get": { params: { id: string }; result: TaskDetail };
@@ -245,6 +268,7 @@ export interface Methods {
 }
 
 export type Push =
+  | { method: "activity.changed"; params: Record<string, never> }
   | { method: "inbox.changed"; params: { ids: string[] } }
   | { method: "concierge.output"; params: { data: string } }
   | { method: "concierge.exit"; params: { exitCode: number | null } }
@@ -304,10 +328,18 @@ function choice<T extends string>(value: unknown, values: readonly T[]) {
   return values.some((item) => item === value);
 }
 
+export function isRef(value: unknown): value is string {
+  return token(value, /^G[1-9][0-9]*(-[1-9][0-9]*)?$/);
+}
+
 export function isProposal(value: unknown): value is Proposal {
   if (!record(value)) return false;
   const { budgets, origin, modelText, pathViolations } = value;
   if (
+    !["ref", "goalRef", "taskRef"].every(
+      (key) =>
+        !Object.hasOwn(value, key) || value[key] === null || isRef(value[key]),
+    ) ||
     !token(value.digest, /^[a-f0-9]{64}$/) ||
     !plainText(value.id) ||
     !value.id ||
@@ -357,6 +389,9 @@ export function isProposal(value: unknown): value is Proposal {
     return false;
   const common = [
     "id",
+    "ref",
+    "goalRef",
+    "taskRef",
     "kind",
     "digest",
     "status",

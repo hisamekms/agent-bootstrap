@@ -1003,6 +1003,14 @@ test("schema 6 migration preserves legacy Goal policies over project defaults", 
   const db = new Database(filename);
   try {
     db.exec(`
+      DROP TRIGGER goals_ref_required;
+      DROP TRIGGER goals_ref_immutable;
+      DROP TRIGGER tasks_ref_required;
+      DROP TRIGGER tasks_ref_immutable;
+      DROP INDEX goals_ref;
+      DROP INDEX tasks_ref;
+      ALTER TABLE goals DROP COLUMN ref;
+      ALTER TABLE tasks DROP COLUMN ref;
       DROP TABLE delegation_rules;
       DROP TABLE goal_policy;
       DROP TABLE task_policy;

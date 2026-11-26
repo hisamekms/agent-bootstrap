@@ -108,6 +108,9 @@ test("status reports counts and pending gates, and show and proposals include co
       {
         id,
         kind: "goal",
+        ref: null,
+        goalRef: null,
+        taskRef: null,
         title: goal.title,
         gate: "goal-registration",
         effectivePolicy: "human",
@@ -135,6 +138,66 @@ test("status reports counts and pending gates, and show and proposals include co
   const rejected = await cli(state, ["proposals", "--status", "rejected"]);
   assert.equal(rejected.code, 0);
   assert.deepEqual(JSON.parse(rejected.stdout), []);
+});
+
+test("CLI accepts case-insensitive Goal and Task refs and event subjects", async () => {
+  using state = orchestratorFixture("lo-cli-refs-");
+  const proposed = state.store.proposeGoal(goal, origin);
+  const { goalId } = state.store.decide(proposed.id, {
+    digest: proposed.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const announced = await cli(state, ["show", "g1"]);
+  assert.equal(announced.code, 0);
+  assert.partialDeepStrictEqual(JSON.parse(announced.stdout), {
+    id: goalId,
+    ref: "G1",
+  });
+  const taskProposal = state.store.proposeTask(
+    {
+      title: "Task",
+      description: "",
+      acceptance: ["Pass"],
+      goalId,
+      actor: "Executor",
+      profile: "base",
+      paths: goal.scope.paths,
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    { kind: "host" },
+  );
+  const taskId =
+    taskProposal.status === "registered"
+      ? taskProposal.taskId
+      : state.store.decide(taskProposal.id, {
+          digest: taskProposal.digest,
+          decision: "approve",
+          answerer: { kind: "human" },
+        }).taskId;
+  const shown = await cli(state, ["show", "g1-1"]);
+  assert.equal(shown.code, 0);
+  assert.partialDeepStrictEqual(JSON.parse(shown.stdout), {
+    id: taskId,
+    ref: "G1-1",
+  });
+  const events = await cli(state, ["events", "--subject", "g1-1"]);
+  assert.equal(events.code, 0);
+  assert.equal(JSON.parse(events.stdout)[0].subjectId, taskId);
+  assert.ok(taskId);
+  assert.ok(state.store.claimTask(taskId));
+  state.store.failTask(taskId, "test-failed");
+  const retried = await cli(state, ["retry-task", "g1-1"], {
+    isTTY: true,
+    answer: () => "retry-task G1-1",
+  });
+  assert.equal(retried.code, 0);
+  assert.partialDeepStrictEqual(JSON.parse(retried.stdout), {
+    ref: "G1-1",
+    retries: 1,
+  });
+  assert.equal((await cli(state, ["show", "g2-1"])).code, 1);
 });
 
 test("proposal display identifies policy loosening and Task scope exceptions", async () => {
@@ -823,6 +886,7 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
     assert.deepEqual(result.questions, [`Type "${phrase}" to confirm: `]);
     assert.deepEqual(JSON.parse(result.stdout), {
       id,
+      ref: "G1-1",
       status: "registered",
       retries,
     });
@@ -831,7 +895,11 @@ test("retry-task confirms on a terminal, records retries and rejects ineligible 
       store.listEvents({ subjectId: id, limit: 1 })[0],
       {
         kind: "task.retried",
-        data: { retries, origin: "operator", budgetReset: true },
+        data: {
+          retries,
+          origin: { kind: "operator", channel: "cli" },
+          budgetReset: true,
+        },
       },
     );
     assert.ok(store.claimTask(id));

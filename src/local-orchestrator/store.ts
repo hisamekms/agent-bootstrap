@@ -155,7 +155,33 @@ type ApprovalPolicy = EffectivePolicy;
 type SettingsOrigin = "cli" | "operator-ui";
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 6;
+const schemaVersion = 7;
+const refsMigration = `
+  ALTER TABLE goals ADD COLUMN ref TEXT NOT NULL DEFAULT '';
+  ALTER TABLE tasks ADD COLUMN ref TEXT NOT NULL DEFAULT '';
+  WITH numbered AS MATERIALIZED (
+    SELECT id, 'G' || row_number() OVER (ORDER BY created_at, rowid) AS ref FROM goals
+  )
+  UPDATE goals SET ref = (SELECT ref FROM numbered WHERE numbered.id = goals.id);
+  WITH numbered AS MATERIALIZED (
+    SELECT t.id, g.ref || '-' ||
+      row_number() OVER (PARTITION BY t.goal_id ORDER BY t.created_at, t.rowid) AS ref
+    FROM tasks t JOIN goals g ON g.id = t.goal_id
+  )
+  UPDATE tasks SET ref = (SELECT ref FROM numbered WHERE numbered.id = tasks.id);
+  CREATE UNIQUE INDEX goals_ref ON goals(ref COLLATE NOCASE);
+  CREATE UNIQUE INDEX tasks_ref ON tasks(ref COLLATE NOCASE);
+  ${["goals", "tasks"]
+    .map(
+      (table) => `
+    CREATE TRIGGER ${table}_ref_required BEFORE INSERT ON ${table}
+      WHEN NEW.ref = '' BEGIN SELECT RAISE(ABORT, 'ref required'); END;
+    CREATE TRIGGER ${table}_ref_immutable BEFORE UPDATE OF ref ON ${table}
+      WHEN NEW.ref <> OLD.ref BEGIN SELECT RAISE(ABORT, 'immutable ref'); END;
+  `,
+    )
+    .join("")}
+`;
 const inboxSeenSchema = "CREATE TABLE inbox_seen (id TEXT PRIMARY KEY) STRICT;";
 export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
@@ -327,6 +353,7 @@ type ProposalRow = {
 type RegisteredRow = {
   id: string;
   proposalId: string;
+  ref: string;
   contentJson: string;
   digest: string;
   createdAt: string;
@@ -374,7 +401,7 @@ type EventRow = {
 const proposalColumns =
   "id, kind, content_json AS contentJson, digest, source_json AS sourceJson, status, created_at AS createdAt, decided_at AS decidedAt";
 const registeredColumns =
-  "id, proposal_id AS proposalId, content_json AS contentJson, digest, status, created_at AS createdAt";
+  "ref, id, proposal_id AS proposalId, content_json AS contentJson, digest, status, created_at AS createdAt";
 const goalColumns = `${registeredColumns}, planning_commit AS planningCommit, base_commit AS baseCommit`;
 const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts,
   (SELECT count(*) FROM events WHERE subject_id = tasks.id AND subject_kind = 'task'
@@ -383,6 +410,38 @@ const executionColumns =
   "id, actor, mode, requested_by_json AS requestedByJson, goal_id AS goalId, task_id AS taskId, status, result_json AS resultJson, started_at AS startedAt, finished_at AS finishedAt";
 const eventColumns =
   "id, at, kind, subject_kind AS subjectKind, subject_id AS subjectId, session_id AS sessionId, execution_id AS executionId, data";
+
+// The action count and inbox share the same resolution and budget predicates.
+const laterTaskStatus = `EXISTS (
+  SELECT 1 FROM events AS later
+  WHERE later.subject_id = t.id AND later.subject_kind = 'task'
+    AND later.kind = 'task.status' AND later.rowid > e.rowid
+    AND json_extract(later.data, '$.status') IN (
+      'running', 'awaiting-integration', 'failed', 'succeeded', 'cancelled'
+    )
+)`;
+const taskBudgetResolved = `t.status IN ('succeeded', 'cancelled') OR EXISTS (
+  SELECT 1 FROM events AS retry
+  WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
+    AND retry.rowid > (
+      SELECT queued.rowid FROM events AS queued
+      WHERE queued.subject_id = x.id AND queued.subject_kind = 'execution'
+        AND queued.kind = 'execution.queued' LIMIT 1
+    )
+)`;
+const executionOverBudget = `(
+  (json_type(x.result_json, '$.tokens') = 'integer'
+    AND json_extract(x.result_json, '$.tokens') <= 9007199254740991
+    AND json_extract(x.result_json, '$.tokens') > coalesce(
+      json_extract(t.content_json, '$.budgets.maxTokens'),
+      json_extract(g.content_json, '$.scope.budgets.maxTokens')
+    ))
+  OR EXISTS (
+    SELECT 1 FROM events AS budget
+    WHERE budget.subject_id = t.id AND budget.kind = 'task.budget-exceeded'
+      AND budget.execution_id = x.id
+  )
+)`;
 
 function proposalRecord({
   contentJson,
@@ -506,6 +565,7 @@ type DecisionReceipt = Readonly<{
   status: "approved" | "rejected";
   goalId?: string;
   taskId?: string;
+  ref?: string;
 }>;
 type GoalReceipt = ProposalReceipt &
   ApprovalPolicy &
@@ -514,6 +574,7 @@ type RegisteredReceipt = Omit<ProposalReceipt, "loosening"> &
   Readonly<{
     status: "registered";
     taskId: string;
+    ref: string;
     autoRegistered: true;
     reason: "in-scope";
   }>;
@@ -570,7 +631,7 @@ export class OrchestratorStore {
             !connection.query("SELECT name FROM sqlite_schema LIMIT 1").get()
           ) {
             connection.exec(
-              `${schema} PRAGMA application_id=${applicationId}; PRAGMA user_version=${schemaVersion}`,
+              `${schema} ${refsMigration} PRAGMA application_id=${applicationId}; PRAGMA user_version=${schemaVersion}`,
             );
           } else if (id !== applicationId) {
             throw new Error();
@@ -610,6 +671,7 @@ export class OrchestratorStore {
               version !== 3 &&
               version !== 4 &&
               version !== 5 &&
+              version !== 6 &&
               version !== schemaVersion
             ) {
               throw new Error();
@@ -621,7 +683,7 @@ export class OrchestratorStore {
                 ALTER TABLE goals ADD COLUMN base_commit TEXT;
               `);
             }
-            if (version !== schemaVersion) {
+            if (version !== 6 && version !== schemaVersion) {
               if (version !== 5) connection.exec(inboxSeenSchema);
               // Legacy defaults keep their precedence until explicitly set again.
               connection.exec(`
@@ -632,11 +694,14 @@ export class OrchestratorStore {
                 INSERT INTO next_approvals SELECT *, NULL, NULL FROM approvals;
                 DROP TABLE approvals;
                 ALTER TABLE next_approvals RENAME TO approvals;
-                PRAGMA user_version=${schemaVersion};
               `);
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
             }
+            if (version !== schemaVersion)
+              connection.exec(
+                `${refsMigration} PRAGMA user_version=${schemaVersion};`,
+              );
           }
         })
         .immediate();
@@ -746,6 +811,16 @@ export class OrchestratorStore {
     });
   }
 
+  recordConciergeDraft(characters: number, sha256: string): void {
+    this.#write((at) => {
+      this.#event(at, "concierge.draft-authorized", "actor", "Concierge", {
+        origin: { kind: "operator", channel: "operator-ui" },
+        characters,
+        sha256,
+      });
+    });
+  }
+
   isActiveConciergeSession(sessionId: string): boolean {
     const id = identifier(sessionId);
     return this.#read(
@@ -846,15 +921,19 @@ export class OrchestratorStore {
   }
 
   goalPolicyOverrides(goalId: string) {
-    const id = identifier(goalId);
-    return this.#read(() => ({
-      "task-registration": this.#goalPolicyOverride(id, "task-registration"),
-      integration: this.#goalPolicyOverride(id, "integration"),
-    }));
+    return this.#read(() => {
+      const id = this.#goalId(identifier(goalId));
+      return {
+        "task-registration": this.#goalPolicyOverride(id, "task-registration"),
+        integration: this.#goalPolicyOverride(id, "integration"),
+      };
+    });
   }
 
   taskPolicyOverride(taskId: string): TaskPolicy {
-    return this.#read(() => this.#taskPolicyOverride(identifier(taskId)));
+    return this.#read(() =>
+      this.#taskPolicyOverride(this.#taskId(identifier(taskId))),
+    );
   }
 
   policySettings() {
@@ -945,12 +1024,11 @@ export class OrchestratorStore {
     origin: SettingsOrigin,
     expected?: GoalPolicy,
   ): void {
-    const id = identifier(goalId);
     oneOf(gate, RULE_GATES);
     oneOf(value, GOAL_POLICIES);
     oneOf(origin, ["cli", "operator-ui"]);
     this.#write((at) => {
-      required(this.#goal(id));
+      const { id } = required(this.#goal(identifier(goalId)));
       const before = this.#goalPolicyOverride(id, gate);
       if (expected !== undefined && expected !== before)
         throw new OrchestratorStoreError("stale-policy");
@@ -975,11 +1053,10 @@ export class OrchestratorStore {
     origin: SettingsOrigin,
     expected?: TaskPolicy,
   ): void {
-    const id = identifier(taskId);
     oneOf(value, TASK_POLICIES);
     oneOf(origin, ["cli", "operator-ui"]);
     this.#write((at) => {
-      required(this.#task(id));
+      const { id } = required(this.#task(identifier(taskId)));
       const before = this.#taskPolicyOverride(id);
       if (expected !== undefined && expected !== before)
         throw new OrchestratorStoreError("stale-policy");
@@ -1172,16 +1249,38 @@ export class OrchestratorStore {
     });
   }
 
+  #goalId(key: string): string {
+    if (!/^g[0-9]+$/i.test(key)) return key;
+    return (
+      this.#db
+        .query<{ id: string }>(
+          "SELECT id FROM goals WHERE ref = ? COLLATE NOCASE",
+        )
+        .get(key)?.id ?? key
+    );
+  }
+
+  #taskId(key: string): string {
+    if (!/^g[0-9]+-[0-9]+$/i.test(key)) return key;
+    return (
+      this.#db
+        .query<{ id: string }>(
+          "SELECT id FROM tasks WHERE ref = ? COLLATE NOCASE",
+        )
+        .get(key)?.id ?? key
+    );
+  }
+
   #goal(id: string) {
     return this.#db
       .query<GoalRow>(`SELECT ${goalColumns} FROM goals WHERE id = ?`)
-      .get(id);
+      .get(this.#goalId(id));
   }
 
   #task(id: string) {
     return this.#db
       .query<TaskRow>(`SELECT ${taskColumns} FROM tasks WHERE id = ?`)
-      .get(id);
+      .get(this.#taskId(id));
   }
 
   #activeGoal(id: string): GoalContent {
@@ -1228,14 +1327,21 @@ export class OrchestratorStore {
 
   #registerTask(row: ProposalRow, task: TaskContent, at: string): string {
     const id = randomUUID();
+    const goalRef = required(this.#goal(task.goalId)).ref;
+    const sequence = this.#db
+      .query<{ next: number }>(
+        "SELECT coalesce(max(CAST(substr(ref, ?1) AS INTEGER)), 0) + 1 AS next FROM tasks WHERE goal_id = ?2",
+      )
+      .get(goalRef.length + 2, task.goalId)!.next;
     this.#run(
-      "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, 'registered', 0, ?)",
+      "INSERT INTO tasks (id, goal_id, proposal_id, content_json, digest, status, attempts, created_at, ref) VALUES (?, ?, ?, ?, ?, 'registered', 0, ?, ?)",
       id,
       task.goalId,
       row.id,
       row.contentJson,
       row.digest,
       at,
+      `${goalRef}-${sequence}`,
     );
     return id;
   }
@@ -1244,10 +1350,15 @@ export class OrchestratorStore {
     content: unknown,
     origin: Origin,
   ): PendingReceipt | RegisteredReceipt {
-    const task = validateTaskContent(content);
+    const input = validateTaskContent(content);
     const source = parseOrigin(origin);
     return this.#write((at) => {
-      const goal = this.#activeGoal(task.goalId);
+      const goalId = required(this.#goal(input.goalId)).id;
+      const dependsOn = input.dependsOn.map((id) => this.#task(id)?.id ?? id);
+      if (new Set(dependsOn).size !== dependsOn.length)
+        throw new OrchestratorStoreError("task-constraints");
+      const task = { ...input, goalId, dependsOn };
+      const goal = this.#activeGoal(goalId);
       const scope = fitsScope(goal, task, this.#taskCount(task.goalId));
       const { gate, loosening, ...policy } = this.#taskPolicy(
         task,
@@ -1281,6 +1392,7 @@ export class OrchestratorStore {
           digest: row.digest,
           status: "registered",
           taskId,
+          ref: required(this.#task(taskId)).ref,
           autoRegistered: true,
           reason: "in-scope",
         });
@@ -1485,7 +1597,11 @@ export class OrchestratorStore {
           { proposalId: id, goalId: task.goalId },
           correlation,
         );
-        return freeze({ status, taskId });
+        return freeze({
+          status,
+          taskId,
+          ref: required(this.#task(taskId)).ref,
+        });
       }
       const planningCommit =
         origin.kind === "actor" && origin.sessionId
@@ -1493,7 +1609,10 @@ export class OrchestratorStore {
           : null;
       const goalId = randomUUID();
       this.#run(
-        "INSERT INTO goals VALUES (?, ?, ?, ?, 'active', ?, ?, NULL)",
+        `INSERT INTO goals (id, proposal_id, content_json, digest, status, created_at, planning_commit, ref)
+         VALUES (?, ?, ?, ?, 'active', ?, ?, (
+           SELECT 'G' || (coalesce(max(CAST(substr(ref, 2) AS INTEGER)), 0) + 1) FROM goals
+         ))`,
         goalId,
         id,
         row.contentJson,
@@ -1509,7 +1628,7 @@ export class OrchestratorStore {
         { proposalId: id },
         correlation,
       );
-      return freeze({ status, goalId });
+      return freeze({ status, goalId, ref: required(this.#goal(goalId)).ref });
     });
   }
 
@@ -1561,9 +1680,9 @@ export class OrchestratorStore {
   }
 
   claimTask(taskId: string) {
-    const id = identifier(taskId);
     return this.#write((at) => {
-      const task = taskRecord(required(this.#task(id)));
+      const task = taskRecord(required(this.#task(identifier(taskId))));
+      const { id } = task;
       if (!this.#ready(task)) return null;
       if (!this.#ownsGoalBranch(task.goalId)) {
         this.#setTaskStatus(id, "failed", "branch-collision", at);
@@ -1579,25 +1698,29 @@ export class OrchestratorStore {
     code: string,
     rejectedPaths?: readonly PathViolation[],
   ) {
-    const id = identifier(taskId);
     const reason = identifier(code);
     this.#write((at) => {
-      if (required(this.#task(id)).status !== "running")
+      const { id, status } = required(this.#task(identifier(taskId)));
+      if (status !== "running")
         throw new OrchestratorStoreError("invalid-transition");
       this.#setTaskStatus(id, "failed", reason, at, undefined, rejectedPaths);
     });
   }
 
-  retryTask(taskId: string, expectedRetries: number) {
-    const id = identifier(taskId);
+  retryTask(
+    taskId: string,
+    expectedRetries: number,
+    channel: SettingsOrigin = "cli",
+  ) {
     return this.#write((at) => {
-      const task = required(this.#task(id));
+      const task = required(this.#task(identifier(taskId)));
+      const { id, ref } = task;
+      if (task.retries !== expectedRetries)
+        throw new OrchestratorStoreError("task-retry-changed");
       if (task.status !== "failed")
         throw new OrchestratorStoreError("invalid-transition");
       if (required(this.#goal(task.goalId)).status === "cancelled")
         throw new OrchestratorStoreError("goal-inactive");
-      if (task.retries !== expectedRetries)
-        throw new OrchestratorStoreError("task-retry-changed");
       if (task.retries >= MAX_TASK_RETRIES)
         throw new OrchestratorStoreError("task-retry-limit");
       const status = "registered";
@@ -1605,10 +1728,10 @@ export class OrchestratorStore {
       this.#setTaskStatus(id, status, null, at);
       this.#event(at, "task.retried", "task", id, {
         retries,
-        origin: "operator",
+        origin: { kind: "operator", channel },
         budgetReset: true,
       });
-      return { id, status, retries } as const;
+      return { id, ref, status, retries } as const;
     });
   }
 
@@ -1617,19 +1740,20 @@ export class OrchestratorStore {
     reviewedBy: string,
     diffSize?: DiffSize,
   ) {
-    const content = validateIntegrationContent(value);
+    const input = validateIntegrationContent(value);
     const executionId = identifier(reviewedBy);
     if (diffSize !== undefined) {
       integer(
         diffSize.changedFiles,
-        content.changedPaths.length,
-        content.changedPaths.length,
+        input.changedPaths.length,
+        input.changedPaths.length,
       );
       if (diffSize.changedLines !== null)
         integer(diffSize.changedLines, 0, Number.MAX_SAFE_INTEGER);
     }
     return this.#write((at) => {
-      const task = taskRecord(required(this.#task(content.taskId)));
+      const task = taskRecord(required(this.#task(input.taskId)));
+      const content = { ...input, taskId: task.id };
       const execution = required(this.#execution(executionId));
       this.#activeGoal(task.goalId);
       const result = execution.resultJson
@@ -1719,7 +1843,7 @@ export class OrchestratorStore {
 
   assertGoalScheduling(goalId: string) {
     this.#read(() => {
-      if (this.#goalIntegrationInProgress(identifier(goalId)))
+      if (this.#goalIntegrationInProgress(this.#goalId(identifier(goalId))))
         throw new OrchestratorStoreError("integration-uncertain");
     });
   }
@@ -1901,7 +2025,7 @@ export class OrchestratorStore {
        WHERE events.kind = 'task.integrated' AND events.subject_kind = 'task' AND tasks.goal_id = ?
        ORDER BY events.rowid DESC LIMIT 1`,
           )
-          .get(identifier(goalId))?.head ?? null,
+          .get(this.#goalId(identifier(goalId)))?.head ?? null,
     );
   }
 
@@ -1913,22 +2037,23 @@ export class OrchestratorStore {
     completed: boolean,
   ) {
     this.#write((at) => {
-      const goal = required(this.#goal(goalId));
-      if (!this.#ownsGoalBranch(goalId) || branch !== goalBranch(goalId))
+      const goal = required(this.#goal(identifier(goalId)));
+      const { id } = goal;
+      if (!this.#ownsGoalBranch(id) || branch !== goalBranch(id))
         throw new OrchestratorStoreError("context-mismatch");
       if (!completed) {
         if (goal.status === "cancelled")
           throw new OrchestratorStoreError("goal-inactive");
-        if (this.#goalIntegrationInProgress(goalId))
+        if (this.#goalIntegrationInProgress(id))
           throw new OrchestratorStoreError("integration-uncertain");
-        if ((this.goalIntegrationHead(goalId) ?? goal.baseCommit) !== to)
+        if ((this.goalIntegrationHead(id) ?? goal.baseCommit) !== to)
           throw new OrchestratorStoreError("export-head-mismatch");
       }
       this.#event(
         at,
         completed ? "goal.exported" : "goal.export-authorized",
         "goal",
-        goalId,
+        id,
         {
           branch,
           from: from === null ? null : gitCommit(from),
@@ -1946,12 +2071,13 @@ export class OrchestratorStore {
           `SELECT ${proposalColumns} FROM proposals WHERE kind = 'integration' AND status = 'pending'
        AND (? IS NULL OR json_extract(content_json, '$.goalId') = ?) ORDER BY rowid`,
         )
-        .all(id ?? null, id ?? null)
+        .all(id ?? null, id === undefined ? null : this.#goalId(id))
         .map((row) => {
           const proposal = proposalRecord(row);
           const gate = this.#proposalGate(proposal);
           return freeze({
             ...proposal,
+            ...this.#proposalRefs(proposal),
             ...gate,
             ...proposalAnswerRequirements(
               proposal,
@@ -2048,17 +2174,21 @@ export class OrchestratorStore {
       (actor === "Reviewer" || origin.kind === "actor")
     )
       throw new OrchestratorStoreError("approval-forbidden");
-    const taskId = Object.hasOwn(input, "taskId")
+    const requestedTaskId = Object.hasOwn(input, "taskId")
       ? identifier(input.taskId)
       : null;
     const requestedGoalId = Object.hasOwn(input, "goalId")
       ? identifier(input.goalId)
       : null;
     return this.#write((at) => {
-      const task = taskId === null ? null : required(this.#task(taskId));
-      if (task && requestedGoalId !== null && requestedGoalId !== task.goalId)
+      const task =
+        requestedTaskId === null ? null : required(this.#task(requestedTaskId));
+      const taskId = task?.id ?? null;
+      const suppliedGoalId =
+        requestedGoalId === null ? null : this.#goalId(requestedGoalId);
+      if (task && suppliedGoalId !== null && suppliedGoalId !== task.goalId)
         throw new OrchestratorStoreError("context-mismatch");
-      const goalId = task?.goalId ?? requestedGoalId;
+      const goalId = task?.goalId ?? suppliedGoalId;
       if (
         goalId !== null &&
         required(this.#goal(goalId)).status === "cancelled"
@@ -2345,10 +2475,10 @@ export class OrchestratorStore {
     commit: string,
     kind: "planning" | "base",
   ): void {
-    const id = identifier(goalId);
+    const key = identifier(goalId);
     const value = gitCommit(commit);
     this.#write((at) => {
-      const { planningCommit, baseCommit } = required(this.#goal(id));
+      const { id, planningCommit, baseCommit } = required(this.#goal(key));
       const pinned = baseCommit ?? planningCommit;
       if (pinned !== null && pinned !== value)
         throw new OrchestratorStoreError("context-mismatch");
@@ -2420,7 +2550,9 @@ export class OrchestratorStore {
   }
 
   goalBaseForUpdate(goalId: string): string | null {
-    return this.#read(() => this.#eligibleGoalBase(identifier(goalId)));
+    return this.#read(() =>
+      this.#eligibleGoalBase(this.#goalId(identifier(goalId))),
+    );
   }
 
   async updateGoalBase(
@@ -2430,7 +2562,7 @@ export class OrchestratorStore {
     moveRef: () => Promise<void>,
     legacyBase = false,
   ) {
-    const id = identifier(goalId);
+    const id = this.#read(() => this.#goalId(identifier(goalId)));
     gitCommit(from);
     gitCommit(to);
     await this.#changeGoalBranch(
@@ -2474,16 +2606,26 @@ export class OrchestratorStore {
   }
 
   assertGoalDiscardable(goalId: string): void {
-    this.#read(() => this.#eligibleGoalDiscard(identifier(goalId)));
+    this.#read(() =>
+      this.#eligibleGoalDiscard(this.#goalId(identifier(goalId))),
+    );
   }
 
   async discardGoal(
     goalId: string,
     expectedHead: string | null,
     deleteRef: (head: string | null) => Promise<void>,
+    channel: SettingsOrigin = "cli",
   ): Promise<void> {
-    const id = identifier(goalId);
+    const key = identifier(goalId);
     const head = expectedHead === null ? null : gitCommit(expectedHead);
+    const origin = { kind: "operator", channel };
+    const id = this.#write((at) => {
+      const id = this.#goalId(key);
+      this.#eligibleGoalDiscard(id);
+      this.#event(at, "goal.discard-authorized", "goal", id, { head, origin });
+      return id;
+    });
     await this.#changeGoalBranch(
       () => this.#eligibleGoalDiscard(id),
       () => deleteRef(head),
@@ -2499,6 +2641,7 @@ export class OrchestratorStore {
         this.#event(at, "goal.status", "goal", id, {
           status: "cancelled",
           discardedHead: head,
+          origin,
         });
       },
       "goal-discard-record-failed",
@@ -2823,6 +2966,33 @@ export class OrchestratorStore {
     this.#activeGoal(content.goalId);
   }
 
+  #subjectRefs(goalId: string | null, taskId: string | null) {
+    const goalRef = goalId === null ? null : (this.#goal(goalId)?.ref ?? null);
+    const taskRef = taskId === null ? null : (this.#task(taskId)?.ref ?? null);
+    return { ref: taskRef ?? goalRef, goalRef, taskRef };
+  }
+
+  #proposalRefs(proposal: ReturnType<typeof proposalRecord>) {
+    if (proposal.kind === "goal") {
+      const goal = this.#db
+        .query<{ id: string }>("SELECT id FROM goals WHERE proposal_id = ?")
+        .get(proposal.id);
+      return this.#subjectRefs(goal?.id ?? null, null);
+    }
+    if (proposal.kind === "integration")
+      return this.#subjectRefs(
+        proposal.content.goalId,
+        proposal.content.taskId,
+      );
+    const task = this.#db
+      .query<{ ref: string }>("SELECT ref FROM tasks WHERE proposal_id = ?")
+      .get(proposal.id);
+    return {
+      ...this.#subjectRefs(proposal.content.goalId, null),
+      taskRef: task?.ref ?? null,
+    };
+  }
+
   getProposalDetails(
     proposalId: string,
     {
@@ -2866,6 +3036,7 @@ export class OrchestratorStore {
           : undefined;
       return freeze({
         ...proposal,
+        ...this.#proposalRefs(proposal),
         ...policy,
         ...proposalAnswerRequirements(
           proposal,
@@ -2961,6 +3132,7 @@ export class OrchestratorStore {
               return {
                 id: proposal.id,
                 kind: proposal.kind,
+                ...this.#proposalRefs(proposal),
                 ...(proposal.kind === "integration"
                   ? {
                       goalId: proposal.content.goalId,
@@ -2982,6 +3154,7 @@ export class OrchestratorStore {
               return {
                 id: task.id,
                 goalId: task.goalId,
+                ...this.#subjectRefs(task.goalId, task.id),
                 status: task.status,
                 ...this.#runningIntegrationState(task),
                 ...this.#taskWindowUsage(
@@ -3015,7 +3188,10 @@ export class OrchestratorStore {
             `SELECT ${proposalColumns} FROM proposals WHERE (? IS NULL OR status = ?) ORDER BY rowid`,
           )
           .all(status, status)
-          .map(proposalRecord),
+          .map((row) => {
+            const proposal = proposalRecord(row);
+            return { ...proposal, ...this.#proposalRefs(proposal) };
+          }),
       ),
     );
   }
@@ -3062,7 +3238,7 @@ export class OrchestratorStore {
           `SELECT data FROM events WHERE subject_kind = 'task' AND subject_id = ? AND kind = 'task.status'
          ORDER BY rowid DESC LIMIT 1`,
         )
-        .get(identifier(taskId));
+        .get(this.#taskId(identifier(taskId)));
       if (!latest) return;
       const data = JSON.parse(latest.data) as {
         code?: string;
@@ -3090,7 +3266,7 @@ export class OrchestratorStore {
           .query<{ tokens: number }>(
             "SELECT total(json_extract(result_json, '$.tokens')) AS tokens FROM executions WHERE task_id = ?",
           )
-          .get(identifier(taskId))!.tokens,
+          .get(this.#taskId(identifier(taskId)))!.tokens,
     );
   }
 
@@ -3154,7 +3330,10 @@ export class OrchestratorStore {
     return this.#read(() => {
       const task = required(this.#task(id));
       return freeze(
-        this.#taskWindowUsage(id, taskRecord(task).content.budgets.maxTokens),
+        this.#taskWindowUsage(
+          task.id,
+          taskRecord(task).content.budgets.maxTokens,
+        ),
       );
     });
   }
@@ -3178,6 +3357,7 @@ export class OrchestratorStore {
           actor,
           mode,
           status,
+          ...this.#subjectRefs(row.goalId, row.taskId),
           ...this.#executionUsage(row, result),
         };
       });
@@ -3191,33 +3371,12 @@ export class OrchestratorStore {
           .query<TaskRow>(
             `SELECT ${taskColumns} FROM tasks WHERE goal_id = ? ORDER BY rowid LIMIT ?`,
           )
-          .all(id, limit)
+          .all(this.#goalId(id), limit)
           .map((row) => ({
             ...taskRecord(row),
             ...this.#runningIntegrationState(row),
           })),
       ),
-    );
-  }
-
-  goalTaskProgress(goalId: string) {
-    return this.#read(() =>
-      this.#db
-        .query<{
-          total: number;
-          done: number;
-          failed: number;
-          running: number;
-          awaitingIntegration: number;
-        }>(
-          `SELECT count(*) AS total,
-             count(*) FILTER (WHERE status = 'succeeded') AS done,
-             count(*) FILTER (WHERE status = 'failed') AS failed,
-             count(*) FILTER (WHERE status = 'running') AS running,
-             count(*) FILTER (WHERE status = 'awaiting-integration') AS awaitingIntegration
-           FROM tasks WHERE goal_id = ?`,
-        )
-        .get(identifier(goalId))!,
     );
   }
 
@@ -3271,8 +3430,8 @@ export class OrchestratorStore {
            ORDER BY position`,
         )
         .all(
-          identifier(goalId),
-          taskId === undefined ? null : identifier(taskId),
+          this.#goalId(identifier(goalId)),
+          taskId === undefined ? null : this.#taskId(identifier(taskId)),
         ),
     );
   }
@@ -3284,7 +3443,7 @@ export class OrchestratorStore {
           `SELECT ${executionColumns} FROM executions
            WHERE task_id = ? ORDER BY rowid DESC LIMIT 10`,
         )
-        .all(identifier(taskId))
+        .all(this.#taskId(identifier(taskId)))
         .map(
           ({ id, actor, mode, status, startedAt, finishedAt, resultJson }) => ({
             id,
@@ -3312,6 +3471,7 @@ export class OrchestratorStore {
         resultJson === null ? null : JSON.parse(resultJson);
       return freeze({
         ...execution,
+        ...this.#subjectRefs(row.goalId, row.taskId),
         requestedBy: parseOrigin(JSON.parse(requestedByJson)),
         tokenUsage: this.#executionUsage(row, result),
         result,
@@ -3319,10 +3479,230 @@ export class OrchestratorStore {
     });
   }
 
+  activityRows() {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          id: string;
+          actor: ActorKind;
+          mode: string;
+          status: "queued" | "running" | "registered";
+          goalId: string | null;
+          goalRef: string | null;
+          goalTitle: string | null;
+          taskId: string | null;
+          taskRef: string | null;
+          taskTitle: string | null;
+          startedAt: string | null;
+        }>(
+          `
+        WITH active AS MATERIALIZED (
+          SELECT rowid, id, actor, mode, status, goal_id, task_id, started_at
+          FROM executions WHERE status IN ('queued', 'running')
+        )
+        SELECT id, actor, mode, status, goalId, goalRef, goalTitle, taskId, taskRef, taskTitle, startedAt
+        FROM (
+          SELECT x.id, x.actor, x.mode, x.status, g.id AS goalId, g.ref AS goalRef,
+            json_extract(g.content_json, '$.title') AS goalTitle, t.id AS taskId,
+            t.ref AS taskRef, json_extract(t.content_json, '$.title') AS taskTitle,
+            x.started_at AS startedAt, 0 AS sourceOrder, x.rowid AS position
+          FROM active x LEFT JOIN tasks t ON t.id = x.task_id
+            LEFT JOIN goals g ON g.id = coalesce(x.goal_id, t.goal_id)
+          UNION ALL
+          SELECT t.id, json_extract(t.content_json, '$.actor'), 'task', t.status, g.id,
+            g.ref, json_extract(g.content_json, '$.title'), t.id,
+            t.ref, json_extract(t.content_json, '$.title'), NULL, 1, t.rowid
+          FROM tasks t JOIN goals g ON g.id = t.goal_id
+          WHERE t.status = 'registered' AND g.status = 'active'
+            AND t.id NOT IN (SELECT task_id FROM active WHERE task_id IS NOT NULL)
+        ) ORDER BY sourceOrder, position
+      `,
+        )
+        .all(),
+    );
+  }
+
+  activityRevision() {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ revision: number }>(
+            `
+        SELECT coalesce(max(rowid), 0) AS revision FROM events
+        WHERE kind IN ('execution.queued', 'execution.started', 'execution.finished',
+          'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
+          'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
+          'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',
+          'project.defaults-set', 'project.rule-set', 'goal.policy-set', 'task.policy-set')
+      `,
+          )
+          .get()!.revision,
+    );
+  }
+
+  #panelActionCounts(goalIds?: string) {
+    const rows = this.#db
+      .query<ProposalRow & { goalId: string | null }>(
+        `SELECT ${proposalColumns}, json_extract(content_json, '$.goalId') AS goalId
+         FROM proposals WHERE status = 'pending'
+           AND (SELECT status FROM goals WHERE id = goalId) IS NOT 'cancelled'
+           AND (?1 IS NULL OR goalId IN (SELECT value FROM json_each(?1)))`,
+      )
+      .all(goalIds ?? null);
+    let total = 0;
+    const byGoal = new Map<string, number>();
+    for (const { goalId, ...row } of rows) {
+      const proposal = proposalRecord(row);
+      const gate = this.#proposalGate(proposal);
+      const requirements = {
+        ...gate,
+        ...proposalAnswerRequirements(
+          proposal,
+          gate.policy,
+          gate.loosening,
+          gate.source,
+        ),
+      };
+      if (
+        permitsPanelAnswer(proposal.source, requirements, "approve") ||
+        permitsPanelAnswer(proposal.source, requirements, "reject")
+      ) {
+        total++;
+        if (goalId !== null) byGoal.set(goalId, (byGoal.get(goalId) ?? 0) + 1);
+      }
+    }
+    return { total, byGoal };
+  }
+
+  goalTurnFacts(goalIds: readonly string[]) {
+    return this.#read(() => {
+      const selected = JSON.stringify(
+        goalIds.map((id) => this.#goalId(identifier(id))),
+      );
+      const approvals = this.#panelActionCounts(selected).byGoal;
+      const rows = this.#db
+        .query<{
+          goalId: string;
+          total: number;
+          done: number;
+          failed: number;
+          running: number;
+          awaitingIntegration: number;
+          failedRef: string | null;
+          failedCode: string;
+          runningRef: string | null;
+          runningActor: ActorKind | null;
+          executionActor: ActorKind | null;
+          executionTaskRef: string | null;
+          queued: 0 | 1;
+          planned: 0 | 1;
+          exportable: 0 | 1;
+        }>(
+          `WITH selected AS MATERIALIZED (
+             SELECT g.id, g.status, g.base_commit
+             FROM json_each(?) AS keys JOIN goals g ON g.id = keys.value
+           ), task_facts AS (
+             SELECT t.goal_id, count(*) AS total,
+               count(*) FILTER (WHERE t.status = 'succeeded') AS done,
+               count(*) FILTER (WHERE t.status = 'failed') AS failed,
+               count(*) FILTER (WHERE t.status = 'running') AS running,
+               count(*) FILTER (WHERE t.status = 'awaiting-integration') AS awaitingIntegration,
+               min(t.rowid) FILTER (WHERE t.status = 'failed') AS firstFailed,
+               min(t.rowid) FILTER (WHERE t.status = 'running') AS firstRunning,
+               max(t.status = 'registered') AS registered
+             FROM selected g JOIN tasks t ON t.goal_id = g.id GROUP BY t.goal_id
+           ), execution_facts AS (
+             SELECT g.id,
+               min(x.rowid) FILTER (WHERE x.status = 'running') AS firstRunning,
+               max(x.status = 'queued') AS queued,
+               max(x.actor = 'Planner' AND x.goal_id IS NOT NULL) AS planned
+             FROM executions x
+             LEFT JOIN tasks subject ON x.goal_id IS NULL AND subject.id = x.task_id
+             JOIN selected g ON g.id = coalesce(x.goal_id, subject.goal_id)
+             WHERE x.status IN ('queued', 'running')
+               OR (x.actor = 'Planner' AND x.status = 'succeeded' AND x.goal_id IS NOT NULL)
+             GROUP BY g.id
+           )
+           SELECT g.id AS goalId, coalesce(t.total, 0) AS total,
+             coalesce(t.done, 0) AS done, coalesce(t.failed, 0) AS failed,
+             coalesce(t.running, 0) AS running,
+             coalesce(t.awaitingIntegration, 0) AS awaitingIntegration,
+             failed.ref AS failedRef, coalesce((
+               SELECT json_extract(e.data, '$.code') FROM events e
+               WHERE e.subject_id = failed.id AND e.subject_kind = 'task' AND e.kind = 'task.status'
+               ORDER BY e.rowid DESC LIMIT 1
+             ), 'unknown') AS failedCode,
+             running.ref AS runningRef, json_extract(running.content_json, '$.actor') AS runningActor,
+             x.actor AS executionActor, xt.ref AS executionTaskRef,
+             (coalesce(e.queued, 0) OR (g.status = 'active' AND coalesce(t.registered, 0))) AS queued,
+             coalesce(e.planned, 0) AS planned,
+             (g.base_commit IS NOT NULL OR (
+               (g.status = 'done' OR (t.total > 0 AND t.total = t.done)) AND EXISTS (
+                 SELECT 1 FROM tasks task JOIN events ev ON ev.subject_id = task.id
+                 WHERE task.goal_id = g.id AND ev.subject_kind = 'task' AND ev.kind = 'task.integrated'
+                   AND json_extract(ev.data, '$.head') IS NOT NULL
+               )
+             )) AS exportable
+           FROM selected g LEFT JOIN task_facts t ON t.goal_id = g.id
+           LEFT JOIN tasks failed ON failed.rowid = t.firstFailed
+           LEFT JOIN tasks running ON running.rowid = t.firstRunning
+           LEFT JOIN execution_facts e ON e.id = g.id
+           LEFT JOIN executions x ON x.rowid = e.firstRunning
+           LEFT JOIN tasks xt ON xt.id = x.task_id`,
+        )
+        .all(selected);
+      return new Map(
+        rows.map(
+          ({
+            goalId,
+            total,
+            done,
+            failed,
+            running,
+            awaitingIntegration,
+            ...facts
+          }) => [
+            goalId,
+            {
+              ...facts,
+              progress: { total, done, failed, running, awaitingIntegration },
+              approvals: approvals.get(goalId) ?? 0,
+            },
+          ],
+        ),
+      );
+    });
+  }
+
+  pendingInboxActions(): number {
+    return this.#read(() => {
+      const { count } = this.#db
+        .query<{ count: number }>(
+          `SELECT (
+             SELECT count(*) FROM events e
+             JOIN tasks t ON e.subject_id = t.id JOIN goals g ON t.goal_id = g.id
+             WHERE e.kind = 'task.status' AND e.subject_kind = 'task'
+               AND json_extract(e.data, '$.status') = 'failed'
+               AND g.status <> 'cancelled' AND NOT ${laterTaskStatus}
+           ) + (
+             SELECT count(*) FROM executions x
+             LEFT JOIN tasks t ON x.task_id = t.id LEFT JOIN goals g ON x.goal_id = g.id
+             WHERE x.finished_at IS NOT NULL AND x.started_at IS NOT NULL
+               AND ${executionOverBudget}
+               AND NOT coalesce(${taskBudgetResolved}, 0)
+               AND (SELECT status FROM goals WHERE id = coalesce(x.goal_id, t.goal_id)) IS NOT 'cancelled'
+           ) AS count`,
+        )
+        .get()!;
+      return count + this.#panelActionCounts().total;
+    });
+  }
+
   inboxRows(
     includeResolved: boolean,
     cutoff: string,
     problemsOnly = false,
+    limit = 200,
   ): InboxRow[] {
     return this.#read(() =>
       this.#db
@@ -3344,14 +3724,7 @@ export class OrchestratorStore {
                     WHEN 'succeeded' THEN 'task-succeeded' ELSE 'task-running' END,
                  e.id, e.at, t.goal_id, t.id, NULL, NULL, json_extract(t.content_json, '$.title'),
                  CASE WHEN json_extract(e.data, '$.status') = 'succeeded' THEN 0 ELSE
-                   EXISTS (
-                     SELECT 1 FROM events AS later
-                     WHERE later.subject_id = t.id AND later.subject_kind = 'task'
-                       AND later.kind = 'task.status' AND later.rowid > e.rowid
-                       AND json_extract(later.data, '$.status') IN (
-                         'running', 'awaiting-integration', 'failed', 'succeeded', 'cancelled'
-                       )
-                   ) END,
+                   ${laterTaskStatus} END,
                  json_extract(e.data, '$.code'), json_array_length(e.data, '$.rejectedPaths'),
                  json_extract(e.data, '$.status') <> 'failed',
                  t.status = 'failed' AND (
@@ -3393,15 +3766,7 @@ export class OrchestratorStore {
                  x.task_id, NULL, x.id, CASE WHEN ?3 THEN coalesce(
                    json_extract(t.content_json, '$.title'), json_extract(g.content_json, '$.title')
                  ) END,
-                 coalesce(t.status IN ('succeeded', 'cancelled') OR EXISTS (
-                   SELECT 1 FROM events AS retry
-                   WHERE retry.subject_id = t.id AND retry.kind = 'task.retried'
-                     AND retry.rowid > (
-                       SELECT queued.rowid FROM events AS queued
-                       WHERE queued.subject_id = x.id AND queued.kind = 'execution.queued'
-                         AND queued.subject_kind = 'execution' LIMIT 1
-                     )
-                 ), 0),
+                 coalesce(${taskBudgetResolved}, 0),
                  NULL, NULL, 0, 0,
                  CASE WHEN ?3 THEN (SELECT e.rowid FROM events AS e WHERE e.subject_id = x.id
                     AND e.subject_kind = 'execution' AND e.kind = 'execution.finished' LIMIT 1) END,
@@ -3409,16 +3774,7 @@ export class OrchestratorStore {
           FROM executions AS x LEFT JOIN tasks AS t ON x.task_id = t.id
             LEFT JOIN goals AS g ON x.goal_id = g.id
           WHERE x.finished_at IS NOT NULL AND x.started_at IS NOT NULL
-            AND ((json_type(x.result_json, '$.tokens') = 'integer'
-              AND json_extract(x.result_json, '$.tokens') <= 9007199254740991
-              AND json_extract(x.result_json, '$.tokens') > coalesce(
-                json_extract(t.content_json, '$.budgets.maxTokens'),
-                json_extract(g.content_json, '$.scope.budgets.maxTokens')
-              )) OR EXISTS (
-              SELECT 1 FROM events AS budget
-              WHERE budget.subject_id = t.id AND budget.kind = 'task.budget-exceeded'
-                AND budget.execution_id = x.id
-            ))
+            AND ${executionOverBudget}
           UNION ALL
           SELECT 'goal-completed', g.id, coalesce((
                    SELECT e.at FROM events AS e WHERE e.subject_id = g.id
@@ -3454,13 +3810,17 @@ export class OrchestratorStore {
         SELECT kind || ':' || CASE WHEN kind IN ('task-failed', 'task-succeeded', 'task-running')
                                    THEN taskId || ':' ELSE '' END || version AS id,
                kind, at, goalId, taskId, proposalId, executionId, modelText, resolved, code,
-               rejectedCount, canRetry, rejectedPathsJson
+               rejectedCount, canRetry, rejectedPathsJson,
+               (SELECT ref FROM goals WHERE id = ranked.goalId OR proposal_id = ranked.proposalId) AS goalRef,
+               (SELECT ref FROM tasks WHERE id = ranked.taskId OR proposal_id = ranked.proposalId) AS taskRef,
+               (SELECT count(*) FROM events WHERE subject_id = ranked.taskId
+                  AND subject_kind = 'task' AND kind = 'task.retried') AS retries
         FROM ranked WHERE rank = 1
         ORDER BY (NOT resolved AND NOT info) DESC, at DESC,
-                 CASE WHEN ?3 THEN position END DESC, version DESC LIMIT 200
+                 CASE WHEN ?3 THEN position END DESC, version DESC LIMIT ?4
       `,
         )
-        .all(Number(includeResolved), cutoff, Number(problemsOnly)),
+        .all(Number(includeResolved), cutoff, Number(problemsOnly), limit),
     );
   }
 
@@ -3495,19 +3855,23 @@ export class OrchestratorStore {
       ? identifier(input.subjectId)
       : null;
     const limit = integer(input.limit, 1, 1000);
-    return this.#read(() =>
-      freeze(
+    return this.#read(() => {
+      const resolvedSubject =
+        subjectId === null ? null : this.#taskId(this.#goalId(subjectId));
+      return freeze(
         this.#db
           .query<EventRow>(
-            `SELECT ${eventColumns} FROM events WHERE (? IS NULL OR subject_id = ?) ORDER BY rowid DESC LIMIT ?`,
+            `SELECT ${eventColumns} FROM events ${resolvedSubject === null ? "" : "WHERE subject_id = ?"} ORDER BY rowid DESC LIMIT ?`,
           )
-          .all(subjectId, subjectId, limit)
+          .all(
+            ...(resolvedSubject === null ? [limit] : [resolvedSubject, limit]),
+          )
           .map(({ data, ...row }) => {
             const eventData: unknown = JSON.parse(data);
             return freeze({ ...row, data: eventData });
           }),
-      ),
-    );
+      );
+    });
   }
 
   decisionHistory(limit = 20) {
@@ -3554,6 +3918,7 @@ export class OrchestratorStore {
       } of rows) {
         const entry = {
           ...row,
+          ...this.#subjectRefs(row.goalId, row.taskId),
           setting: details
             ? (JSON.parse(details) as EffectivePolicy)
             : { policy, source },
@@ -3595,9 +3960,10 @@ export class OrchestratorStore {
         .transaction(() => {
           const task =
             taskId === null ? null : taskRecord(required(this.#task(taskId)));
-          if (task && goalId !== null && task.goalId !== goalId)
+          const suppliedGoalId = goalId === null ? null : this.#goalId(goalId);
+          if (task && suppliedGoalId !== null && task.goalId !== suppliedGoalId)
             throw new OrchestratorStoreError("context-mismatch");
-          const id = task?.goalId ?? goalId;
+          const id = task?.goalId ?? suppliedGoalId;
           const layers =
             id === null
               ? { defaults: this.#defaults() }

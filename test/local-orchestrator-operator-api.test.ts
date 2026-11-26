@@ -669,6 +669,90 @@ async function operatorClient(path: string, prefix = "concierge.") {
 }
 
 test(
+  "operator activity subscribes to execution changes and serves refs and actions",
+  { timeout: 5000 },
+  async () => {
+    const { state, options, path } = socketFixture();
+    using fixture = state;
+    const { store } = fixture;
+    const proposed = store.proposeGoal(goal, { kind: "operator" });
+    const { goalId } = store.decide(proposed.id, {
+      digest: proposed.digest,
+      decision: "approve",
+      answerer: { kind: "human" },
+    });
+    const api = await listenOperatorApi({ ...options, pollMs: 10 });
+    try {
+      const client = await operatorClient(path, "");
+      try {
+        assert.partialDeepStrictEqual(
+          await client.request("goal.get", { id: "g1" }),
+          {
+            result: { id: goalId, ref: "G1", head: null },
+          },
+        );
+        assert.deepEqual(
+          (await client.request("task.get", { id: "g1-8" })).error,
+          { code: "not-found" },
+        );
+        assert.deepEqual((await client.request("activity.subscribe")).result, {
+          subscribed: true,
+        });
+        assert.ok(goalId);
+        const execution = store.createExecution({
+          actor: "Planner",
+          mode: "task-decomposition",
+          goalId,
+          requestedBy: { kind: "host" },
+        });
+        assert.deepEqual(await client.next(), {
+          method: "activity.changed",
+          params: {},
+        });
+        assert.partialDeepStrictEqual(
+          (await client.request("activity.get")).result,
+          {
+            queued: [{ id: execution.id, goalRef: "G1" }],
+            queuedCount: 1,
+          },
+        );
+        store.startExecution(execution.id);
+        assert.deepEqual(await client.next(), {
+          method: "activity.changed",
+          params: {},
+        });
+        assert.partialDeepStrictEqual(
+          (await client.request("activity.get")).result,
+          {
+            running: [{ id: execution.id, goalRef: "G1" }],
+            queuedCount: 0,
+          },
+        );
+        assert.deepEqual(
+          (
+            await client.request("goal.discard", {
+              id: "g1",
+              confirm: "G1",
+              expectedHead: null,
+            })
+          ).error,
+          { code: "goal-busy" },
+        );
+        assert.deepEqual(
+          (await client.request("concierge.draft", { text: "draft" })).error,
+          { code: "terminal-unavailable" },
+        );
+      } finally {
+        client.reader.close();
+        client.socket.destroy();
+      }
+    } finally {
+      await api.close();
+    }
+  },
+);
+
+test(
   "operator API replays filtered terminal output and transfers input ownership",
   { timeout: 5000 },
   async () => {

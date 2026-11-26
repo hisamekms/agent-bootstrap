@@ -518,7 +518,7 @@ async function execute(
         return refuse(io, "Only failed Tasks can be retried.");
       if (task.retries >= MAX_TASK_RETRIES)
         return refuse(io, "Task retry limit reached.");
-      const phrase = `retry-task ${task.id}`;
+      const phrase = `retry-task ${command.id === task.id ? task.id : task.ref}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await writeCheckedJson(store.retryTask(task.id, task.retries));

@@ -12,11 +12,29 @@ import {
   pendingDecisions,
   groupProblems,
   isProposal,
+  isRef,
   retryCommand,
   statusRepository,
   type PanelInboxItem,
   type Problem,
 } from "../src/operator-ui/web/protocol.ts";
+
+test("only canonical Goal and Task refs pass protocol validation", () => {
+  for (const value of ["G1", "G123", "G1-1", "G123-456"])
+    assert.equal(isRef(value), true);
+  for (const value of [
+    null,
+    "",
+    "g1",
+    "G0",
+    "G01",
+    "G1-0",
+    "G1-01",
+    "G1-2-3",
+    "G1\n",
+  ])
+    assert.equal(isRef(value), false);
+});
 
 test("connection metadata only accepts a project and a relative repository path", () => {
   assert.equal(statusRepository({ counts: {} }), null);
@@ -203,6 +221,9 @@ test("problem cards group each Task's reports and keep unrelated reports distinc
     at: "2026-11-26T00:00:00.000Z",
     goalId: "goal",
     taskId: "task",
+    ref: "G1-1",
+    goalRef: "G1",
+    taskRef: "G1-1",
     title: "Task",
     kind: "task-failed",
     code: "unknown",
@@ -213,6 +234,9 @@ test("problem cards group each Task's reports and keep unrelated reports distinc
     at: "2026-11-26T00:00:00.000Z",
     goalId: "goal",
     taskId: "task",
+    ref: "G1-1",
+    goalRef: "G1",
+    taskRef: "G1-1",
     title: "Task",
     kind: "execution-over-budget",
     executionId: "one",

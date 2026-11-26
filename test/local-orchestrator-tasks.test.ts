@@ -982,8 +982,9 @@ test(
     const failed = task(store, f.goalId);
     assert.ok(store.claimTask(failed));
     store.failTask(failed, "review-concern");
-    const args = ["discard-goal", f.goalId];
-    const phrase = `discard-goal ${f.goalId} ${f.next.slice(0, 12)}`;
+    const key = store.getGoal(f.goalId)!.ref.toLowerCase();
+    const args = ["discard-goal", key];
+    const phrase = `discard-goal ${key} ${f.next.slice(0, 12)}`;
     const mismatch = await f.cli(args, true, () => "wrong");
     assert.equal(mismatch.code, 1);
     assert.deepEqual(mismatch.stderr, [
@@ -991,7 +992,7 @@ test(
     ]);
     assert.deepEqual(mismatch.questions, [`Type "${phrase}" to confirm: `]);
     assert.deepEqual(JSON.parse(mismatch.stdout[0]!), {
-      goalId: f.goalId,
+      goalId: key,
       branch: goalBranch(f.goalId),
       head: f.next,
     });
@@ -2519,13 +2520,10 @@ test(
     f.git(["worktree", "add", "--detach", checkout, f.base]);
     const operator = (args: string[]) =>
       String(command("/usr/bin/git", checkout, args, "utf8")).trim();
-    const args = ["export-goal-branch", f.goalId, "--repo", checkout];
+    const key = store.getGoal(f.goalId)!.ref.toLowerCase();
+    const args = ["export-goal-branch", key, "--repo", checkout];
     const exportAt = (to: string) =>
-      f.cli(
-        args,
-        true,
-        () => `export-goal-branch ${f.goalId} ${to.slice(0, 12)}`,
-      );
+      f.cli(args, true, () => `export-goal-branch ${key} ${to.slice(0, 12)}`);
     const initialHead = operator(["rev-parse", "HEAD"]);
     const dirty = join(checkout, "operator.txt");
     writeFileSync(dirty, "preserve me\n");

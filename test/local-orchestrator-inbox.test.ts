@@ -12,7 +12,11 @@ import { projectStateDirectory } from "../src/config/layers.ts";
 import { addProject } from "../src/config/projects.ts";
 import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
-import { operatorProposal } from "../src/local-orchestrator/operator-read.ts";
+import {
+  operatorActivity,
+  operatorInbox,
+  operatorProposal,
+} from "../src/local-orchestrator/operator-read.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
 import { prepareTargetDirectory } from "../src/local-orchestrator/target.ts";
@@ -69,8 +73,19 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
   const { store } = state;
   const target = "/example/it's a target";
   const pending = store.proposeGoal(inboxGoal, operator);
-  const read = (includeResolved = false) =>
-    projectInbox({ store, target }, { includeResolved });
+  const read = (includeResolved = false) => {
+    const source = { store, target };
+    const inbox = projectInbox(source, { includeResolved });
+    if (!includeResolved) {
+      const actions = operatorInbox(store, inbox).filter(
+        (item) =>
+          item.weight === "action" &&
+          (!item.subject.proposalId || "answer" in item),
+      );
+      assert.equal(operatorActivity(source).yourTurn, actions.length);
+    }
+    return inbox;
+  };
   const [gate] = read();
   assert.partialDeepStrictEqual(gate, {
     id: `goal-registration:${pending.id}`,
@@ -413,6 +428,14 @@ test("version four stores acquire seen marks without losing pending proposals", 
   try {
     db.exec(`
       DROP TABLE inbox_seen;
+      DROP TRIGGER goals_ref_required;
+      DROP TRIGGER goals_ref_immutable;
+      DROP TRIGGER tasks_ref_required;
+      DROP TRIGGER tasks_ref_immutable;
+      DROP INDEX goals_ref;
+      DROP INDEX tasks_ref;
+      ALTER TABLE goals DROP COLUMN ref;
+      ALTER TABLE tasks DROP COLUMN ref;
       DROP TABLE delegation_rules;
       DROP TABLE goal_policy;
       DROP TABLE task_policy;

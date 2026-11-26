@@ -113,6 +113,9 @@ const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 function details(digest: string): Extract<Proposal, { kind: "goal" }> {
   return {
     id,
+    ref: null,
+    goalRef: null,
+    taskRef: null,
     digest,
     kind: "goal",
     status: "pending",

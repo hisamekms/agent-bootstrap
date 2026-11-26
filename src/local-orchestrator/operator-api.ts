@@ -5,8 +5,10 @@ import {
   validateDelegationRules,
 } from "./delegation.ts";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { connect, createServer, type Socket } from "node:net";
 import { isAbsolute, join } from "node:path";
+import { GitIntegrationError } from "../git-integration.ts";
 import { privatePath } from "../config/layers.ts";
 import { isTerminalSize } from "../sandbox-runtime.ts";
 import { escapeTerminalControls } from "./analysis.ts";
@@ -23,12 +25,14 @@ import {
   ContractError,
   fields,
   GATES,
+  gitCommit,
   identifier,
   integer,
   oneOf,
 } from "./model.ts";
 import {
   goalStatuses,
+  operatorActivity,
   operatorGoal,
   operatorGoalList,
   operatorInbox,
@@ -44,10 +48,12 @@ import {
   parsePanelAnswer,
 } from "./proposal-answer.ts";
 import {
+  MAX_TASK_RETRIES,
   OrchestratorStoreError,
   type OrchestratorStore,
   type StoreErrorCode,
 } from "./store.ts";
+import { previewGoalDiscard, readGoalBranchHead } from "./tasks.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -66,10 +72,13 @@ type ErrorCode =
   | "unknown-method"
   | "terminal-unavailable"
   | "terminal-exited"
-  | "terminal-read-only";
+  | "terminal-read-only"
+  | "confirmation-mismatch"
+  | "stale-base";
 type Reply = { result: unknown } | { error: { code: ErrorCode } };
 type Client = {
   subscribedSnapshot?: Map<string, string>;
+  activityRevision?: string;
   send: Parameters<ConciergeTerminalHub["attach"]>[0];
   pendingBytes: number;
 };
@@ -78,6 +87,80 @@ const failure = (code: ErrorCode): Reply => ({ error: { code } });
 const maxClients = 8;
 const maxPendingBytes = 1024 * 1024;
 const maxTerminalInputBytes = 16 * 1024;
+const maxDraftCharacters = 2000;
+
+export function draftToConcierge(
+  store: OrchestratorStore,
+  terminal: ConciergeTerminalHub | undefined,
+  client: Parameters<ConciergeTerminalHub["attach"]>[0],
+  params: unknown,
+): Reply {
+  if (!terminal) return failure("terminal-unavailable");
+  if (terminal.status !== "ready") return failure(terminal.status);
+  if (!terminal.ownsInput(client)) return failure("terminal-read-only");
+  try {
+    const { text } = fields(params, ["text"]);
+    if (typeof text !== "string") throw new ContractError();
+    const characters = Array.from(
+      text.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, ""),
+    ).slice(0, maxDraftCharacters);
+    if (!characters.length) throw new ContractError();
+    const sanitized = characters.join("");
+    const sha256 = createHash("sha256").update(sanitized).digest("hex");
+    store.recordConciergeDraft(characters.length, sha256);
+    terminal.write(Buffer.from(`\x1b[200~${sanitized}\x1b[201~`));
+    return { result: { characters: characters.length } };
+  } catch (error) {
+    return failure(
+      error instanceof ContractError ? "invalid-params" : "write-failed",
+    );
+  }
+}
+
+export async function operatorAction(
+  store: OrchestratorStore,
+  stateDirectory: string,
+  method: "task.retry" | "goal.discard",
+  params: unknown,
+): Promise<Reply> {
+  try {
+    if (method === "task.retry") {
+      const { id, expectedRetries } = fields(params, ["id", "expectedRetries"]);
+      return {
+        result: store.retryTask(
+          identifier(id),
+          integer(expectedRetries, 0, MAX_TASK_RETRIES),
+          "operator-ui",
+        ),
+      };
+    }
+    const { id, confirm, expectedHead } = fields(params, [
+      "id",
+      "confirm",
+      "expectedHead",
+    ]);
+    if (typeof confirm !== "string") throw new ContractError();
+    const expected = expectedHead === null ? null : gitCommit(expectedHead);
+    const goal = store.getGoal(identifier(id));
+    if (!goal) return failure("not-found");
+    if (confirm !== goal.ref) return failure("confirmation-mismatch");
+    const { head, apply } = await previewGoalDiscard(
+      store,
+      stateDirectory,
+      goal.id,
+      "operator-ui",
+    );
+    if (head !== expected) return failure("stale-base");
+    await apply();
+    return { result: { id: goal.id, ref: goal.ref, status: "cancelled" } };
+  } catch (error) {
+    if (error instanceof ContractError) return failure("invalid-params");
+    if (error instanceof OrchestratorStoreError) return failure(error.code);
+    if (error instanceof GitIntegrationError && error.code === "stale-base")
+      return failure("stale-base");
+    return failure("write-failed");
+  }
+}
 
 function requestId(value: unknown): RequestId {
   return typeof value === "number" && Number.isSafeInteger(value)
@@ -229,11 +312,19 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   const project = (includeResolved = false) =>
     operatorInbox(store, projectInbox(options, { includeResolved }));
 
+  function activityRevision() {
+    const pendingChecks =
+      options.secretTests?.().filter(({ passed }) => !passed).length ?? 0;
+    return `${store.activityRevision()}:${pendingChecks}`;
+  }
+
   function terminalRequest(
     method: string,
     params: unknown,
     client: Client,
   ): Reply | undefined {
+    if (method === "concierge.draft")
+      return draftToConcierge(store, terminal, client.send, params);
     if (
       method !== "concierge.attach" &&
       method !== "concierge.input" &&
@@ -285,6 +376,15 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   async function dispatch(method: string, params: unknown): Promise<Reply> {
     try {
       switch (method) {
+        case "task.retry":
+        case "goal.discard":
+          return operatorAction(store, stateDirectory, method, params);
+        case "activity.get":
+          fields(params, []);
+          return { result: operatorActivity(options) };
+        case "activity.subscribe":
+          fields(params, []);
+          return { result: { subscribed: true } };
         case "inbox.list":
         case "problem.list": {
           const { includeResolved } = fields(params, ["includeResolved"]);
@@ -333,11 +433,16 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
             ),
           };
         }
-        case "goal.get":
+        case "goal.get": {
+          const { id } = fields(params, ["id"]);
+          const goal = operatorGoal(store, identifier(id));
+          if (!goal) return failure("not-found");
+          const head = await readGoalBranchHead(stateDirectory, goal.id);
+          return { result: { ...goal, head } };
+        }
         case "task.get": {
           const { id } = fields(params, ["id"]);
-          const read = method === "goal.get" ? operatorGoal : operatorTask;
-          const result = read(store, identifier(id));
+          const result = operatorTask(store, identifier(id));
           return result ? { result } : failure("not-found");
         }
         case "task.list": {
@@ -408,6 +513,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         let id: RequestId | null = null;
         let reply: Reply;
         let subscribedSnapshot: Client["subscribedSnapshot"];
+        let subscribedActivityRevision: Client["activityRevision"];
         try {
           const message = fields(
             JSON.parse(decoder.decode(line.subarray(0, length))),
@@ -433,12 +539,16 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
               try {
                 if (message.method === "inbox.subscribe")
                   subscribedSnapshot = inboxSnapshot(project(true));
+                else if (message.method === "activity.subscribe")
+                  subscribedActivityRevision = activityRevision();
                 // Decision receipts carry fixed codes and IDs (screened before
                 // writing for answerMany; the caller's own ID for answer).
                 else if (
                   message.method !== "inbox.markSeen" &&
                   message.method !== "proposal.answer" &&
-                  message.method !== "proposal.answerMany"
+                  message.method !== "proposal.answerMany" &&
+                  message.method !== "task.retry" &&
+                  message.method !== "goal.discard"
                 ) {
                   const serialized = JSON.stringify(reply.result);
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
@@ -459,6 +569,8 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         length = 0;
         await write(socket, client, { id, ...reply });
         if (subscribedSnapshot) client.subscribedSnapshot = subscribedSnapshot;
+        if (subscribedActivityRevision !== undefined)
+          client.activityRevision = subscribedActivityRevision;
         if (invalid >= 3) return;
       }
     }
@@ -518,6 +630,29 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
     if (!identity?.isSocket()) throw new Error("Operator socket unavailable");
     chmodSync(path, 0o600);
     timer = setInterval(() => {
+      if (
+        [...clients.values()].some(
+          ({ activityRevision }) => activityRevision !== undefined,
+        )
+      ) {
+        try {
+          const revision = activityRevision();
+          for (const [socket, client] of clients) {
+            if (
+              client.activityRevision === undefined ||
+              client.activityRevision === revision
+            )
+              continue;
+            client.activityRevision = revision;
+            void write(socket, client, {
+              method: "activity.changed",
+              params: {},
+            }).catch(() => socket.destroy());
+          }
+        } catch {
+          // Allow another tick to read the journal.
+        }
+      }
       if (
         ![...clients.values()].some(
           ({ subscribedSnapshot }) => subscribedSnapshot,

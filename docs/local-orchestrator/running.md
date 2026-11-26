@@ -307,13 +307,35 @@ agent-bootstrap show-execution <executionId>
 agent-bootstrap retry-task <taskId>
 ```
 
-For a failed Task, type `retry-task <taskId>` with the full ID at the host
-terminal prompt. The scheduler can pick up the registered Task during an
+For a failed Task, type the confirmation shown at the host terminal prompt.
+The prompt displays the canonical short ref if you invoked the command with one. The scheduler can pick up the registered Task during an
 active Concierge session or the next launch. Each Task allows three
 operator retries. Each retry starts a fresh token budget window.
 Use `show <taskId>` to see the current budgeted usage and the total
 across all attempts. Use the same `--db` as the launcher if you supplied
 a custom path.
+
+## Use short Goal and Task refs
+
+Each target repository has its own Goal sequence. Approving a Goal assigns a
+ref such as `G12`. Registering a Task assigns the next ref within its Goal,
+such as `G12-3`. Refs stay with cancelled rows. UUIDs remain valid wherever
+the CLI takes a Goal or Task ID, and short refs are case-insensitive.
+
+```sh
+agent-bootstrap show g12
+agent-bootstrap show G12-3
+agent-bootstrap retry-task G12-3
+agent-bootstrap events --subject g12-3
+agent-bootstrap discard-goal G12
+agent-bootstrap export-goal-branch G12
+```
+
+See the [operator activity API](../operator-ui/activity-api.md) for the
+Workplace protocol. Proposal and execution IDs still identify their own
+records. The Concierge
+`get_goal`, `request_planner` Goal argument, and `draft_task` Goal and Task
+dependency arguments also take short refs.
 
 ## Update an untouched Goal to local main
 
@@ -325,7 +347,7 @@ local `main`, update it from a host terminal.
 agent-bootstrap update-goal-base <goalId>
 ```
 
-Use the full Goal ID. Review the two commit IDs, then type
+Use the Goal ref or UUID. Review the two commit IDs, then type
 `update-goal-base <goalId> <first 12 hex of new base>` at the prompt. With
 a custom `--db <path>`, also pass `--target <path>` for the repository the
 launcher targeted. The command uses that repository's local `main` and performs
@@ -352,7 +374,8 @@ or `discard-goal <goalId> none` if the private branch is absent.
 
 Running or awaiting-integration Tasks, queued or running executions, and
 pending integration proposals block discard. After confirmation, the command
-rechecks eligibility and deletes the private branch only at the confirmed head,
+records a durable `goal.discard-authorized` event, rechecks eligibility, and
+deletes the private branch only at the confirmed head,
 or verifies its absence. It cancels the Goal and its registered Tasks and
 records the discarded head in a `goal.status` event. Its inbox items move to
 resolved history. Export and base updates refuse cancelled Goals.
