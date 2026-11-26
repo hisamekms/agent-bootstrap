@@ -62,6 +62,8 @@ type AuditDetail =
   | {
       readonly socketPath: string;
       readonly vsockPort: number;
+      readonly watchSocketPath?: string;
+      readonly watchVsockPort?: number;
       readonly snapshotDir: string;
       readonly volumeName: string;
       readonly mounts?: readonly AuditMount[];
@@ -915,15 +917,36 @@ function parseAuditDetail(
     const detail = dataFields(value, [
       "socketPath",
       "vsockPort",
+      "watchSocketPath",
+      "watchVsockPort",
       "snapshotDir",
       "volumeName",
       "mounts",
       ...(stored ? ["group"] : []),
     ]);
-    const { socketPath, snapshotDir, volumeName, mounts, group } = detail;
+    const {
+      socketPath,
+      snapshotDir,
+      volumeName,
+      mounts,
+      group,
+      watchSocketPath,
+    } = detail;
+    const vsockPort = integer(detail.vsockPort, 1024, 65535);
+    const watchVsockPort =
+      detail.watchVsockPort === undefined
+        ? undefined
+        : integer(detail.watchVsockPort, 1024, 65535);
     if (
       !isInteractiveAuditPath(socketPath) ||
       Buffer.byteLength(socketPath) >= 100 ||
+      (watchSocketPath === undefined
+        ? watchVsockPort !== undefined
+        : !isInteractiveAuditPath(watchSocketPath) ||
+          Buffer.byteLength(watchSocketPath) >= 100 ||
+          watchSocketPath === socketPath ||
+          watchVsockPort === undefined ||
+          watchVsockPort === vsockPort) ||
       !isInteractiveAuditPath(snapshotDir) ||
       !isConciergeVolumeName(volumeName) ||
       (group !== undefined && (!validAuditGroup(group) || mounts !== undefined))
@@ -931,7 +954,10 @@ function parseAuditDetail(
       return invalidEvent();
     return {
       socketPath,
-      vsockPort: integer(detail.vsockPort, 1024, 65535),
+      vsockPort,
+      ...(typeof watchSocketPath === "string"
+        ? { watchSocketPath, watchVsockPort }
+        : {}),
       snapshotDir,
       volumeName,
       ...(mounts === undefined ? {} : { mounts: auditMounts(mounts) }),

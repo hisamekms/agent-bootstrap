@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Duplex } from "node:stream";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { execFile, spawnSync } from "node:child_process";
@@ -7,6 +8,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import {
+  acceptConciergeWatch,
+  conciergeWatchEvents,
+  createConciergeWatch,
+} from "../src/local-orchestrator/concierge-watch.ts";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import {
   draftToConcierge,
@@ -522,6 +528,8 @@ test("activity counts decisions and groups a Task failure with its over-budget e
   const { store } = state;
   const source = { store, target: "fixture" };
   const goalId = goal(store);
+  const { id: sessionId } = store.startSession("Concierge", "budget-watch");
+  const cursor = store.conciergeWatchStart(sessionId);
   const taskId = task(store, goalId);
   assert.ok(store.claimTask(taskId));
   const { id } = store.createExecution({
@@ -537,6 +545,10 @@ test("activity counts decisions and groups a Task failure with its over-budget e
   for (let index = 0; index < 3; index++)
     store.proposeGoal(goalContent, operator);
 
+  assert.deepEqual(
+    conciergeWatchEvents(source, store.conciergeWatchRows(cursor)),
+    ["task-failed G1-1 budget-exceeded", "decision-needed 3"],
+  );
   const problems = operatorProblems(store);
   assert.deepEqual(problems.map((row) => [row.taskId, row.kind]).sort(), [
     [taskId, "execution-over-budget"],
@@ -700,4 +712,151 @@ test("audit write refusal prevents retry, discard, and terminal input", async ()
       assert.equal(store.getTask(taskId)?.retries, 0);
     }
   }
+});
+
+test("Concierge watch tails the session journal, coalesces decisions and discards input", () => {
+  using state = orchestratorFixture("concierge-watch-");
+  const { store, filename } = state;
+  const source = { store, target: "/fixture" };
+  goal(store);
+  const { id: sessionId } = store.startSession("Concierge", "watch-run");
+  const approved = goal(store);
+  store.proposeGoal({ ...goalContent, title: "Pending one" }, operator);
+  store.proposeGoal({ ...goalContent, title: "Pending two" }, operator);
+
+  const { id } = store.createExecution({
+    actor: "Planner",
+    mode: "task-decomposition",
+    goalId: approved,
+    requestedBy: host,
+  });
+  store.startExecution(id);
+  store.finishExecution(id, "succeeded", {});
+
+  const watch = createConciergeWatch(source, sessionId);
+  const lines: string[] = [];
+  const socket = new Duplex({
+    read() {},
+    write(bytes, _encoding, done) {
+      lines.push(String(bytes));
+      done();
+    },
+  });
+  const revision = operatorActivityRevision(source);
+  assert.equal(operatorActivity(source).conciergeWatching, false);
+  acceptConciergeWatch(watch, socket);
+  assert.equal(operatorActivity(source).conciergeWatching, true);
+  assert.notEqual(operatorActivityRevision(source), revision);
+  assert.equal(socket.readableFlowing, true);
+  assert.equal(socket.listenerCount("data"), 0);
+  socket.push("request_planner attacker-input\n");
+  const second = new Duplex({ read() {} });
+  acceptConciergeWatch(watch, second);
+  assert.equal(second.destroyed, true);
+  watch.poll();
+  watch.poll();
+  assert.deepEqual(lines, [
+    "event goal-approved G2\n",
+    "event plan-ready G2\n",
+    "event decision-needed 2\n",
+  ]);
+  const connectedRevision = operatorActivityRevision(source);
+  watch.disconnect();
+  assert.equal(socket.destroyed, true);
+  assert.equal(operatorActivity(source).conciergeWatching, false);
+  assert.notEqual(operatorActivityRevision(source), connectedRevision);
+  const db = new Database(filename, { readonly: true });
+  try {
+    assert.deepEqual(
+      db
+        .query(
+          "SELECT kind, data FROM events WHERE kind LIKE 'concierge-watch.%' ORDER BY rowid",
+        )
+        .all()
+        .map(({ kind, data }: { kind: string; data: string }) => [
+          kind,
+          JSON.parse(data),
+        ]),
+      [
+        ["concierge-watch.connected", {}],
+        ["concierge-watch.sent", { eventKind: "goal-approved", ref: "G2" }],
+        ["concierge-watch.sent", { eventKind: "plan-ready", ref: "G2" }],
+        ["concierge-watch.sent", { eventKind: "decision-needed", count: 2 }],
+        ["concierge-watch.disconnected", {}],
+      ],
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("Concierge watch caps lines and stops before output if the audit fails", () => {
+  using state = orchestratorFixture("watch-audit-");
+  const { store } = state;
+  const { id } = store.startSession("Concierge", "watch-run");
+  const source = { store, target: "/fixture" };
+  const original = store.conciergeWatchRows.bind(store);
+  store.conciergeWatchRows = (after) =>
+    original(after).flatMap((row) => [
+      { ...row, goalRef: `G${"9".repeat(100)}` },
+      row,
+    ]);
+  const watch = createConciergeWatch(source, id);
+  const socket = new Duplex({
+    read() {},
+    write() {
+      assert.fail("audit failure must prevent delivery");
+    },
+  });
+  acceptConciergeWatch(watch, socket);
+  watch.poll();
+  goal(store);
+  const record = store.recordConciergeWatch.bind(store);
+  let attempts = 0;
+  store.recordConciergeWatch = (...args) => {
+    if (args[1] === "sent") {
+      attempts++;
+      assert.equal(args[2], "goal-approved G1");
+      throw new Error("audit unavailable");
+    }
+    record(...args);
+  };
+  watch.poll();
+  assert.equal(attempts, 1);
+  assert.equal(watch.failed, true);
+  assert.equal(socket.destroyed, true);
+  assert.equal(operatorActivity(source).conciergeWatching, false);
+});
+
+test("watch reconnects are cooled down and capped without recording refused connections", () => {
+  using state = orchestratorFixture("watch-reconnect-");
+  const { store } = state;
+  const { id } = store.startSession("Concierge", "watch-run");
+  const source = { store, target: "/fixture" };
+  let now = 0;
+  const watch = createConciergeWatch(source, id, () => now);
+  for (let i = 0; i < 12; i++) {
+    const socket = new Duplex({ read() {} });
+    acceptConciergeWatch(watch, socket);
+    assert.equal(socket.destroyed, false);
+    watch.disconnect();
+    assert.equal(socket.destroyed, true);
+    const revision = operatorActivityRevision(source);
+    const retry = new Duplex({ read() {} });
+    acceptConciergeWatch(watch, retry);
+    assert.equal(retry.destroyed, true);
+    assert.equal(operatorActivityRevision(source), revision);
+    now += 5000;
+  }
+  const revision = operatorActivityRevision(source);
+  const capped = new Duplex({ read() {} });
+  acceptConciergeWatch(watch, capped);
+  assert.equal(capped.destroyed, true);
+  assert.equal(operatorActivityRevision(source), revision);
+  assert.equal(
+    store
+      .listEvents({ subjectId: id, limit: 30 })
+      .filter(({ kind }) => kind.startsWith("concierge-watch.")).length,
+    24,
+  );
 });

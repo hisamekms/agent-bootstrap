@@ -72,6 +72,7 @@ export interface SandboxEgressGateway {
 
 export interface InteractiveSpec {
   readonly vsock: { readonly hostPath: string; readonly port: number };
+  readonly watchVsock?: InteractiveSpec["vsock"];
   readonly stateVolume: string;
   readonly snapshotDir: string;
 }

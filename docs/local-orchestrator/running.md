@@ -94,8 +94,66 @@ approval from Workplace. Use the TTY CLI with the same target for
 on-behalf answers.
 
 After approving a Goal, its card tracks planning until the next decision
-for that Goal arrives. Use **Concierge に計画を頼む** to paste a draft
-request into the terminal and press Enter when ready to send it.
+for that Goal arrives. When the Concierge watcher is connected, Workplace
+shows **Concierge に知らせました**. The Concierge reads the approved Goal and
+can request task decomposition. When the watcher is disconnected, use
+**Concierge に計画を頼む** to paste a draft request into the terminal and
+press Enter to send it. Approvals from before the session began require a
+manual request.
+
+The watcher uses Claude Code Monitor and a dedicated, output-only guest
+channel. The host journals accepted connections and disconnects.
+`concierge-watch.sent` records an attempted send before each socket write.
+Connections are accepted at least five seconds apart, with at most twelve
+accepted connections per session. Only the operator answers gates.
+
+Watch requires an unmounted session and the CLI pin at 2.1.330. The
+launcher verifies the staged binary against that build's SHA-256 digest.
+An unsupported pin or a Concierge mount selects the manual workflow with
+`--tools ""` and Bash denied. A binary that fails the staged digest check
+fails startup. Watch sessions use `--tools Read,Glob,Grep,Bash,Monitor`.
+Managed policy denies Edit, Write, and NotebookEdit in every Concierge
+session.
+
+The Alpine launcher replaces the installed shell entry points, including
+`/bin/bash`, `/bin/ash`, and `/bin/sh`, with links to the guard and
+read-only binds their directories. The verified CLI binary moves into the
+guard directory. The launcher also binds that directory, `/lib`, `/usr/lib`,
+`/usr/libexec`, and `/etc` read-only before starting the watch. The `/etc`
+bind preserves the nested read-only managed policy mount, and the launcher
+checks the policy digest across the remount. Package setup finishes first,
+and the CLI uses `/state` or `/tmp` for writable state. Any bind or remount
+failure aborts startup. The CLI's shell override and `SHELL` also select
+the guard. The guard uses BusyBox
+ash as its script interpreter. The kernel passes the guard file to ash
+before any CLI arguments, so falling back to `/bin/sh -c …` still runs the
+guard. The BusyBox multicall binary remains available for the interpreter
+and guest utilities. This controls shell selection and dispatch from the
+CLI's tools. A process with independent arbitrary execution inside the
+guest can invoke BusyBox directly.
+
+**TODO** Drop root before executing the Concierge CLI. This requires a pinned
+`su-exec` or `setpriv` helper and operator approval to add the dependency.
+
+The live VM check with the staged build is pending. In a disposable,
+unmounted Concierge session, confirm that Monitor connects with
+`/usr/bin/socat -u VSOCK-CONNECT:2:5001 STDOUT` and that Read, Glob, and
+Grep are available. From inside Concierge, try `Bash(echo x)`,
+`Bash(/usr/bin/socat -u VSOCK-CONNECT:2:5001 STDOUT extra)`, and Monitor
+with `echo x`. All three calls must fail without running their commands.
+In a disposable volume, try using Write or Edit to change an existing
+executable and set `core.fsmonitor` in a writable `/state/home/.gitconfig`.
+Also attempt the repository route against `/repo/.git/config` if present.
+Expect the tool to be unavailable or denied, the fixtures to be unchanged,
+and subsequent Git activity to leave a harmless marker absent. Try Write or Edit
+against `/sys/kernel/uevent_helper` and verify denial and an unchanged value
+if the entry exists. Try NotebookEdit on a disposable notebook and verify
+denial and unchanged contents. Repeat the file-tool checks in manual mode,
+with and without a Concierge mount.
+Approve a disposable Goal and check that the watcher receives its event
+and Concierge requests planning. Repeat with a Concierge mount and check
+that Workplace offers a manual draft.
+
 The **問題** tab offers **やり直す** when a failed Task can be retried.
 Confirming resets the Task's budget window and queues the same work.
 **Goal を取り消す** requires a separate confirmation bound to the branch

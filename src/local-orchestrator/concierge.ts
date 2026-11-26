@@ -16,13 +16,14 @@ import {
   readdir,
   rm,
 } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { claudeRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
+  CLAUDE_MANAGED_PATH,
   claudeCodeGuestSetup,
   claudeCodeProvider,
   claudeCodeTools,
@@ -55,7 +56,16 @@ import {
   userStateDirectory,
   type ClaudeAuthMode,
 } from "./claude-config.ts";
-import { orchestratorMcp, SECRET_EXECUTOR_SHELL } from "./claude-policy.ts";
+import {
+  CONCIERGE_WATCH_PORT,
+  conciergeWatchCommand,
+  conciergeWatchShell,
+  conciergeWatchShellScript,
+  conciergeWatchSupportsCli,
+  orchestratorMcp,
+  SECRET_EXECUTOR_SHELL,
+} from "./claude-policy.ts";
+import { listenConciergeWatch } from "./concierge-watch.ts";
 import { HostApiServer } from "./host-api.ts";
 import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
 import { gitCommit } from "./model.ts";
@@ -131,6 +141,7 @@ export interface ConciergeDeps {
   readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
+  readonly listenWatch?: typeof listenConciergeWatch;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
   ) => Promise<Pick<HostApiServer, "close">>;
@@ -156,6 +167,7 @@ export function parseConciergeMode(value: unknown): PermissionMode {
 export function conciergeCommand(
   options: Pick<ConciergeOptions, "model" | "mode" | "continue">,
   auth: ClaudeCodeAuth,
+  watch = true,
 ): TerminalCommand {
   const { model } = options;
   if (typeof model !== "string" || !/^[a-z0-9][a-z0-9.-]{0,80}$/.test(model))
@@ -167,7 +179,10 @@ export function conciergeCommand(
   );
   const secretEnv =
     auth.mode === "external" ? undefined : claudeCodeProvider(auth).secretEnv;
+  const watchEnabled = watch && conciergeWatchSupportsCli();
+  const watchDirectory = dirname(conciergeWatchShell);
   const mcp = JSON.stringify({ mcpServers: { orchestrator: orchestratorMcp } });
+  const watchPrompt = `At session start, start Monitor once with command ${conciergeWatchCommand} and description Watch Workplace events. Use persistent mode if offered. Re-arm only if the watch expires. For each event line, read details with orchestrator tools. On goal-approved, get_goal and request_planner in task-decomposition mode only if the Goal is still active and unplanned. On plan-ready or decision-needed, briefly point the operator to Workplace. On task-failed, explain and suggest a retry, a smaller Task, or a bigger budget. Never answer gates.`;
   const script = `
 ${claudeCodeGuestSetup(secretEnv, "alpine")}    umask 077
     mkdir -p /state/home
@@ -180,17 +195,55 @@ ${claudeCodeGuestSetup(secretEnv, "alpine")}    umask 077
     cat > /tmp/lo-mcp.json <<'EOF'
 ${mcp}
 EOF
-    set --
-    if test -n "\${LO_MOUNT_RESTRICTED:-}"; then set -- --tools ""; fi
+    watch_shell=
+    watch_prompt=
+    claude_bin=${CLAUDE_CODE.guestPath}
+    set -- --tools ""
+    if test ${watchEnabled} = true && test -z "\${LO_MOUNT_RESTRICTED:-}"; then
+      mkdir -m 700 ${watchDirectory}
+      claude_bin=${watchDirectory}/claude
+      mv ${CLAUDE_CODE.guestPath} "$claude_bin"
+      cat > ${conciergeWatchShell} <<'EOF'
+${conciergeWatchShellScript}EOF
+      chmod 500 ${conciergeWatchShell}
+      # Replace shell paths without following BusyBox applet symlinks.
+      # BusyBox itself is the guard's interpreter and supplies guest utilities.
+      for dir in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do
+        test -d "$dir" || continue
+        for shell in sh ash bash rbash dash zsh ksh mksh pdksh hush csh tcsh fish yash; do
+          path="$dir/$shell"
+          if test -e "$path" || test -L "$path"; then
+            rm "$path"
+            ln -s ${conciergeWatchShell} "$path"
+          fi
+        done
+        mount --bind "$dir" "$dir"
+        mount -o remount,bind,ro "$dir"
+      done
+      mkdir -p /usr/libexec
+      for dir in ${watchDirectory} /lib /usr/lib /usr/libexec; do
+        mount --bind "$dir" "$dir"
+        mount -o remount,bind,ro "$dir"
+      done
+      # Preserve the nested read-only managed policy mount under /etc.
+      managed_digest=$(sha256sum ${CLAUDE_MANAGED_PATH})
+      mount -o rbind /etc /etc
+      mount -o remount,bind,ro /etc
+      test "$(sha256sum ${CLAUDE_MANAGED_PATH})" = "$managed_digest"
+      watch_shell='CLAUDE_CODE_SHELL=${conciergeWatchShell} SHELL=${conciergeWatchShell}'
+      watch_prompt='${watchPrompt}'
+      set -- --tools 'Read,Glob,Grep,Bash,Monitor' -- 'Start the Workplace event watch as instructed.'
+    fi
     cd /repo
+    # TODO: Drop root before exec once the operator approves a pinned su-exec or setpriv dependency.
     exec env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/state/home \\
-      CLAUDE_CONFIG_DIR="$claude_config" ${secretEnv ? `${secretEnv}="$${secretEnv}"` : ""} \\
+      $watch_shell CLAUDE_CONFIG_DIR="$claude_config" ${secretEnv ? `${secretEnv}="$${secretEnv}"` : ""} \\
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \\
       DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 \\
       NODE_EXTRA_CA_CERTS="\${NODE_EXTRA_CA_CERTS:-}" TERM=xterm-256color \\
-      ${CLAUDE_CODE.guestPath} --mcp-config /tmp/lo-mcp.json --strict-mcp-config --setting-sources '' \\
-      --append-system-prompt 'At the start of each operator turn, call orchestrator get_inbox. Tell the operator about new action items using their host titles and IDs. For gates, direct the operator to the host panel if available or the operator CLI. Only the operator can answer gates. Never claim to have answered a gate.' \\
-      "$@" --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""}
+      "$claude_bin" --mcp-config /tmp/lo-mcp.json --strict-mcp-config --setting-sources '' \\
+      --append-system-prompt 'At the start of each operator turn, call orchestrator get_inbox. Tell the operator about new action items using their host titles and IDs. For gates, direct the operator to the host panel if available or the operator CLI. Only the operator can answer gates. Never claim to have answered a gate.'" $watch_prompt" \\
+      --model '${model}' --permission-mode ${mode}${options.continue ? " --continue" : ""} "$@"
   `;
   return { argv: ["/bin/sh", "-ec", script], workdir: "/repo" };
 }
@@ -442,7 +495,13 @@ export async function startConcierge(
   const mode = parseConciergeMode(
     options.mode === undefined ? "auto" : options.mode,
   );
-  const command = conciergeCommand({ ...options, mode }, auth);
+  const { config, baseImage } = deps;
+  const watch =
+    conciergeWatchSupportsCli() &&
+    !Object.values(config.mounts ?? {}).some(({ actors }) =>
+      actors.includes("Concierge"),
+    );
+  const command = conciergeCommand({ ...options, mode }, auth, watch);
   const lifetime =
     options.lifetimeMs === undefined ? 8 * 60 * 60 * 1000 : options.lifetimeMs;
   if (
@@ -463,7 +522,6 @@ export async function startConcierge(
   const { repoRoot } = options;
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
-  const { config, baseImage } = deps;
   const secretHarness = (actor: SecretActor) => {
     const variable = secretVariable(config, actor);
     if (!variable) return;
@@ -533,6 +591,7 @@ export async function startConcierge(
   let snapshotDir: string | undefined;
   let socketDir: string | undefined;
   let server: Pick<HostApiServer, "close"> | undefined;
+  let watcher: Awaited<ReturnType<typeof listenConciergeWatch>> | undefined;
   let drain: Promise<void> | undefined;
   let drainFailed = false;
   let scheduler: ReturnType<typeof setInterval> | undefined;
@@ -564,6 +623,7 @@ export async function startConcierge(
     const context = await conciergeContext(snapshot, target?.isDefault);
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
+    const watchSocket = watch ? join(socketDir, "w.sock") : undefined;
     const scan = deps.scan;
     const tasks =
       host.runWorker && host.runVerification
@@ -699,6 +759,12 @@ export async function startConcierge(
         },
       },
     });
+    if (watchSocket)
+      watcher = await (deps.listenWatch ?? listenConciergeWatch)(
+        { store, target: target.repoRoot },
+        sessionId,
+        watchSocket,
+      );
     options.signal?.throwIfAborted();
     await host.prepareConciergeVolume(stateVolume);
     options.signal?.throwIfAborted();
@@ -716,6 +782,14 @@ export async function startConcierge(
           maxLifetimeMs: lifetime,
           interactive: {
             vsock: { hostPath: socket, port: PORT },
+            ...(watchSocket
+              ? {
+                  watchVsock: {
+                    hostPath: watchSocket,
+                    port: CONCIERGE_WATCH_PORT,
+                  },
+                }
+              : {}),
             stateVolume,
             snapshotDir,
           },
@@ -769,6 +843,7 @@ export async function startConcierge(
         cleanupErrors.push(code);
       }
     };
+    await cleanup("concierge-close-watch-failed", () => watcher?.close());
     await cleanup("concierge-end-session-failed", () =>
       store.endSession(sessionId, {
         mode,

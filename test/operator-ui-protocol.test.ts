@@ -28,6 +28,7 @@ test("the activity pill reports waiting, queued work and human turns", () => {
     queued: [],
     queuedCount: 0,
     yourTurn: 0,
+    conciergeWatching: false,
   };
   assert.equal(activityLabel(idle), "AI は待機中");
   assert.equal(

@@ -396,10 +396,15 @@ function interactiveArgs(spec: SandboxSpec): string[] {
   if (!interactive.vsock) invalid();
   const {
     vsock: { hostPath, port },
+    watchVsock,
     stateVolume,
     snapshotDir,
   } = interactive;
-  for (const path of [hostPath, snapshotDir])
+  for (const path of [
+    hostPath,
+    snapshotDir,
+    ...(watchVsock ? [watchVsock.hostPath] : []),
+  ])
     if (
       typeof path !== "string" ||
       !isAbsolute(path) ||
@@ -409,10 +414,23 @@ function interactiveArgs(spec: SandboxSpec): string[] {
       invalid();
   if (Buffer.byteLength(hostPath) >= 100 || port < 1024) invalid();
   boundedInteger(port, 65_535);
+  if (watchVsock) {
+    if (
+      watchVsock.hostPath === hostPath ||
+      Buffer.byteLength(watchVsock.hostPath) >= 100 ||
+      watchVsock.port < 1024 ||
+      watchVsock.port === port
+    )
+      invalid();
+    boundedInteger(watchVsock.port, 65_535);
+  }
   checkVolumeName(stateVolume);
   return [
     "--vsock",
     `${hostPath}:${port}`,
+    ...(watchVsock
+      ? ["--vsock", `${watchVsock.hostPath}:${watchVsock.port}`]
+      : []),
     "--mount-named",
     `${stateVolume}:/state`,
     "--mount-dir",
@@ -509,10 +527,7 @@ function checkClaudeManagedSettings(path: string) {
 }
 
 function checkInteractivePaths(spec: InteractiveSpec): void {
-  const {
-    vsock: { hostPath },
-    snapshotDir,
-  } = spec;
+  const { vsock, watchVsock, snapshotDir } = spec;
   const uid = process.getuid?.();
   if (uid === undefined) invalid();
   // Check from the root down so lstat never traverses an unchecked parent.
@@ -531,14 +546,16 @@ function checkInteractivePaths(spec: InteractiveSpec): void {
       invalid();
   };
   checkDir(snapshotDir, true);
-  checkDir(dirname(hostPath));
-  const socket = lstatSync(hostPath, { throwIfNoEntry: false });
-  if (
-    !socket?.isSocket() ||
-    socket.uid !== uid ||
-    (socket.mode & 0o7777) !== 0o600
-  )
-    invalid();
+  for (const { hostPath } of watchVsock ? [vsock, watchVsock] : [vsock]) {
+    checkDir(dirname(hostPath));
+    const socket = lstatSync(hostPath, { throwIfNoEntry: false });
+    if (
+      !socket?.isSocket() ||
+      socket.uid !== uid ||
+      (socket.mode & 0o7777) !== 0o600
+    )
+      invalid();
+  }
 }
 
 function terminalArgs(command: TerminalCommand): string[] {
@@ -956,7 +973,13 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const requestedInteractive = spec.interactive;
     const interactive =
       requestedInteractive && "vsock" in requestedInteractive
-        ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
+        ? {
+            ...requestedInteractive,
+            vsock: { ...requestedInteractive.vsock },
+            ...(requestedInteractive.watchVsock
+              ? { watchVsock: { ...requestedInteractive.watchVsock } }
+              : {}),
+          }
         : undefined;
     const managed = spec.claudeManagedSettings;
     const secretSocket = spec.claudeSecretSocket;

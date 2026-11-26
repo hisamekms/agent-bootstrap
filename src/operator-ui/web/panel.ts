@@ -1874,9 +1874,12 @@ export function createHostPanel(
     queued: [],
     queuedCount: 0,
     yourTurn: 0,
+    conciergeWatching: false,
   };
 
   function planButton(ref: string, title: string) {
+    if (activity.conciergeWatching)
+      return textElement("span", "Concierge に知らせました", "muted");
     const status = textElement("span", "", "muted");
     status.setAttribute("role", "status");
     const message = "下書きを入れました（Enter で送ります）";
@@ -1909,6 +1912,7 @@ export function createHostPanel(
       id,
       track,
       draftedPlans.has(track.ref),
+      activity.conciergeWatching,
       goals.find(({ ref }) => ref === track.ref),
       activity.running.find(
         (run) => run.goalRef === track.ref && run.actor === "Planner",
@@ -2618,6 +2622,7 @@ export function createHostPanel(
               running,
               problem,
               draftedPlans.has(detail.ref),
+              activity.conciergeWatching,
             ],
             () =>
               goalDetail(

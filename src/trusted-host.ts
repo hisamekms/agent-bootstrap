@@ -702,6 +702,9 @@ export class TrustedHost {
       ...(plan.sandbox.claude ? { claude: true } : {}),
       interactive: Object.freeze({
         vsock: Object.freeze({ ...interactive.vsock }),
+        ...(interactive.watchVsock
+          ? { watchVsock: Object.freeze({ ...interactive.watchVsock }) }
+          : {}),
         stateVolume: interactive.stateVolume,
         snapshotDir: interactive.snapshotDir,
       }),
@@ -987,6 +990,18 @@ export class TrustedHost {
         ...mount,
         mode: shellMount ? ("rw" as const) : (mount.mode ?? "ro"),
       }));
+    const interactive = sandbox.interactive;
+    if (
+      mounted.length &&
+      interactive &&
+      "vsock" in interactive &&
+      interactive.watchVsock
+    )
+      sandbox.interactive = {
+        vsock: interactive.vsock,
+        stateVolume: interactive.stateVolume,
+        snapshotDir: interactive.snapshotDir,
+      };
     if (mounted.length && !shellMount && !claude)
       throw new ConfigError(
         `mounts.${mounted[0]!.name}.actors`,
@@ -1255,6 +1270,12 @@ export class TrustedHost {
                     detail: {
                       socketPath: interactive.vsock.hostPath,
                       vsockPort: interactive.vsock.port,
+                      ...(interactive.watchVsock
+                        ? {
+                            watchSocketPath: interactive.watchVsock.hostPath,
+                            watchVsockPort: interactive.watchVsock.port,
+                          }
+                        : {}),
                       snapshotDir: interactive.snapshotDir,
                       volumeName: interactive.stateVolume,
                       ...(mountAudit.length ? { mounts: mountAudit } : {}),
@@ -1338,11 +1359,14 @@ export class TrustedHost {
         try {
           const shell =
             mounted.length === 0 &&
-            "command" in input &&
-            input.command.claudeShell === true;
+            (("command" in input && input.command.claudeShell === true) ||
+              (actor === "Concierge" &&
+                interactive &&
+                "vsock" in interactive &&
+                interactive.watchVsock !== undefined));
           managed = claude.managedSettings(
             actor,
-            shell,
+            shell === true,
             mounted.map(({ path }) => path),
             auth === "secret-file" ? auth : undefined,
           );

@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { SqliteAudit } from "../src/audit.ts";
 import { JsonlWriter } from "../src/jsonl-files.ts";
+import { conciergeWatchEvents } from "../src/local-orchestrator/concierge-watch.ts";
 import { runDuckDb } from "../src/local-orchestrator/analysis.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import { exportOrchestrator } from "../src/local-orchestrator/export.ts";
@@ -167,6 +168,15 @@ function fixture(store: OrchestratorStore) {
     store.approvedIntegration(integration.id).approvalId,
   );
   store.finishIntegration(integration.id, "completed", "ok");
+  assert.deepEqual(
+    conciergeWatchEvents(
+      { store, target: "/fixture" },
+      store
+        .conciergeWatchRows(0)
+        .filter(({ kind }) => kind === "task.integrated"),
+    ),
+    ["integrated G1-1", "goal-exportable G1"],
+  );
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
   const rejected = store.proposeGoal(store.getGoal(goalId)!.content, operator);
   const approver = store.createExecution({

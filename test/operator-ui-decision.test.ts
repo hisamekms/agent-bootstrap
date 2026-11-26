@@ -683,6 +683,7 @@ test("the popover groups problems and resets confirmations while tracking approv
     queued: [],
     queuedCount: 0,
     yourTurn: 2,
+    conciergeWatching: false,
   };
   const host = createHostPanel(
     {
@@ -782,6 +783,12 @@ test("the popover groups problems and resets confirmations while tracking approv
     assert.ok(findAction("goal:goal-id", area));
   }
 
+  activity.conciergeWatching = true;
+  await host.refresh();
+  assert.match(popover.textContent, /Concierge に知らせました/);
+  assert.equal(findAction("plan:G12", popover), undefined);
+  activity.conciergeWatching = false;
+  await host.refresh();
   click("plan:G12", popover);
   await settle();
   assert.equal(focuses, 1);

@@ -247,7 +247,13 @@ export function operatorActivity(source: InboxSource) {
   const yourTurn =
     pendingDecisions(projectInbox(source)).length +
     groupProblems(operatorProblems(source.store)).length;
-  return { running, queued, queuedCount: queued.length, yourTurn };
+  return {
+    running,
+    queued,
+    queuedCount: queued.length,
+    yourTurn,
+    conciergeWatching: source.store.conciergeWatching(),
+  };
 }
 
 export function operatorActivityRevision(
@@ -261,7 +267,7 @@ export function operatorActivityRevision(
     { ...source, secretTests: () => checks },
     { now },
   ).filter(({ weight }) => weight === "info").length;
-  return `${source.store.activityRevision()}:${pendingChecks}:${visibleHistory}`;
+  return `${source.store.activityRevision()}:${pendingChecks}:${visibleHistory}:${source.store.conciergeWatching()}`;
 }
 
 export const goalStatuses = ["active", "done", "cancelled"] as const;

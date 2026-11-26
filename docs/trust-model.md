@@ -37,7 +37,11 @@ provides partial observation.
 The Concierge runs in an interactive VM with a read-only repository snapshot
 and a named session volume. It reaches the Host API through a dedicated
 Unix socket exposed over vsock. The Host API binds actions to the session
-and reserves approval for the operator.
+and reserves approval for the operator. A host `goal-approved` watch event
+can prompt Concierge to call `request_planner` without an operator turn.
+The trusted host still authorizes the request against the active session,
+Goal state, and Planner request rules. A watch event supplies context and
+carries no authorization.
 
 In default API-key mode, Microsandbox substitutes the API key into
 `x-api-key` at `api.anthropic.com:443`. The guest can read the placeholder.

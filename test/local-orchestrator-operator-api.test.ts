@@ -698,6 +698,24 @@ test(
         assert.deepEqual((await client.request("activity.subscribe")).result, {
           subscribed: true,
         });
+        const session = store.startSession("Concierge", "watch-run");
+        assert.equal(
+          (await client.request("activity.get")).result.conciergeWatching,
+          false,
+        );
+        store.recordConciergeWatch(session.id, "connected");
+        assert.equal((await client.next()).method, "activity.changed");
+        assert.equal(
+          (await client.request("activity.get")).result.conciergeWatching,
+          true,
+        );
+        store.recordConciergeWatch(session.id, "disconnected");
+        assert.equal((await client.next()).method, "activity.changed");
+        assert.equal(
+          (await client.request("activity.get")).result.conciergeWatching,
+          false,
+        );
+        store.endSession(session.id);
         assert.ok(goalId);
         const execution = store.createExecution({
           actor: "Planner",

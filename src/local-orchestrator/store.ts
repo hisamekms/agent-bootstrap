@@ -3523,6 +3523,97 @@ export class OrchestratorStore {
     );
   }
 
+  conciergeWatchStart(sessionId: string) {
+    return this.#read(
+      () =>
+        required(
+          this.#db
+            .query<{ sequence: number }>(
+              "SELECT rowid AS sequence FROM events WHERE subject_id = ? AND kind = 'session.started'",
+            )
+            .get(identifier(sessionId)),
+        ).sequence,
+    );
+  }
+
+  conciergeWatchRows(after: number) {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          sequence: number;
+          kind: string;
+          goalId: string | null;
+          goalRef: string | null;
+          taskRef: string | null;
+        }>(
+          `
+        SELECT e.rowid AS sequence,
+          CASE WHEN e.subject_kind = 'proposal' THEN 'decision-needed' ELSE e.kind END AS kind,
+          g.id AS goalId, g.ref AS goalRef, t.ref AS taskRef
+        FROM events e
+        LEFT JOIN tasks t ON e.subject_kind = 'task' AND e.subject_id = t.id
+        LEFT JOIN executions x ON e.kind = 'execution.finished' AND e.subject_id = x.id
+        LEFT JOIN goals g ON g.id = coalesce(t.goal_id, x.goal_id,
+          CASE WHEN e.subject_kind = 'goal' THEN e.subject_id END)
+        WHERE e.rowid > ? AND (
+          e.kind IN ('goal.registered', 'task.integrated', 'task.budget-exceeded')
+          OR (e.kind IN ('goal.proposed', 'task.proposed', 'proposal.created') AND EXISTS (
+            SELECT 1 FROM proposals p WHERE p.id = e.subject_id AND p.status = 'pending'
+          ))
+          OR (e.kind = 'goal.status' AND json_extract(e.data, '$.status') = 'done')
+          OR (e.kind = 'task.status' AND json_extract(e.data, '$.status') = 'failed')
+          OR (e.kind = 'execution.finished' AND x.actor = 'Planner'
+            AND x.mode = 'task-decomposition' AND json_extract(e.data, '$.status') = 'succeeded')
+        )
+        ORDER BY e.rowid LIMIT 256
+      `,
+        )
+        .all(after),
+    );
+  }
+
+  recordConciergeWatch(
+    sessionId: string,
+    kind: "connected" | "disconnected" | "sent",
+    event?: string,
+  ) {
+    const id = identifier(sessionId);
+    this.#write((at) => {
+      if (kind !== "disconnected" && !this.isActiveConciergeSession(id))
+        throw new OrchestratorStoreError("invalid-transition");
+      const [eventKind, ref, code] = event?.split(" ") ?? [];
+      const data =
+        eventKind === "decision-needed"
+          ? { eventKind, count: Number(ref) }
+          : eventKind
+            ? { eventKind, ref, ...(code ? { code } : {}) }
+            : {};
+      this.#event(at, `concierge-watch.${kind}`, "session", id, data, {
+        sessionId: id,
+      });
+    });
+  }
+
+  conciergeWatching(): boolean {
+    return this.#read(
+      () =>
+        !this.#writeFailed &&
+        this.#db
+          .query(
+            `
+        SELECT 1 FROM actor_sessions s
+        WHERE s.actor = 'Concierge' AND s.status = 'active' AND (
+          SELECT e.kind FROM events e
+          WHERE e.subject_id = s.id
+            AND e.kind IN ('concierge-watch.connected', 'concierge-watch.disconnected')
+          ORDER BY e.rowid DESC LIMIT 1
+        ) = 'concierge-watch.connected'
+      `,
+          )
+          .get() !== null,
+    );
+  }
+
   activityRevision() {
     return this.#read(
       () =>
@@ -3535,7 +3626,8 @@ export class OrchestratorStore {
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
           'task.retried', 'task.budget-exceeded',
           'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',
-          'project.defaults-set', 'project.rule-set', 'goal.policy-set', 'task.policy-set')
+          'project.defaults-set', 'project.rule-set', 'goal.policy-set', 'task.policy-set',
+          'concierge-watch.connected', 'concierge-watch.disconnected')
       `,
           )
           .get()!.revision,

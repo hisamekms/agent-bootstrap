@@ -1,8 +1,14 @@
+import {
+  conciergeWatchCommand,
+  conciergeWatchShellScript,
+  conciergeWatchSupportsCli,
+  managedClaudeSettings,
+} from "../src/local-orchestrator/claude-policy.ts";
 import { addProject } from "../src/config/projects.ts";
 import { resolveTarget } from "../src/local-orchestrator/target.ts";
 import { configEnv, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   lstat,
@@ -19,6 +25,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { ALPINE_3_23 } from "../src/image-recipes.ts";
 import {
+  CLAUDE_CODE,
   claudeCodeProvider,
   claudeCodeTools,
   type ClaudeCodeAuth,
@@ -99,6 +106,9 @@ for (const cancelled of [false, true]) {
               commit: snapshotCommit,
               files: [],
             }),
+            async listenWatch() {
+              return { async close() {} };
+            },
             async listen() {
               return { async close() {} };
             },
@@ -170,11 +180,16 @@ const failures = [
   "end",
   "close",
 ] as const;
-for (const failure of [undefined, ...failures]) {
+for (const { failure, mounted } of [
+  ...[undefined, ...failures].map((failure) => ({ failure, mounted: false })),
+  { failure: undefined, mounted: true },
+]) {
   test(
     failure
       ? `Concierge cleans up after ${failure} failure`
-      : "Concierge starts and cleans up in order with an exact interactive plan",
+      : mounted
+        ? "mounted Concierge omits the watch listener and vsock"
+        : "Concierge starts and cleans up in order with an exact interactive plan",
     async () => {
       await fixture(async (repoRoot, store, target) => {
         const log: string[] = [];
@@ -202,7 +217,21 @@ for (const failure of [undefined, ...failures]) {
         };
         const deps: ConciergeDeps = {
           store,
-          config: { version: 1 },
+          config: {
+            version: 1,
+            ...(mounted
+              ? {
+                  mounts: {
+                    data: {
+                      volume: "private",
+                      dir: "data",
+                      path: "/mnt/data",
+                      actors: ["Concierge"],
+                    },
+                  },
+                }
+              : {}),
+          },
           baseImage: ALPINE_3_23.reference,
           auth,
           install,
@@ -222,6 +251,10 @@ for (const failure of [undefined, ...failures]) {
               commit: snapshotCommit,
               files: ["AGENTS.md"],
             };
+          },
+          async listenWatch() {
+            assert.equal(mounted, false);
+            return { async close() {} };
           },
           async listen(options) {
             assert.equal(options.sessionId, sessionId);
@@ -261,6 +294,14 @@ for (const failure of [undefined, ...failures]) {
                   maxLifetimeMs: 28_800_000,
                   interactive: {
                     vsock: { hostPath: join(socketDir!, "h.sock"), port: 5000 },
+                    ...(!mounted
+                      ? {
+                          watchVsock: {
+                            hostPath: join(socketDir!, "w.sock"),
+                            port: 5001,
+                          },
+                        }
+                      : {}),
                     stateVolume: target.volume,
                     snapshotDir,
                   },
@@ -269,7 +310,10 @@ for (const failure of [undefined, ...failures]) {
               const value = await use({
                 async attach(command) {
                   step("attach");
-                  assert.deepEqual(command, conciergeCommand({ model }, auth));
+                  assert.deepEqual(
+                    command,
+                    conciergeCommand({ model }, auth, !mounted),
+                  );
                   return { exitCode: 0 };
                 },
               });
@@ -367,6 +411,9 @@ test("Concierge drains a single active Planner and cancels queued work on exit",
           commit: snapshotCommit,
           files: [],
         }),
+        async listenWatch() {
+          return { async close() {} };
+        },
         async listen(options) {
           requester = options.requester;
           return {
@@ -446,6 +493,9 @@ test("Concierge refuses further Planner work after a failed execution audit writ
         commit: snapshotCommit,
         files: [],
       }),
+      async listenWatch() {
+        return { async close() {} };
+      },
       async listen(options) {
         api = options;
         return { async close() {} };
@@ -501,16 +551,49 @@ test("Concierge guest command admits only validated options and uses a fixed rel
   assert.equal(alpine.workdir, "/repo");
   execFileSync("/bin/sh", ["-n"], { input: script! });
   assert.match(script!, /sha256sum -c/);
+  assert.ok(script!.includes(CLAUDE_CODE.sha256));
+  assert.ok(conciergeWatchSupportsCli(CLAUDE_CODE.version));
+  assert.ok(!conciergeWatchSupportsCli("2.1.331"));
+  assert.match(
+    conciergeCommand({ model }, auth, false).argv[2]!,
+    /set -- --tools ""\s+if test false/,
+  );
+  assert.deepEqual(script!.match(/--tools (?:""|'[^']*')/g), [
+    '--tools ""',
+    "--tools 'Read,Glob,Grep,Bash,Monitor'",
+  ]);
+  assert.match(
+    script!,
+    /if test true = true && test -z "\$\{LO_MOUNT_RESTRICTED:-\}"; then/,
+  );
+  assert.match(script!, /for shell in sh ash bash rbash dash zsh/);
+  assert.match(
+    script!,
+    /claude_bin=\/tmp\/lo-watch\/claude\s+mv \/tmp\/claude "\$claude_bin"/,
+  );
+  assert.match(
+    script!,
+    /for dir in \/tmp\/lo-watch \/lib \/usr\/lib \/usr\/libexec; do\s+mount --bind "\$dir" "\$dir"\s+mount -o remount,bind,ro "\$dir"\s+done/,
+  );
+  assert.match(
+    script!,
+    /managed_digest=\$\(sha256sum \/etc\/claude-code\/managed-settings\.json\)\s+mount -o rbind \/etc \/etc\s+mount -o remount,bind,ro \/etc\s+test "\$\(sha256sum \/etc\/claude-code\/managed-settings\.json\)" = "\$managed_digest"/,
+  );
+  assert.match(script!, /"\$claude_bin" --mcp-config/);
   assert.match(script!, /apk add --no-network --no-cache/);
   assert.ok(
     script!.includes("test \"$ANTHROPIC_API_KEY\" = '$MSB_ANTHROPIC_API_KEY'"),
   );
   assert.ok(script!.includes('["STDIO","VSOCK-CONNECT:2:5000"]'));
-  assert.doesNotMatch(script!, /managed-settings/);
+  assert.ok(
+    script!.includes(
+      `start Monitor once with command ${conciergeWatchCommand}`,
+    ),
+  );
   assert.match(script!, /--strict-mcp-config --setting-sources ''/);
   assert.match(
     script!,
-    /--append-system-prompt '[^']*get_inbox[^']*Only the operator can answer gates[^']*' \\\n/,
+    /--append-system-prompt '[^']*get_inbox[^']*Only the operator can answer gates[^']*'" \$watch_prompt" \\\n/,
   );
   assert.match(script!, /exec env -i .*HOME=\/state\/home/);
   assert.ok(script!.includes("claude_config=/state/claude"));
@@ -706,4 +789,70 @@ test("Planner selection reserves space for request.json and bounds file count, b
         workspaceBytes,
     );
   });
+});
+
+test("only watch-enabled Concierge policy allows the fixed Bash and Monitor commands", () => {
+  const policy = managedClaudeSettings("Concierge", true).permissions;
+  assert.deepEqual(policy.allow, [
+    "mcp__orchestrator",
+    `Monitor(${conciergeWatchCommand})`,
+    `Bash(${conciergeWatchCommand})`,
+  ]);
+  assert.equal(policy.disableBypassPermissionsMode, "disable");
+  assert.ok(!policy.deny.includes("Bash"));
+  for (const tool of ["Edit", "Write", "NotebookEdit"])
+    assert.ok(policy.deny.includes(tool), tool);
+  for (const manual of [
+    managedClaudeSettings("Concierge"),
+    managedClaudeSettings("Concierge", true, ["/data"]),
+  ]) {
+    assert.equal(manual.allowManagedPermissionRulesOnly, true);
+    assert.deepEqual(manual.permissions.allow, ["mcp__orchestrator"]);
+    assert.ok(manual.permissions.deny.includes("Bash"));
+    for (const tool of ["Edit", "Write", "NotebookEdit"])
+      assert.ok(manual.permissions.deny.includes(tool), tool);
+  }
+});
+
+test("the watch guard dispatches only the fixed command from the CLI wrapper", () => {
+  const dispatch = `exec /usr/bin/env -i ${conciergeWatchCommand}`;
+  assert.ok(conciergeWatchShellScript.includes(dispatch));
+  const guard = conciergeWatchShellScript.replace(
+    dispatch,
+    "printf fixed-exec",
+  );
+  execFileSync("/bin/sh", ["-n"], { input: guard });
+  const run = (...args: string[]) =>
+    spawnSync("/bin/sh", ["-c", guard, "bash", ...args], {
+      env: {},
+      encoding: "utf8",
+    });
+  const wrapped = (command: string, stdin = " < /dev/null") =>
+    `setup && eval '${command}'${stdin} && pwd -P >| '/tmp/claude-cwd'`;
+  for (const flags of [["-c"], ["-c", "-l"], ["-l", "-c"]]) {
+    for (const stdin of ["", " < /dev/null"]) {
+      const result = run(...flags, wrapped(conciergeWatchCommand, stdin));
+      assert.equal(result.status, 0);
+      assert.equal(result.stdout, "fixed-exec");
+    }
+  }
+  assert.equal(run("--version").status, 0);
+  for (const args of [
+    ["--version", wrapped(conciergeWatchCommand)],
+    ["-l", wrapped(conciergeWatchCommand)],
+    ["-c", "echo x"],
+    ["-l", "-c", wrapped("echo x")],
+    ["-l", "-c", wrapped(`${conciergeWatchCommand} extra`)],
+    ["-c", wrapped(`${conciergeWatchCommand}; echo unsafe`)],
+    ["-c", wrapped("/usr/bin/socat -u VSOCK-CONNECT:2:5000 STDOUT")],
+    [
+      "-c",
+      wrapped(`echo x' && eval '${conciergeWatchCommand}' && pwd -P >| '`, ""),
+    ],
+    ["-c", `${wrapped(conciergeWatchCommand, "")} && echo x`],
+  ]) {
+    const result = run(...args);
+    assert.equal(result.status, 126);
+    assert.equal(result.stdout, "");
+  }
 });

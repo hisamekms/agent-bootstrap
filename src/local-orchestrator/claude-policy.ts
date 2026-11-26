@@ -19,12 +19,59 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { CLAUDE_CODE } from "../claude-code.ts";
 import type { ClaudeHostPolicy } from "../trusted-host.ts";
 import type { ClaudeActor, EffectiveClaudeConfig } from "./claude-config.ts";
 import { VolumeError, Volume, privateDirectory } from "../volumes/volume.ts";
 
 import { SECRET_TOOL_DIRS } from "../secret-file.ts";
 import { createCredentialScanner } from "./credential-scan.ts";
+
+export const CONCIERGE_WATCH_PORT = 5001;
+export const conciergeWatchCommand = `/usr/bin/socat -u VSOCK-CONNECT:2:${CONCIERGE_WATCH_PORT} STDOUT`;
+export const conciergeWatchShell = "/tmp/lo-watch/bash";
+// Revalidate the wrapper and live policy before updating this version.
+export function conciergeWatchSupportsCli(
+  version: string = CLAUDE_CODE.version,
+) {
+  return version === "2.1.330";
+}
+
+// Claude Code delegates Monitor command permissions to its Bash checker.
+// The substitute shell never evaluates the CLI's shell program and can
+// dispatch only the fixed reader, even if a wider permission is granted.
+export const conciergeWatchShellScript = `#!/bin/busybox sh
+if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
+  echo 'GNU bash (Concierge command guard)'
+  exit 0
+fi
+# Claude Code 2.1.330 puts the quoted command in an eval clause and
+# appends its cwd bookkeeping. Recognize that clause without running it.
+if [ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = -l ]; then
+  shift 2
+else
+  if [ "$#" -eq 3 ] && [ "$1" = -l ]; then shift; fi
+  test "$#" -eq 2 && test "$1" = -c || exit 126
+  shift
+fi
+program=$1
+marker=" && eval '"
+clause=\${program#*"$marker"}
+test "$clause" != "$program" || exit 126
+case "$clause" in
+  "${conciergeWatchCommand}' && pwd -P >| "*) cwd=\${clause#*">| "} ;;
+  "${conciergeWatchCommand}' < /dev/null && pwd -P >| "*) cwd=\${clause#*">| "} ;;
+  *) exit 126 ;;
+esac
+case "$cwd" in
+  "'"*"'") cwd=\${cwd#"'"}; cwd=\${cwd%"'"} ;;
+esac
+case "$cwd" in
+  *[!a-zA-Z0-9_./-]*) exit 126 ;;
+  /*) exec /usr/bin/env -i ${conciergeWatchCommand} ;;
+  *) exit 126 ;;
+esac
+`;
 
 export const orchestratorMcp = {
   type: "stdio",
@@ -42,13 +89,23 @@ export function managedClaudeSettings(
   auth?: "secret-file",
 ) {
   const concierge = actor === "Concierge";
+  const watch =
+    concierge && shell && !mounts.length && conciergeWatchSupportsCli();
   const secretFile = auth === "secret-file";
   const toolDirs = Object.values(SECRET_TOOL_DIRS);
   const gitPaths = ["/workspace/.git/config", "/workspace/.git/hooks"];
   const scope = actor === "Executor" ? "/workspace" : "/review";
   const fileTools = ["Read", "Glob", "Grep", "Edit", "Write"];
   const allow = concierge
-    ? ["mcp__orchestrator"]
+    ? [
+        "mcp__orchestrator",
+        ...(watch
+          ? [
+              `Monitor(${conciergeWatchCommand})`,
+              `Bash(${conciergeWatchCommand})`,
+            ]
+          : []),
+      ]
     : [
         ...fileTools
           .slice(0, actor === "Executor" ? 5 : 3)
@@ -87,6 +144,7 @@ export function managedClaudeSettings(
       disableBypassPermissionsMode: "disable",
       allow,
       deny: [
+        ...(concierge ? ["Edit", "Write", "NotebookEdit"] : []),
         ...[
           "/etc/claude-code",
           ...(secretFile
@@ -108,7 +166,13 @@ export function managedClaudeSettings(
             )
           : []),
         ...(concierge || mounts.length
-          ? ["Bash", "WebFetch", "WebSearch", "Agent", "Skill"]
+          ? [
+              ...(watch ? [] : ["Bash"]),
+              "WebFetch",
+              "WebSearch",
+              "Agent",
+              "Skill",
+            ]
           : secretFile
             ? ["WebFetch", "WebSearch", "Agent", "Skill"]
             : []),

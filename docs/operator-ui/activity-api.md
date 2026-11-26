@@ -31,7 +31,8 @@ Send `activity.get` with empty params. A response can look like this.
   ],
   "queued": [],
   "queuedCount": 0,
-  "yourTurn": 1
+  "yourTurn": 1,
+  "conciergeWatching": true
 }
 ```
 
@@ -48,10 +49,17 @@ their `id` identifies the corresponding execution or Task.
 plus problems from the default `problem.list` response. Problem rows for
 the same Task count once. Marking an item seen keeps it in the count.
 
+`conciergeWatching` is true while the active Concierge session has an
+audited watcher connection. Workplace uses it to display
+**Concierge に知らせました** or offer a manual planning draft. The watcher
+reads events recorded since the session started. The live VM check is
+pending.
+
 Send `activity.subscribe` with empty params before the first
 `activity.get`. The host acknowledges with `{"subscribed":true}` and
 sends `{"method":"activity.changed","params":{}}` when it sees a newer
-activity-relevant audit event, a change in the pending self-test count, or
+activity-relevant audit event, a watcher connection change, a change in the
+pending self-test count, or
 visible inbox history expiring at the one-week cutoff. Relevant events
 include execution queue, start, and finish events and Goal or Task
 registration and status changes. Fetch

@@ -2075,6 +2075,7 @@ const conciergePlan = {
     },
     interactive: {
       vsock: { hostPath: "/fixture/api.sock", port: 5000 },
+      watchVsock: { hostPath: "/fixture/watch.sock", port: 5001 },
       stateVolume: "lo-session",
       snapshotDir: "/fixture/repo",
     },
@@ -2222,6 +2223,8 @@ test("Concierge creates through the audited provider gateway and records each te
   assert.deepEqual(request?.detail, {
     socketPath: "/fixture/api.sock",
     vsockPort: 5000,
+    watchSocketPath: "/fixture/watch.sock",
+    watchVsockPort: 5001,
     volumeName: "lo-session",
     snapshotDir: "/fixture/repo",
   });
