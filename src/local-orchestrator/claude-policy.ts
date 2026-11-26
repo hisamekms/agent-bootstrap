@@ -107,6 +107,9 @@ export function managedClaudeSettings(
               ]),
             )
           : []),
+        // The Concierge runs as root in its VM. Writing tools could plant a
+        // program that a root process (for example git) later runs.
+        ...(concierge ? ["Edit", "Write", "NotebookEdit"] : []),
         ...(concierge || mounts.length
           ? ["Bash", "WebFetch", "WebSearch", "Agent", "Skill"]
           : secretFile

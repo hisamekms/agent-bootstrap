@@ -260,3 +260,34 @@ and integration.
   and looked broken. A fresh instance behaved.
   _Lesson:_ start a fresh browser for each UI check and assert
   visibility before judging the page.
+
+## 2026-11-26: what happens after an approval (#59 to #61)
+
+- **Approving a Goal did not start anything.** Only the Concierge asks
+  the Planner to split a Goal, and it acts only on an operator turn. The
+  operator approved a Goal and saw nothing move.
+  _Lesson:_ every approval needs a visible next step and an owner. Show
+  "nobody is working on this" as its own state.
+- **The host cannot speak to a CLI agent first.** Claude Code reads its
+  inbox only during a turn. Its Monitor tool (each line a background
+  process prints wakes the model) needed a shell, because the CLI checks
+  Monitor commands through its Bash permission rules. A Concierge with a
+  mounted volume must not have a shell, so the watcher worked only
+  without mounts. MCP channels need a development-only flag. We closed
+  the watcher PR (#61) and kept a draft button that the operator sends.
+  _Lesson:_ design host-to-agent events into the orchestrator from the
+  start (a session-level event input the host owns), not through the
+  agent's shell.
+- **The Concierge runs as root with writing tools.** Edit on an existing
+  executable plus a root process that runs it (for example a git
+  setting) runs code without a shell. The Concierge now has Edit, Write
+  and NotebookEdit denied. Dropping root before the CLI starts needs a
+  pinned helper.
+  _Lesson:_ run each agent CLI as an unprivileged user, and give the
+  coordinator no writing tools.
+- **Show whose turn it is, not every state.** Goal, Task and execution
+  states fold into five owners: the operator, AI, stopped, nobody, done.
+  Each view shows only what its use case needs. The header shows a
+  one-line count. The work may run in parallel later.
+  _Lesson:_ keep the state model complete in the API and fold it per
+  view in the UI.
