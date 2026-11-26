@@ -1,6 +1,7 @@
 import { projectInbox, type InboxSource } from "./inbox.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
+import { operatorGoalTurn } from "./operator-read.ts";
 import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -17,7 +18,11 @@ import {
   validateTaskContent,
   TASK_CATEGORIES,
 } from "./model.ts";
-import { proposalStatuses, type OrchestratorStore } from "./store.ts";
+import {
+  OrchestratorStoreError,
+  proposalStatuses,
+  type OrchestratorStore,
+} from "./store.ts";
 
 const plannerModes = [
   "goal-design",
@@ -83,7 +88,7 @@ const tools = {
   ],
   list_goals: ["List registered goals", schema()],
   get_goal: [
-    "Read a registered goal and its tasks",
+    "Read a registered goal by ID or ref, and its tasks",
     schema({ id: idSchema }, ["id"]),
   ],
   get_execution: [
@@ -143,7 +148,12 @@ function isTool(value: unknown): value is Tool {
 function readExecution(store: OrchestratorStore, id: string) {
   const execution = store.getExecution(id);
   if (!execution) return null;
-  const { status, result } = execution;
+  const { status, result, ref, goalRef, taskRef } = execution;
+  const subject = {
+    ...(ref && { ref }),
+    ...(goalRef && { goalRef }),
+    ...(taskRef && { taskRef }),
+  };
   if (result && typeof result === "object" && !Array.isArray(result)) {
     // Keep operator diagnostics, including host paths in recovery commands, on the host.
     const {
@@ -152,9 +162,9 @@ function readExecution(store: OrchestratorStore, id: string) {
       ...visible
     } = result as Record<string, unknown>;
     if (visible.code === "secret-test-required") delete visible.next;
-    return { id, status, result: visible };
+    return { id, status, ...subject, result: visible };
   }
-  return { id, status, result };
+  return { id, status, ...subject, result };
 }
 
 async function waitForExecution(
@@ -222,6 +232,9 @@ function prepareTool(
           id: proposal.id,
           kind: proposal.kind,
           status: proposal.status,
+          ref: proposal.ref,
+          goalRef: proposal.goalRef,
+          taskRef: proposal.taskRef,
           ...(proposal.kind === "integration"
             ? {
                 goalId: proposal.content.goalId,
@@ -235,12 +248,17 @@ function prepareTool(
       return () => store.getProposalDetails(id);
     }
     case "list_goals":
-      return () =>
-        store.listGoals().map(({ id, content, status }) => ({
-          id,
-          title: content.title,
-          status,
+      return () => {
+        const goals = store.listGoals();
+        const facts = store.goalTurnFacts(goals.map(({ id }) => id));
+        return goals.map((goal) => ({
+          id: goal.id,
+          ref: goal.ref,
+          title: goal.content.title,
+          status: goal.status,
+          turn: operatorGoalTurn(store, goal, facts.get(goal.id)!),
         }));
+      };
     case "get_goal": {
       const id = identifier(input.id);
       return () => {
@@ -248,7 +266,8 @@ function prepareTool(
         return (
           goal && {
             ...goal,
-            tasks: store.listTasks(id).map((task) => {
+            turn: operatorGoalTurn(store, goal),
+            tasks: store.listTasks(goal.id).map((task) => {
               const usage = store.taskUsage(task.id);
               return {
                 ...task,
@@ -257,7 +276,7 @@ function prepareTool(
                 totalTokens: store.taskTokens(task.id),
               };
             }),
-            pendingIntegrations: store.pendingIntegrations(id),
+            pendingIntegrations: store.pendingIntegrations(goal.id),
           }
         );
       };
@@ -303,14 +322,19 @@ function prepareTool(
       const { brief } = input;
       if (typeof brief !== "string" || brief.length > briefLimit)
         throw new ContractError();
-      return async () => ({
-        executionId: await requester.requestPlanner({
-          mode,
-          ...goal,
-          brief,
-          sessionId,
-        }),
-      });
+      return async () => {
+        const registered =
+          goal.goalId === undefined ? undefined : store.getGoal(goal.goalId);
+        if (goal.goalId !== undefined && !registered) return null;
+        return {
+          executionId: await requester.requestPlanner({
+            mode,
+            ...(registered && { goalId: registered.id }),
+            brief,
+            sessionId,
+          }),
+        };
+      };
     }
   }
 }
@@ -434,7 +458,10 @@ async function callTool(
       code =
         error instanceof ClaudeRunError && error.code === "credential-leak"
           ? "credential-leak"
-          : "tool-failed";
+          : error instanceof OrchestratorStoreError &&
+              error.code === "not-found"
+            ? "not-found"
+            : "tool-failed";
       outcome = "error";
     }
   }

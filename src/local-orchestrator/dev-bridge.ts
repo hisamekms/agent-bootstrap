@@ -15,6 +15,8 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "inbox.list",
   "inbox.markSeen",
   "inbox.subscribe",
+  "activity.get",
+  "activity.subscribe",
   "status",
   "proposal.get",
   "proposal.answer",
@@ -27,11 +29,14 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "decision.history",
   "goal.list",
   "goal.get",
+  "goal.discard",
   "task.list",
   "task.get",
+  "task.retry",
   "problem.list",
   "concierge.attach",
   "concierge.input",
+  "concierge.draft",
   "concierge.resize",
 ]);
 const messageLimit = 64 * 1024;

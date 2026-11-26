@@ -4,7 +4,7 @@ import {
   type CredentialScanner,
 } from "./credential-scan.ts";
 import { MAX_REVISIONS } from "../integration-journal.ts";
-import { inboxLimit, type InboxItem } from "./inbox.ts";
+import { inboxLimit, type InboxItem, type InboxSource } from "./inbox.ts";
 import { GATES, goalBranch } from "./model.ts";
 import {
   goalEstimate,
@@ -61,6 +61,9 @@ export function operatorStatus(store: OrchestratorStore) {
     .map((proposal) => ({
       id: proposal.id,
       kind: proposal.kind,
+      ref: proposal.ref,
+      goalRef: proposal.goalRef,
+      taskRef: proposal.taskRef,
       ...(proposal.kind === "integration"
         ? {
             goalId: proposal.content.goalId,
@@ -151,6 +154,9 @@ export async function operatorProposal(
     id: proposal.id,
     status: proposal.status,
     digest: proposal.digest,
+    ref: proposal.ref,
+    goalRef: proposal.goalRef,
+    taskRef: proposal.taskRef,
     ...policy,
     ...(ruleId !== undefined && { ruleId: await screen(ruleId) }),
     ...(ruleName !== undefined && { ruleName: await screen(ruleName) }),
@@ -223,23 +229,98 @@ export async function operatorProposal(
   };
 }
 
+export function operatorActivity(source: InboxSource) {
+  const rows = source.store.activityRows();
+  const running = rows.filter(({ status }) => status === "running");
+  const queued = rows.filter(({ status }) => status !== "running");
+  const yourTurn =
+    source.store.pendingInboxActions() +
+    (source.secretTests?.().filter(({ passed }) => !passed).length ?? 0);
+  return { running, queued, queuedCount: queued.length, yourTurn };
+}
+
 export const goalStatuses = ["active", "done", "cancelled"] as const;
 type GoalStatus = (typeof goalStatuses)[number];
 type Goal = NonNullable<ReturnType<OrchestratorStore["getGoal"]>>;
 type Task = NonNullable<ReturnType<OrchestratorStore["getTask"]>>;
 
+type GoalTurnFacts = NonNullable<
+  ReturnType<ReturnType<OrchestratorStore["goalTurnFacts"]>["get"]>
+>;
+
+export function operatorGoalTurn(
+  store: OrchestratorStore,
+  goal: Goal,
+  facts = store.goalTurnFacts([goal.id]).get(goal.id)!,
+) {
+  const {
+    approvals,
+    progress,
+    failedRef,
+    failedCode,
+    runningRef,
+    runningActor,
+    executionActor,
+    executionTaskRef,
+    queued,
+    planned,
+    exportable,
+  } = facts;
+  if (approvals > 0)
+    return {
+      owner: "human",
+      reason: { kind: "approvals", count: approvals },
+    } as const;
+  if (goal.status === "cancelled")
+    return { owner: "stopped", reason: { kind: "cancelled" } } as const;
+  if (failedRef)
+    return {
+      owner: "stopped",
+      reason: { kind: "failed", taskRef: failedRef, code: failedCode },
+    } as const;
+
+  if (executionActor === "Planner")
+    return { owner: "ai", reason: { kind: "planning" } } as const;
+  if (executionActor || runningActor)
+    return {
+      owner: "ai",
+      reason: {
+        kind: "running",
+        actor: executionActor ?? runningActor!,
+        taskRef: executionActor ? executionTaskRef : runningRef,
+      },
+    } as const;
+  if (queued || progress.awaitingIntegration > 0)
+    return { owner: "ai", reason: { kind: "queued" } } as const;
+
+  if (goal.status === "active" && progress.total === 0 && !planned)
+    return { owner: "idle", reason: { kind: "not-planned" } } as const;
+  if (
+    goal.status === "done" ||
+    (progress.total > 0 && progress.done === progress.total)
+  )
+    return {
+      owner: "done",
+      reason: { kind: exportable ? "exportable" : "completed" },
+    } as const;
+  return { owner: "idle", reason: { kind: "idle" } } as const;
+}
+
 function goalSummary(
   store: OrchestratorStore,
   goal: Goal,
   wallTime: number | null,
+  facts: GoalTurnFacts,
 ) {
-  const { id, status, createdAt, content } = goal;
-  const progress = store.goalTaskProgress(id);
+  const { id, ref, status, createdAt, content } = goal;
+  const { progress } = facts;
   return {
     id,
+    ref,
     title: content.title,
     status,
     createdAt,
+    turn: operatorGoalTurn(store, goal, facts),
     progress,
     estimate:
       status === "active"
@@ -255,7 +336,10 @@ export function operatorGoalList(
   const goals = store.listGoals(status, inboxLimit);
   if (!goals.length) return [];
   const wallTime = meanTaskWallTime(store.succeededTaskWallTimes());
-  return goals.map((goal) => goalSummary(store, goal, wallTime));
+  const facts = store.goalTurnFacts(goals.map(({ id }) => id));
+  return goals.map((goal) =>
+    goalSummary(store, goal, wallTime, facts.get(goal.id)!),
+  );
 }
 
 function taskContext(
@@ -276,7 +360,7 @@ function taskSummary(
   task: Task,
   { timings, means, now }: ReturnType<typeof taskContext>,
 ) {
-  const { id, content, status, attempts, retries } = task;
+  const { id, ref, content, status, attempts, retries } = task;
   const timing = timings.get(id);
   const stage = taskStage(
     status,
@@ -290,9 +374,11 @@ function taskSummary(
       : timing?.times[stage];
   return {
     id,
+    ref,
     title: content.title,
     status,
     stage,
+    retries,
     attempt: {
       current: attempts,
       max:
@@ -318,15 +404,17 @@ function taskSummaries(store: OrchestratorStore, goalId: string) {
     .map((task) => taskSummary(task, context));
 }
 
-export function operatorGoal(store: OrchestratorStore, id: string) {
-  const goal = store.getGoal(id);
+export function operatorGoal(store: OrchestratorStore, key: string) {
+  const goal = store.getGoal(key);
   if (!goal) return null;
+  const { id } = goal;
   const { description, acceptance, scope } = goal.content;
   return {
     ...goalSummary(
       store,
       goal,
       meanTaskWallTime(store.succeededTaskWallTimes()),
+      store.goalTurnFacts([id]).get(id)!,
     ),
     description,
     acceptance,
@@ -340,13 +428,15 @@ export function operatorGoal(store: OrchestratorStore, id: string) {
 }
 
 export function operatorTaskList(store: OrchestratorStore, goalId: string) {
-  return store.getGoal(goalId) ? taskSummaries(store, goalId) : null;
+  const goal = store.getGoal(goalId);
+  return goal ? taskSummaries(store, goal.id) : null;
 }
 
-export function operatorTask(store: OrchestratorStore, id: string) {
-  const task = store.getTask(id);
+export function operatorTask(store: OrchestratorStore, key: string) {
+  const task = store.getTask(key);
   if (!task) return null;
   const {
+    id,
     goalId,
     content: { description, acceptance, actor, paths, budgets, category },
   } = task;
@@ -367,6 +457,7 @@ export function operatorTask(store: OrchestratorStore, id: string) {
   return {
     ...taskSummary(task, context),
     goalId,
+    goalRef: store.getGoal(goalId)!.ref,
     description,
     acceptance,
     actor,
@@ -398,11 +489,16 @@ export function operatorProblems(
   includeResolved = false,
 ) {
   const problems = store.inboxRows(includeResolved, "", true).map((row) => {
-    const { at, goalId, taskId, executionId, modelText } = row;
+    const { at, goalId, taskId, goalRef, taskRef, executionId, modelText } =
+      row;
     const problem = {
       at,
       goalId,
       taskId,
+      ref: taskRef ?? goalRef,
+      goalRef,
+      taskRef,
+      ...(taskId && { expectedRetries: row.retries }),
       title: modelText ?? "",
       ...(executionId && { executionId }),
     };

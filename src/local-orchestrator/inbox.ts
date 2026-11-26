@@ -23,6 +23,9 @@ export interface InboxRow {
   at: string;
   goalId: string | null;
   taskId: string | null;
+  goalRef: string | null;
+  taskRef: string | null;
+  retries: number;
   proposalId: string | null;
   executionId: string | null;
   modelText: string | null;
@@ -46,6 +49,9 @@ export interface InboxItem {
   subject: {
     goalId?: string;
     taskId?: string;
+    ref?: string;
+    goalRef?: string;
+    taskRef?: string;
     proposalId?: string;
     executionId?: string;
   };
@@ -64,16 +70,29 @@ export interface InboxSource {
 
 export function projectInbox(
   { store, target, secretTests }: InboxSource,
-  { includeResolved = false, now = Date.now() } = {},
+  { includeResolved = false, now = Date.now(), limit = inboxLimit } = {},
 ): InboxItem[] {
   const command = `agent-bootstrap --target ${shellWord(target)}`;
   const rows = store.inboxRows(
     includeResolved,
     new Date(now - week).toISOString(),
+    false,
+    limit,
   );
   const items = rows.map((row): InboxItem => {
-    const { id, kind, at, goalId, taskId, proposalId, executionId } = row;
-    const task = taskId?.slice(0, 8);
+    const {
+      id,
+      kind,
+      at,
+      goalId,
+      taskId,
+      goalRef,
+      taskRef,
+      proposalId,
+      executionId,
+    } = row;
+    const ref = taskRef ?? goalRef;
+    const task = taskRef ?? taskId?.slice(0, 8);
     let title: string;
     let next: string;
     let weight: InboxItem["weight"] = "action";
@@ -115,7 +134,7 @@ export function projectInbox(
         break;
       case "goal-completed":
         weight = "info";
-        title = `Goal ${goalId?.slice(0, 8)} completed`;
+        title = `Goal ${goalRef ?? goalId?.slice(0, 8)} completed`;
         next = `show ${goalId}`;
         break;
     }
@@ -129,6 +148,9 @@ export function projectInbox(
       subject: {
         ...(goalId && { goalId }),
         ...(taskId && { taskId }),
+        ...(ref && { ref }),
+        ...(goalRef && { goalRef }),
+        ...(taskRef && { taskRef }),
         ...(proposalId && { proposalId }),
         ...(executionId && { executionId }),
       },
@@ -156,11 +178,12 @@ export function projectInbox(
     });
   }
   // Keep unresolved checks without timestamps visible ahead of dated history.
-  const bounded = [
+  const combined = [
     ...checks.filter(({ state }) => state !== "resolved"),
     ...items,
     ...checks.filter(({ state }) => state === "resolved"),
-  ].slice(0, inboxLimit);
+  ];
+  const bounded = limit < 0 ? combined : combined.slice(0, limit);
   const seen = store.inboxSeen(bounded.map(({ id }) => id));
   return bounded.map((item) =>
     item.state === "open" && seen.has(item.id)
@@ -186,8 +209,15 @@ export function inboxSnapshot(items: readonly InboxItem[]) {
 }
 
 export function formatInboxItem(item: InboxItem): string {
-  const ids = Object.values(item.subject)
-    .map((id) => id.slice(0, 8))
+  const { goalId, taskId, goalRef, taskRef, proposalId, executionId } =
+    item.subject;
+  const ids = [
+    goalRef ?? goalId?.slice(0, 8),
+    taskRef ?? taskId?.slice(0, 8),
+    proposalId?.slice(0, 8),
+    executionId?.slice(0, 8),
+  ]
+    .filter(Boolean)
     .join(" ");
   // Model text goes last and quoted, so it never sits next to the host's command.
   const model = item.modelText
