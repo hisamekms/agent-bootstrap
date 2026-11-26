@@ -33,6 +33,7 @@ import {
 import {
   goalStatuses,
   operatorActivity,
+  operatorActivityRevision,
   operatorGoal,
   operatorGoalList,
   operatorInbox,
@@ -114,6 +115,24 @@ export function draftToConcierge(
     return failure(
       error instanceof ContractError ? "invalid-params" : "write-failed",
     );
+  }
+}
+
+export async function readOperatorGoal(
+  store: OrchestratorStore,
+  stateDirectory: string,
+  id: string,
+) {
+  const goal = operatorGoal(store, id);
+  if (!goal) return null;
+  try {
+    return {
+      ...goal,
+      head: await readGoalBranchHead(stateDirectory, goal.id),
+      headAvailable: true,
+    };
+  } catch {
+    return { ...goal, head: null, headAvailable: false };
   }
 }
 
@@ -312,12 +331,6 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   const project = (includeResolved = false) =>
     operatorInbox(store, projectInbox(options, { includeResolved }));
 
-  function activityRevision() {
-    const pendingChecks =
-      options.secretTests?.().filter(({ passed }) => !passed).length ?? 0;
-    return `${store.activityRevision()}:${pendingChecks}`;
-  }
-
   function terminalRequest(
     method: string,
     params: unknown,
@@ -435,10 +448,12 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         }
         case "goal.get": {
           const { id } = fields(params, ["id"]);
-          const goal = operatorGoal(store, identifier(id));
-          if (!goal) return failure("not-found");
-          const head = await readGoalBranchHead(stateDirectory, goal.id);
-          return { result: { ...goal, head } };
+          const result = await readOperatorGoal(
+            store,
+            stateDirectory,
+            identifier(id),
+          );
+          return result ? { result } : failure("not-found");
         }
         case "task.get": {
           const { id } = fields(params, ["id"]);
@@ -540,7 +555,8 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                 if (message.method === "inbox.subscribe")
                   subscribedSnapshot = inboxSnapshot(project(true));
                 else if (message.method === "activity.subscribe")
-                  subscribedActivityRevision = activityRevision();
+                  subscribedActivityRevision =
+                    operatorActivityRevision(options);
                 // Decision receipts carry fixed codes and IDs (screened before
                 // writing for answerMany; the caller's own ID for answer).
                 else if (
@@ -636,7 +652,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         )
       ) {
         try {
-          const revision = activityRevision();
+          const revision = operatorActivityRevision(options);
           for (const [socket, client] of clients) {
             if (
               client.activityRevision === undefined ||

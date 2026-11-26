@@ -49,6 +49,11 @@ function focusOtherRegion(event: KeyboardEvent, fromTerminal: boolean) {
 }
 
 term.attachCustomKeyEventHandler((event) => {
+  if (event.key === "Escape" && event.type === "keydown" && panel.closeNow()) {
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  }
   if (event.key !== "F6") return true;
   focusOtherRegion(event, true);
   return false;
@@ -156,6 +161,7 @@ term.onBinary((bytes) =>
 function openChannel() {
   return new WorkplaceChannel(({ method, params }) => {
     switch (method) {
+      case "activity.changed":
       case "inbox.changed":
         void panel.refresh();
         break;
@@ -176,7 +182,10 @@ function openChannel() {
   });
 }
 const channel = token ? openChannel() : undefined;
-const panel = createHostPanel(channel);
+const panel = createHostPanel(channel, () => {
+  if (conversation.hidden) toggleFullscreen();
+  term.focus();
+});
 
 function connectionState(
   state: "connecting" | "connected" | "disconnected",
@@ -211,8 +220,10 @@ if (channel) {
     socket.addEventListener("open", () => {
       if (!current()) return;
       socket.send(JSON.stringify({ token }));
-      void workplaceChannel
-        .request("inbox.subscribe", {})
+      void Promise.all([
+        workplaceChannel.request("inbox.subscribe", {}),
+        workplaceChannel.request("activity.subscribe", {}),
+      ])
         .then(() => {
           if (!current()) return;
           connectionState("connected", "接続中");
@@ -287,6 +298,11 @@ function toggleFullscreen() {
 fullscreen.addEventListener("click", toggleFullscreen);
 document.addEventListener("keydown", (event) => {
   if (event.defaultPrevented || event.isComposing) return;
+  if (event.key === "Escape" && panel.closeNow()) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   if (
     event.key === "Escape" &&
     !conversation.contains(document.activeElement) &&

@@ -1,5 +1,6 @@
 import {
   action,
+  disclosure,
   element,
   group,
   restoreFocus,
@@ -12,9 +13,11 @@ import {
   taskDelegation,
 } from "./delegation-panel.ts";
 import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
+import { failureReason } from "../../local-orchestrator/operator-attention.ts";
 import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
 import {
+  activityLabel,
   estimateLabel,
   gateLabels,
   settingLabel,
@@ -22,9 +25,12 @@ import {
   formatTimestamp,
   formatTokens,
   pendingDecisions,
+  planningDraft,
   groupProblems,
   retryCommand,
   withheld,
+  type Activity,
+  type ActivityRow,
   type AgentDecision,
   type AnswerableProposal,
   type GoalDetail,
@@ -195,12 +201,16 @@ function proposalList(
     : textElement("pre", value.join("\n") || "なし", classes);
 }
 
+function proposalHasWithheld(proposal: Proposal) {
+  return (
+    Object.values(proposal).some(withheld) ||
+    Object.values(proposal.modelText).some(withheld)
+  );
+}
+
 function proposalEvidence(proposal: Proposal) {
   const { origin, budgets, effectivePolicy, policySource, ruleId, ruleName } =
     proposal;
-  const hasWithheld =
-    Object.values(proposal).some(withheld) ||
-    Object.values(proposal.modelText).some(withheld);
   const policy =
     effectivePolicy && policySource
       ? `${effectivePolicy === "human" ? "人" : "AI"} · ${settingLabel({
@@ -315,9 +325,9 @@ function proposalEvidence(proposal: Proposal) {
     );
   }
   const content = group("div", "stack", facts(hostFacts), model);
-  if (hasWithheld)
+  if (proposalHasWithheld(proposal))
     content.append(textElement("p", withheldApproval, "warning"));
-  return { content, hasWithheld };
+  return content;
 }
 
 type Watch = (
@@ -325,26 +335,43 @@ type Watch = (
   ids: readonly string[],
   load?: () => void,
 ) => void;
-type GoalLink = (id?: string | null) => Node[];
+type GoalLink = (id?: string | null, ref?: string | null) => Node[];
 
 export function createInboxPanel(
   channel: Pick<WorkplaceChannel, "request">,
   refresh: () => void,
   watch: Watch,
   unwatch: (root: HTMLElement) => void,
+  onGoalApproved: (item: PanelInboxItem, ref: string) => void = () => {},
 ) {
   const inbox = element("inbox-items");
   const batch = element("answer-batch");
   const results = element("answer-results");
   const chosen = new Map<string, string>();
+  const cards = new Map<
+    string,
+    Map<
+      string,
+      {
+        signature: string;
+        node: HTMLElement;
+        updateButtons: () => void;
+        updateSelection?: () => void;
+      }
+    >
+  >();
   const expanded = new Set<string>();
-  let proposals: AnswerableProposal[] = [];
+  const stale = new Map<string, string>();
+  const previews = new Map<
+    string,
+    { digest: string; pending: Promise<Proposal> }
+  >();
+  let proposals: PanelInboxItem[] = [];
   let controls: (() => void)[] = [];
   let answering = false;
-  let cancelConfirmation: (() => void) | undefined;
-  let activeSubmit: HTMLButtonElement | undefined;
+  let cancelConfirmation: ((root?: HTMLElement) => void) | undefined;
   let previous = "";
-  const stale = new Set<string>();
+  let revision = 0;
 
   const selection = textElement("span", "", "q");
   const clear = action(
@@ -363,9 +390,11 @@ export function createInboxPanel(
     "approve-batch",
     () => {
       const pinned = proposals.filter(
-        ({ id, digest }) => chosen.get(id) === digest,
+        (item) =>
+          "answer" in item && chosen.get(item.answer.id) === item.answer.digest,
       );
-      if (pinned.length >= 2) confirm(batch, pinned, "approve", batchButton);
+      if (pinned.length >= 2)
+        confirm(batch, pinned, "approve", batchButton, batchActions);
     },
     "btn primary",
   );
@@ -380,190 +409,249 @@ export function createInboxPanel(
     batchButton.textContent = `${chosen.size} 件をまとめて承認`;
   }
 
+  function preview(id: string, digest: string) {
+    const existing = previews.get(id);
+    if (existing?.digest === digest) return existing.pending;
+    const pending = channel
+      .request("proposal.get", { id })
+      .catch((error: unknown) => {
+        if (previews.get(id)?.pending === pending) previews.delete(id);
+        throw error;
+      });
+    previews.set(id, { digest, pending });
+    return pending;
+  }
+
+  function staleAnswer(answer: AnswerableProposal, item: PanelInboxItem) {
+    if (stale.get(answer.id) === answer.digest) return;
+    stale.set(answer.id, answer.digest);
+    expanded.add(item.id);
+    previews.delete(answer.id);
+    revision++;
+    refresh();
+  }
+
+  async function validate(answer: AnswerableProposal) {
+    const proposal = await preview(answer.id, answer.digest);
+    if (proposal.digest !== answer.digest) throw new Error("stale-digest");
+    if (proposal.status !== "pending") throw new Error("invalid-transition");
+    if (proposalHasWithheld(proposal)) throw new Error("withheld");
+    return proposal;
+  }
+
+  async function send(
+    rows: PanelInboxItem[],
+    decision: PanelAnswer["decision"],
+    status: HTMLElement,
+    done: () => void,
+  ) {
+    if (answering) return;
+    answering = true;
+    updateControls();
+    const pinned = rows.flatMap((item) =>
+      "answer" in item ? [{ item, answer: item.answer }] : [],
+    );
+    const answers = pinned.map(({ answer: { id, digest } }) => ({
+      id,
+      digest,
+      decision,
+    }));
+    function report(code: string) {
+      const message = textElement("p", answerError(code), "status-error");
+      status.append(message);
+      if (status !== results)
+        results.append(textElement("p", answerError(code), "status-error"));
+    }
+    results.replaceChildren();
+    status.replaceChildren();
+    try {
+      const outcomes =
+        answers.length === 1 && answers[0]
+          ? [await channel.request("proposal.answer", answers[0])]
+          : await channel.request("proposal.answerMany", { answers });
+      for (const outcome of outcomes) {
+        const match = pinned.find(({ answer }) => answer.id === outcome.id);
+        if (!match) continue;
+        const { item, answer } = match;
+        if ("error" in outcome) {
+          if (outcome.error.code === "stale-digest") staleAnswer(answer, item);
+          report(outcome.error.code);
+          continue;
+        }
+        previews.delete(answer.id);
+        if (decision === "approve" && answer.kind === "goal") {
+          try {
+            const approved = await channel.request("proposal.get", {
+              id: answer.id,
+            });
+            if (
+              approved.kind !== "goal" ||
+              approved.status !== "approved" ||
+              !approved.goalRef
+            )
+              throw new Error("invalid-response");
+            onGoalApproved(item, approved.goalRef);
+          } catch {
+            results.append(
+              textElement(
+                "p",
+                "承認を記録しました。Goal の参照を取得できませんでした。",
+                "notice",
+              ),
+            );
+          }
+        } else {
+          results.append(
+            textElement(
+              "p",
+              `${item.subject.ref ? `${item.subject.ref} · ` : ""}${decision === "approve" ? "承認" : "却下"}を記録しました。`,
+              "notice",
+            ),
+          );
+        }
+      }
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "write-failed";
+      if (code === "stale-digest")
+        for (const { answer, item } of pinned) staleAnswer(answer, item);
+      report(code);
+    } finally {
+      for (const { id } of answers) chosen.delete(id);
+      answering = false;
+      done();
+      updateControls();
+      refresh();
+    }
+  }
+
   function confirm(
     container: HTMLElement,
-    pinned: AnswerableProposal[],
+    pinned: PanelInboxItem[],
     decision: PanelAnswer["decision"],
     trigger: HTMLElement,
+    actions: HTMLElement,
+    status = results,
   ) {
     if (answering) return;
     cancelConfirmation?.();
+    const answers = pinned.flatMap((item) =>
+      "answer" in item ? [item.answer] : [],
+    );
+    const first = answers[0];
+    const integration = first?.kind === "integration";
     const reject = decision === "reject";
-    const integration =
-      pinned.length === 1 && pinned[0]?.kind === "integration";
-    const label = reject ? "却下" : integration ? "承認して統合" : "承認";
-    const question = reject
-      ? "この提案を却下しますか。"
+    const title = first?.title ?? pinned[0]?.modelText ?? "提案";
+    const message = reject
+      ? `「${title}」を却下します。`
       : pinned.length > 1
-        ? `${pinned.length} 件をまとめて承認しますか。${pinned.some(({ kind }) => kind === "integration") ? "統合を含む提案は承認すると Goal のブランチに統合されます。" : ""}`
-        : integration
-          ? "この変更を Goal のブランチに統合しますか。"
-          : "この提案を承認しますか。";
-    const review = group("div", "q", textElement("p", question));
-    if (pinned.length > 1) review.tabIndex = 0;
+        ? `${pinned.length} 件を承認します。`
+        : `「${title}」を${integration ? "統合" : "承認"}します。`;
+    const msg = textElement("bdi", message, "q");
     const cancel = action("戻す", "cancel-answer", () => {
       close();
       trigger.focus();
     });
     const submit = action(
-      pinned.length > 1 ? "確定" : `${label}を確定`,
+      reject
+        ? "却下を確定"
+        : integration && pinned.length === 1
+          ? "承認して統合を確定"
+          : "承認を確定",
       "submit-answer",
-      () => void send(),
+      () => {
+        if (submit.disabled || cancelConfirmation !== close || answering)
+          return;
+        submit.disabled = cancel.disabled = true;
+        void send(pinned, decision, status, () => {
+          if (cancelConfirmation === close) {
+            close();
+            trigger.focus({ preventScroll: true });
+          }
+        });
+      },
       reject ? "btn danger" : "btn primary",
     );
     const strip = group(
       "div",
       reject ? "confirm reject" : "confirm",
-      review,
+      msg,
       cancel,
       submit,
     );
     strip.setAttribute("role", "group");
     strip.setAttribute("aria-label", "回答の確認");
-    const actions =
-      container === batch
-        ? batchActions
-        : container.querySelector<HTMLElement>(".decision-actions");
-    if (actions) actions.hidden = true;
+    actions.hidden = true;
     container.append(strip);
-    activeSubmit = submit;
     cancelConfirmation = close;
-    const previews: Promise<boolean>[] = [];
-    for (const proposal of pinned) {
-      const { id, kind, title, agentGates } = proposal;
-      const evidence = textElement(
-        "p",
-        `${answerLabels[kind]} · ${id.slice(0, 8)}`,
-        "muted",
-      );
-      if (title !== null && pinned.length > 1)
-        evidence.prepend(modelTitle("span", title, "model-content"), " · ");
-      review.append(evidence);
-      if (!reject && agentGates.length)
-        review.append(
-          textElement(
-            "p",
-            `この提案には AI へ判断を委任する設定が含まれます（${agentGates.map((gate) => gateLabels[gate]).join("、")}）。`,
-            "warning",
-          ),
-        );
-      if (!reject) {
-        const detail = textElement("div", "提案の詳細を読み込み中…");
-        detail.setAttribute("role", "status");
-        review.append(detail);
-        previews.push(loadEvidence(proposal, detail));
-      }
-    }
-    if (previews.length) {
-      submit.disabled = true;
-      void Promise.all(previews).then((ready) => {
-        if (activeSubmit === submit) submit.disabled = !ready.every(Boolean);
-      });
-    }
     cancel.focus();
 
-    function close() {
+    function close(root?: HTMLElement) {
+      if (root && !root.contains(strip)) return;
       strip.remove();
-      if (actions) actions.hidden = false;
-      activeSubmit = undefined;
-      cancelConfirmation = undefined;
+      actions.hidden = false;
+      if (cancelConfirmation === close) cancelConfirmation = undefined;
     }
 
-    async function loadEvidence(
-      answer: AnswerableProposal,
-      detail: HTMLElement,
-    ) {
-      try {
-        const proposal = await channel.request("proposal.get", {
-          id: answer.id,
-        });
-        if (activeSubmit !== submit) return false;
-        if (proposal.digest !== answer.digest) {
-          stale.add(answer.id);
-          detail.textContent = answerError("stale-digest");
-          previous = "";
-          refresh();
-          return false;
-        }
-        if (proposal.status !== "pending") {
-          detail.textContent = answerError("invalid-transition");
-          refresh();
-          return false;
-        }
-        const { content, hasWithheld } = proposalEvidence(proposal);
-        detail.replaceChildren(content);
-        return !hasWithheld;
-      } catch {
-        detail.textContent = "提案の詳細を取得できませんでした。";
-        return false;
-      }
-    }
-
-    async function send() {
-      if (answering || activeSubmit !== submit || submit.disabled) return;
-      answering = true;
-      submit.disabled = cancel.disabled = true;
-      updateControls();
-      results.replaceChildren();
-      const answers = pinned.map(({ id, digest }) => ({
-        id,
-        digest,
-        decision,
-      }));
-      try {
-        const outcomes =
-          answers.length === 1 && answers[0]
-            ? [await channel.request("proposal.answer", answers[0])]
-            : await channel.request("proposal.answerMany", { answers });
-        for (const outcome of outcomes)
-          if ("error" in outcome && outcome.error.code === "stale-digest")
-            stale.add(outcome.id);
-        results.replaceChildren(
-          ...outcomes.map((outcome) =>
-            textElement(
-              "p",
-              `${outcome.id.slice(0, 8)} · ${
-                "ok" in outcome
-                  ? `${label}を記録しました。`
-                  : answerError(outcome.error.code)
-              }`,
-              "ok" in outcome ? "notice" : "status-error",
-            ),
-          ),
+    if (!reject) {
+      submit.disabled = true;
+      void Promise.all(
+        pinned.map(async (item) => {
+          if (!("answer" in item)) return "提案を取得できませんでした。";
+          const { answer } = item;
+          try {
+            await validate(answer);
+            return "";
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "read-failed";
+            if (code === "stale-digest") staleAnswer(answer, item);
+            if (code === "invalid-transition") refresh();
+            return code === "withheld"
+              ? withheldApproval
+              : code === "stale-digest" || code === "invalid-transition"
+                ? answerError(code)
+                : "提案の詳細を取得できませんでした。";
+          }
+        }),
+      ).then((messages) => {
+        if (cancelConfirmation !== close) return;
+        const errors = [...new Set(messages.filter(Boolean))];
+        status.replaceChildren(
+          ...errors.map((error) => textElement("p", error, "warning")),
         );
-      } catch (error) {
-        if (error instanceof Error && error.message === "stale-digest")
-          for (const { id } of answers) stale.add(id);
-        results.replaceChildren(
-          textElement(
-            "p",
-            answerError(
-              error instanceof Error ? error.message : "write-failed",
-            ),
-            "status-error",
-          ),
-        );
-      } finally {
-        if (answers.some(({ id }) => stale.has(id))) previous = "";
-        for (const { id } of answers) chosen.delete(id);
-        answering = false;
-        if (activeSubmit === submit) {
-          close();
-          (pinned.length === 1 ? trigger : element("tab-decisions")).focus({
-            preventScroll: true,
-          });
-        }
-        updateControls();
-        refresh();
-      }
+        submit.disabled = errors.length > 0;
+      });
     }
   }
 
-  function card(item: PanelInboxItem, goalLink: GoalLink) {
+  function card(
+    item: PanelInboxItem,
+    goalLink: GoalLink,
+    options: {
+      batch?: boolean;
+      goalRef?: string;
+      flat?: boolean;
+      surface?: "decisions" | "popover" | "list" | "goal";
+      goalTitle?: string;
+    } = {},
+  ) {
     const answer = "answer" in item ? item.answer : undefined;
     const name = answer?.title ?? item.modelText;
     const id = item.subject.proposalId;
     const needsReview = id !== undefined && stale.has(id);
+    const signature = JSON.stringify([
+      decisionSnapshot([item]),
+      options,
+      id && stale.get(id),
+    ]);
+    const cached = options.surface && cards.get(item.id)?.get(options.surface);
+    if (cached && signature === cached.signature) {
+      if (options.batch) {
+        controls.push(cached.updateButtons);
+        if (cached.updateSelection) controls.push(cached.updateSelection);
+      }
+      watch(cached.node, item.state === "open" ? [item.id] : []);
+      return cached.node;
+    }
     const reason = textElement(
       "span",
       needsReview ? answerError("stale-digest") : "確認が必要です。",
@@ -573,33 +661,39 @@ export function createInboxPanel(
       "div",
       "card-top",
       chip(kind, item.kind === "integration" || !answer ? "warn" : "accent"),
+      ...refNodes(item.subject.ref, options.goalRef),
       reason,
     );
-    const row = textElement("li", "", "card");
-    const detail = textElement("div", "", "stack");
-    detail.hidden = !needsReview && !expanded.has(item.id);
-    if (needsReview) expanded.add(item.id);
-    const fields = facts([
-      ...Object.entries(item.subject),
-      ["時刻", time(item.at)],
-    ]);
+    const row = textElement(
+      options.batch ? "li" : "article",
+      "",
+      options.flat ? "card flat" : "card",
+    );
+    const detail = textElement("div", "", "stack decision-detail");
+    detail.hidden = !expanded.has(item.id);
+    const info = textElement("div", "", "stack");
+    const status = textElement("div", "", "decision-event");
+    status.setAttribute("role", "status");
+    detail.append(info);
     const command = commandControls(
       item.next,
       "CLI コマンドをコピー",
       `copy:${item.id}`,
       true,
     );
-    const info = textElement("div", "", "stack");
-    detail.append(
-      fields,
-      info,
+    const fallback = group(
+      "div",
+      "stack",
       command.text,
       group("div", "actions", command.copy, command.status),
     );
+    fallback.hidden = Boolean(answer?.approve);
+    detail.append(fallback);
     const toggle = action(
       "",
       `detail:${item.id}`,
       () => {
+        cancelConfirmation?.();
         detail.hidden = !detail.hidden;
         if (detail.hidden) expanded.delete(item.id);
         else {
@@ -607,22 +701,46 @@ export function createInboxPanel(
           void load();
         }
         updateDisclosure();
+        toggle.focus({ preventScroll: true });
       },
       "link",
     );
-    function updateDisclosure() {
-      toggle.textContent = detail.hidden ? "詳細" : "詳細を閉じる";
-      toggle.setAttribute("aria-expanded", String(!detail.hidden));
-    }
-    updateDisclosure();
+    const hint = textElement("span", "読んだ内容で確定します", "muted");
     const actions = group(
       "div",
       "actions decision-actions",
       toggle,
       textElement("span", "", "spacer"),
+      hint,
     );
-    const answerArea = group("div", "", actions);
-    if (answer?.approve) {
+    const answerArea = group("div", "stack", actions, status);
+    let viewed: Proposal | undefined;
+    let approve: HTMLButtonElement | undefined;
+    let reject: HTMLButtonElement | undefined;
+    let sending = false;
+    function updateButtons() {
+      if (reject) reject.disabled = answering;
+      if (approve)
+        approve.disabled =
+          answering ||
+          (!detail.hidden &&
+            (!viewed ||
+              viewed.status !== "pending" ||
+              viewed.digest !== answer?.digest ||
+              proposalHasWithheld(viewed)));
+    }
+    function updateDisclosure() {
+      const parent = detail.hidden ? answerArea : detail;
+      if (actions.parentElement !== parent) parent.prepend(actions);
+      if (!detail.hidden && detail.lastElementChild !== actions)
+        detail.append(actions);
+      hint.hidden = detail.hidden || !answer?.approve;
+      toggle.textContent = detail.hidden ? "詳細" : "詳細を閉じる";
+      toggle.setAttribute("aria-expanded", String(!detail.hidden));
+      updateButtons();
+    }
+    let updateSelection: (() => void) | undefined;
+    if (options.batch && answer?.approve) {
       const checkbox = textElement("input", "", "check");
       checkbox.type = "checkbox";
       checkbox.dataset.focusKey = `choose:${item.id}`;
@@ -636,118 +754,193 @@ export function createInboxPanel(
         else chosen.delete(answer.id);
         updateControls();
       });
-      controls.push(() => {
+      updateSelection = () => {
         checkbox.checked = chosen.get(answer.id) === answer.digest;
         checkbox.disabled =
           answering || (!checkbox.checked && chosen.size >= 20);
-      });
+      };
+      controls.push(updateSelection);
       top.prepend(checkbox);
     }
-    if (answer) {
-      if (answer.reject) answerButton("却下", "reject", "btn secondary");
-      if (answer.approve)
-        answerButton(
-          answer.kind === "integration" ? "承認して統合" : "承認",
-          "approve",
-          "btn primary",
-        );
-    }
-    function answerButton(
-      label: string,
-      decision: PanelAnswer["decision"],
-      classes: string,
-    ) {
-      if (!answer) return;
-      const button = action(
-        label,
-        `${decision}:${item.id}`,
-        () => confirm(answerArea, [answer], decision, button),
-        classes,
+    if (answer?.reject) {
+      const button = action("却下", `reject:${item.id}`, () =>
+        confirm(answerArea, [item], "reject", button, actions, status),
       );
+      reject = button;
       actions.append(button);
-      controls.push(() => {
-        button.disabled = answering;
-      });
     }
+    if (answer?.approve) {
+      const button = action(
+        answer.kind === "integration" ? "承認して統合" : "承認",
+        `approve:${item.id}`,
+        () => {
+          if (button.disabled || answering || sending) return;
+          if (detail.hidden)
+            confirm(answerArea, [item], "approve", button, actions, status);
+          else {
+            cancelConfirmation?.();
+            sending = true;
+            button.disabled = true;
+            void send([item], "approve", status, () => {
+              sending = false;
+              updateButtons();
+            });
+          }
+        },
+        "btn primary",
+      );
+      approve = button;
+      actions.append(button);
+    }
+    if (options.batch) controls.push(updateButtons);
+    updateDisclosure();
+
     row.append(
       top,
       name ? modelTitle("h3", name) : textElement("h3", item.title, "title"),
-      ...goalLink(item.subject.goalId),
+      ...(options.goalRef
+        ? []
+        : goalLink(item.subject.goalId, item.subject.goalRef)),
+      ...(answer?.agentGates.length
+        ? [
+            textElement(
+              "p",
+              `この提案には AI へ判断を委任する設定が含まれます（${answer.agentGates.map((gate) => gateLabels[gate]).join("、")}）。`,
+              "warning",
+            ),
+          ]
+        : []),
       detail,
       answerArea,
     );
-    let requested = false;
     async function load() {
-      if (!id || requested) return;
-      requested = true;
+      if (!id || viewed) return;
       info.textContent = "提案の詳細を読み込み中…";
       try {
-        const proposal = await channel.request("proposal.get", { id });
+        const proposal = await preview(id, answer?.digest ?? "");
         if (answer && proposal.digest !== answer.digest) {
           reason.textContent = answerError("stale-digest");
-          if (!stale.has(id)) {
-            stale.add(id);
-            previous = "";
-            refresh();
-          }
+          info.replaceChildren();
+          staleAnswer(answer, item);
+          return;
         }
-        info.replaceChildren(proposalEvidence(proposal).content);
+        viewed = proposal;
+        info.replaceChildren(proposalEvidence(proposal));
+        if (proposalHasWithheld(proposal)) fallback.hidden = false;
+        updateButtons();
       } catch {
-        requested = false;
         info.textContent = "提案の詳細を取得できませんでした。";
       }
     }
-    if (!detail.hidden) void load();
+    if (!detail.hidden) {
+      expanded.add(item.id);
+      void load();
+    }
     watch(row, item.state === "open" ? [item.id] : []);
+    if (options.surface) {
+      const surfaces = cards.get(item.id) ?? new Map();
+      surfaces.set(options.surface, {
+        signature,
+        node: row,
+        updateButtons,
+        ...(updateSelection && { updateSelection }),
+      });
+      cards.set(item.id, surfaces);
+    }
     return row;
   }
 
   return {
+    card,
+    cancelConfirmation(root: HTMLElement) {
+      cancelConfirmation?.(root);
+    },
+    get revision() {
+      return revision;
+    },
     invalidate() {
       previous = "";
+      revision++;
+      previews.clear();
+      cards.clear();
     },
     render(
       rows: PanelInboxItem[],
       goalLink: GoalLink,
       goalTitle: (id?: string) => string | undefined,
+      extra: {
+        anchors: string[];
+        render: (id: string) => HTMLElement | undefined;
+      } = { anchors: [], render: () => undefined },
+      tracking: unknown = null,
     ) {
-      const snapshot = JSON.stringify(
-        rows.map(({ state: _state, ...row }) => [
-          row,
-          goalTitle(row.subject.goalId),
-        ]),
-      );
+      const snapshot = JSON.stringify([
+        revision,
+        tracking,
+        decisionSnapshot(rows),
+        rows.map((row) => goalTitle(row.subject.goalId)),
+      ]);
       if (snapshot === previous) return;
       previous = snapshot;
-      proposals = rows.flatMap((item) =>
-        "answer" in item ? [item.answer] : [],
-      );
+      const inboxChanged =
+        JSON.stringify(decisionSnapshot(proposals)) !==
+        JSON.stringify(decisionSnapshot(rows));
+      proposals = rows;
+      if (inboxChanged) cancelConfirmation?.(batch);
       const approvable = new Map(
-        proposals
-          .filter(({ approve }) => approve)
-          .map(({ id, digest }) => [id, digest]),
+        proposals.flatMap((item) =>
+          "answer" in item && item.answer.approve
+            ? [[item.answer.id, item.answer.digest]]
+            : [],
+        ),
       );
+      const ids = new Set(rows.map((row) => row.subject.proposalId));
       for (const [id, digest] of chosen)
         if (approvable.get(id) !== digest) chosen.delete(id);
-      for (const id of stale)
-        if (!rows.some((row) => row.subject.proposalId === id))
-          stale.delete(id);
-      for (const id of expanded)
-        if (!rows.some((row) => row.id === id)) expanded.delete(id);
+      for (const map of [stale, previews])
+        for (const id of map.keys()) if (!ids.has(id)) map.delete(id);
+      const rowIds = new Set(rows.map(({ id }) => id));
+      for (const id of expanded) if (!rowIds.has(id)) expanded.delete(id);
+      for (const id of cards.keys()) if (!rowIds.has(id)) cards.delete(id);
       controls = [];
       restoreFocus(
         inbox,
         () => {
-          cancelConfirmation?.();
           unwatch(inbox);
-          inbox.replaceChildren(...rows.map((item) => card(item, goalLink)));
+          inbox.replaceChildren(
+            ...withTracking(rows, extra, (item) =>
+              card(item, goalLink, {
+                batch: true,
+                surface: "decisions",
+                goalTitle: goalTitle(item.subject.goalId) ?? "",
+              }),
+            ),
+          );
         },
         element("tab-decisions"),
       );
-      element("empty-inbox").hidden = rows.length !== 0;
+      element("empty-inbox").hidden =
+        rows.length !== 0 || extra.anchors.length !== 0;
       updateControls();
     },
   };
+}
+
+function decisionSnapshot(items: readonly PanelInboxItem[]) {
+  return items.map(({ state: _state, ...item }) => item);
+}
+
+function withTracking(
+  rows: PanelInboxItem[],
+  extra: { anchors: string[]; render: (id: string) => HTMLElement | undefined },
+  card: (item: PanelInboxItem) => HTMLElement,
+) {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return [...new Set([...extra.anchors, ...byId.keys()])].flatMap((id) => {
+    const tracking = extra.render(id);
+    const row = byId.get(id);
+    return tracking ? [tracking] : row ? [card(row)] : [];
+  });
 }
 
 function historyCards(
@@ -769,10 +962,7 @@ function historyCards(
             const subject = taskId || goalId;
             const caption = title
               ? modelTitle("span", title, "model-content")
-              : textElement(
-                  "span",
-                  `${taskId ? "Task" : goalId ? "Goal" : "提案"} ${(subject ?? entry.proposalId).slice(0, 8)}`,
-                );
+              : textElement("span", taskId ? "Task" : goalId ? "Goal" : "提案");
             const link = action(
               "",
               `history:${entry.id}`,
@@ -788,6 +978,7 @@ function historyCards(
               "span",
               "grow",
               document.createTextNode(`${gateLabels[entry.gate]} · `),
+              ...refNodes(entry.taskRef ?? entry.goalRef),
               subject ? link : caption,
               document.createTextNode(" · "),
               action(
@@ -821,67 +1012,171 @@ function historyCards(
   ];
 }
 
-function goalOverview(
-  goal: GoalSummary,
-  pending: number,
-  openDecisions?: () => void,
-) {
+function refNodes(ref?: string | null, goalRef?: string) {
+  if (!ref) return [];
+  const display =
+    goalRef && ref.startsWith(`${goalRef}-`)
+      ? `#${ref.slice(goalRef.length + 1)}`
+      : ref;
+  return [textElement("span", display, "ref")];
+}
+
+const turnGroups = [
+  { label: "あなたの番", owners: ["human"] },
+  { label: "止まっている・誰も動いていない", owners: ["stopped", "idle"] },
+  { label: "AI の番", owners: ["ai"] },
+  { label: "終わった", owners: ["done"] },
+];
+
+function turnReason(reason: GoalSummary["turn"]["reason"]) {
+  switch (reason.kind) {
+    case "approvals":
+      return `判断 ${reason.count} 件`;
+    case "cancelled":
+      return "Goal を取り消しました";
+    case "failed":
+      return `が${failureReason(reason.code)}で失敗`;
+    case "planning":
+      return "Planner が Task を分けています";
+    case "running":
+      return `${reason.taskRef ? "を" : ""}作業中（${reason.actor}）`;
+    case "queued":
+      return "順番待ち";
+    case "not-planned":
+      return "計画がまだ依頼されていません";
+    case "exportable":
+      return "統合済み。書き出せます";
+    case "completed":
+      return "Goal が完了しました";
+    case "idle":
+      return "動いている作業はありません";
+  }
+}
+
+function goalTurn(goal: GoalSummary, local = false) {
+  const { owner, reason } = goal.turn;
+  const [label, tone] = (
+    {
+      human: ["あなたの番", "warn"],
+      stopped: ["止まっています", "danger"],
+      ai: ["AI の番", "accent"],
+      idle: ["待機中", "info"],
+      done: ["完了", "ok"],
+    } as const
+  )[owner];
+  const task =
+    "taskRef" in reason
+      ? refNodes(reason.taskRef, local ? goal.ref : undefined)
+      : [];
+  return group(
+    "div",
+    "turn-line",
+    chip(label, tone),
+    group(
+      "span",
+      "meta",
+      ...task,
+      document.createTextNode(`${task.length ? " " : ""}${turnReason(reason)}`),
+    ),
+  );
+}
+
+function goalProgress(goal: GoalSummary) {
   const { done, total } = goal.progress;
-  const summary = `${done} / ${total} Task 完了`;
   const estimate = estimateLabel(goal.estimate.remainingMs);
-  return [
-    group(
-      openDecisions ? "div" : "span",
-      "rowline",
-      modelTitle(openDecisions ? "h2" : "span", goal.title, "title grow"),
-      displayState(goal.status),
-    ),
-    progress(done, total, summary),
-    group(
-      openDecisions ? "div" : "span",
-      "rowline meta",
-      textElement(
-        "span",
-        estimate ? `${summary} · ${estimate}` : summary,
-        "grow",
-      ),
-      ...(pending
-        ? [
-            openDecisions
-              ? action(
-                  `判断待ち ${pending} 件を見る ›`,
-                  "goal-decisions",
-                  openDecisions,
-                  "link",
-                )
-              : chip(`判断待ち ${pending}`, "warn"),
-          ]
-        : []),
-    ),
-  ];
+  return `${done} / ${total} Task 完了${estimate ? ` · ${estimate}` : ""}`;
 }
 
-function goalRow(goal: GoalSummary, pending: number, open: () => void) {
-  const button = action("", goal.id, open, "card goalrow");
-  button.append(...goalOverview(goal, pending));
-  return button;
+function goalRow(
+  goal: GoalSummary,
+  open: () => void,
+  decisions: () => Node[],
+  hasDecisions: boolean,
+  opened: Set<string>,
+) {
+  const link = action("", goal.id, open, "link goal-title");
+  link.append(modelTitle("span", goal.title), " ›");
+  const header = group(
+    "div",
+    "goal-head",
+    ...refNodes(goal.ref),
+    link,
+    textElement("span", goalProgress(goal), "meta"),
+  );
+  const turn = goalTurn(goal);
+  const row = group("article", "card goal-row", header, turn);
+  if (hasDecisions) {
+    const cards = group("div", "stack");
+    const toggle = action(
+      "",
+      `inline:${goal.id}`,
+      () => {
+        if (opened.has(goal.id)) opened.delete(goal.id);
+        else opened.add(goal.id);
+        render();
+      },
+      "link",
+    );
+    function render() {
+      const expanded = opened.has(goal.id);
+      if (expanded && !cards.childElementCount) cards.append(...decisions());
+      cards.hidden = !expanded;
+      toggle.textContent = expanded ? "閉じる" : "ここで答える";
+      toggle.setAttribute("aria-expanded", String(expanded));
+    }
+    render();
+    turn.append(toggle);
+    row.append(cards);
+  }
+  return row;
 }
 
-function taskRow(task: TaskSummary, open: () => void) {
+function taskRow(task: TaskSummary, goalRef: string, open: () => void) {
   const row = action("", task.id, open, "taskrow");
   const estimate = estimateLabel(task.estimate.remainingMs);
-  row.append(modelTitle("span", task.title, "t"), displayState(task.stage));
+  row.append(
+    ...refNodes(task.ref, goalRef),
+    modelTitle("span", task.title, "t"),
+    displayState(task.stage),
+  );
   if (estimate) row.append(textElement("span", estimate, "eta"));
   return row;
 }
 
+function runningLine(run: ActivityRow, open: () => void, local?: string) {
+  const elapsed = textElement("span", "", "meta elapsed");
+  elapsed.dataset.startedAt = run.startedAt ?? "";
+  elapsed.textContent = elapsedLabel(run.startedAt);
+  const row = group(
+    "div",
+    "running-line",
+    textElement("span", "", "now-dot"),
+    ...refNodes(run.taskRef ?? run.goalRef, local),
+    modelTitle("span", run.taskTitle ?? run.goalTitle ?? run.actor, "grow"),
+    textElement("span", run.actor, "meta"),
+    elapsed,
+  );
+  if (!run.taskId && !run.goalId) return row;
+  const link = action("", `run:${run.id}`, open, "link running-link");
+  link.append(row);
+  return link;
+}
+
+function elapsedLabel(startedAt: string | null) {
+  const started = startedAt ? Date.parse(startedAt) : Number.NaN;
+  return Number.isFinite(started)
+    ? formatDuration(Math.max(0, Date.now() - started))
+    : "—";
+}
+
 function goalDetail(
   goal: GoalDetail,
-  pending: number,
+  now: Node[],
+  decisions: Node[],
+  problem: Node[],
   delegation: Node,
   activity: PanelInboxItem[],
   selectTask: (id: string) => void,
-  openDecisions: () => void,
   watch: Watch,
 ) {
   const scope = goal.scope;
@@ -914,6 +1209,7 @@ function goalDetail(
       "div",
       "activity",
       time(item.at),
+      ...refNodes(item.subject.taskRef ?? item.subject.goalRef, goal.ref),
       group(
         "span",
         "grow",
@@ -930,15 +1226,29 @@ function goalDetail(
     return row;
   });
   return [
-    group("header", "card", ...goalOverview(goal, pending, openDecisions)),
+    group(
+      "header",
+      "goal-head",
+      ...refNodes(goal.ref),
+      modelTitle("h2", goal.title),
+      textElement("span", goalProgress(goal), "meta"),
+    ),
+    ...now,
+    ...decisions,
+    ...problem,
+    ...(goal.turn.reason.kind === "exportable"
+      ? [exportCommand(goal.ref)]
+      : []),
     sectionTitle("Task"),
     goal.tasks.length
       ? group(
           "div",
           "card tasklist",
-          ...goal.tasks.map((task) => taskRow(task, () => selectTask(task.id))),
+          ...goal.tasks.map((task) =>
+            taskRow(task, goal.ref, () => selectTask(task.id)),
+          ),
         )
-      : empty("Task はありません。"),
+      : empty("まだ Task はありません。"),
     ...(goal.progress.total > goal.tasks.length
       ? [
           textElement(
@@ -955,6 +1265,16 @@ function goalDetail(
       : empty("最近の動きはありません。"),
     details,
   ];
+}
+
+function exportCommand(ref: string) {
+  const { text, copy, status } = commandControls(
+    `agent-bootstrap export-goal-branch ${ref}`,
+    "コピー",
+    "export-goal",
+    true,
+  );
+  return group("div", "card", text, group("div", "actions", copy, status));
 }
 
 function tokenBudget(task: TaskDetail) {
@@ -1079,6 +1399,7 @@ function taskDetail(
       group(
         "div",
         "rowline",
+        ...refNodes(task.ref),
         modelTitle("h2", task.title, "title large grow"),
         displayState(task.stage),
       ),
@@ -1126,21 +1447,285 @@ function taskDetail(
   ];
 }
 
+type OperatorRequest = Pick<WorkplaceChannel, "request">;
+
+function draftButton(
+  channel: OperatorRequest,
+  label: string,
+  key: string,
+  text: string,
+  status: HTMLElement,
+  onDraft: () => void,
+  success: string,
+) {
+  const button = action(label, key, () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    status.textContent = "";
+    void channel
+      .request("concierge.draft", { text })
+      .then(() => {
+        status.textContent = success;
+        if (key.startsWith("plan:")) button.remove();
+        onDraft();
+      })
+      .catch(() => {
+        status.textContent = "Concierge に下書きを入れられませんでした。";
+        button.disabled = false;
+      });
+  });
+  return button;
+}
+
+function consultation(
+  channel: OperatorRequest,
+  problem: Problem,
+  status: HTMLElement,
+  focus: () => void,
+) {
+  const ref = problem.ref ?? "";
+  const reason =
+    "code" in problem
+      ? failureReason(problem.code)
+      : problem.kind === "execution-over-budget"
+        ? "予算超過"
+        : "対象範囲外の変更";
+  return draftButton(
+    channel,
+    "Concierge に相談",
+    `consult:${problem.taskId ?? problem.goalId}`,
+    `${ref}「${problem.title}」が${reason}で失敗しました。原因を調べて、次にどうするか提案してください。`,
+    status,
+    focus,
+    "左の Concierge に下書きを入れました。送るまで何も起きません。",
+  );
+}
+
+export function problemActions(
+  channel: OperatorRequest,
+  problem: Problem,
+  goalTitle: string | undefined,
+  goalLink: GoalLink,
+  focusConcierge: () => void,
+  accepted: (receipt: "retried" | "cancelled") => void,
+) {
+  const { goalId, goalRef, taskId, expectedRetries } = problem;
+  const key = taskId ?? goalId ?? "problem";
+  const area = group("div", "stack");
+  const status = textElement("p", "", "meta decision-event");
+  status.setAttribute("role", "status");
+  const buttons = group(
+    "div",
+    "actions",
+    textElement("span", "", "spacer"),
+    consultation(channel, problem, status, focusConcierge),
+  );
+  area.append(buttons, status);
+
+  function confirm(
+    message: string,
+    label: string,
+    trigger: HTMLElement,
+    danger: boolean,
+    send: () => Promise<unknown>,
+    receipt: "retried" | "cancelled",
+  ) {
+    status.textContent = "";
+    buttons.hidden = true;
+    const msg = textElement("bdi", message, "q");
+    if (danger)
+      msg.append(textElement("span", "取り消すと戻せません。", "danger-text"));
+    const cancel = action("戻す", `back:${key}`, () => reset());
+    const submit = action(
+      label,
+      `confirm:${key}`,
+      () => {
+        if (submit.disabled) return;
+        submit.disabled = cancel.disabled = true;
+        void send()
+          .then(() => {
+            area.replaceChildren(problemReceipt(problem, receipt, goalLink));
+            accepted(receipt);
+          })
+          .catch((error: unknown) => {
+            reset();
+            const code = error instanceof Error ? error.message : "";
+            status.textContent =
+              code === "stale-base"
+                ? "Goal が変わりました。もう一度確認してください。"
+                : code === "goal-head-unavailable"
+                  ? "Goal のブランチを確認できないため、取り消せません。"
+                  : code === "goal-busy"
+                    ? "Goal は作業中のため、取り消せません。"
+                    : code === "task-retry-changed"
+                      ? "Task が変わりました。もう一度確認してください。"
+                      : "操作を確定できませんでした。";
+          });
+      },
+      danger ? "btn danger" : "btn primary",
+    );
+    const strip = group(
+      "div",
+      danger ? "confirm reject" : "confirm",
+      msg,
+      cancel,
+      submit,
+    );
+    strip.setAttribute("role", "group");
+    strip.setAttribute("aria-label", "操作の確認");
+    area.append(strip);
+    cancel.focus();
+
+    function reset() {
+      strip.remove();
+      buttons.hidden = false;
+      trigger.focus();
+    }
+  }
+
+  if (goalId && goalRef) {
+    const discard = action(
+      "Goal を取り消す",
+      `discard:${key}`,
+      () => {
+        if (buttons.hidden || discard.disabled) return;
+        discard.disabled = true;
+        buttons.hidden = true;
+        status.textContent = "Goal を確認しています…";
+        void channel
+          .request("goal.get", { id: goalId })
+          .then((goal) => {
+            if (goal.headAvailable !== true || goal.ref !== goalRef)
+              throw new Error("goal-head-unavailable");
+            confirm(
+              `${goal.ref}「${goal.title || goalTitle || goal.ref}」を取り消します。`,
+              "取り消しを確定",
+              discard,
+              true,
+              () =>
+                channel.request("goal.discard", {
+                  id: goal.id,
+                  confirm: goal.ref,
+                  expectedHead: goal.head,
+                }),
+              "cancelled",
+            );
+          })
+          .catch(() => {
+            buttons.hidden = false;
+            status.textContent =
+              "Goal のブランチを確認できないため、取り消せません。";
+            discard.focus();
+          })
+          .finally(() => {
+            discard.disabled = false;
+          });
+      },
+      "btn quiet",
+    );
+    buttons.prepend(discard);
+  }
+  if (
+    taskId &&
+    typeof expectedRetries === "number" &&
+    "canRetry" in problem &&
+    problem.canRetry
+  ) {
+    const retry = action(
+      "やり直す",
+      `retry:${key}`,
+      () => {
+        if (buttons.hidden) return;
+        confirm(
+          `「${problem.title}」を同じ内容でやり直します（予算はリセット）。`,
+          "やり直しを確定",
+          retry,
+          false,
+          () => channel.request("task.retry", { id: taskId, expectedRetries }),
+          "retried",
+        );
+      },
+      "btn primary",
+    );
+    buttons.append(retry);
+  }
+  return area;
+}
+
+function problemReceipt(
+  problem: Problem,
+  receipt: "retried" | "cancelled",
+  goalLink: GoalLink,
+) {
+  const text =
+    receipt === "retried"
+      ? [chip("受け付けました", "ok"), textElement("span", "· 順番待ち")]
+      : [textElement("span", `${problem.goalRef} を取り消しました。`)];
+  return group(
+    "div",
+    "confirm",
+    ...text,
+    ...goalLink(problem.goalId, problem.goalRef),
+  );
+}
+
+function goalProblem(
+  goal: GoalDetail,
+  problem: Problem,
+  channel: OperatorRequest,
+  goProblems: () => void,
+  focusConcierge: () => void,
+) {
+  const status = textElement("p", "", "meta decision-event");
+  status.setAttribute("role", "status");
+  return [
+    sectionTitle("止まっている理由"),
+    group(
+      "article",
+      "card",
+      group(
+        "p",
+        "meta",
+        ...refNodes(problem.taskRef, goal.ref),
+        textElement(
+          "bdi",
+          `「${problem.title}」が${"code" in problem ? failureReason(problem.code) : "実行エラー"}で失敗しました。`,
+        ),
+      ),
+      group(
+        "div",
+        "actions",
+        consultation(channel, problem, status, focusConcierge),
+        action("指示を選ぶ", "goal-problems", goProblems, "btn primary"),
+      ),
+      status,
+    ),
+  ];
+}
+
+function problemReason(rows: Problem[]) {
+  if (rows.some(({ kind }) => kind === "execution-over-budget"))
+    return "予算超過";
+  const failure = rows.find((row) => "code" in row);
+  return failure ? failureReason(failure.code) : "パス違反";
+}
+
 function problemCard(
   rows: Problem[],
   items: PanelInboxItem[],
   channel: WorkplaceChannel,
   goalLink: GoalLink,
   select: (subject: { goalId?: string; taskId?: string }) => void,
+  title: string | undefined,
+  focusConcierge: () => void,
+  accepted: (problem: Problem, receipt: "retried" | "cancelled") => void,
   watch: Watch,
 ) {
   const first = rows[0]!;
   const { goalId, taskId } = first;
   const model = rows.find(({ title }) => title)?.title;
-  const failed = rows.some((row) => "canRetry" in row);
+  const failed = rows.find((row) => "canRetry" in row);
   const over = rows.filter(({ kind }) => kind === "execution-over-budget");
-  const canRetry = rows.some((row) => "canRetry" in row && row.canRetry);
-  const command = taskId && canRetry ? retryCommand(taskId, items) : undefined;
   const matching = items.filter(
     (item) =>
       item.state === "open" &&
@@ -1153,20 +1738,21 @@ function problemCard(
           ))),
   );
   const usage = textElement("div", "", "stack");
-  const actions = group("div", "actions", textElement("span", "", "spacer"));
+
   const card = group(
     "article",
     "card",
     group(
       "div",
       "card-top",
-      chip(failed ? "失敗" : over.length ? "予算超過" : "対象範囲外", "danger"),
+      chip(problemReason(rows), "danger"),
+      ...refNodes(first.ref),
       time(first.at),
     ),
     model
       ? modelTitle("h3", model)
       : textElement("h3", taskId ?? goalId ?? "問題", "title"),
-    ...goalLink(goalId),
+    ...goalLink(goalId, first.goalRef),
     ...rows.map((row) =>
       group(
         "div",
@@ -1181,27 +1767,23 @@ function problemCard(
       ),
     ),
     usage,
-    actions,
+    taskId
+      ? action(
+          "Task を開く",
+          `problem:${taskId}`,
+          () => select({ taskId }),
+          "link",
+        )
+      : textElement("span", ""),
+    problemActions(
+      channel,
+      failed ?? first,
+      title,
+      goalLink,
+      focusConcierge,
+      (receipt) => accepted(failed ?? first, receipt),
+    ),
   );
-  if (command) {
-    const { text, copy, status } = commandControls(
-      command,
-      "再試行コマンドをコピー",
-      `retry:${taskId}`,
-      false,
-    );
-    actions.append(copy, status);
-    card.append(text);
-  }
-  if (taskId || goalId)
-    actions.append(
-      action(
-        taskId ? "Task を開く" : "Goal を開く",
-        `problem:${taskId ?? goalId}`,
-        () => select({ ...(goalId && { goalId }), ...(taskId && { taskId }) }),
-        "btn primary",
-      ),
-    );
   watch(
     card,
     matching.map(({ id }) => id),
@@ -1253,7 +1835,10 @@ const settingsSections = {
 } as const;
 type SettingsSection = keyof typeof settingsSections;
 
-export function createHostPanel(channel?: WorkplaceChannel) {
+export function createHostPanel(
+  channel?: WorkplaceChannel,
+  focusConcierge = () => {},
+) {
   const notice = element("inbox-notice");
   let view: View = { tab: "decisions" };
   let settings: SettingsSection | undefined;
@@ -1270,6 +1855,263 @@ export function createHostPanel(channel?: WorkplaceChannel) {
   let goals: GoalSummary[] = [];
   let problems: Problem[][] = [];
   let lastGoal: GoalDetail | undefined;
+  const nowButton = element("now-toggle");
+  const nowPopover = element("now-popover");
+  const now = disclosure(nowButton, nowPopover, () =>
+    inbox?.cancelConfirmation(nowPopover),
+  );
+  const inlineGoals = new Set<string>();
+  const draftedPlans = new Set<string>();
+  const tracks = new Map<string, { ref: string; title: string }>();
+  const problemReceipts = new Map<
+    string,
+    { problem: Problem; receipt: "retried" | "cancelled" }
+  >();
+  let decisionOrder: string[] = [];
+  let previousNow = "";
+  let activity: Activity = {
+    running: [],
+    queued: [],
+    queuedCount: 0,
+    yourTurn: 0,
+  };
+
+  function planButton(ref: string, title: string) {
+    const status = textElement("span", "", "muted");
+    status.setAttribute("role", "status");
+    const message = "下書きを入れました（Enter で送ります）";
+    if (draftedPlans.has(ref)) status.textContent = message;
+    const button =
+      channel &&
+      draftButton(
+        channel,
+        "Concierge に計画を頼む",
+        `plan:${ref}`,
+        planningDraft(ref, title),
+        status,
+        () => {
+          draftedPlans.add(ref);
+          focusConcierge();
+          void refresh(false);
+        },
+        message,
+      );
+    return group(
+      "span",
+      "plan-action",
+      ...(button && !draftedPlans.has(ref) ? [button] : []),
+      status,
+    );
+  }
+
+  function trackingData() {
+    return [...tracks].map(([id, track]) => [
+      id,
+      track,
+      draftedPlans.has(track.ref),
+      goals.find(({ ref }) => ref === track.ref),
+      activity.running.find(
+        (run) => run.goalRef === track.ref && run.actor === "Planner",
+      ),
+      activity.queued.some(
+        (run) => run.goalRef === track.ref && run.actor === "Planner",
+      ),
+    ]);
+  }
+
+  function trackingCard(id: string, inList: boolean) {
+    const track = tracks.get(id);
+    if (!track) return;
+    const { ref, title } = track;
+    const goal = goals.find((entry) => entry.ref === ref);
+    const planner = activity.running.find(
+      (run) => run.goalRef === ref && run.actor === "Planner",
+    );
+    const queued = activity.queued.some(
+      (run) => run.goalRef === ref && run.actor === "Planner",
+    );
+    const started = Boolean(
+      planner ||
+      queued ||
+      goal?.progress.total ||
+      goal?.turn.reason.kind === "planning",
+    );
+    const plannerStatus = planner
+      ? runningLine(planner, () => selectRun(planner))
+      : textElement(
+          "span",
+          queued ? "順番待ち" : goal?.progress.total ? "Task を分けました" : "",
+          "muted",
+        );
+    const step = (label: string, note?: Node, complete = false) =>
+      group(
+        "li",
+        complete ? "complete" : "",
+        textElement("span", complete ? "✓" : "○", "track-mark"),
+        textElement("span", label),
+        ...(note ? [note] : []),
+      );
+    const card = group(
+      inList ? "li" : "article",
+      "card tracking-card",
+      group("div", "card-top", chip("受け付けました", "ok"), ...refNodes(ref)),
+      modelTitle("h3", title),
+      group(
+        "ol",
+        "tracking-steps",
+        step(
+          "Goal を承認",
+          textElement("span", `${ref} を作りました`, "muted"),
+          true,
+        ),
+        step(
+          "Concierge に知らせる",
+          started ? undefined : planButton(ref, title),
+          started || draftedPlans.has(ref),
+        ),
+        step(
+          "Planner が Task を分ける",
+          plannerStatus,
+          Boolean(goal?.progress.total),
+        ),
+        step(
+          "Task の承認",
+          textElement("span", "あなたの番になったら、ここに出ます", "muted"),
+        ),
+      ),
+      group(
+        "div",
+        "actions",
+        ...goalLink(goal?.id, ref),
+        textElement("span", "", "spacer"),
+        action(
+          "閉じる",
+          `track-close:${id}`,
+          () => {
+            tracks.delete(id);
+            previousNow = "";
+            renderNow(pendingDecisions(items));
+            inbox?.render(
+              pendingDecisions(items),
+              goalLink,
+              goalTitle,
+              trackSlots(true),
+              trackingData(),
+            );
+          },
+          "link",
+        ),
+      ),
+    );
+    card.setAttribute("aria-live", "polite");
+    return card;
+  }
+
+  function trackSlots(inList: boolean) {
+    return {
+      anchors: tracks.size ? decisionOrder : [],
+      render: (id: string) => trackingCard(id, inList),
+    };
+  }
+
+  function selectRun({ goalId, taskId }: ActivityRow) {
+    if (goalId || taskId)
+      navigate({
+        tab: "goals",
+        ...(goalId && { goalId }),
+        ...(taskId && { taskId }),
+      });
+  }
+
+  function renderNow(pending: PanelInboxItem[]) {
+    nowButton.textContent = activityLabel({
+      ...activity,
+      yourTurn: pending.length + problems.length,
+    });
+    nowButton.dataset.running = String(activity.running.length > 0);
+    if (nowPopover.hidden) return;
+    const snapshot = JSON.stringify([
+      activity,
+      decisionSnapshot(pending),
+      trackingData(),
+      inbox?.revision,
+      pending.map(({ subject }) => goalTitle(subject.goalId)),
+      problems,
+    ]);
+    if (snapshot === previousNow) return;
+    previousNow = snapshot;
+    const refs = [
+      ...new Set(
+        activity.queued.flatMap((row) => {
+          const ref = row.taskRef ?? row.goalRef;
+          return ref ? [row.actor === "Planner" ? `${ref}（計画）` : ref] : [];
+        }),
+      ),
+    ];
+    restoreFocus(
+      nowPopover,
+      () => {
+        unwatch(nowPopover);
+        nowPopover.replaceChildren(
+          sectionTitle("AI が動いているもの"),
+          ...(activity.running.length
+            ? activity.running.map((row) =>
+                runningLine(row, () => selectRun(row)),
+              )
+            : [textElement("p", "AI は待機中", "meta")]),
+          textElement(
+            "p",
+            `順番待ち ${activity.queuedCount} 件${refs.length ? ` · ${refs.join("、")}` : ""}`,
+            "meta",
+          ),
+          ...Array.from(tracks.keys(), (id) => trackingCard(id, false)).filter(
+            (card) => card !== undefined,
+          ),
+          ...(pending.length || problems.length
+            ? [sectionTitle("あなたの番")]
+            : []),
+          ...(inbox
+            ? pending.map((item) =>
+                inbox.card(item, goalLink, {
+                  flat: true,
+                  surface: "popover",
+                  goalTitle: goalTitle(item.subject.goalId) ?? "",
+                }),
+              )
+            : []),
+          ...problems.map((rows) => {
+            const { taskId, goalId, executionId, ref } = rows[0]!;
+            const title = rows.find((row) => row.title)?.title;
+            return group(
+              "div",
+              "now-problem",
+              ...refNodes(ref),
+              title
+                ? modelTitle("span", title, "grow")
+                : textElement("span", taskId ?? goalId ?? "実行", "grow"),
+              chip(problemReason(rows), "danger"),
+              action(
+                "問題を見る ›",
+                `now-problem:${taskId ?? executionId ?? goalId}`,
+                () => navigate({ tab: "problems" }),
+                "link",
+              ),
+            );
+          }),
+        );
+      },
+      nowPopover,
+    );
+  }
+
+  nowButton.addEventListener("click", () => {
+    now.toggle();
+    previousNow = "";
+    renderNow(pendingDecisions(items));
+    // Refresh problems too, so the list matches the header count.
+    if (!nowPopover.hidden) void refresh();
+  });
+
   const marked = new Set<string>();
   const observed = new WeakMap<
     Element,
@@ -1311,7 +2153,20 @@ export function createHostPanel(channel?: WorkplaceChannel) {
     }
   }
   const inbox =
-    channel && createInboxPanel(channel, () => void refresh(), watch, unwatch);
+    channel &&
+    createInboxPanel(
+      channel,
+      () => void refresh(),
+      watch,
+      unwatch,
+      (item, ref) => {
+        if (!decisionOrder.includes(item.id)) decisionOrder.push(item.id);
+        tracks.set(item.id, {
+          ref,
+          title: ("answer" in item ? item.answer.title : item.modelText) ?? ref,
+        });
+      },
+    );
 
   function goalTitle(id?: string | null) {
     return id === lastGoal?.id
@@ -1319,17 +2174,22 @@ export function createHostPanel(channel?: WorkplaceChannel) {
       : goals.find((goal) => goal.id === id)?.title;
   }
 
-  function goalLink(id?: string | null) {
+  function goalLink(id?: string | null, ref?: string | null) {
     if (!id) return [];
     const title = goalTitle(id);
-    if (!title) return [];
+    ref ??= goals.find((goal) => goal.id === id)?.ref;
+    if (!title && !ref) return [];
     const link = action(
       "",
       `goal:${id}`,
       () => navigate({ tab: "goals", goalId: id }),
       "link",
     );
-    link.append(textElement("bdi", title), " ›");
+    link.append(
+      ...refNodes(ref),
+      ...(title ? [textElement("bdi", title)] : []),
+      " ›",
+    );
     return [group("div", "meta", document.createTextNode("Goal: "), link)];
   }
 
@@ -1360,6 +2220,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
     section: SettingsSection,
     trigger = document.activeElement,
   ) {
+    now.close(false);
     if (!settings && trigger instanceof HTMLElement) settingsTrigger = trigger;
     settings = section;
     updateVisibility();
@@ -1427,7 +2288,10 @@ export function createHostPanel(channel?: WorkplaceChannel) {
         () => navigate({ tab: "goals", goalId }),
         "link",
       );
-      back.append(textElement("bdi", title ?? "Goal 詳細"));
+      back.append(
+        ...refNodes(task?.goalRef),
+        textElement("bdi", title ?? "Goal 詳細"),
+      );
       nav.append(back);
     }
     separator();
@@ -1436,11 +2300,14 @@ export function createHostPanel(channel?: WorkplaceChannel) {
       task?.title ?? title ?? (current.taskId ? "Task 詳細" : "Goal 詳細"),
     );
     here.setAttribute("aria-current", "page");
-    nav.append(here);
+    nav.append(...refNodes(task?.ref ?? goal?.ref), here);
     return [nav];
   }
 
   function navigate(next: View, decisionId?: string) {
+    now.close(false);
+    if (view.tab === "problems" && next.tab !== "problems")
+      problemReceipts.clear();
     view = next;
     previousView = "";
     pendingFocus = decisionId;
@@ -1456,6 +2323,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
         empty(disconnected ? "ホストに接続されていません。" : "読み込み中…"),
       );
       if (view.goalId || view.taskId) contents.querySelector("button")?.focus();
+      else element(`tab-${view.tab}`).focus();
     } else {
       if (!focusDecision()) element("tab-decisions").focus();
     }
@@ -1561,11 +2429,12 @@ export function createHostPanel(channel?: WorkplaceChannel) {
           task,
           policy,
           history,
+          activityResult,
         ] = await Promise.allSettled([
           refreshBadges || loadWork
             ? channel.request("inbox.list", {})
             : undefined,
-          refreshBadges || problemTab
+          refreshBadges || loadWork
             ? channel.request("problem.list", {})
             : undefined,
           refreshBadges || (goalTab && !current.goalId && !current.taskId)
@@ -1581,6 +2450,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
             ? channel.request("policy.get", {})
             : undefined,
           decisionTab ? channel.request("decision.history", {}) : undefined,
+          channel.request("activity.get", {}),
         ] as const);
         if (disconnected || socket !== channel.socket) continue;
         if (itemResult.status === "fulfilled" && itemResult.value) {
@@ -1592,7 +2462,41 @@ export function createHostPanel(channel?: WorkplaceChannel) {
           problems = groupProblems(problemResult.value);
         if (goalResult.status === "fulfilled" && goalResult.value)
           goals = goalResult.value;
+        if (activityResult.status === "fulfilled")
+          activity = activityResult.value;
         const pending = pendingDecisions(items);
+        for (const [id, { ref }] of tracks) {
+          const goal = goals.find((entry) => entry.ref === ref);
+          if (
+            pending.some(
+              ({ subject }) =>
+                subject.goalRef === ref || (goal && subject.goalId === goal.id),
+            )
+          )
+            tracks.delete(id);
+        }
+        if (!tracks.size) decisionOrder = pending.map(({ id }) => id);
+        else {
+          const active = new Set([
+            ...pending.map(({ id }) => id),
+            ...tracks.keys(),
+          ]);
+          decisionOrder = [
+            ...new Set([
+              ...decisionOrder.filter((id) => active.has(id)),
+              ...pending.map(({ id }) => id),
+            ]),
+          ];
+        }
+        renderNow(pending);
+        if (itemResult.status === "fulfilled")
+          inbox?.render(
+            pending,
+            goalLink,
+            goalTitle,
+            trackSlots(true),
+            trackingData(),
+          );
         badge("decisions", pending.length);
         badge("problems", problems.length);
         badge(
@@ -1607,6 +2511,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
           task,
           policy,
           history,
+          activityResult,
         ];
         if (
           reads.some(
@@ -1648,7 +2553,6 @@ export function createHostPanel(channel?: WorkplaceChannel) {
 
         if (decisionTab) {
           if (itemResult.status === "fulfilled") {
-            inbox?.render(pending, goalLink, goalTitle);
             // A decision answered meanwhile never gets a card: drop the request.
             if (!focusDecision()) pendingFocus = undefined;
           }
@@ -1686,24 +2590,76 @@ export function createHostPanel(channel?: WorkplaceChannel) {
             item.subject.goalId === detail.id ||
             Boolean(item.subject.taskId && tasks.has(item.subject.taskId));
           const decisions = pending.filter(related);
-          const activity = items.filter(
+          const recent = items.filter(
             (item) => item.weight === "info" && related(item),
           );
+          const running = activity.running.filter(
+            ({ goalId }) => goalId === detail.id,
+          );
+          const problem = (
+            problemResult.status === "fulfilled"
+              ? problemResult.value
+              : undefined
+          )?.find((row) => row.goalId === detail.id && "canRetry" in row);
           renderWork(
             [
-              detail,
-              decisions,
-              activity.map(({ state: _state, ...item }) => item),
+              {
+                ...detail,
+                tasks: detail.tasks.map(
+                  ({ elapsedMs: _elapsed, estimate, ...task }) => [
+                    task,
+                    estimateLabel(estimate.remainingMs),
+                  ],
+                ),
+              },
+              decisionSnapshot(decisions),
+              inbox?.revision,
+              decisionSnapshot(recent),
+              running,
+              problem,
+              draftedPlans.has(detail.ref),
             ],
             () =>
               goalDetail(
                 detail,
-                decisions.length,
+                [
+                  group(
+                    "section",
+                    "card goal-now",
+                    sectionTitle("いま"),
+                    goalTurn(detail, true),
+                    ...running.map((row) =>
+                      runningLine(row, () => selectRun(row), detail.ref),
+                    ),
+                    ...(detail.turn.reason.kind === "not-planned"
+                      ? [planButton(detail.ref, detail.title)]
+                      : []),
+                  ),
+                ],
+                decisions.length && inbox
+                  ? [
+                      sectionTitle("あなたの番"),
+                      ...decisions.map((item) =>
+                        inbox.card(item, goalLink, {
+                          goalRef: detail.ref,
+                          surface: "goal",
+                        }),
+                      ),
+                    ]
+                  : [],
+                problem
+                  ? goalProblem(
+                      detail,
+                      problem,
+                      channel,
+                      () => navigate({ tab: "problems" }),
+                      focusConcierge,
+                    )
+                  : [],
                 goalDelegation(detail, channel, savedPolicy),
-                activity,
+                recent,
                 (taskId) =>
                   navigate({ tab: "goals", goalId: detail.id, taskId }),
-                () => navigate({ tab: "decisions" }, decisions[0]?.id),
                 watch,
               ),
             undefined,
@@ -1728,23 +2684,64 @@ export function createHostPanel(channel?: WorkplaceChannel) {
             detail,
           );
         } else if (problemTab && problemResult.status === "fulfilled") {
-          const context = problems.map(([row]) => [
-            row && goalTitle(row.goalId),
-            row?.taskId && retryCommand(row.taskId, items),
-          ]);
-          renderWork([problems, context], () =>
-            problems.length
-              ? problems.map((rows) =>
-                  problemCard(
-                    rows,
-                    items,
-                    channel,
-                    goalLink,
-                    (subject) => navigate({ tab: "goals", ...subject }),
-                    watch,
-                  ),
-                )
-              : [empty("問題はありません。")],
+          for (const [id, { problem }] of problemReceipts) {
+            if (
+              problems.some((rows) =>
+                rows.some(
+                  (row) =>
+                    row.taskId === id &&
+                    row.expectedRetries !== problem.expectedRetries,
+                ),
+              )
+            )
+              problemReceipts.delete(id);
+          }
+          const receipts = [...problemReceipts.values()];
+          const currentProblems = problems.filter(
+            (rows) =>
+              !receipts.some(({ problem, receipt }) =>
+                rows.some((row) =>
+                  receipt === "cancelled"
+                    ? row.goalId === problem.goalId
+                    : row.taskId === problem.taskId,
+                ),
+              ),
+          );
+          renderWork(
+            [
+              currentProblems,
+              receipts,
+              currentProblems.map(([row]) => goalTitle(row?.goalId)),
+            ],
+            () => [
+              ...receipts.map(({ problem, receipt }) =>
+                problemReceipt(problem, receipt, goalLink),
+              ),
+              ...(currentProblems.length
+                ? currentProblems.map((rows) =>
+                    problemCard(
+                      rows,
+                      items,
+                      channel,
+                      goalLink,
+                      (subject) => navigate({ tab: "goals", ...subject }),
+                      goalTitle(rows[0]?.goalId),
+                      focusConcierge,
+                      (problem, receipt) => {
+                        const key =
+                          (receipt === "retried"
+                            ? problem.taskId
+                            : problem.goalId) ?? "";
+                        problemReceipts.set(key, { problem, receipt });
+                        void refresh();
+                      },
+                      watch,
+                    ),
+                  )
+                : receipts.length
+                  ? []
+                  : [empty("問題はありません。")]),
+            ],
           );
         } else if (
           goalTab &&
@@ -1752,18 +2749,47 @@ export function createHostPanel(channel?: WorkplaceChannel) {
           !current.taskId &&
           goalResult.status === "fulfilled"
         ) {
-          const entries = goals.map((entry) => ({
-            entry,
-            count: pending.filter(({ subject }) => subject.goalId === entry.id)
-              .length,
-          }));
-          renderWork(entries, () =>
-            entries.length
-              ? entries.map(({ entry, count }) =>
-                  goalRow(entry, count, () =>
-                    navigate({ tab: "goals", goalId: entry.id }),
-                  ),
-                )
+          const byGoal = new Map(
+            goals.map((goal) => [
+              goal.id,
+              pending.filter(
+                ({ subject }) =>
+                  subject.goalId === goal.id || subject.goalRef === goal.ref,
+              ),
+            ]),
+          );
+          renderWork([goals, decisionSnapshot(pending), inbox?.revision], () =>
+            goals.length
+              ? turnGroups.flatMap(({ label, owners }) => {
+                  const groupGoals = goals.filter(({ turn }) =>
+                    owners.includes(turn.owner),
+                  );
+                  return groupGoals.length
+                    ? [
+                        sectionTitle(label),
+                        ...groupGoals.map((entry) => {
+                          const decisions = byGoal.get(entry.id) ?? [];
+                          return goalRow(
+                            entry,
+                            () => navigate({ tab: "goals", goalId: entry.id }),
+                            () =>
+                              inbox
+                                ? decisions.map((item) =>
+                                    inbox.card(item, goalLink, {
+                                      flat: true,
+                                      surface: "list",
+                                      goalTitle:
+                                        goalTitle(item.subject.goalId) ?? "",
+                                    }),
+                                  )
+                                : [],
+                            decisions.length > 0,
+                            inlineGoals,
+                          );
+                        }),
+                      ]
+                    : [];
+                })
               : [empty("Goal はありません。")],
           );
         } else if (goalTab || problemTab) {
@@ -1779,12 +2805,17 @@ export function createHostPanel(channel?: WorkplaceChannel) {
 
   let poll = 0;
   if (channel) {
-    window.setInterval(() => void refresh(++poll % 4 === 0), 5000);
+    window.setInterval(() => {
+      void refresh(++poll % 4 === 0);
+      for (const elapsed of document.querySelectorAll<HTMLElement>(".elapsed"))
+        elapsed.textContent = elapsedLabel(elapsed.dataset.startedAt ?? null);
+    }, 5000);
     document.addEventListener("visibilitychange", () => void refresh());
   }
   return {
     refresh,
     closeSettings,
+    closeNow: now.close,
     connect() {
       disconnected = false;
       inbox?.invalidate();

@@ -1,4 +1,8 @@
 import { ROLE_PROFILES } from "../../sandbox-profiles.ts";
+export {
+  groupProblems,
+  pendingDecisions,
+} from "../../local-orchestrator/operator-attention.ts";
 import type {
   DelegationRule,
   EffectivePolicy,
@@ -36,7 +40,10 @@ export type Status = ReturnType<typeof operatorStatus> &
 export type GoalSummary = ReturnType<typeof operatorGoalList>[number];
 export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
   head: string | null;
+  headAvailable: boolean;
 };
+export type Activity = ReturnType<typeof operatorActivity>;
+export type ActivityRow = Activity["running"][number];
 export type TaskSummary = NonNullable<
   ReturnType<typeof operatorTaskList>
 >[number];
@@ -560,25 +567,14 @@ export function formatTokens(tokens: number | null) {
   return tokens === null ? "—" : tokenCount.format(tokens);
 }
 
-export function pendingDecisions(items: readonly PanelInboxItem[]) {
-  return items.filter(
-    ({ weight, state, kind }) =>
-      weight === "action" &&
-      state !== "resolved" &&
-      kind !== "task-failed" &&
-      kind !== "execution-over-budget",
-  );
+export function planningDraft(ref: string, title: string) {
+  return `${ref}「${title}」が承認されました。Task に分けてください。`;
 }
 
-export function groupProblems(problems: readonly Problem[]) {
-  const groups = new Map<string, Problem[]>();
-  for (const [index, problem] of problems.entries()) {
-    const key = problem.taskId ? `task:${problem.taskId}` : `problem:${index}`;
-    const group = groups.get(key);
-    if (group) group.push(problem);
-    else groups.set(key, [problem]);
-  }
-  return [...groups.values()];
+export function activityLabel({ running, queuedCount, yourTurn }: Activity) {
+  const work = running.length ? `AI 作業中 ${running.length}` : "AI は待機中";
+  const queue = running.length || queuedCount ? ` · 待ち ${queuedCount}` : "";
+  return `${work}${queue}${yourTurn ? ` · あなたの番 ${yourTurn}` : ""}`;
 }
 
 export function retryCommand(taskId: string, items: readonly PanelInboxItem[]) {

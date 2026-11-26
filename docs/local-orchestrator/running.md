@@ -78,28 +78,39 @@ slot as the TTY launcher.
 
 With `--dev-bridge`, open the private loopback URL printed at startup.
 Keep the URL private. The page shows the Concierge terminal beside a
-host panel. **判断待ち** shows the inbox, proposal details and a
-copyable CLI command. **問題** links failures, rejected paths and budget
-overruns to their Task or Goal. **Goal** shows Task progress and estimates
-for the current plan based on completed work in this target. Task details show the stage,
-attempts, elapsed time, token usage, acceptance criteria and recent events.
-`F6` moves focus between the terminal and panel. Closing the browser
-leaves the session running. To end it, press Ctrl-C or send SIGTERM to the
-workplace process. The launcher closes the operator API and the bridge at
-shutdown. If that shutdown hangs, press Ctrl-C again to exit at once
-without cleanup, then run `agent-bootstrap doctor`. A third Ctrl-C kills
-the launcher. The launcher also stops when the workplace command ends for
-any reason, including SIGKILL.
+host panel. Open the **いま** pill to see running work, queue refs and
+decisions you can answer in place. **Goal** groups work by whose turn it
+is. Each Goal detail shows its running Tasks, decisions, failures and a
+copyable export command when the Goal is ready to export. Goal and Task
+refs can be used in the CLI. Within a Goal detail, `#m` is shorthand for
+the Task with that number in the Goal.
 
-In **判断待ち**, choose **承認** or **却下** on a proposal that needs the
-operator. **承認して統合** records approval for the runner to integrate
-the candidate. Check the proposal kind, model-generated title and
-pinned digest prefix, then choose **確定** to record the answer.
-Select two to twenty proposals to approve them in one confirmation.
-The panel reports the outcome for each proposal and refreshes the inbox.
-If a proposal changed, review the refreshed details before answering
-again. The copyable CLI command remains available as a fallback. Use the
-TTY CLI with the same target for on-behalf answers.
+On a closed decision card, **承認** opens a one-line confirmation. Open
+**詳細** to read the evidence and use **承認** directly. **承認して統合**
+records approval for the runner to integrate the candidate. Select two
+to twenty proposals to approve them together. If a proposal changes,
+the card reopens with the refreshed details. Withheld fields block
+approval from Workplace. Use the TTY CLI with the same target for
+on-behalf answers.
+
+After approving a Goal, its card tracks planning until the next decision
+for that Goal arrives. Use **Concierge に計画を頼む** to paste a draft
+request into the terminal and press Enter when ready to send it.
+The **問題** tab offers **やり直す** when a failed Task can be retried.
+Confirming resets the Task's budget window and queues the same work.
+**Goal を取り消す** requires a separate confirmation bound to the branch
+head. If the Goal changes, review the updated Goal before confirming again.
+**Concierge に相談** pastes a draft and moves focus to the terminal.
+
+`F6` moves focus between the terminal and panel. `F` toggles the
+panel's fullscreen view. `Esc` closes the activity popover first.
+Closing the browser leaves the session running. To end it, press Ctrl-C
+or send SIGTERM to the workplace process. The launcher closes the
+operator API and the bridge at shutdown. If that shutdown hangs, press
+Ctrl-C again to exit at once without cleanup, then run
+`agent-bootstrap doctor`. A third Ctrl-C kills the launcher. The launcher
+also stops when the workplace command ends for any reason, including
+SIGKILL.
 
 ## Choose what the Reviewer can decide
 

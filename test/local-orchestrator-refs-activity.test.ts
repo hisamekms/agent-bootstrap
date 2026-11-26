@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -11,15 +11,18 @@ import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-
 import {
   draftToConcierge,
   operatorAction,
+  readOperatorGoal,
 } from "../src/local-orchestrator/operator-api.ts";
 import {
   operatorActivity,
+  operatorActivityRevision,
   operatorGoal,
   operatorGoalList,
   operatorProblems,
   operatorTask,
   operatorTaskList,
 } from "../src/local-orchestrator/operator-read.ts";
+import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
 import { readGoalBranchHead } from "../src/local-orchestrator/tasks.ts";
 import type { OrchestratorStore } from "../src/local-orchestrator/store.ts";
@@ -447,6 +450,133 @@ test("discard rejects a moved Goal branch before authorizing deletion", async ()
     result: { id, ref: "G1", status: "cancelled" },
   });
   assert.equal(await readGoalBranchHead(root, id), null);
+});
+
+test("an unreadable branch preserves Goal detail and blocks discard before audit", async () => {
+  using state = orchestratorFixture("refs-unreadable-head-");
+  const { root, store } = state;
+  const id = goal(store);
+  const available = await readOperatorGoal(store, root, "G1");
+  assert.equal(available?.head, null);
+  assert.equal(available?.headAvailable, true);
+
+  const repository = join(root, "repository.git");
+  const result = spawnSync(
+    "/usr/bin/git",
+    ["init", "--bare", "--template=", repository],
+    {
+      env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+    },
+  );
+  assert.equal(result.status, 0);
+  mkdirSync(join(repository, "refs", "heads", "lo"), { recursive: true });
+  writeFileSync(
+    join(repository, "refs", "heads", goalBranch(id)),
+    "malformed-ref\n",
+  );
+
+  const detail = await readOperatorGoal(store, root, "g1");
+  assert.equal(detail?.ref, "G1");
+  assert.equal(detail?.title, goalContent.title);
+  assert.equal(detail?.head, null);
+  assert.equal(detail?.headAvailable, false);
+  assert.deepEqual(
+    await operatorAction(store, root, "goal.discard", {
+      id: "G1",
+      confirm: "G1",
+      expectedHead: null,
+    }),
+    { error: { code: "goal-head-unavailable" } },
+  );
+  assert.equal(store.getGoal(id)?.status, "active");
+  assert.ok(
+    !store
+      .listEvents({ subjectId: id, limit: 10 })
+      .some(({ kind }) => kind === "goal.discard-authorized"),
+  );
+});
+
+test("activity counts the same unresolved actions as the bounded inbox", () => {
+  using state = orchestratorFixture("refs-inbox-alignment-");
+  const { store } = state;
+  const source = {
+    store,
+    target: "fixture",
+    secretTests: () =>
+      Array.from({ length: 201 }, (_, index) => ({
+        variable: `FIXTURE_${index}`,
+        version: "1",
+        passed: false,
+      })),
+  };
+  store.proposeGoal(goalContent, operator);
+  const visibleActions = projectInbox(source).filter(
+    ({ state, weight }) => weight === "action" && state !== "resolved",
+  );
+  assert.equal(visibleActions.length, 200);
+  assert.equal(operatorActivity(source).yourTurn, visibleActions.length);
+});
+
+test("activity counts decisions and groups a Task failure with its over-budget execution", () => {
+  using state = orchestratorFixture("refs-activity-problems-");
+  const { store } = state;
+  const source = { store, target: "fixture" };
+  const goalId = goal(store);
+  const taskId = task(store, goalId);
+  assert.ok(store.claimTask(taskId));
+  const { id } = store.createExecution({
+    taskId,
+    goalId,
+    actor: "Executor",
+    mode: "task",
+    requestedBy: host,
+  });
+  store.startExecution(id);
+  store.finishExecution(id, "failed", { tokens: 501 });
+  store.failTask(taskId, "budget-exceeded");
+  for (let index = 0; index < 3; index++)
+    store.proposeGoal(goalContent, operator);
+
+  const problems = operatorProblems(store);
+  assert.deepEqual(problems.map((row) => [row.taskId, row.kind]).sort(), [
+    [taskId, "execution-over-budget"],
+    [taskId, "task-failed"],
+  ]);
+  assert.match(
+    problems.find((row) => row.kind === "task-failed")!.detail,
+    /予算超過/,
+  );
+  assert.doesNotMatch(
+    problems.find((row) => row.kind === "task-failed")!.detail,
+    /budget-exceeded/,
+  );
+  assert.equal(operatorActivity(source).yourTurn, 4);
+});
+
+test("the activity revision changes when visible inbox history crosses the cutoff", () => {
+  using state = orchestratorFixture("refs-activity-cutoff-");
+  const { store } = state;
+  const source = { store, target: "fixture" };
+  const goalId = goal(store);
+  const db = new Database(state.filename);
+  try {
+    db.query("UPDATE goals SET status = 'done' WHERE id = ?").run(goalId);
+  } finally {
+    db.close();
+  }
+  const completed = projectInbox(source).find(
+    ({ kind }) => kind === "goal-completed",
+  );
+  assert.ok(completed?.at);
+  const boundary = Date.parse(completed.at) + 7 * 86_400_000;
+  assert.equal(
+    operatorActivityRevision(source, boundary - 1),
+    operatorActivityRevision(source, boundary),
+  );
+  assert.notEqual(
+    operatorActivityRevision(source, boundary),
+    operatorActivityRevision(source, boundary + 1),
+  );
 });
 
 test("Goal base updates and discard write to canonical subjects when given refs", async () => {

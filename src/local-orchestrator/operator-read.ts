@@ -4,8 +4,19 @@ import {
   type CredentialScanner,
 } from "./credential-scan.ts";
 import { MAX_REVISIONS } from "../integration-journal.ts";
-import { inboxLimit, type InboxItem, type InboxSource } from "./inbox.ts";
+import {
+  inboxLimit,
+  projectInbox,
+  type InboxItem,
+  type InboxSource,
+} from "./inbox.ts";
 import { GATES, goalBranch } from "./model.ts";
+import {
+  failureLabel,
+  failureReason,
+  groupProblems,
+  pendingDecisions,
+} from "./operator-attention.ts";
 import {
   goalEstimate,
   meanTaskWallTime,
@@ -234,9 +245,23 @@ export function operatorActivity(source: InboxSource) {
   const running = rows.filter(({ status }) => status === "running");
   const queued = rows.filter(({ status }) => status !== "running");
   const yourTurn =
-    source.store.pendingInboxActions() +
-    (source.secretTests?.().filter(({ passed }) => !passed).length ?? 0);
+    pendingDecisions(projectInbox(source)).length +
+    groupProblems(operatorProblems(source.store)).length;
   return { running, queued, queuedCount: queued.length, yourTurn };
+}
+
+export function operatorActivityRevision(
+  source: InboxSource,
+  now = Date.now(),
+) {
+  const checks = source.secretTests?.() ?? [];
+  const pendingChecks = checks.filter(({ passed }) => !passed).length;
+  // The rolling inbox cutoff can expire visible history without a journal write.
+  const visibleHistory = projectInbox(
+    { ...source, secretTests: () => checks },
+    { now },
+  ).filter(({ weight }) => weight === "info").length;
+  return `${source.store.activityRevision()}:${pendingChecks}:${visibleHistory}`;
 }
 
 export const goalStatuses = ["active", "done", "cancelled"] as const;
@@ -517,19 +542,20 @@ export function operatorProblems(
       return {
         ...problem,
         kind: "path-violation" as const,
-        detail: "実行で対象範囲外の変更が拒否されました。",
+        detail: "パス違反で実行が拒否されました。",
         ...(rejectedPaths && { rejectedPaths }),
       };
     }
     const code = row.code ?? "unknown";
     const canRetry = Boolean(row.canRetry && !row.resolved);
     const kind = code === "path-violation" ? "path-violation" : "task-failed";
+    const label = failureLabel(code);
     return {
       ...problem,
       kind,
       code,
       canRetry,
-      detail: `Task が失敗しました（${code}）。${canRetry ? "再試行できます。" : "再試行できません。"}`,
+      detail: `${label ? `Task が${label}で失敗しました` : failureReason(code)}。${canRetry ? "再試行できます。" : "再試行できません。"}`,
       ...(rejectedPaths && { rejectedPaths }),
     };
   });
