@@ -1,3 +1,4 @@
+import { codexExecutorOptions } from "../local-orchestrator/codex-executor.ts";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -997,6 +998,7 @@ export function mergeConfig(
     ...harnesses,
     ...config.actors,
   };
+  codexExecutorOptions(config);
   const entries = Object.entries(config.mounts ?? {});
   for (const [index, [name, mount]] of entries.entries()) {
     const path = `mounts.${name}`;

@@ -659,6 +659,9 @@ export async function runBootstrap(
           "Concierge prerequisites are missing.",
           first.fix.join(" && ") ||
             "Run agent-bootstrap doctor with the same target.",
+          first.code
+            ? { code: first.code, ...(first.key ? { key: first.key } : {}) }
+            : undefined,
         );
       if (!(await (io.launch ?? launch)(root, rest, json)))
         return fail(
@@ -694,6 +697,9 @@ export async function runBootstrap(
           "Workplace prerequisites are missing.",
           first.fix.join(" && ") ||
             "Run agent-bootstrap doctor with the same target.",
+          first.code
+            ? { code: first.code, ...(first.key ? { key: first.key } : {}) }
+            : undefined,
         );
       return await (io.launchWorkplace ?? launchWorkplace)(root, rest);
     }

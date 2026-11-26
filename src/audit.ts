@@ -1,3 +1,4 @@
+import { isCodexFailureCode, type CodexFailureCode } from "./codex-exec.ts";
 import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import {
   CLAUDE_FAILURE_CODES,
@@ -75,7 +76,16 @@ type AuditDetail =
       readonly managedPath: typeof CLAUDE_MANAGED_PATH;
       readonly mounts?: readonly AuditMount[];
     }
-  | { readonly code: ClaudeFailureCode }
+  | { readonly code: ClaudeFailureCode | CodexFailureCode }
+  | {
+      readonly event: "siwc-refresh";
+      readonly status: "started" | "ok";
+    }
+  | {
+      readonly event: "siwc-refresh";
+      readonly status: "failed";
+      readonly code: Exclude<CodexFailureCode, "codex-auth">;
+    }
   | { readonly event: "secret.served"; readonly variable: string }
   | {
       readonly event: "secret.delivery";
@@ -837,12 +847,38 @@ function parseAuditDetail(
     outcome === "failed"
   ) {
     const { code } = dataFields(value, ["code"]);
+    if (role === "Worker" && isCodexFailureCode(code)) return { code };
     return {
       code: enumField(
         code,
         stored ? storedClaudeFailureCodes : CLAUDE_FAILURE_CODES,
       ),
     };
+  }
+  if (
+    present &&
+    role === "Worker" &&
+    operation === "sandbox.create" &&
+    kind === "operation.requested" &&
+    value &&
+    typeof value === "object" &&
+    Object.hasOwn(value, "event")
+  ) {
+    const { event, status, code } = dataFields(value, [
+      "event",
+      "status",
+      "code",
+    ]);
+    if (event !== "siwc-refresh") return invalidEvent();
+    if ((status === "started" || status === "ok") && code === undefined)
+      return { event, status };
+    if (
+      status === "failed" &&
+      isCodexFailureCode(code) &&
+      code !== "codex-auth"
+    )
+      return { event, status, code };
+    return invalidEvent();
   }
   if (
     present &&

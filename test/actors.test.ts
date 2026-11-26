@@ -1,9 +1,15 @@
+import {
+  codexExecutorOptions,
+  readCodexExecutor,
+} from "../src/local-orchestrator/codex-executor.ts";
+import { ActorConfigError } from "../src/config/messages.ts";
+import type { Config } from "../src/config/layers.ts";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   claudeRoleHarness,
@@ -14,7 +20,11 @@ import {
 import { CLAUDE_CODE_BUILDS } from "../src/claude-code.ts";
 import { ClaudeCodeCoordinator } from "../src/claude-coordinator.ts";
 import {
+  codexAuthExitCode,
+  codexBinaryPath,
   codexCoordinatorCommand,
+  derivePinnedCodexCatalog,
+  siwcCodexEndpoint,
   codexHostService,
   codexRoleCommand,
   deriveCodexCatalog,
@@ -463,4 +473,109 @@ test("harnesses set the profile and pick guest-specific tools and commands", () 
     explicit.command({ role: "Reviewer", prompt: "x", timeoutMs: 1 }).argv[2]!,
     /apk/,
   );
+});
+
+test("the configured Executor selects Codex on the Task profile and rejects incompatible inputs", async (t) => {
+  const selected = {
+    version: 1,
+    actors: { Executor: "codex" },
+    codex: { model: "fixture-model", auth: "siwc" },
+  } as const;
+  assert.equal(codexExecutorOptions({ version: 1 }), undefined);
+  assert.equal(
+    codexExecutorOptions({ ...selected, actors: { Executor: "claude" } }),
+    undefined,
+  );
+  const options = codexExecutorOptions(selected)!;
+  const harness = codexRoleHarness(options, [], undefined, "browser");
+  assert.equal(harness.harness, "codex");
+  assert.equal(harness.model, selected.codex.model);
+  assert.equal(harness.sandbox.profile, "browser");
+  assert.equal(harness.sandbox.provider?.host, siwcCodexEndpoint.host);
+  for (const [key, config] of [
+    ["codex.model", { version: 1, actors: selected.actors }],
+    ["mounts", { ...selected, mounts: { fixture: { actors: ["Executor"] } } }],
+    [
+      "secretEnv",
+      { ...selected, secretEnv: { FIXTURE_TOKEN: { actors: ["Executor"] } } },
+    ],
+  ] as const)
+    assert.throws(
+      () => codexExecutorOptions(config as Config),
+      (error) =>
+        error instanceof ActorConfigError && error.key === key && !!error.next,
+    );
+  const directory = mkdtempSync(join(tmpdir(), "codex-install-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  await assert.rejects(
+    readCodexExecutor(directory, options),
+    (error) =>
+      error instanceof ActorConfigError &&
+      error.key === "codex.binary" &&
+      !!error.next,
+  );
+  const binary = join(directory, codexBinaryPath);
+  mkdirSync(dirname(binary), { recursive: true });
+  writeFileSync(binary, "wrong fixture", { mode: 0o700 });
+  await assert.rejects(
+    readCodexExecutor(directory, options),
+    (error) =>
+      error instanceof ActorConfigError &&
+      error.key === "codex.binary" &&
+      !!error.next,
+  );
+  assert.throws(
+    () =>
+      derivePinnedCodexCatalog(
+        Buffer.from('embedded:{\n  "models": [{"slug":"gpt-6.2-sol"}]}'),
+        options.model,
+      ),
+    /catalog changed/,
+  );
+});
+
+test("the Codex Executor reduces provider rejection to a fixed exit code", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "codex-auth-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const fake = join(directory, "codex");
+  const task = { role: "Worker", prompt: "fixture", timeoutMs: 1000 } as const;
+  const script = codexRoleCommand(task, {
+    endpoint: siwcCodexEndpoint,
+    model: "fixture-model",
+    classifyAuthFailure: true,
+  }).argv[2]!;
+  const body = script
+    .slice(script.indexOf("codex_errors=$(mktemp)"))
+    .replaceAll("/tmp/codex", '"$FAKE_CODEX"')
+    .replace("cd /workspace", 'cd "$WORKER_DIR"');
+  writeFileSync(
+    fake,
+    '#!/bin/sh\nprintf "%s" "$FAKE_STDERR" >&2\nexit "$FAKE_STATUS"\n',
+    { mode: 0o700 },
+  );
+  for (const [status, diagnostic, expected] of [
+    [
+      1,
+      "ERROR: unexpected status 401 Unauthorized: private body",
+      codexAuthExitCode,
+    ],
+    [1, "ERROR: HTTP 403 Forbidden", codexAuthExitCode],
+    [codexAuthExitCode, "ordinary failure", 1],
+    [0, "", 0],
+  ] as const) {
+    const result = spawnSync("/bin/sh", ["-ec", body, "codex", task.prompt], {
+      encoding: "utf8",
+      env: {
+        PATH: "/usr/bin:/bin",
+        TMPDIR: directory,
+        FAKE_CODEX: fake,
+        WORKER_DIR: directory,
+        FAKE_STATUS: String(status),
+        FAKE_STDERR: diagnostic,
+      },
+    });
+    assert.equal(result.status, expected);
+    assert.equal(result.stderr, "");
+    assert.equal(result.stdout, status ? "" : '{"tool":"collect"}');
+  }
 });

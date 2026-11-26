@@ -1,3 +1,5 @@
+import type { Harness } from "../actors.ts";
+import { codexFailureActions } from "../codex-exec.ts";
 import {
   GOAL_POLICIES,
   TASK_POLICIES,
@@ -376,6 +378,8 @@ type TaskRow = RegisteredRow & {
   attempts: number;
   retries: number;
 };
+type ExecutionAgent = { harness: Harness; model: string };
+
 type ExecutionRow = {
   id: string;
   actor: ActorKind;
@@ -409,6 +413,13 @@ const taskColumns = `${registeredColumns}, goal_id AS goalId, attempts,
     AND kind = 'task.retried') AS retries`;
 const executionColumns =
   "id, actor, mode, requested_by_json AS requestedByJson, goal_id AS goalId, task_id AS taskId, status, result_json AS resultJson, started_at AS startedAt, finished_at AS finishedAt";
+const executionAgentColumns = ["harness", "model"]
+  .map(
+    (field) => `(SELECT json_extract(data, '$.${field}') FROM events
+    WHERE subject_id = executions.id AND subject_kind = 'execution'
+      AND kind = 'execution.started' LIMIT 1) AS ${field}`,
+  )
+  .join(", ");
 const eventColumns =
   "id, at, kind, subject_kind AS subjectKind, subject_id AS subjectId, session_id AS sessionId, execution_id AS executionId, data";
 
@@ -2280,7 +2291,7 @@ export class OrchestratorStore {
       .get(id);
   }
 
-  startExecution(executionId: string): void {
+  startExecution(executionId: string, agent?: ExecutionAgent): void {
     const id = identifier(executionId);
     this.#write((at) => {
       const row = required(this.#execution(id));
@@ -2296,7 +2307,12 @@ export class OrchestratorStore {
         "execution.started",
         "execution",
         id,
-        {},
+        agent
+          ? {
+              harness: oneOf(agent.harness, ["claude", "codex"] as const),
+              model: identifier(agent.model),
+            }
+          : {},
         { ...parseOrigin(JSON.parse(row.requestedByJson)), executionId: id },
       );
     });
@@ -3440,19 +3456,32 @@ export class OrchestratorStore {
   recentTaskExecutions(taskId: string) {
     return this.#read(() =>
       this.#db
-        .query<ExecutionRow>(
-          `SELECT ${executionColumns} FROM executions
+        .query<
+          ExecutionRow & { harness: Harness | null; model: string | null }
+        >(
+          `SELECT ${executionColumns}, ${executionAgentColumns} FROM executions
            WHERE task_id = ? ORDER BY rowid DESC LIMIT 10`,
         )
         .all(this.#taskId(identifier(taskId)))
         .map(
-          ({ id, actor, mode, status, startedAt, finishedAt, resultJson }) => ({
+          ({
             id,
             actor,
             mode,
             status,
             startedAt,
             finishedAt,
+            resultJson,
+            harness,
+            model,
+          }) => ({
+            id,
+            actor,
+            mode,
+            status,
+            startedAt,
+            finishedAt,
+            ...(harness && model ? { harness, model } : {}),
             tokens: readTokenReport(
               resultJson === null ? null : JSON.parse(resultJson),
               startedAt !== null && finishedAt !== null,
@@ -3465,17 +3494,30 @@ export class OrchestratorStore {
   getExecution(executionId: string) {
     const id = identifier(executionId);
     return this.#read(() => {
-      const row = this.#execution(id);
+      const row = this.#db
+        .query<
+          ExecutionRow & { harness: Harness | null; model: string | null }
+        >(
+          `SELECT ${executionColumns}, ${executionAgentColumns} FROM executions WHERE id = ?`,
+        )
+        .get(id);
       if (!row) return null;
-      const { requestedByJson, resultJson, ...execution } = row;
+      const { requestedByJson, resultJson, harness, model, ...execution } = row;
       const result: unknown =
         resultJson === null ? null : JSON.parse(resultJson);
       return freeze({
         ...execution,
+        ...(harness && model ? { harness, model } : {}),
         ...this.#subjectRefs(row.goalId, row.taskId),
         requestedBy: parseOrigin(JSON.parse(requestedByJson)),
         tokenUsage: this.#executionUsage(row, result),
-        result,
+        result:
+          result &&
+          typeof result === "object" &&
+          "code" in result &&
+          result.code === "codex-auth"
+            ? { ...result, next: codexFailureActions["codex-auth"] }
+            : result,
       });
     });
   }

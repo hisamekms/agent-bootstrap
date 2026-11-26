@@ -1,3 +1,5 @@
+import type { SqliteAudit } from "./audit.ts";
+import { SandboxRuntimeError } from "./sandbox-runtime.ts";
 import assert from "node:assert/strict";
 import {
   execFile,
@@ -1444,5 +1446,59 @@ export function siwcProvider({
           ),
         true,
       ),
+  };
+}
+
+/** Bind one refresh to the audited sandbox create that will consume it. */
+export function siwcSandboxCredential(
+  audit: Pick<SqliteAudit, "read" | "append" | "isV5Writable">,
+  provider: (hooks: {
+    beforeRefresh: () => Promise<void>;
+    onRefresh: (event: SiwcRefreshEvent) => Promise<void>;
+  }) => Pick<SiwcProvider, "accessToken">,
+): CredentialProvider {
+  return {
+    async withAccessToken(consume, invocationId) {
+      if (!invocationId) throw new SandboxRuntimeError("siwc-unavailable");
+      const record = async (
+        detail: SiwcRefreshEvent | { event: "siwc-refresh"; status: "started" },
+      ) => {
+        if (!audit.isV5Writable)
+          throw new SandboxRuntimeError("siwc-unavailable");
+        await audit.append({
+          invocationId,
+          role: "Worker",
+          kind: "operation.requested",
+          operation: "sandbox.create",
+          detail,
+        });
+      };
+      let token: string;
+      try {
+        const starts = audit
+          .read(invocationId)
+          .filter(({ kind }) => kind === "invocation.started");
+        const [invocation] = starts;
+        if (
+          !audit.isV5Writable ||
+          starts.length !== 1 ||
+          invocation?.role !== "Worker" ||
+          invocation.detail !== undefined
+        )
+          throw new SandboxRuntimeError("siwc-unavailable");
+        token = await provider({
+          beforeRefresh: () =>
+            record({ event: "siwc-refresh", status: "started" }),
+          onRefresh: record,
+        }).accessToken();
+        if (!audit.isV5Writable)
+          throw new SandboxRuntimeError("siwc-unavailable");
+      } catch (error) {
+        throw new SandboxRuntimeError(
+          error instanceof SiwcError ? error.code : "siwc-unavailable",
+        );
+      }
+      return consume(token);
+    },
   };
 }

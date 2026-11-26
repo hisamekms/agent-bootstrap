@@ -524,7 +524,11 @@ export class ActorRunner {
   ): Promise<void> {
     const { store } = this.#deps;
     if (store.getExecution(job.id)?.status === "cancelled") return;
-    store.startExecution(job.id);
+    const { harness, plannerHarness } = this.#deps;
+    store.startExecution(
+      job.id,
+      job.kind === "planner" ? (plannerHarness ?? harness) : harness,
+    );
     let attempts = 0;
     const results: (ClaudeCodeResult | null)[] = [];
     const recordResult = (result: ClaudeCodeResult | null) => {

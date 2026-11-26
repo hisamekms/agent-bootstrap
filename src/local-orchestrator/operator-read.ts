@@ -1,3 +1,4 @@
+import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import {
   builtInCredentialScanner,
@@ -500,6 +501,9 @@ export function operatorTask(store: OrchestratorStore, key: string) {
       failure: {
         code: timing?.failureCode ?? "unknown",
         stage: timing?.lastStage ?? "registered",
+        ...(isCodexFailureCode(timing?.failureCode) && {
+          next: codexFailureActions[timing.failureCode],
+        }),
         ...(rejectedPaths && { rejectedPaths }),
       },
     }),

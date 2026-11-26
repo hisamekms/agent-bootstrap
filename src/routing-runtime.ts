@@ -146,18 +146,23 @@ export class RoutingSandboxRuntime implements SandboxRuntime {
   }
 
   #volumeRuntime(): ConciergeVolumeBackend {
-    // Volume operations have no handle. Prefer the Concierge provider's
-    // backend, or require a unique volume backend in other deployments.
+    // Volume operations have no handle. Use the Concierge provider or its external route.
     const concierge = this.#routes.filter(
       ({ provider }) =>
         provider?.host === "api.anthropic.com" &&
         (provider.port ?? 443) === 443,
     );
+    const external = this.#routes.filter(
+      ({ provider, runtime }) =>
+        provider === undefined && runtime.createVolume && runtime.removeVolume,
+    );
     const routes = concierge.length
       ? concierge
-      : this.#routes.filter(
-          ({ runtime }) => runtime.createVolume && runtime.removeVolume,
-        );
+      : external.length
+        ? external
+        : this.#routes.filter(
+            ({ runtime }) => runtime.createVolume && runtime.removeVolume,
+          );
     const candidates = new Set(routes.map(({ runtime }) => runtime));
     const [runtime] = candidates;
     if (

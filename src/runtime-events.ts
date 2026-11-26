@@ -1,3 +1,4 @@
+import type { CodexFailureCode } from "./codex-exec.ts";
 import type { ClaudeFailureCode } from "./local-orchestrator/claude-config.ts";
 import { randomUUID } from "node:crypto";
 import type { ExecutionContext } from "./execution-context.ts";
@@ -80,7 +81,7 @@ export interface RuntimeEventPayloads {
   };
   readonly "execution.finished": Duration & {
     readonly outcome: ExecutionOutcome;
-    readonly code?: ClaudeFailureCode;
+    readonly code?: ClaudeFailureCode | CodexFailureCode;
   };
   readonly "sandbox.created": EffectOutcome &
     Duration & {

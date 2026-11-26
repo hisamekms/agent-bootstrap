@@ -1,3 +1,4 @@
+import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
 import type { DiffSize } from "./delegation.ts";
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
@@ -81,6 +82,8 @@ type CandidateReview = PinnedCandidate & {
 };
 
 export interface TaskFlow {
+  readonly workerAgent?: Pick<RoleHarness, "harness" | "model">;
+  readonly reviewerAgent?: Pick<RoleHarness, "harness" | "model">;
   worker(
     id: string,
     revise: boolean,
@@ -522,6 +525,8 @@ export function createTaskExecutor(options: {
     );
 
     const flow: TaskFlow = {
+      workerAgent: worker,
+      reviewerAgent: reviewer,
       async worker(id, revise, observed) {
         workerResult = observed;
         return revise
@@ -668,20 +673,25 @@ export async function runTask(
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
   let code = "host-error";
   let rejectedPaths: PathViolation[] | undefined;
-  const begin = (actor: "Executor" | "Reviewer", mode: TaskRunMode) => {
+  const begin = (
+    actor: "Executor" | "Reviewer",
+    mode: TaskRunMode,
+    agent?: Pick<RoleHarness, "harness" | "model">,
+  ) => {
     const { id: execution } = store.createExecution({
       actor,
       mode,
       taskId: task.id,
       requestedBy: { kind: "host" },
     });
-    store.startExecution(execution);
+    store.startExecution(execution, agent);
     return execution;
   };
 
   async function execute<T>(
     actor: "Executor" | "Reviewer",
     mode: TaskRunMode,
+    agent: Pick<RoleHarness, "harness" | "model"> | undefined,
     run: (
       id: string,
       observed: ActorResult,
@@ -691,7 +701,7 @@ export async function runTask(
       result?: Record<string, unknown> & { rejectedPaths?: PathViolation[] };
     }>,
   ) {
-    const executionId = begin(actor, mode);
+    const executionId = begin(actor, mode, agent);
     const observed: ActorResult = {};
     let completion: Awaited<ReturnType<typeof run>> | undefined;
     let failure: string | undefined;
@@ -730,9 +740,11 @@ export async function runTask(
         ...(failure ? { code: failure } : {}),
         ...(failure === "unsafe-input-symlink"
           ? { next: unsafeInputSymlinkNext }
-          : failure === "secret-test-required" && next
-            ? { next }
-            : {}),
+          : isCodexFailureCode(failure)
+            ? { next: codexFailureActions[failure] }
+            : failure === "secret-test-required" && next
+              ? { next }
+              : {}),
         ...(observed.revision === undefined
           ? {}
           : { revision: observed.revision }),
@@ -766,6 +778,7 @@ export async function runTask(
       const worker = await execute(
         "Executor",
         "task",
+        flow.workerAgent,
         async (runId, observed) => {
           observed.revision = attempt > 0;
           const pin = await flow.worker(runId, attempt > 0, observed);
@@ -824,6 +837,7 @@ export async function runTask(
         const verification = await execute(
           "Reviewer",
           "verification",
+          undefined,
           async (runId, observed) => {
             const passed = await verify(runId, observed);
             return {
@@ -848,6 +862,7 @@ export async function runTask(
       const review = await execute(
         "Reviewer",
         "review",
+        flow.reviewerAgent,
         async (runId, observed) => {
           const value = await flow.review(runId, observed);
           if (

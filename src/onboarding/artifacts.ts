@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
+import { CODEX, codexBinaryPath } from "../codex-exec.ts";
 import { createHash } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -25,18 +27,21 @@ export const allProfiles = [...defaultProfiles, ...extraProfiles];
 const maxBytes = 512 * 1024 * 1024;
 const releases = "https://downloads.claude.ai/claude-code-releases";
 const alpine = "https://dl-cdn.alpinelinux.org/alpine/v3.23/main/aarch64";
+const codex = "https://github.com/openai/codex/releases/download";
 const bun = "https://github.com/oven-sh/bun/releases/download";
 
 export interface Artifact {
   readonly path: string;
   readonly url: string;
   readonly sha256: string;
+  readonly archive?: { readonly sha256: string; readonly member: string };
 }
 
 export function artifacts(
   profiles: readonly string[],
   alternateClaude?: string,
   includeSecrets = false,
+  includeCodex = false,
 ): Artifact[] {
   const inputs = new Map<string, Artifact>();
   function add(item: Artifact) {
@@ -52,6 +57,13 @@ export function artifacts(
     url: `${releases}/${releasePath}`,
     sha256,
   });
+  if (includeCodex)
+    add({
+      path: codexBinaryPath,
+      url: `${codex}/rust-v${CODEX.version}/${CODEX.archive.name}`,
+      sha256: CODEX.sha256,
+      archive: { sha256: CODEX.archive.sha256, member: CODEX.archive.member },
+    });
   const alpineProfiles = profiles.filter(
     (profile) => recipeFor(profile).base.kind === "alpine",
   );
@@ -74,6 +86,7 @@ export function artifacts(
 export async function artifactStatus(
   path: string,
   sha256: string,
+  mode?: number,
 ): Promise<"ok" | "missing" | "wrong"> {
   try {
     await using file = await open(
@@ -81,7 +94,12 @@ export async function artifactStatus(
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
     const info = await file.stat();
-    if (!info.isFile() || info.size > maxBytes) return "wrong";
+    if (
+      !info.isFile() ||
+      info.size > maxBytes ||
+      (mode !== undefined && (info.mode & 0o7777) !== mode)
+    )
+      return "wrong";
     const hash = createHash("sha256");
     let size = 0;
     for await (const data of file.createReadStream({ autoClose: false })) {
@@ -107,7 +125,7 @@ function allowedUrl(url: URL, original: string): boolean {
       new URL(bun).host,
     ].includes(url.hostname);
   return (
-    original.startsWith(bun + "/") &&
+    (original.startsWith(bun + "/") || original.startsWith(codex + "/")) &&
     url.hostname === "release-assets.githubusercontent.com"
   );
 }
@@ -191,13 +209,59 @@ export async function fetchArtifact(
       createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
       { signal },
     );
-    if (hash.digest("hex") !== item.sha256)
+    if (hash.digest("hex") !== (item.archive?.sha256 ?? item.sha256))
       throw new Error("Download checksum does not match");
+    let staged = temporary;
+    if (item.archive) {
+      staged = join(work, "binary");
+      // Stream only the named member. Archive metadata never controls the output path or mode.
+      const tar = spawn(
+        "/usr/bin/tar",
+        ["-xOzf", temporary, "--", item.archive.member],
+        {
+          env: { PATH: "/usr/bin:/bin" },
+          stdio: ["ignore", "pipe", "ignore"],
+          signal,
+        },
+      );
+      const exited = new Promise<void>((resolve, reject) => {
+        tar.once("error", reject);
+        tar.once("close", (code) =>
+          code === 0
+            ? resolve()
+            : reject(new Error("Archive extraction failed")),
+        );
+      });
+      let extracted = 0;
+      await Promise.all([
+        exited,
+        pipeline(
+          tar.stdout,
+          new Transform({
+            transform(chunk: Buffer, _encoding, done) {
+              extracted += chunk.length;
+              if (extracted > maxBytes)
+                return done(new Error("Extracted binary too large"));
+              done(null, chunk);
+            },
+          }),
+          createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+          { signal },
+        ),
+      ]);
+      if ((await artifactStatus(staged, item.sha256)) !== "ok")
+        throw new Error("Extracted binary checksum does not match");
+      await chmod(staged, 0o700);
+    }
     await checkDirectory(directory);
-    const existing = await artifactStatus(destination, item.sha256);
+    const existing = await artifactStatus(
+      destination,
+      item.sha256,
+      item.archive ? 0o700 : undefined,
+    );
     if (existing === "ok") return;
     if (existing === "wrong") throw new Error("Artifact destination changed");
-    await rename(temporary, destination);
+    await rename(staged, destination);
   } finally {
     await rm(work, { recursive: true, force: true });
   }

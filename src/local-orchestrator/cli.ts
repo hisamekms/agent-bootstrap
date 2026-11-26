@@ -1,3 +1,4 @@
+import { isCodexFailureCode } from "../codex-exec.ts";
 import {
   GOAL_POLICIES,
   RULE_GATES,
@@ -537,7 +538,8 @@ async function execute(
         writePathSummary(readPathViolations(result.rejectedPaths));
       if (
         !io.json &&
-        result?.code === "secret-test-required" &&
+        (result?.code === "secret-test-required" ||
+          isCodexFailureCode(result?.code)) &&
         typeof result.next === "string"
       )
         io.stdout.write(

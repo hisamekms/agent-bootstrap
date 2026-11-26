@@ -1,3 +1,13 @@
+import {
+  codexAuthExitCode,
+  codexProvider,
+  siwcCodexEndpoint,
+} from "../src/codex-exec.ts";
+import {
+  SiwcError,
+  siwcSandboxCredential,
+  type SiwcCode,
+} from "../src/siwc.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -32,6 +42,8 @@ type BackendEvent = {
   hasGatewayPassword?: boolean;
   durableBinding?: boolean;
   credentialMatches?: boolean;
+  siwcRecorded?: boolean;
+  siwcEnvPresent?: boolean;
 };
 
 async function fixture(t: TestContext, version = "msb 0.7.16") {
@@ -51,11 +63,15 @@ import { Database } from "bun:sqlite";
 import { appendFileSync, existsSync } from "node:fs";
 const args = process.argv.slice(2);
 const event = { args };
+const siwcEnv = ${JSON.stringify(siwcCodexEndpoint.secretEnv)};
+event.siwcEnvPresent = Object.hasOwn(process.env, siwcEnv);
 const option = (key) => args[args.indexOf(key) + 1];
 if (args[0] === "create" && args.includes("--proxy")) {
   event.hasGatewayPassword = /^[a-f0-9]{64}$/.test(process.env[option("--socks5-password-env")] ?? "");
   const audit = new Database(${JSON.stringify(auditPath)}, { readonly: true });
   event.durableBinding = !!audit.query("SELECT 1 FROM sandbox_bindings WHERE sandbox_id = ? AND egress_mode = 'gateway'").get(option("--name"));
+  const siwcStatus = args.some(arg => arg.startsWith("agent-bootstrap-invocation=")) ? audit.query("SELECT json_extract(detail, '$.status') AS status FROM audit_events WHERE json_extract(detail, '$.event') = 'siwc-refresh' AND invocation_id = ? ORDER BY sequence").all(args.find(arg => arg.startsWith("agent-bootstrap-invocation="))?.split("=")[1]) : [];
+  event.siwcRecorded = siwcStatus.map(row => row.status).join(",") === "started,ok";
   audit.close();
   if (args.includes("--secret")) {
     const variable = option("--secret").split(":")[0];
@@ -73,6 +89,7 @@ switch (args[0]) {
   case "rm": break;
   case "metrics": console.log(JSON.stringify({ memory_bytes: 456 })); break;
   case "exec":
+    if (args.at(-1) === "fixture-codex-auth") process.exitCode = ${codexAuthExitCode};
     if (args.at(-1) === "wait-for-sample")
       while (!existsSync(${JSON.stringify(sampled)}))
         await Bun.sleep(5);
@@ -449,4 +466,184 @@ test("operator shell uses a bounded audited terminal with no provider or credent
     events.find(({ args }) => args[0] === "exec")?.args.slice(-2),
     ["--", "/bin/sh"],
   );
+});
+
+test("SIWC refresh is audited before VM create and the token stays in the create environment", async (t) => {
+  const f = await fixture(t);
+  const provider = codexProvider(siwcCodexEndpoint)!;
+  const fixtureToken = provider.secretEnv + "-fixture";
+  const notes: string[] = [];
+  let errorCode: SiwcCode | undefined;
+  let exchanges = 0;
+  let observed: Awaited<ReturnType<typeof createObservedHost>>;
+  observed = await createObservedHost({
+    ...f.options,
+    claude: {
+      managedSettings: () => "{}",
+      note: (message) => notes.push(message),
+    },
+    gatewayHosts: [provider.host],
+    providerBindings: [
+      {
+        provider,
+        credentials: {
+          withAccessToken(consume, invocationId) {
+            return siwcSandboxCredential(observed.audit, (hooks) => ({
+              async accessToken() {
+                if (errorCode !== "siwc-missing") {
+                  await hooks.beforeRefresh();
+                  exchanges++;
+                }
+                if (errorCode) {
+                  await hooks.onRefresh({
+                    event: "siwc-refresh",
+                    status: "failed",
+                    code: errorCode,
+                  });
+                  throw new SiwcError(errorCode);
+                }
+                await hooks.onRefresh({ event: "siwc-refresh", status: "ok" });
+                return fixtureToken;
+              },
+            })).withAccessToken(consume, invocationId);
+          },
+        },
+      },
+    ],
+  });
+  t.after(() => observed.close());
+  const worker = { ...plan, sandbox: { provider } };
+  const otherRole = await observed.host.runPlanner(worker);
+  assert.equal(otherRole.outcome, "failed");
+  assert.equal(exchanges, 0);
+  assert.ok(
+    !observed.audit
+      .read(otherRole.id)
+      .some(
+        ({ detail }) =>
+          detail && "event" in detail && detail.event === "siwc-refresh",
+      ),
+  );
+  async function check(
+    outcome: "ok" | "failed",
+    code?: SiwcCode | "codex-auth",
+  ) {
+    notes.length = 0;
+    const result = await observed.host.runWorker(
+      code === "codex-auth"
+        ? {
+            ...worker,
+            command: { ...worker.command, argv: ["fixture-codex-auth"] },
+          }
+        : worker,
+    );
+    assert.equal(result.outcome, outcome);
+    assert.equal(result.code, code);
+    const audit = observed.audit.readExecution(result.id);
+    const refresh = audit.auditEvents.flatMap(({ detail }) =>
+      detail && "event" in detail && detail.event === "siwc-refresh"
+        ? [detail]
+        : [],
+    );
+    assert.deepEqual(
+      refresh.map(({ status }) => status),
+      errorCode === "siwc-missing"
+        ? ["failed"]
+        : ["started", errorCode ? "failed" : "ok"],
+    );
+    if (code) assert.deepEqual(audit.auditEvents.at(-1)?.detail, { code });
+    if (code === "siwc-rejected") {
+      assert.deepEqual(notes, ["next: agent-bootstrap codex authorize"]);
+      assert.deepEqual(audit.processResults, []);
+    }
+    if (code === "codex-auth") {
+      assert.deepEqual(notes, [
+        "next: The Executor reported that the provider rejected the credential. Inspect the execution.",
+      ]);
+      assert.equal(audit.processResults[0]?.guestReported, true);
+    }
+    assert.ok(!JSON.stringify(audit).includes(fixtureToken));
+  }
+  for (const code of [
+    "siwc-missing",
+    "siwc-rejected",
+    "siwc-unavailable",
+  ] as const) {
+    errorCode = code;
+    await check("failed", code);
+  }
+  assert.equal(
+    (await f.events()).filter(({ args }) => args[0] === "create").length,
+    0,
+  );
+  errorCode = undefined;
+  await check("ok");
+  await check("failed", "codex-auth");
+  assert.equal(exchanges, 4);
+  const events = await f.events();
+  const creates = events.filter(({ args }) => args[0] === "create");
+  assert.equal(creates.length, 2);
+  for (const create of creates) {
+    assert.ok(
+      create.credentialMatches && create.siwcRecorded && create.siwcEnvPresent,
+    );
+    assert.ok(
+      create.args.includes(
+        provider.secretEnv + ":headers=authorization@api.openai.com",
+      ),
+    );
+  }
+  assert.ok(
+    events
+      .filter(({ args }) => args[0] !== "create")
+      .every(({ siwcEnvPresent }) => !siwcEnvPresent),
+  );
+  assert.ok(!JSON.stringify(events).includes(fixtureToken));
+});
+
+test("SIWC refuses refresh and token delivery when the prerequisite audit write fails", async () => {
+  let exchanged = false;
+  let delivered = false;
+  let appendAttempts = 0;
+  let duplicate = false;
+  const credentials = siwcSandboxCredential(
+    {
+      isV5Writable: true,
+      read(invocationId) {
+        const start = {
+          invocationId,
+          role: "Worker",
+          kind: "invocation.started",
+          sequence: 1,
+          recordedAt: "2026-01-01T00:00:00.000Z",
+        } as const;
+        return duplicate
+          ? [start, { ...start, role: "Planner", sequence: 2 }]
+          : [start];
+      },
+      append() {
+        appendAttempts++;
+        throw new Error("fixture audit write failed");
+      },
+    },
+    (hooks) => ({
+      async accessToken() {
+        await hooks.beforeRefresh();
+        exchanged = true;
+        return "fixture-token";
+      },
+    }),
+  );
+  for (const repeated of [false, true]) {
+    duplicate = repeated;
+    await assert.rejects(
+      credentials.withAccessToken(async () => {
+        delivered = true;
+      }, randomUUID()),
+      (error: Error) => "code" in error && error.code === "siwc-unavailable",
+    );
+    assert.equal(appendAttempts, 1);
+  }
+  assert.equal(exchanged, false);
+  assert.equal(delivered, false);
 });

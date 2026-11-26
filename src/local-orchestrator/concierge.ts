@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { codexExecutorOptions, readCodexExecutor } from "./codex-executor.ts";
+import { codexTools } from "../codex-exec.ts";
 import { secretTestFacts } from "./secret-test-record.ts";
 import {
   requireCredentialScan,
@@ -15,11 +18,12 @@ import {
   open,
   readdir,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { claudeRoleHarness, guestOf } from "../actors.ts";
+import { claudeRoleHarness, codexRoleHarness, guestOf } from "../actors.ts";
 import {
   CLAUDE_CODE,
   CLAUDE_CODE_BUILDS,
@@ -464,6 +468,10 @@ export async function startConcierge(
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
   const { config, baseImage } = deps;
+  const codexOptions = codexExecutorOptions(config);
+  const codexInstall = codexOptions
+    ? await readCodexExecutor(bootstrapRoot, codexOptions)
+    : undefined;
   const secretHarness = (actor: SecretActor) => {
     const variable = secretVariable(config, actor);
     if (!variable) return;
@@ -485,7 +493,7 @@ export async function startConcierge(
   };
   const planner = secretHarness("Planner");
   const reviewer = secretHarness("Reviewer") ?? harness;
-  const executor = secretHarness("Executor");
+  const executor = codexOptions ? undefined : secretHarness("Executor");
   function runActor<P extends WorkerPlan | ReviewerPlan, T>(
     run: (
       plan: P,
@@ -565,6 +573,20 @@ export async function startConcierge(
     socketDir = await mkdtemp(join(socketRoot(), "lo-"));
     const socket = join(socketDir, "h.sock");
     const scan = deps.scan;
+    let executorTools: ReturnType<typeof codexTools> | undefined;
+    if (codexInstall) {
+      const path = join(socketDir, "models.json");
+      await writeFile(path, codexInstall.catalog, { flag: "wx", mode: 0o600 });
+      executorTools = codexTools({
+        binary: codexInstall.binary,
+        catalog: {
+          path,
+          sha256: createHash("sha256")
+            .update(codexInstall.catalog)
+            .digest("hex"),
+        },
+      });
+    }
     const tasks =
       host.runWorker && host.runVerification
         ? createTaskExecutor({
@@ -583,6 +605,13 @@ export async function startConcierge(
               runVerification: host.runVerification.bind(host),
             },
             worker(profile) {
+              if (codexOptions && executorTools)
+                return codexRoleHarness(
+                  codexOptions,
+                  executorTools,
+                  undefined,
+                  profile,
+                );
               if (executor) {
                 if (profile !== "base") {
                   const error = new ConfigError(
