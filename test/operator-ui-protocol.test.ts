@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  activityLabel,
+  planningDraft,
   chunkInput,
   clampSize,
   decodeBase64,
@@ -15,9 +17,55 @@ import {
   isRef,
   retryCommand,
   statusRepository,
+  type Activity,
   type PanelInboxItem,
   type Problem,
 } from "../src/operator-ui/web/protocol.ts";
+
+test("the activity pill reports waiting, queued work and human turns", () => {
+  const idle: Activity = {
+    running: [],
+    queued: [],
+    queuedCount: 0,
+    yourTurn: 0,
+  };
+  assert.equal(activityLabel(idle), "AI は待機中");
+  assert.equal(
+    activityLabel({ ...idle, yourTurn: 1 }),
+    "AI は待機中 · あなたの番 1",
+  );
+  assert.equal(
+    activityLabel({ ...idle, queuedCount: 2 }),
+    "AI は待機中 · 待ち 2",
+  );
+  assert.equal(
+    activityLabel({
+      ...idle,
+      queuedCount: 2,
+      yourTurn: 3,
+      running: [
+        {
+          id: "exec",
+          status: "running",
+          actor: "Executor",
+          mode: "task",
+          goalId: "goal",
+          goalRef: "G1",
+          goalTitle: "Goal",
+          taskId: "task",
+          taskRef: "G1-1",
+          taskTitle: "Task",
+          startedAt: "2026-11-26T00:00:00Z",
+        },
+      ],
+    }),
+    "AI 作業中 1 · 待ち 2 · あなたの番 3",
+  );
+  assert.equal(
+    planningDraft("G12", "ログを見やすくする"),
+    "G12「ログを見やすくする」が承認されました。Task に分けてください。",
+  );
+});
 
 test("only canonical Goal and Task refs pass protocol validation", () => {
   for (const value of ["G1", "G123", "G1-1", "G123-456"])

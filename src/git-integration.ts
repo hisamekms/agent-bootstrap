@@ -308,6 +308,21 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+function hasGitDiagnostics(stderr: Buffer) {
+  // Apple's git launcher falls back to /tmp before invoking Git in a sandbox.
+  // Ref warnings from Git itself still make a missing ref ambiguous.
+  return stderr
+    .toString("utf8")
+    .split("\n")
+    .some(
+      (line) =>
+        line.trim() !== "" &&
+        !/^git: warning: confstr\(\) failed with code \d+: couldn't get path of DARWIN_USER_TEMP_DIR; using \/tmp instead$/.test(
+          line,
+        ),
+    );
+}
+
 /** Trusted-host local boundary; it does not authorize a candidate. Callers must
  * durably record an independently authenticated human approval before advance.
  * No remotes, merges, branch checkouts, hooks, filters or user settings are used.
@@ -341,9 +356,13 @@ export class LocalGitIntegration {
   #git(
     args: readonly string[],
     worktree?: string,
-    allowExitOne = false,
-    transaction?: { input: string; validate: () => Promise<void> },
+    options: {
+      allowExitOne?: boolean;
+      rejectStderr?: boolean;
+      transaction?: { input: string; validate: () => Promise<void> };
+    } = {},
   ): Promise<Buffer> {
+    const { allowExitOne, rejectStderr, transaction } = options;
     const context = worktree
       ? ["-C", worktree]
       : [`--git-dir=${this.#config.repository}`];
@@ -363,7 +382,7 @@ export class LocalGitIntegration {
           maxBuffer: outputLimit,
           encoding: "buffer",
         },
-        (error, stdout) => {
+        (error, stdout, stderr) => {
           if (
             transaction &&
             commitSent &&
@@ -387,6 +406,8 @@ export class LocalGitIntegration {
             transaction &&
             (!preparing || !stdout.toString("utf8").includes("commit: ok\n"))
           )
+            reject(new GitIntegrationError("git-failed"));
+          else if (rejectStderr && hasGitDiagnostics(stderr))
             reject(new GitIntegrationError("git-failed"));
           else resolve(stdout);
         },
@@ -424,7 +445,10 @@ export class LocalGitIntegration {
 
   async #reference(ref: string, checkout?: string): Promise<string | null> {
     const symbolic = (
-      await this.#git(["symbolic-ref", "--quiet", ref], checkout, true)
+      await this.#git(["symbolic-ref", "--quiet", ref], checkout, {
+        allowExitOne: true,
+        rejectStderr: true,
+      })
     )
       .toString("utf8")
       .trim();
@@ -438,6 +462,7 @@ export class LocalGitIntegration {
           ref,
         ],
         checkout,
+        { rejectStderr: true },
       )
     ).toString("utf8");
     if (entry === "") return null;
@@ -468,12 +493,14 @@ export class LocalGitIntegration {
         : previous === null
           ? `verify ${ref} ${old}`
           : `delete ${ref} ${old}`;
-    await this.#git(["update-ref", "--stdin"], checkout, false, {
-      input: `start\noption no-deref\n${command}\nprepare\n`,
-      validate: async () => {
-        if ((await this.#reference(ref, checkout)) !== previous)
-          throw new GitIntegrationError("stale-base");
-        if (checkout) await this.#requireBranchNotCheckedOut(checkout);
+    await this.#git(["update-ref", "--stdin"], checkout, {
+      transaction: {
+        input: `start\noption no-deref\n${command}\nprepare\n`,
+        validate: async () => {
+          if ((await this.#reference(ref, checkout)) !== previous)
+            throw new GitIntegrationError("stale-base");
+          if (checkout) await this.#requireBranchNotCheckedOut(checkout);
+        },
       },
     });
   }
@@ -605,10 +632,15 @@ export class LocalGitIntegration {
   }
 
   async head(): Promise<string> {
+    const commit = await this.branchHead();
+    if (commit === null) throw new GitIntegrationError("invalid-object");
+    return commit;
+  }
+
+  async branchHead(): Promise<string | null> {
     await this.#repository();
     const commit = await this.#reference(this.#ref);
-    if (commit === null) throw new GitIntegrationError("invalid-object");
-    await this.#commit(commit);
+    if (commit !== null) await this.#commit(commit);
     return commit;
   }
 
@@ -1396,7 +1428,9 @@ export class LocalGitIntegration {
     if (previous !== undefined) {
       await this.#commit(previous);
       const ancestor = (
-        await this.#git(["merge-base", base, previous], undefined, true)
+        await this.#git(["merge-base", base, previous], undefined, {
+          allowExitOne: true,
+        })
       )
         .toString("utf8")
         .trim();

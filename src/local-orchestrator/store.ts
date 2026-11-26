@@ -109,6 +109,7 @@ export type StoreErrorCode =
   | "task-retry-changed"
   | "approval-forbidden"
   | "goal-inactive"
+  | "goal-head-unavailable"
   | "goal-busy"
   | "goal-discard-record-failed"
   | "goal-base-ineligible"
@@ -3532,6 +3533,7 @@ export class OrchestratorStore {
         WHERE kind IN ('execution.queued', 'execution.started', 'execution.finished',
           'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
+          'task.retried', 'task.budget-exceeded',
           'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',
           'project.defaults-set', 'project.rule-set', 'goal.policy-set', 'task.policy-set')
       `,
@@ -3671,30 +3673,6 @@ export class OrchestratorStore {
           ],
         ),
       );
-    });
-  }
-
-  pendingInboxActions(): number {
-    return this.#read(() => {
-      const { count } = this.#db
-        .query<{ count: number }>(
-          `SELECT (
-             SELECT count(*) FROM events e
-             JOIN tasks t ON e.subject_id = t.id JOIN goals g ON t.goal_id = g.id
-             WHERE e.kind = 'task.status' AND e.subject_kind = 'task'
-               AND json_extract(e.data, '$.status') = 'failed'
-               AND g.status <> 'cancelled' AND NOT ${laterTaskStatus}
-           ) + (
-             SELECT count(*) FROM executions x
-             LEFT JOIN tasks t ON x.task_id = t.id LEFT JOIN goals g ON x.goal_id = g.id
-             WHERE x.finished_at IS NOT NULL AND x.started_at IS NOT NULL
-               AND ${executionOverBudget}
-               AND NOT coalesce(${taskBudgetResolved}, 0)
-               AND (SELECT status FROM goals WHERE id = coalesce(x.goal_id, t.goal_id)) IS NOT 'cancelled'
-           ) AS count`,
-        )
-        .get()!;
-      return count + this.#panelActionCounts().total;
     });
   }
 

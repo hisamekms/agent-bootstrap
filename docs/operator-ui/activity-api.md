@@ -44,15 +44,17 @@ availability still affect when a registered Task can start. Waiting rows
 have a null `startedAt`. Their `status` is `queued` or `registered`, and
 their `id` identifies the corresponding execution or Task.
 
-`yourTurn` counts unresolved inbox actions. A proposal counts when an
-operator can answer it. An inbox mark records that an item was seen and
-does not resolve it.
+`yourTurn` counts decisions and checks from the default `inbox.list` page
+plus problems from the default `problem.list` response. Problem rows for
+the same Task count once. Marking an item seen keeps it in the count.
 
 Send `activity.subscribe` with empty params before the first
 `activity.get`. The host acknowledges with `{"subscribed":true}` and
 sends `{"method":"activity.changed","params":{}}` when it sees a newer
-activity-relevant audit event or a change in the pending self-test count. This includes execution queue, start, and
-finish events and Goal or Task registration and status changes. Fetch
+activity-relevant audit event, a change in the pending self-test count, or
+visible inbox history expiring at the one-week cutoff. Relevant events
+include execution queue, start, and finish events and Goal or Task
+registration and status changes. Fetch
 `activity.get` again on notification and resubscribe after reconnecting.
 Several transitions can share one notification. The inbox watcher still sends
 its item-level changes.
@@ -94,9 +96,13 @@ the budget window in the same transaction. A changed count returns
 
 Discard requires the exact uppercase Goal ref and the `head` from
 `goal.get` when the operator previewed the action. The `head` is the
-current private branch commit, or `null` if the branch is absent. Discard
-applies the CLI eligibility checks and returns `goal-busy` for a busy Goal
-or `stale-base` when the expected head differs from the current head. The
+current private branch commit, or `null` if the branch is absent.
+`goal.get` sets `headAvailable: true` in both cases. If the private repository
+or ref cannot be read, Goal detail is still returned with `head: null` and
+`headAvailable: false`. Discard refuses with `goal-head-unavailable` when
+it cannot read the head. It applies the CLI eligibility checks and returns
+`goal-busy` for a busy Goal or `stale-base` when the expected head differs
+from the current head. The
 host writes `goal.discard-authorized` before deleting the branch with a
 Git compare-and-swap, then records the resulting cancellation.
 

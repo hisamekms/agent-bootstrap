@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -129,6 +129,36 @@ async function fixture(
     policies,
   };
 }
+
+test("ref reads permit the launcher warning and fail closed on other stderr", async (t) => {
+  const { config, git } = await fixture(t);
+  const head = await git.branchHead();
+  assert.ok(head);
+  const binary = join(config.repository, "..", "git-with-stderr");
+  const wrapped = new LocalGitIntegration({ ...config, binary });
+  async function writeWrapper(sample: string) {
+    await writeFile(
+      binary,
+      `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = for-each-ref ]; then
+    cat >&2 <<'SAMPLE'
+${sample}
+SAMPLE
+  fi
+done
+exec /usr/bin/git "$@"
+`,
+      { mode: 0o700 },
+    );
+  }
+  await writeWrapper(
+    "git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead",
+  );
+  assert.equal(await wrapped.branchHead(), head);
+  await writeWrapper("fixture: harmless stderr with a successful exit");
+  await assert.rejects(wrapped.branchHead(), { code: "git-failed" });
+});
 
 test("single-file integration scopes gateway services and provider to their roles", async (t) => {
   const { git, host, journal, plan, policies, audit } = await fixture(t, true);

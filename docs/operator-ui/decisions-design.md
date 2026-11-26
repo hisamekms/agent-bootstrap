@@ -41,7 +41,7 @@ panel, with a breadcrumb back.
 | Tab        | Content                                                                                 |
 | ---------- | --------------------------------------------------------------------------------------- |
 | Decisions  | Waiting decisions, with batch approval. Below them, the decisions the AI made recently. |
-| Problems   | Failed Tasks, out-of-scope changes, budget overruns. Each links to its Task.            |
+| Problems   | Failed Tasks, out-of-scope changes, budget overruns, and actions for the affected work. |
 | Goals      | Goals with a progress bar, done out of total and an estimate. Detail lists the Tasks.   |
 | Delegation | The default per gate, the rules, and the invariants that no setting changes.            |
 
@@ -107,6 +107,26 @@ choice?}` and `proposal.answerMany` with a list of the same. The bridge
 - Problems are derived from records that already exist: failed Tasks,
   out-of-scope path violations, and executions over budget.
 
+### Activity and in-place decisions
+
+The header pill summarizes running work, queued work, and items in
+「あなたの番」. The popover lists the same decision cards as the Decisions
+tab and Goal views, followed by one compact row per problem Task.
+The inbox refresh updates all copies after the host records an answer.
+Every view uses Goal and Task refs. Inside a Goal detail, its Task refs
+use the shorter `#m` form.
+
+The Goal list groups rows by who can act next. A Goal detail shows its
+turn, running work, decisions and failures above the Task list. An approved
+Goal proposal becomes a tracking card until a decision for that Goal arrives
+or the operator closes it. The plan and consultation buttons paste drafts
+into Concierge and transfer focus to its terminal.
+
+Problems allow retrying the same Task or confirming a Goal discard. Retry
+submits the displayed retry count. Opening the discard confirmation reads
+the current branch head. A stale head requires another confirmation with a
+fresh read. The host contract is documented in [Activity and actions](activity-api.md).
+
 ### Proposal details and connection
 
 Opening a decision card fetches `proposal.get`. The response contains
@@ -116,10 +136,12 @@ Workplace shows host-checked paths, size, limits, origin and policy above
 are plain text. The AI verdict is a textual reference. Goal scope is
 structured and appears as paths, eligible roles and profiles, and limits.
 
-The confirmation submits the digest for the details it previews.
-Workplace keeps the digest internal. If the host reports a stale digest,
-the panel refreshes the inbox, reopens the affected card and fetches its
-details again. For integration, the Git diff has its own digest. The
+The approve button in an open detail submits the digest for the evidence
+already shown. The button on a closed card opens a one-line confirmation.
+Closed and batch approvals read the pinned proposal before enabling
+submission. Withheld fields block approval. Workplace keeps the digest
+internal. If the host reports a stale digest, the panel refreshes the
+inbox, reopens the affected card and fetches its details again. For integration, the Git diff has its own digest. The
 creation event names the successful, candidate-pinned Reviewer execution.
 The execution is immutable, and the proposal digest also covers the
 findings saved in the proposal row.

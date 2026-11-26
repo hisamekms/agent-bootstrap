@@ -47,6 +47,15 @@ test("the workplace serves three self-contained assets under its strict CSP", as
     html,
     /id="settings-toggle"[^>]*aria-pressed="false"[^>]*aria-controls="settings"/,
   );
+  assert.match(
+    html,
+    /id="now-toggle"[^>]*aria-controls="now-popover"[^>]*aria-expanded="false"[^>]*aria-haspopup="dialog"/,
+  );
+  assert.match(
+    html,
+    /id="now-popover"[^>]*role="dialog"[^>]*tabindex="-1"[^>]*hidden/,
+  );
+  assert.ok(html.indexOf('id="now-toggle"') < html.indexOf('id="fullscreen"'));
   assert.match(html, /id="theme-system" aria-pressed="true"/);
   for (const id of [
     "connection-project",
@@ -57,6 +66,9 @@ test("the workplace serves three self-contained assets under its strict CSP", as
   const js = read("/app.js", "text/javascript; charset=utf-8");
   assert.match(js, /adoptedStyleSheets/);
   assert.match(js, /AI の記述/);
+  assert.match(js, /読んだ内容で確定します/);
+  assert.match(js, /activity\.subscribe/);
+  assert.match(js, /activity\.changed/);
   assert.match(js, /内容が変わりました。もう一度確認してください/);
   assert.match(js, /資格情報のような文字列を含むため隠しました/);
   assert.doesNotMatch(

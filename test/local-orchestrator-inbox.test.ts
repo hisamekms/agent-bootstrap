@@ -13,8 +13,12 @@ import { addProject } from "../src/config/projects.ts";
 import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import {
+  groupProblems,
+  pendingDecisions,
+} from "../src/local-orchestrator/operator-attention.ts";
+import {
   operatorActivity,
-  operatorInbox,
+  operatorProblems,
   operatorProposal,
 } from "../src/local-orchestrator/operator-read.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
@@ -77,12 +81,11 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
     const source = { store, target };
     const inbox = projectInbox(source, { includeResolved });
     if (!includeResolved) {
-      const actions = operatorInbox(store, inbox).filter(
-        (item) =>
-          item.weight === "action" &&
-          (!item.subject.proposalId || "answer" in item),
+      assert.equal(
+        operatorActivity(source).yourTurn,
+        pendingDecisions(inbox).length +
+          groupProblems(operatorProblems(store)).length,
       );
-      assert.equal(operatorActivity(source).yourTurn, actions.length);
     }
     return inbox;
   };

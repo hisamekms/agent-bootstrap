@@ -229,19 +229,9 @@ async function importGoalBase(
     throw new Error("Git pack import failed");
 }
 
-async function goalBranchHead(
-  git: LocalGitIntegration,
-): Promise<string | null> {
-  return git.head().catch((error: unknown) => {
-    if (error instanceof GitIntegrationError && error.code === "invalid-object")
-      return null;
-    throw error;
-  });
-}
-
 export async function readGoalBranchHead(directory: string, goalId: string) {
   if (!(await privateRepositoryExists(directory))) return null;
-  return goalBranchHead(localGit(directory, goalBranch(goalId)));
+  return localGit(directory, goalBranch(goalId)).branchHead();
 }
 
 export async function previewGoalBaseUpdate(
@@ -256,7 +246,7 @@ export async function previewGoalBaseUpdate(
   const recordedBase = store.goalBaseForUpdate(goalId);
   const repository = join(directory, "repository.git");
   const git = localGit(directory, goalBranch(goalId));
-  const head = await goalBranchHead(git);
+  const head = await git.branchHead();
   const from = recordedBase ?? head;
   if (from === null) throw new OrchestratorStoreError("goal-base-ineligible");
   if (head !== from) throw new GitIntegrationError("stale-base");
@@ -268,7 +258,7 @@ export async function previewGoalBaseUpdate(
       store.goalBaseForUpdate(goalId);
       if (
         (await localMainCommit(repoRoot)) !== to ||
-        (await goalBranchHead(git)) !== from
+        (await git.branchHead()) !== from
       )
         throw new GitIntegrationError("stale-base");
       await importGoalBase(repoRoot, repository, to);
@@ -295,7 +285,9 @@ export async function previewGoalDiscard(
   store.assertGoalDiscardable(goalId);
   const branch = goalBranch(goalId);
   const git = localGit(directory, branch);
-  const head = await readGoalBranchHead(directory, goalId);
+  const head = await readGoalBranchHead(directory, goalId).catch(() => {
+    throw new OrchestratorStoreError("goal-head-unavailable");
+  });
   return {
     branch,
     head,
@@ -334,7 +326,7 @@ export async function previewGoalBranchExport(
     store.goalIntegrationHead(goalId) ?? goal.baseCommit,
   );
   if (
-    (await goalBranchHead(git)) !== to ||
+    (await git.branchHead()) !== to ||
     (store.goalIntegrationHead(goalId) ?? store.getGoal(goalId)?.baseCommit) !==
       to
   )
@@ -997,11 +989,11 @@ export async function integrateApprovedProposal(
         throw new TaskError("candidate-mismatch");
     }
 
-    if ((await goalBranchHead(git)) !== base)
+    if ((await git.branchHead()) !== base)
       throw new GitIntegrationError("stale-base");
     store.beginIntegration(proposalId, proposal.digest, approvalId);
     isPreGitFailure = () =>
-      Promise.all([goalBranchHead(git), journal.read()]).then(
+      Promise.all([git.branchHead(), journal.read()]).then(
         ([head, events]) =>
           head === base &&
           !events.some((event) => event.kind === "integration.authorized"),
@@ -1094,7 +1086,7 @@ export async function reconciliationIntegrationHeads(
   )) {
     if (!directory) throw new OrchestratorStoreError("integration-uncertain");
     const { taskId, branch, base, candidate, digest } = content;
-    const head = await goalBranchHead(localGit(directory, branch));
+    const head = await localGit(directory, branch).branchHead();
     if (head === candidate) {
       const events = await taskJournal(directory, taskId, retries).read();
       if (

@@ -89,6 +89,16 @@
           <div class="toolbar-actions">
             <button
               type="button"
+              id="now-toggle"
+              class="now-pill"
+              aria-controls="now-popover"
+              aria-expanded="false"
+              aria-haspopup="dialog"
+            >
+              AI は待機中
+            </button>
+            <button
+              type="button"
               class="iconbtn"
               id="fullscreen"
               aria-label="全画面にする"
@@ -151,6 +161,14 @@
               </svg>
             </button>
           </div>
+          <section
+            id="now-popover"
+            class="now-popover stack"
+            role="dialog"
+            aria-label="いまの状況"
+            tabindex="-1"
+            hidden
+          ></section>
         </div>
         <div class="notices">
           <p id="terminal-notice" role="status"></p>
