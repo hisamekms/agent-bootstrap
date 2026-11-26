@@ -4,9 +4,11 @@ import { goalBranch } from "../src/local-orchestrator/model.ts";
 import {
   operatorGoalList,
   operatorProblems,
+  operatorProposal,
   operatorTask,
 } from "../src/local-orchestrator/operator-read.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
+import { isProposal } from "../src/operator-ui/web/protocol.ts";
 
 const goal = {
   title: "A Goal",
@@ -52,6 +54,72 @@ function setup(store: ReturnType<typeof orchestratorFixture>["store"]) {
   };
   return { approve, goalId, task };
 }
+
+test("proposal detail returns checked scope and screens each model field before escape", async () => {
+  using state = orchestratorFixture("lo-read-");
+  const { store } = state;
+  const description = "A <tag>\u202e description\r\nSecond line\nThird\rline";
+  const acceptance = ["screen this criterion"];
+  const proposed = store.proposeGoal(
+    { ...goal, description, acceptance },
+    { kind: "actor", actor: "Concierge" },
+  );
+  const details = await operatorProposal(
+    store,
+    state.root,
+    proposed.id,
+    async (...fields) => {
+      if (fields.includes(acceptance[0]!)) throw new Error();
+    },
+  );
+  assert.ok(isProposal(details));
+  assert.partialDeepStrictEqual(details, {
+    digest: proposed.digest,
+    origin: { kind: "actor", actor: "Concierge" },
+    effectivePolicy: "human",
+    paths: goal.scope.paths,
+    budgets: goal.scope.budgets,
+    pathViolations: [],
+    modelText: {
+      description: "A <tag>\\u202e description\nSecond line\nThird\\u000dline",
+      acceptance: { withheld: true },
+    },
+  });
+  assert.ok(!JSON.stringify(details).includes(acceptance[0]!));
+
+  const { goalId } = store.decide(proposed.id, {
+    digest: proposed.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const synthetic = "bearer " + "x".repeat(24);
+  const task = store.proposeTask(
+    {
+      title: "Task",
+      goalId,
+      description: synthetic,
+      acceptance: ["First\r\nSecond\nThird\tline"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["outside/file.ts", "src/ok.ts"],
+      budgets: goal.scope.budgets,
+      dependsOn: [],
+    },
+    host,
+  );
+  const taskDetail = await operatorProposal(store, state.root, task.id);
+  assert.ok(isProposal(taskDetail));
+  assert.partialDeepStrictEqual(taskDetail, {
+    digest: task.digest,
+    origin: host,
+    pathViolations: ["outside/file.ts"],
+    modelText: {
+      description: { withheld: true },
+      acceptance: ["First\nSecond\nThird\\u0009line"],
+    },
+  });
+  assert.ok(!JSON.stringify(taskDetail).includes(synthetic));
+});
 
 test("an integrating Task reads as awaiting integration, not running", () => {
   using state = orchestratorFixture("lo-read-");

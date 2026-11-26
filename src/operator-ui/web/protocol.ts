@@ -1,3 +1,4 @@
+import { ROLE_PROFILES } from "../../sandbox-profiles.ts";
 import type {
   DelegationRule,
   EffectivePolicy,
@@ -28,7 +29,9 @@ import type {
 export type Proposal = NonNullable<
   Awaited<ReturnType<typeof operatorProposal>>
 >;
-export type Status = ReturnType<typeof operatorStatus>;
+type Repository = { project: string; repositoryPath: string };
+export type Status = ReturnType<typeof operatorStatus> &
+  (Repository | { project?: never; repositoryPath?: never });
 export type GoalSummary = ReturnType<typeof operatorGoalList>[number];
 export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>>;
 export type TaskSummary = NonNullable<
@@ -246,6 +249,212 @@ export type Push =
   | { method: "concierge.output"; params: { data: string } }
   | { method: "concierge.exit"; params: { exitCode: number | null } }
   | { method: "concierge.notice"; params: { code: "input-transferred" } };
+
+function record(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function keys(value: Record<string, unknown>, allowed: string[]) {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function plainText(value: unknown): value is string {
+  return (
+    typeof value === "string" && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)
+  );
+}
+
+function multilineText(value: unknown): value is string {
+  return typeof value === "string" && value.split("\n").every(plainText);
+}
+
+function token(value: unknown, pattern: RegExp) {
+  return typeof value === "string" && pattern.test(value);
+}
+
+function count(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= min &&
+    value <= max
+  );
+}
+
+function textList(
+  value: unknown,
+  max: number,
+  min = 0,
+  validate = plainText,
+): value is string[] {
+  return (
+    Array.isArray(value) &&
+    count(value.length, min, max) &&
+    value.every(validate)
+  );
+}
+
+export function withheld(value: unknown) {
+  return record(value) && keys(value, ["withheld"]) && value.withheld === true;
+}
+
+const actors = ["Concierge", "Planner", "Researcher", "Executor", "Reviewer"];
+
+function choice<T extends string>(value: unknown, values: readonly T[]) {
+  return values.some((item) => item === value);
+}
+
+export function isProposal(value: unknown): value is Proposal {
+  if (!record(value)) return false;
+  const { budgets, origin, modelText, pathViolations } = value;
+  if (
+    !token(value.digest, /^[a-f0-9]{64}$/) ||
+    !plainText(value.id) ||
+    !value.id ||
+    !choice(value.status, ["pending", "approved", "rejected", "registered"]) ||
+    !(value.gate === null || choice(value.gate, Object.keys(gateLabels))) ||
+    !(
+      value.effectivePolicy === null ||
+      choice(value.effectivePolicy, ["human", "agent"])
+    ) ||
+    !(
+      value.policySource === null ||
+      choice(value.policySource, [
+        "default",
+        "request",
+        "goal",
+        "task",
+        "operator-task",
+        "operator-goal",
+        "rule",
+        "invariant",
+      ])
+    ) ||
+    !Array.isArray(value.loosening) ||
+    !value.loosening.every((gate) => choice(gate, Object.keys(gateLabels))) ||
+    !["ruleId", "ruleName"].every(
+      (key) =>
+        !Object.hasOwn(value, key) ||
+        plainText(value[key]) ||
+        withheld(value[key]),
+    ) ||
+    (Object.hasOwn(value, "invariant") &&
+      !choice(value.invariant, Object.keys(invariantLabels))) ||
+    !["humanApprovalRequired", "humanAnswerRequired"].every(
+      (key) => !Object.hasOwn(value, key) || value[key] === true,
+    ) ||
+    !record(origin) ||
+    !(origin.kind === "actor"
+      ? keys(origin, ["kind", "actor"]) && choice(origin.actor, actors)
+      : keys(origin, ["kind"]) && choice(origin.kind, ["operator", "host"])) ||
+    !record(budgets) ||
+    !keys(budgets, ["maxExecutionMs", "maxRetries", "maxTokens"]) ||
+    !count(budgets.maxExecutionMs, 1, 3_600_000) ||
+    !count(budgets.maxRetries, 0, 10) ||
+    !count(budgets.maxTokens, 1, 10_000_000) ||
+    !record(modelText)
+  )
+    return false;
+  const common = [
+    "id",
+    "kind",
+    "digest",
+    "status",
+    "gate",
+    "effectivePolicy",
+    "policySource",
+    "ruleId",
+    "ruleName",
+    "invariant",
+    "loosening",
+    "humanApprovalRequired",
+    "humanAnswerRequired",
+    "origin",
+    "budgets",
+    "pathViolations",
+    "diffStat",
+    "modelText",
+  ];
+  if (value.kind === "integration")
+    return (
+      keys(value, [
+        ...common,
+        "changedPaths",
+        "changedFiles",
+        "changedLines",
+        "reviewExecutionId",
+      ]) &&
+      (withheld(value.diffStat) || multilineText(value.diffStat)) &&
+      count(value.changedFiles, 1, 10_000) &&
+      (value.changedLines === null || count(value.changedLines)) &&
+      (withheld(value.changedPaths) ||
+        (textList(value.changedPaths, 10_000, 1) &&
+          value.changedPaths.length === value.changedFiles)) &&
+      textList(pathViolations, 0) &&
+      plainText(value.reviewExecutionId) &&
+      value.reviewExecutionId.length > 0 &&
+      keys(modelText, ["verdict", "findings"]) &&
+      modelText.verdict === "pass" &&
+      (modelText.findings === null ||
+        multilineText(modelText.findings) ||
+        withheld(modelText.findings))
+    );
+  if (
+    value.diffStat !== null ||
+    !keys(modelText, ["description", "acceptance"]) ||
+    !(
+      multilineText(modelText.description) || withheld(modelText.description)
+    ) ||
+    !(
+      textList(modelText.acceptance, 32, 1, multilineText) ||
+      withheld(modelText.acceptance)
+    )
+  )
+    return false;
+  if (value.kind === "goal")
+    return (
+      keys(value, [...common, "paths", "profiles", "actors", "maxTasks"]) &&
+      (textList(value.paths, 64, 1) || withheld(value.paths)) &&
+      textList(value.profiles, ROLE_PROFILES.Worker.length) &&
+      value.profiles.every((profile) =>
+        choice(profile, ROLE_PROFILES.Worker),
+      ) &&
+      Array.isArray(value.actors) &&
+      value.actors.length <= 4 &&
+      value.actors.every((actor) => choice(actor, actors.slice(1))) &&
+      count(value.maxTasks, 1, 1000) &&
+      textList(pathViolations, 0)
+    );
+  return (
+    value.kind === "task" &&
+    keys(value, [...common, "paths", "actor", "profile"]) &&
+    (textList(value.paths, 64) || withheld(value.paths)) &&
+    (textList(pathViolations, 64) || withheld(pathViolations)) &&
+    choice(value.actor, ["Executor", "Researcher"]) &&
+    choice(value.profile, ROLE_PROFILES.Worker)
+  );
+}
+
+export function statusRepository(value: unknown): Repository | null {
+  if (!record(value)) throw new Error("invalid-response");
+  const { project, repositoryPath } = value;
+  if (
+    !Object.hasOwn(value, "project") &&
+    !Object.hasOwn(value, "repositoryPath")
+  )
+    return null;
+  if (
+    typeof project !== "string" ||
+    !/^[a-z][a-z0-9-]{0,47}$/.test(project) ||
+    !plainText(repositoryPath) ||
+    (repositoryPath !== "." &&
+      repositoryPath
+        .split("/")
+        .some((part) => !part || part === "." || part === ".."))
+  )
+    throw new Error("invalid-response");
+  return { project, repositoryPath };
+}
 
 export function decodeBase64(data: string): Uint8Array {
   const binary = atob(data);

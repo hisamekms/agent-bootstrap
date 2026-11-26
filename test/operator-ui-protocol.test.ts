@@ -11,10 +11,78 @@ import {
   formatTokens,
   pendingDecisions,
   groupProblems,
+  isProposal,
   retryCommand,
+  statusRepository,
   type PanelInboxItem,
   type Problem,
 } from "../src/operator-ui/web/protocol.ts";
+
+test("connection metadata only accepts a project and a relative repository path", () => {
+  assert.equal(statusRepository({ counts: {} }), null);
+  for (const repositoryPath of [".", "Team/Repository"])
+    assert.deepEqual(statusRepository({ project: "demo", repositoryPath }), {
+      project: "demo",
+      repositoryPath,
+    });
+  for (const repositoryPath of [
+    undefined,
+    "/repo",
+    "../repo",
+    "a/../repo",
+    "a//b",
+    "",
+  ])
+    assert.throws(
+      () => statusRepository({ project: "demo", repositoryPath }),
+      /invalid-response/,
+    );
+});
+
+test("proposal messages reject malformed field markers, controls, and review evidence", () => {
+  const details = {
+    id: "proposal",
+    digest: "a".repeat(64),
+    status: "pending",
+    kind: "integration",
+    gate: "integration",
+    effectivePolicy: "human",
+    policySource: "default",
+    loosening: [],
+    origin: { kind: "host" },
+    changedPaths: ["a.txt"],
+    changedFiles: 1,
+    changedLines: null,
+    diffStat: "stat\n",
+    budgets: { maxExecutionMs: 1000, maxRetries: 1, maxTokens: 500 },
+    pathViolations: [],
+    reviewExecutionId: "review",
+    modelText: { verdict: "pass", findings: { withheld: true } },
+  };
+  assert.ok(isProposal(details));
+  assert.ok(
+    isProposal({
+      ...details,
+      modelText: { verdict: "pass", findings: "First\nSecond" },
+    }),
+  );
+  for (const replacement of [
+    { changedFiles: 2 },
+    { changedLines: -1 },
+    { changedPaths: ["a\nb.txt"] },
+    { reviewExecutionId: null },
+    { ruleName: "First\nSecond" },
+    { modelText: { verdict: "revise", findings: null } },
+    { modelText: { verdict: "pass", findings: "First\nwith\u202econtrols" } },
+    {
+      modelText: {
+        verdict: "pass",
+        findings: { withheld: true, text: "extra" },
+      },
+    },
+  ])
+    assert.ok(!isProposal({ ...details, ...replacement }));
+});
 
 test("base64 preserves all byte values and split UTF-8 sequences", () => {
   const bytes = Uint8Array.from({ length: 256 }, (_, index) => index);

@@ -2762,13 +2762,7 @@ export class OrchestratorStore {
       { kind: "integration" }
     >,
   ) {
-    const evidence =
-      proposal &&
-      this.#db
-        .query<DiffSize>(
-          "SELECT changed_files AS changedFiles, changed_lines AS changedLines FROM integration_policy_facts WHERE proposal_id = ?",
-        )
-        .get(proposal.id);
+    const evidence = proposal && this.#integrationDiffSize(proposal.id);
     const invariant =
       proposal &&
       (integrationInvariant(proposal) ??
@@ -2794,6 +2788,29 @@ export class OrchestratorStore {
     );
   }
 
+  #integrationDiffSize(id: string) {
+    return this.#db
+      .query<DiffSize>(
+        "SELECT changed_files AS changedFiles, changed_lines AS changedLines FROM integration_policy_facts WHERE proposal_id = ?",
+      )
+      .get(id);
+  }
+
+  #integrationReview(id: string) {
+    // Only a succeeded, candidate-pinned review can create this event.
+    // Terminal executions cannot be started, finished or reconciled again.
+    return this.#db
+      .query<{ executionId: string; verdict: "pass" }>(
+        `SELECT e.id AS executionId, json_extract(e.result_json, '$.review') AS verdict
+         FROM events p JOIN executions e ON e.id = p.execution_id
+         WHERE p.subject_kind = 'proposal' AND p.subject_id = ?
+           AND p.kind = 'proposal.created' AND e.actor = 'Reviewer'
+           AND e.mode = 'review' AND e.status = 'succeeded'
+           AND json_extract(e.result_json, '$.review') = 'pass'`,
+      )
+      .get(id);
+  }
+
   #checkIntegrationTask(content: IntegrationContent, proposalId: string) {
     const task = required(this.#task(content.taskId));
     if (task.goalId !== content.goalId)
@@ -2808,7 +2825,13 @@ export class OrchestratorStore {
 
   getProposalDetails(
     proposalId: string,
-    { includeDelegation = false }: { includeDelegation?: boolean } = {},
+    {
+      includeDelegation = false,
+      includeEvidence = false,
+    }: {
+      includeDelegation?: boolean;
+      includeEvidence?: boolean;
+    } = {},
   ) {
     const id = identifier(proposalId);
     return this.#read(() => {
@@ -2851,6 +2874,24 @@ export class OrchestratorStore {
           policy.source,
         ),
         origin: proposal.source,
+        ...(includeEvidence &&
+          proposal.kind === "integration" && {
+            diffSize: this.#integrationDiffSize(id),
+            pinnedReview: this.#integrationReview(id),
+            budgets: taskRecord(required(this.#task(proposal.content.taskId)))
+              .content.budgets,
+          }),
+        ...(includeEvidence &&
+          proposal.kind === "task" && {
+            pathViolations: proposal.content.paths.filter(
+              (path) =>
+                !allowsPath(
+                  goalRecord(required(this.#goal(proposal.content.goalId)))
+                    .content.scope.paths,
+                  path,
+                ),
+            ),
+          }),
         ...(answerer?.kind === "human" &&
           answerer.delegate && { approval: { delegated: true, answerer } }),
       });

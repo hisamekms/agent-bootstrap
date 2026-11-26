@@ -48,13 +48,23 @@ test("the workplace serves three self-contained assets under its strict CSP", as
     /id="settings-toggle"[^>]*aria-pressed="false"[^>]*aria-controls="settings"/,
   );
   assert.match(html, /id="theme-system" aria-pressed="true"/);
+  for (const id of [
+    "connection-project",
+    "connection-repository",
+    "connection-reconnect",
+  ])
+    assert.match(html, new RegExp(`id="${id}"`));
   const js = read("/app.js", "text/javascript; charset=utf-8");
   assert.match(js, /adoptedStyleSheets/);
+  assert.match(js, /AI の記述/);
+  assert.match(js, /内容が変わりました。もう一度確認してください/);
+  assert.match(js, /資格情報のような文字列を含むため隠しました/);
   assert.doesNotMatch(
     js,
     /(?:createElement|setAttribute)\(["']style["']|\beval\s*\(|\bnew Function\s*\(/,
   );
   const css = read("/app.css", "text/css; charset=utf-8");
+  assert.match(css, /\.proposal-text\s*\{[^}]*white-space:\s*pre-wrap/);
   assert.match(css, /\.xterm-helper-textarea\b/);
   assert.doesNotMatch(css, /@import\b/i);
 });

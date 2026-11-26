@@ -24,12 +24,14 @@ import {
   pendingDecisions,
   groupProblems,
   retryCommand,
+  withheld,
   type AgentDecision,
   type AnswerableProposal,
   type GoalDetail,
   type GoalSummary,
   type PanelInboxItem,
   type Problem,
+  type Proposal,
   type TaskDetail,
   type TaskSummary,
 } from "./protocol.ts";
@@ -168,7 +170,7 @@ function commandControls(
 function answerError(code: string) {
   switch (code) {
     case "stale-digest":
-      return "提案が変更されました。一覧を更新しています。";
+      return "内容が変わりました。もう一度確認してください";
     case "invalid-transition":
       return "この提案はすでに判断待ちではありません。";
     case "approval-forbidden":
@@ -180,6 +182,144 @@ function answerError(code: string) {
   }
 }
 
+const withheldText = "資格情報のような文字列を含むため隠しました";
+const withheldApproval =
+  "隠した項目があるため、画面からは承認できません。CLI で内容を確認してください。";
+
+function proposalList(
+  value: readonly string[] | { readonly withheld: true },
+  classes?: string,
+) {
+  return "withheld" in value
+    ? textElement("p", withheldText)
+    : textElement("pre", value.join("\n") || "なし", classes);
+}
+
+function proposalEvidence(proposal: Proposal) {
+  const { origin, budgets, effectivePolicy, policySource, ruleId, ruleName } =
+    proposal;
+  const hasWithheld =
+    Object.values(proposal).some(withheld) ||
+    Object.values(proposal.modelText).some(withheld);
+  const policy =
+    effectivePolicy && policySource
+      ? `${effectivePolicy === "human" ? "人" : "AI"} · ${settingLabel({
+          policy: effectivePolicy,
+          source: policySource,
+          ...(ruleId !== undefined && {
+            ruleId: typeof ruleId === "string" ? ruleId : withheldText,
+          }),
+          ...(ruleName !== undefined && {
+            ruleName: typeof ruleName === "string" ? ruleName : withheldText,
+          }),
+          ...(proposal.invariant && { invariant: proposal.invariant }),
+        })}`
+      : "—";
+  const hostFacts: [string, string | Node][] = [
+    [
+      "提案元",
+      origin.kind === "actor"
+        ? origin.actor
+        : origin.kind === "host"
+          ? "ホスト"
+          : "オペレーター",
+    ],
+    ["適用ポリシー", policy],
+    [
+      "予算",
+      `${formatDuration(budgets.maxExecutionMs)} / ${formatTokens(budgets.maxTokens)} トークン / 再試行 ${budgets.maxRetries} 回`,
+    ],
+    ["範囲外のパス", proposalList(proposal.pathViolations)],
+  ];
+  if (proposal.humanAnswerRequired || proposal.humanApprovalRequired)
+    hostFacts.push(["人の判断", "必要"]);
+  if (proposal.loosening.length)
+    hostFacts.push(["委任範囲", "拡大を含みます。"]);
+
+  const model = group(
+    "section",
+    "stack",
+    textElement("h4", "AI の記述", "section-title"),
+  );
+  if (proposal.kind === "integration") {
+    hostFacts.unshift(
+      ["変更ファイル数", String(proposal.changedFiles)],
+      [
+        "変更行数",
+        proposal.changedLines === null ? "—" : String(proposal.changedLines),
+      ],
+      ["変更パス", proposalList(proposal.changedPaths)],
+      [
+        "変更規模",
+        typeof proposal.diffStat === "string"
+          ? textElement("pre", proposal.diffStat.trim())
+          : withheldText,
+      ],
+    );
+    const { verdict, findings } = proposal.modelText;
+    model.append(textElement("p", `レビュー（AI）: ${verdict}`));
+    if (findings !== null)
+      model.append(
+        facts([
+          [
+            "所見",
+            textElement(
+              "pre",
+              typeof findings === "string" ? findings : withheldText,
+              "model-content proposal-text",
+            ),
+          ],
+        ]),
+      );
+  } else {
+    hostFacts.unshift(["対象パス", proposalList(proposal.paths)]);
+    if (proposal.kind === "goal")
+      hostFacts.push(
+        ["実行ロール", proposal.actors.join("、") || "なし"],
+        ["プロファイル", proposal.profiles.join("、") || "なし"],
+        ["Task 上限", String(proposal.maxTasks)],
+      );
+    else
+      hostFacts.push(
+        ["実行ロール", proposal.actor],
+        ["プロファイル", proposal.profile],
+      );
+    const { description, acceptance } = proposal.modelText;
+    model.append(
+      facts([
+        [
+          "説明",
+          textElement(
+            "pre",
+            typeof description === "string"
+              ? description || "なし"
+              : withheldText,
+            "model-content proposal-text",
+          ),
+        ],
+        [
+          "受け入れ条件",
+          "withheld" in acceptance
+            ? textElement("p", withheldText)
+            : acceptance.length
+              ? group(
+                  "ul",
+                  "",
+                  ...acceptance.map((item) =>
+                    textElement("li", item, "model-content proposal-text"),
+                  ),
+                )
+              : textElement("p", "なし"),
+        ],
+      ]),
+    );
+  }
+  const content = group("div", "stack", facts(hostFacts), model);
+  if (hasWithheld)
+    content.append(textElement("p", withheldApproval, "warning"));
+  return { content, hasWithheld };
+}
+
 type Watch = (
   node: HTMLElement,
   ids: readonly string[],
@@ -187,8 +327,8 @@ type Watch = (
 ) => void;
 type GoalLink = (id?: string | null) => Node[];
 
-function createInboxPanel(
-  channel: WorkplaceChannel,
+export function createInboxPanel(
+  channel: Pick<WorkplaceChannel, "request">,
   refresh: () => void,
   watch: Watch,
   unwatch: (root: HTMLElement) => void,
@@ -204,7 +344,7 @@ function createInboxPanel(
   let cancelConfirmation: (() => void) | undefined;
   let activeSubmit: HTMLButtonElement | undefined;
   let previous = "";
-  let previewQueue = Promise.resolve();
+  const stale = new Set<string>();
 
   const selection = textElement("span", "", "q");
   const clear = action(
@@ -290,10 +430,10 @@ function createInboxPanel(
     cancelConfirmation = close;
     const previews: Promise<boolean>[] = [];
     for (const proposal of pinned) {
-      const { id, kind, digest, title, agentGates } = proposal;
+      const { id, kind, title, agentGates } = proposal;
       const evidence = textElement(
         "p",
-        `${answerLabels[kind]} · ${id.slice(0, 8)} · ${digest.slice(0, 12)}`,
+        `${answerLabels[kind]} · ${id.slice(0, 8)}`,
         "muted",
       );
       if (title !== null && pinned.length > 1)
@@ -307,11 +447,11 @@ function createInboxPanel(
             "warning",
           ),
         );
-      if (!reject && kind === "integration") {
-        const stat = textElement("pre", "変更規模を読み込み中…");
-        stat.setAttribute("role", "status");
-        review.append(stat);
-        previews.push(loadDiffStat(id, digest, stat));
+      if (!reject) {
+        const detail = textElement("div", "提案の詳細を読み込み中…");
+        detail.setAttribute("role", "status");
+        review.append(detail);
+        previews.push(loadEvidence(proposal, detail));
       }
     }
     if (previews.length) {
@@ -329,25 +469,34 @@ function createInboxPanel(
       cancelConfirmation = undefined;
     }
 
-    async function loadDiffStat(id: string, digest: string, stat: HTMLElement) {
+    async function loadEvidence(
+      answer: AnswerableProposal,
+      detail: HTMLElement,
+    ) {
       try {
-        const proposal = await channel.request("proposal.get", { id });
-        if (proposal.digest !== digest || proposal.status !== "pending") {
-          stat.textContent = answerError(
-            proposal.digest !== digest ? "stale-digest" : "invalid-transition",
-          );
-          if (stat.isConnected) refresh();
+        const proposal = await channel.request("proposal.get", {
+          id: answer.id,
+        });
+        if (activeSubmit !== submit) return false;
+        if (proposal.digest !== answer.digest) {
+          stale.add(answer.id);
+          detail.textContent = answerError("stale-digest");
+          previous = "";
+          refresh();
           return false;
         }
-        if (proposal.diffStat !== null) {
-          stat.textContent = proposal.diffStat;
-          return true;
+        if (proposal.status !== "pending") {
+          detail.textContent = answerError("invalid-transition");
+          refresh();
+          return false;
         }
+        const { content, hasWithheld } = proposalEvidence(proposal);
+        detail.replaceChildren(content);
+        return !hasWithheld;
       } catch {
-        // Keep confirmation disabled when the pinned diff is unavailable.
+        detail.textContent = "提案の詳細を取得できませんでした。";
+        return false;
       }
-      stat.textContent = "変更規模を取得できませんでした。";
-      return false;
     }
 
     async function send() {
@@ -366,6 +515,9 @@ function createInboxPanel(
           answers.length === 1 && answers[0]
             ? [await channel.request("proposal.answer", answers[0])]
             : await channel.request("proposal.answerMany", { answers });
+        for (const outcome of outcomes)
+          if ("error" in outcome && outcome.error.code === "stale-digest")
+            stale.add(outcome.id);
         results.replaceChildren(
           ...outcomes.map((outcome) =>
             textElement(
@@ -380,6 +532,8 @@ function createInboxPanel(
           ),
         );
       } catch (error) {
+        if (error instanceof Error && error.message === "stale-digest")
+          for (const { id } of answers) stale.add(id);
         results.replaceChildren(
           textElement(
             "p",
@@ -390,6 +544,7 @@ function createInboxPanel(
           ),
         );
       } finally {
+        if (answers.some(({ id }) => stale.has(id))) previous = "";
         for (const { id } of answers) chosen.delete(id);
         answering = false;
         if (activeSubmit === submit) {
@@ -407,7 +562,12 @@ function createInboxPanel(
   function card(item: PanelInboxItem, goalLink: GoalLink) {
     const answer = "answer" in item ? item.answer : undefined;
     const name = answer?.title ?? item.modelText;
-    const reason = textElement("span", "確認が必要です。");
+    const id = item.subject.proposalId;
+    const needsReview = id !== undefined && stale.has(id);
+    const reason = textElement(
+      "span",
+      needsReview ? answerError("stale-digest") : "確認が必要です。",
+    );
     const kind = proposalLabels[item.kind] ?? item.title;
     const top = group(
       "div",
@@ -417,7 +577,8 @@ function createInboxPanel(
     );
     const row = textElement("li", "", "card");
     const detail = textElement("div", "", "stack");
-    detail.hidden = !expanded.has(item.id);
+    detail.hidden = !needsReview && !expanded.has(item.id);
+    if (needsReview) expanded.add(item.id);
     const fields = facts([
       ...Object.entries(item.subject),
       ["時刻", time(item.at)],
@@ -454,7 +615,6 @@ function createInboxPanel(
       toggle.setAttribute("aria-expanded", String(!detail.hidden));
     }
     updateDisclosure();
-    const stat = textElement("pre", "", "facts");
     const actions = group(
       "div",
       "actions decision-actions",
@@ -513,73 +673,39 @@ function createInboxPanel(
       top,
       name ? modelTitle("h3", name) : textElement("h3", item.title, "title"),
       ...goalLink(item.subject.goalId),
-      stat,
       detail,
       answerArea,
     );
-    const id = item.subject.proposalId;
     let requested = false;
     async function load() {
       if (!id || requested) return;
       requested = true;
+      info.textContent = "提案の詳細を読み込み中…";
       try {
         const proposal = await channel.request("proposal.get", { id });
         if (answer && proposal.digest !== answer.digest) {
           reason.textContent = answerError("stale-digest");
-          refresh();
-          return;
+          if (!stale.has(id)) {
+            stale.add(id);
+            previous = "";
+            refresh();
+          }
         }
-        const { effectivePolicy, policySource } = proposal;
-        if (effectivePolicy && policySource) {
-          const source = settingLabel({
-            policy: effectivePolicy,
-            source: policySource,
-            ...("ruleId" in proposal && {
-              ruleId: proposal.ruleId,
-              ruleName: proposal.ruleName,
-            }),
-            ...("invariant" in proposal && { invariant: proposal.invariant }),
-          });
-          reason.textContent =
-            policySource !== "invariant" &&
-            (effectivePolicy === "human" || proposal.humanAnswerRequired)
-              ? `${source} · 人の判断が必要です。`
-              : source;
-        }
-        const diff = proposal.diffStat?.trim();
-        stat.textContent = diff?.split("\n").at(-1) ?? "";
-        info.replaceChildren(
-          facts([
-            ["ダイジェスト", proposal.digest],
-            ...(diff ? [["変更規模", textElement("pre", diff)] as const] : []),
-            ...(effectivePolicy
-              ? [["判断者", effectivePolicy === "human" ? "人" : "AI"] as const]
-              : []),
-            ...(proposal.loosening
-              ? [["ポリシー", "委任範囲の拡大を含みます。"] as const]
-              : []),
-          ]),
-        );
+        info.replaceChildren(proposalEvidence(proposal).content);
       } catch {
         requested = false;
         info.textContent = "提案の詳細を取得できませんでした。";
       }
     }
-    watch(
-      row,
-      item.state === "open" ? [item.id] : [],
-      id
-        ? () => {
-            previewQueue = previewQueue.then(() =>
-              row.isConnected ? load() : undefined,
-            );
-          }
-        : undefined,
-    );
+    if (!detail.hidden) void load();
+    watch(row, item.state === "open" ? [item.id] : []);
     return row;
   }
 
   return {
+    invalidate() {
+      previous = "";
+    },
     render(
       rows: PanelInboxItem[],
       goalLink: GoalLink,
@@ -603,6 +729,9 @@ function createInboxPanel(
       );
       for (const [id, digest] of chosen)
         if (approvable.get(id) !== digest) chosen.delete(id);
+      for (const id of stale)
+        if (!rows.some((row) => row.subject.proposalId === id))
+          stale.delete(id);
       for (const id of expanded)
         if (!rows.some((row) => row.id === id)) expanded.delete(id);
       controls = [];
@@ -1136,7 +1265,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
   let loading = false;
   let refreshNeeded = false;
   let badgesNeeded = false;
-  let disconnected = !channel;
+  let disconnected = true;
   let items: PanelInboxItem[] = [];
   let goals: GoalSummary[] = [];
   let problems: Problem[][] = [];
@@ -1419,6 +1548,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
         badgesNeeded = false;
         const current = view;
         const section = settings;
+        const socket = channel.socket;
         const loadWork = !section;
         const decisionTab = loadWork && current.tab === "decisions";
         const problemTab = loadWork && current.tab === "problems";
@@ -1452,7 +1582,7 @@ export function createHostPanel(channel?: WorkplaceChannel) {
             : undefined,
           decisionTab ? channel.request("decision.history", {}) : undefined,
         ] as const);
-        if (disconnected) return;
+        if (disconnected || socket !== channel.socket) continue;
         if (itemResult.status === "fulfilled" && itemResult.value) {
           items = itemResult.value;
           const activeIds = new Set(items.map(({ id }) => id));
@@ -1648,18 +1778,20 @@ export function createHostPanel(channel?: WorkplaceChannel) {
   }
 
   let poll = 0;
-  const interval =
-    channel && window.setInterval(() => void refresh(++poll % 4 === 0), 5000);
-  const becameVisible = () => void refresh();
-  if (channel) document.addEventListener("visibilitychange", becameVisible);
+  if (channel) {
+    window.setInterval(() => void refresh(++poll % 4 === 0), 5000);
+    document.addEventListener("visibilitychange", () => void refresh());
+  }
   return {
     refresh,
     closeSettings,
+    connect() {
+      disconnected = false;
+      inbox?.invalidate();
+      void refresh();
+    },
     disconnect() {
       disconnected = true;
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", becameVisible);
-      visible.disconnect();
     },
   };
 }

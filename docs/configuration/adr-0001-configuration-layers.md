@@ -145,7 +145,7 @@ Re-approval replaces only `approved.json`. It never touches `local.json`.
 
 ### C5. Local permissions
 
-`local.json` takes every key the user config takes except `microsandbox`,
+`local.json` takes every key the user config takes except `microsandbox`, `repositories`,
 volume definitions, and secret source definitions. `local.json` can refer to
 volumes and secret sources defined in the user config. `agent-bootstrap
 config edit [--project <name>]` opens the right file in `$EDITOR`.
@@ -155,6 +155,19 @@ This trusted directory holds images, volumes and VM state for the whole
 machine. The CLI uses a nonempty `MSB_HOME` first, then the configured home,
 then `$HOME/.msb`. Create the chosen directory before use and keep its
 real path at most 40 bytes. Doctor reports the selected source.
+
+Set `"repositories": { "root": "/absolute/path" }` in the user config
+with `agent-bootstrap config edit`. The directory must exist. The default
+is the user's home directory. Target resolution and project add and move
+accept the root itself and Git worktrees below its real path. They reject
+targets whose resolved paths are outside the root, including symlinks
+that point outside it.
+Workplace shows the repository path relative to this directory, with
+`.` for a repository at the root.
+
+**Upgrade note.** Projects and the default checkout outside your home
+directory now require `repositories.root`. Set it in your user
+configuration to a directory that contains those worktrees.
 
 The user config defines Keychain sources by name.
 

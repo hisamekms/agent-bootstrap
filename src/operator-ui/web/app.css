@@ -781,6 +781,9 @@ ol {
 }
 pre {
   margin: 0;
+}
+pre,
+.proposal-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

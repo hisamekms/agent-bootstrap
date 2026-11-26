@@ -64,7 +64,7 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   };
 };
 
-test("inbox projects gates, failure, retry, budget, integration, and completion", async () => {
+test("inbox projects gates, failure, retry, budget, integration, and completion", async (t) => {
   using state = orchestratorFixture("inbox-");
   const { store } = state;
   const target = "/example/it's a target";
@@ -200,9 +200,14 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
       candidate,
       digest,
       changedPaths: ["src/a.ts"],
-      review: { result: "pass" },
+      review: { result: "pass", notes: "Findings\u202e <tag>\r\nMore\nEnd" },
     },
     review.id,
+    { changedFiles: 1, changedLines: 1 },
+  );
+  assert.throws(
+    () => store.finishExecution(review.id, "succeeded", { review: "revise" }),
+    /invalid-transition/,
   );
   assert.partialDeepStrictEqual(
     read().find(({ kind }) => kind === "integration"),
@@ -215,9 +220,78 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
   assert.partialDeepStrictEqual(details, {
     digest: integration.digest,
     effectivePolicy: "human",
+    origin: host,
+    changedPaths: ["src/a.ts"],
+    changedFiles: 1,
+    changedLines: 1,
+    budgets,
+    pathViolations: [],
+    reviewExecutionId: review.id,
+    modelText: {
+      verdict: "pass",
+      findings: "Findings\\u202e <tag>\nMore\nEnd",
+    },
   });
-  assert.match(details!.diffStat!, /src\/a\.ts.*1 \+/);
-  assert.ok(!details!.diffStat!.includes("export"));
+  const screened = await operatorProposal(
+    store,
+    state.root,
+    integration.id,
+    async (...fields) => {
+      if (
+        fields.some(
+          (field) => typeof field === "string" && field.startsWith("Findings"),
+        )
+      )
+        throw new Error();
+    },
+  );
+  assert.partialDeepStrictEqual(screened, {
+    digest: integration.digest,
+    reviewExecutionId: review.id,
+    modelText: { verdict: "pass", findings: { withheld: true } },
+  });
+  assert.ok(typeof details?.diffStat === "string");
+  const { diffStat } = details;
+  assert.match(details.diffStat, /src\/a\.ts.*1 \+/);
+  assert.ok(!details.diffStat.includes("export"));
+  const hiddenStat = await operatorProposal(
+    store,
+    state.root,
+    integration.id,
+    async (...fields) => {
+      if (fields.includes(diffStat)) throw new Error();
+    },
+  );
+  assert.partialDeepStrictEqual(hiddenStat, {
+    changedPaths: ["src/a.ts"],
+    diffStat: { withheld: true },
+  });
+  const hiddenPath = await operatorProposal(
+    store,
+    state.root,
+    integration.id,
+    async (...fields) => {
+      if (fields.includes("src/a.ts")) throw new Error();
+    },
+  );
+  assert.partialDeepStrictEqual(hiddenPath, {
+    changedPaths: { withheld: true },
+    diffStat: { withheld: true },
+    changedFiles: 1,
+  });
+  const stat = t.mock.method(
+    LocalGitIntegration.prototype,
+    "diffStat",
+    async () => " bearer " + "x".repeat(24) + " | 1 +\n",
+  );
+  try {
+    assert.partialDeepStrictEqual(
+      await operatorProposal(store, state.root, integration.id),
+      { changedPaths: ["src/a.ts"], diffStat: { withheld: true } },
+    );
+  } finally {
+    stat.mock.restore();
+  }
   answer(store, integration);
   const { approvalId } = store.approvedIntegration(integration.id);
   store.beginIntegration(integration.id, integration.digest, approvalId);

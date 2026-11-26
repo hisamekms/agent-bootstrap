@@ -452,6 +452,10 @@ async function launchConcierge(
       store,
       stateDirectory: directory,
       target: repoRoot,
+      repository: {
+        project: target.project.name,
+        repositoryPath: target.repositoryPath,
+      },
       secretTests: () =>
         secretTestFacts(
           effective.config.secretEnv,

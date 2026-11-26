@@ -1,4 +1,10 @@
-import { addProject, removeProject } from "../src/config/projects.ts";
+import {
+  addProject,
+  moveProject,
+  removeProject,
+} from "../src/config/projects.ts";
+import { parseConfig } from "../src/config/layers.ts";
+import { ConfigError } from "../src/config/messages.ts";
 import { configEnv } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -18,13 +24,17 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { runCli } from "../src/local-orchestrator/cli.ts";
 import {
   conciergeContext,
   snapshotConciergeRepo,
 } from "../src/local-orchestrator/concierge.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
-import { resolveTarget } from "../src/local-orchestrator/target.ts";
+import {
+  resolveTarget,
+  TargetError,
+} from "../src/local-orchestrator/target.ts";
 import {
   configuredVerification,
   parseVerificationConfig,
@@ -145,12 +155,131 @@ test("registered worktree paths resolve to private state and named volumes", () 
     await mkdir(nested);
     const bare = join(root, "bare.git");
     git(one, "clone", "--bare", "--", one, bare);
-    for (const path of [nested, bare, root, join(root, "missing")])
+    for (const path of [nested, bare, root])
       await assert.rejects(
         resolveTarget(path, bootstrap, env),
         /Git worktree root/,
       );
+    await assert.rejects(resolveTarget(join(root, "missing"), bootstrap, env), {
+      constructor: ConfigError,
+      message: /project\.identity/,
+    });
+    await assert.rejects(resolveTarget(undefined, join(root, "missing"), env), {
+      code: "ENOENT",
+    });
+    await rm(join(two, ".git"), { recursive: true });
+    await assert.rejects(resolveTarget(two, bootstrap, env), {
+      constructor: TargetError,
+      message: /project\.identity.*registered Git directory is missing/,
+      next: "Run agent-bootstrap project move <name> <path>.",
+    });
   }));
+
+test("the user repository root contains the target and its disclosed relative path", () =>
+  fixture(async (root) => {
+    const allowed = await repo(join(root, "Allowed"));
+    const descendant = await repo(join(allowed, "Team", "Worktree"));
+    const outside = await repo(join(root, "Allowed-sibling"));
+    const foo = await repo(join(allowed, "foo"));
+    const alias = join(allowed, "alias");
+    await symlink(outside, alias);
+    addProject(outside, "existing", configEnv(root));
+    const env = configEnv(root, allowed);
+    addProject(allowed, "root", env);
+    addProject(descendant, "child", env);
+    assert.equal(
+      (await resolveTarget(allowed, allowed, env)).repositoryPath,
+      ".",
+    );
+    assert.equal(
+      (await resolveTarget(descendant, allowed, env)).repositoryPath,
+      "Team/Worktree",
+    );
+    if (process.platform === "darwin" && existsSync(join(root, "allowed"))) {
+      assert.equal(
+        (
+          await resolveTarget(
+            join(root, "allowed", "team", "worktree"),
+            allowed,
+            env,
+          )
+        ).repositoryPath,
+        "Team/Worktree",
+      );
+    }
+    const parent = `${allowed}/../Allowed-sibling`;
+    const inRootParent = `${allowed}/Team/../Team/Worktree`;
+    assert.equal(
+      (await resolveTarget(inRootParent, allowed, env)).repositoryPath,
+      "Team/Worktree",
+    );
+    execFileSync(
+      process.execPath,
+      [
+        "--no-env-file",
+        fileURLToPath(new URL("../bin/agent-bootstrap.ts", import.meta.url)),
+        "project",
+        "add",
+        "../foo",
+      ],
+      {
+        cwd: join(allowed, "Team"),
+        env: { ...env, PATH: "/usr/bin:/bin" },
+        stdio: "pipe",
+      },
+    );
+    assert.equal((await resolveTarget(foo, allowed, env)).project.name, "foo");
+    const outsideRoot = {
+      message:
+        "Invalid configuration: repositories.root. The target is outside repositories.root.",
+      next: /Set repositories\.root in the user configuration to a directory that contains the target/,
+    };
+    for (const path of [outside, alias, parent]) {
+      assert.throws(() => addProject(path, "bad", env), {
+        constructor: ConfigError,
+        ...outsideRoot,
+      });
+      assert.throws(() => moveProject("child", path, env), {
+        constructor: ConfigError,
+        ...outsideRoot,
+      });
+      await assert.rejects(resolveTarget(path, allowed, env), {
+        constructor: TargetError,
+        ...outsideRoot,
+      });
+    }
+    await assert.rejects(resolveTarget(undefined, outside, env), {
+      constructor: TargetError,
+      ...outsideRoot,
+    });
+    await rm(join(outside, ".git"), { recursive: true });
+    await assert.rejects(resolveTarget(outside, allowed, env), {
+      constructor: TargetError,
+      ...outsideRoot,
+    });
+
+    const invalidEnv = configEnv(root, join(root, "missing-root"));
+    assert.throws(
+      () => addProject(allowed, "bad", invalidEnv),
+      /repositories\.root/,
+    );
+    await assert.rejects(
+      resolveTarget(allowed, allowed, invalidEnv),
+      /repositories\.root/,
+    );
+  }));
+
+test("the repository root is an absolute path set in user configuration only", () => {
+  const config = { version: 1, repositories: { root: "/worktrees" } };
+  assert.deepEqual(parseConfig(config, "user"), config);
+  for (const layer of ["local", "approved"] as const)
+    assert.throws(() => parseConfig(config, layer), /repositories/);
+  assert.throws(
+    () =>
+      parseConfig({ version: 1, repositories: { root: "worktrees" } }, "user"),
+    /repositories\.root/,
+  );
+});
 
 test("external snapshots pin local main and limit Planner context to the target's root docs and listing", () =>
   fixture(async (root) => {

@@ -482,7 +482,8 @@ test(
     using fixture = state;
     const { store } = fixture;
     const { id, digest } = store.proposeGoal(goal, { kind: "operator" });
-    const api = await listenOperatorApi({ ...options, pollMs: 20 });
+    const repository = { project: "demo", repositoryPath: "team/demo" };
+    const api = await listenOperatorApi({ ...options, repository, pollMs: 20 });
     try {
       assert.equal(statSync(directory).mode & 0o777, 0o700);
       assert.equal(statSync(path).mode & 0o777, 0o600);
@@ -514,7 +515,7 @@ test(
       const item = `goal-registration:${id}`;
       assert.deepEqual(
         (await request("status")).result,
-        JSON.parse(JSON.stringify(operatorStatus(store))),
+        JSON.parse(JSON.stringify({ ...operatorStatus(store), ...repository })),
       );
       assert.partialDeepStrictEqual(
         (await request("proposal.get", { id })).result,

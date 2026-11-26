@@ -9,6 +9,7 @@ import { connect, createServer, type Socket } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { privatePath } from "../config/layers.ts";
 import { isTerminalSize } from "../sandbox-runtime.ts";
+import { escapeTerminalControls } from "./analysis.ts";
 import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import {
@@ -50,6 +51,7 @@ import {
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
+  repository?: { project: string; repositoryPath: string };
   scan?: CredentialScanner;
   maxLineBytes?: number;
   pollMs?: number;
@@ -311,7 +313,17 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         }
         case "status":
           fields(params, []);
-          return { result: operatorStatus(store) };
+          return {
+            result: {
+              ...operatorStatus(store),
+              ...(options.repository && {
+                project: options.repository.project,
+                repositoryPath: escapeTerminalControls(
+                  options.repository.repositoryPath,
+                ),
+              }),
+            },
+          };
         case "goal.list": {
           const { status } = fields(params, ["status"]);
           return {
@@ -431,7 +443,9 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                   const serialized = JSON.stringify(reply.result);
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
                     reply = failure("read-failed");
-                  else await scan?.(serialized);
+                  // Proposal text is screened field by field before escaping.
+                  else if (message.method !== "proposal.get")
+                    await scan?.(serialized);
                 }
               } catch {
                 reply = failure("read-failed");

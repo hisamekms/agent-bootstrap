@@ -551,12 +551,13 @@ test("volume shell requires a TTY and resolves the named mount before launching"
   t.after(() => rmSync(home, { recursive: true, force: true }));
   env.HOME = home;
   const repo = initConfigRepo(join(root, "project"));
-  addProject(repo, undefined, env);
   writePrivateConfig(userConfigPath(env), configRoot(env), {
     version: 1,
+    repositories: { root },
     volumes: { private: definition },
     mounts: { example: mount },
   });
+  addProject(repo, undefined, env);
   const output: string[] = [];
   let launches = 0;
   const io: BootstrapIo = {
