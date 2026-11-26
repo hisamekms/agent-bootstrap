@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="ja" class="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -17,93 +17,233 @@
         id="divider"
         role="separator"
         tabindex="0"
-        aria-label="Concierge width"
+        aria-label="Concierge の幅"
         aria-orientation="vertical"
         aria-controls="conversation"
         aria-valuemin="20"
         aria-valuemax="80"
-        aria-valuenow="60"
+        aria-valuenow="50"
       ></div>
-      <section id="host" aria-labelledby="host-title" tabindex="-1">
-        <header><h2 id="host-title">ホストパネル</h2></header>
-        <div id="summary">
-          <p id="connection" role="status">Connecting…</p>
+      <section id="host" aria-label="作業の状況" tabindex="-1">
+        <div class="tabbar">
+          <div id="host-tabs" role="tablist" aria-label="作業の状況">
+            <button
+              type="button"
+              id="tab-decisions"
+              class="tab"
+              role="tab"
+              aria-selected="true"
+              aria-controls="decisions"
+            >
+              判断待ち <span id="badge-decisions" class="count urgent"></span>
+            </button>
+            <button
+              type="button"
+              id="tab-problems"
+              class="tab"
+              role="tab"
+              aria-selected="false"
+              aria-controls="problems"
+              tabindex="-1"
+            >
+              問題 <span id="badge-problems" class="count bad"></span>
+            </button>
+            <button
+              type="button"
+              id="tab-goals"
+              class="tab"
+              role="tab"
+              aria-selected="false"
+              aria-controls="goals"
+              tabindex="-1"
+            >
+              Goal <span id="badge-goals" class="count"></span>
+            </button>
+          </div>
+          <button
+            type="button"
+            id="settings-back"
+            class="link"
+            aria-label="設定を閉じて戻る"
+            hidden
+          >
+            ← 設定
+          </button>
+          <div class="spacer"></div>
+          <div class="toolbar-actions">
+            <button
+              type="button"
+              class="iconbtn"
+              id="settings-toggle"
+              aria-label="設定"
+              title="設定"
+              aria-pressed="false"
+              aria-controls="settings"
+            >
+              <svg
+                class="icon"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="3"></circle>
+                <path
+                  d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"
+                ></path>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="iconbtn"
+              id="fullscreen"
+              aria-label="全画面にする"
+              title="全画面にする（F）"
+              aria-pressed="false"
+            >
+              <svg
+                class="icon icon-expand"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg
+              ><svg
+                class="icon icon-collapse"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"></path>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="iconbtn"
+              id="connection"
+              aria-label="接続しています"
+              title="接続しています"
+            >
+              <span
+                class="dot"
+                id="connection-dot"
+                data-state="connecting"
+                aria-hidden="true"
+              ></span>
+            </button>
+          </div>
+        </div>
+        <div class="notices">
           <p id="terminal-notice" role="status"></p>
           <p id="inbox-notice" role="status"></p>
         </div>
-        <div id="host-tabs" role="tablist" aria-label="ホストパネル">
-          <button
-            type="button"
-            id="tab-decisions"
-            role="tab"
-            aria-selected="true"
-            aria-controls="decisions"
-          >
-            判断待ち <span id="badge-decisions" class="tab-count"></span>
-          </button>
-          <button
-            type="button"
-            id="tab-problems"
-            role="tab"
-            aria-selected="false"
-            aria-controls="problems"
-            tabindex="-1"
-          >
-            問題 <span id="badge-problems" class="tab-count"></span>
-          </button>
-          <button
-            type="button"
-            id="tab-goals"
-            role="tab"
-            aria-selected="false"
-            aria-controls="goals"
-            tabindex="-1"
-          >
-            Goal <span id="badge-goals" class="tab-count"></span>
-          </button>
-          <button
-            type="button"
-            id="tab-delegation"
-            role="tab"
-            aria-selected="false"
-            aria-controls="delegation"
-            tabindex="-1"
-          >
-            任せ方
-          </button>
-        </div>
-        <div id="decisions" role="tabpanel" aria-labelledby="tab-decisions">
-          <div id="details"></div>
-          <div id="inbox">
-            <div id="answer-batch"></div>
-            <div id="answer-confirmation"></div>
-            <div id="answer-results" role="status"></div>
-            <p id="empty-inbox" hidden>表示する項目はありません。</p>
-            <ul id="inbox-items"></ul>
-            <section id="decision-history"></section>
+        <div
+          id="decisions"
+          role="tabpanel"
+          tabindex="0"
+          aria-labelledby="tab-decisions"
+        >
+          <div id="inbox" class="content">
+            <div class="col">
+              <div id="answer-results" role="status"></div>
+              <p id="empty-inbox" class="card empty" hidden>
+                判断待ちはありません。
+              </p>
+              <ul id="inbox-items"></ul>
+              <section id="decision-history"></section>
+            </div>
           </div>
+          <div id="answer-batch" class="batchbar" hidden></div>
         </div>
         <div
           id="problems"
-          class="work-panel"
+          class="content"
           role="tabpanel"
+          tabindex="0"
           aria-labelledby="tab-problems"
           hidden
-        ></div>
+        >
+          <div class="col" id="problem-content"></div>
+        </div>
         <div
           id="goals"
-          class="work-panel"
+          class="content"
           role="tabpanel"
+          tabindex="0"
           aria-labelledby="tab-goals"
           hidden
-        ></div>
-        <div
-          id="delegation"
-          class="work-panel"
-          role="tabpanel"
-          aria-labelledby="tab-delegation"
-          hidden
-        ></div>
+        >
+          <div class="col" id="goal-content"></div>
+        </div>
+        <section id="settings" class="content" aria-label="設定" hidden>
+          <div class="col settings">
+            <nav class="setnav" aria-label="設定の項目">
+              <button
+                type="button"
+                id="settings-delegation"
+                aria-current="page"
+              >
+                任せ方
+              </button>
+              <button type="button" id="settings-display">表示</button>
+              <button type="button" id="settings-connection">接続</button>
+            </nav>
+            <div id="delegation" class="setpanel"></div>
+            <section id="display-settings" class="setpanel" hidden>
+              <h2 class="title large">表示</h2>
+              <div class="card">
+                <div class="setting">
+                  <div class="label">
+                    テーマ<small
+                      >OS のライト／ダークの切り替えに追従できます。</small
+                    >
+                  </div>
+                  <div class="seg" role="group" aria-label="テーマ">
+                    <button type="button" id="theme-system" aria-pressed="true">
+                      OS に合わせる
+                    </button>
+                    <button type="button" id="theme-light" aria-pressed="false">
+                      ライト
+                    </button>
+                    <button type="button" id="theme-dark" aria-pressed="false">
+                      ダーク
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+            <section id="connection-settings" class="setpanel" hidden>
+              <h2 class="title large">接続</h2>
+              <dl class="card detail">
+                <dt>接続状態</dt>
+                <dd id="connection-state" role="status"></dd>
+                <dt>接続先</dt>
+                <dd id="connection-host"></dd>
+                <dt>最終更新</dt>
+                <dd id="connection-update">—</dd>
+                <dt>Concierge</dt>
+                <dd id="connection-terminal"></dd>
+              </dl>
+            </section>
+          </div>
+        </section>
       </section>
     </main>
   </body>

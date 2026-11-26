@@ -9,7 +9,7 @@ import type {
   TaskCategory,
 } from "../../local-orchestrator/model.ts";
 import type { WorkplaceChannel } from "./channel.ts";
-import { action, textElement } from "./dom.ts";
+import { action, group, sectionTitle, textElement } from "./dom.ts";
 import {
   gateLabels,
   invariantLabels,
@@ -35,25 +35,25 @@ const defaultChoices = [
   ["human", "人"],
   ["agent", "AI"],
 ] as const;
-const goalChoices = [["inherit", "全体に従う"], ...defaultChoices] as const;
+const goalChoices = [["inherit", "既定に従う"], ...defaultChoices] as const;
 const taskChoices = [
   ["rule", "ルールに従う"],
-  ["human", "人が判断"],
-  ["agent", "AI に任せる"],
+  ["human", "人"],
+  ["agent", "AI"],
 ] as const;
 
 function policyControls(title: string, saved: () => void) {
   const section = document.createElement("section");
-  section.className = "policy-section";
-  section.append(textElement("h3", title));
+  section.className = "stack";
+  section.append(sectionTitle(title));
   const controls = document.createElement("fieldset");
   controls.className = "policy-controls";
   const editor = document.createElement("div");
   const confirmation = document.createElement("div");
-  confirmation.className = "policy-confirmation";
-  const status = document.createElement("p");
+  confirmation.className = "policy-confirmation confirm";
+  const status = textElement("p", "", "policy-status");
   status.setAttribute("role", "status");
-  section.append(controls, editor, confirmation, status);
+  section.append(group("div", "card", controls, editor, confirmation, status));
 
   function close() {
     editor.replaceChildren();
@@ -116,19 +116,25 @@ function policyControls(title: string, saved: () => void) {
       return;
     }
     if (form) form.disabled = true;
-    const confirm = action("変更を確認", "policy-confirm", () => void save());
+    const confirm = action(
+      "変更を確定",
+      "policy-confirm",
+      () => void save(),
+      "btn primary",
+    );
     confirmation.append(
       textElement(
         "p",
         "この変更で AI が判断できる範囲が広がる場合があります。",
+        "q",
       ),
-      confirm,
-      action("キャンセル", "policy-cancel", () => {
+      action("やめる", "policy-cancel", () => {
         confirmation.replaceChildren();
         if (form) form.disabled = false;
         else close();
         if (focused instanceof HTMLElement) focused.focus();
       }),
+      confirm,
     );
     confirm.focus();
   }
@@ -144,16 +150,17 @@ function segmented<T extends string>(
   canSetCurrent = false,
 ) {
   const row = document.createElement("div");
-  row.className = "policy-segments";
-  row.setAttribute("role", "group");
-  row.setAttribute("aria-label", label);
-  row.append(textElement("span", label));
+  row.className = "setting";
+  const segments = textElement("div", "", "seg");
+  segments.setAttribute("role", "group");
+  segments.setAttribute("aria-label", label);
+  row.append(textElement("span", label, "label"), segments);
   for (const [option, text] of choices) {
     const button = action(text, `${key}:${option}`, () => {
       if (option !== value || canSetCurrent) select(option);
     });
     button.setAttribute("aria-pressed", String(option === value));
-    row.append(button);
+    segments.append(button);
   }
   return row;
 }
@@ -345,6 +352,7 @@ function ruleForm(
 
   const submit = textElement("button", "ルールを保存");
   submit.type = "submit";
+  submit.className = "btn primary";
   fields.append(
     categoryRow,
     submit,
@@ -385,8 +393,17 @@ export function delegationPanel(
   channel: WorkplaceChannel,
   saved: () => void,
 ) {
-  const panel = document.createElement("div");
-  const defaults = policyControls("全体の既定値", saved);
+  const panel = group(
+    "div",
+    "stack",
+    textElement("h2", "任せ方", "title large"),
+    textElement(
+      "p",
+      "プロジェクト全体の設定です。Goal ごと・Task ごとの設定は、それぞれの詳細画面で変えられます。",
+      "meta",
+    ),
+  );
+  const defaults = policyControls("既定", saved);
   for (const gate of Object.keys(gateLabels) as Gate[]) {
     const untouched = !settings.explicitDefaults.includes(gate);
     defaults.controls.append(
@@ -442,20 +459,23 @@ export function delegationPanel(
     );
   }
   for (const [index, rule] of original.entries()) {
-    const row = document.createElement("li");
-    row.append(
+    const row = textElement("li", "", "setting");
+    const summary = group(
+      "div",
+      "label",
       textElement("strong", rule.name),
       textElement(
         "p",
         `${gateLabels[rule.gate]} · ${rule.action === "agent" ? "AI" : "人"} · 過去 7 日に ${rule.hitsLast7Days} 件`,
+        "meta",
       ),
     );
     const conditions = document.createElement("ul");
     conditions.append(...describeConditions(rule.conditions));
     const buttons = document.createElement("div");
-    buttons.className = "answer-controls";
+    buttons.className = "actions";
     const toggle = action(
-      rule.enabled ? "有効" : "無効",
+      "",
       `toggle:${rule.id}`,
       () => {
         update(
@@ -466,9 +486,12 @@ export function delegationPanel(
           ),
         );
       },
+      "switch",
     );
+    toggle.append(textElement("span", ""));
+    toggle.setAttribute("role", "switch");
     toggle.setAttribute("aria-label", `ルール「${rule.name}」を有効にする`);
-    toggle.setAttribute("aria-pressed", String(rule.enabled));
+    toggle.setAttribute("aria-checked", String(rule.enabled));
     const up = action("上へ", `up:${rule.id}`, () =>
       update(moveRule(original, index, -1)),
     );
@@ -478,15 +501,15 @@ export function delegationPanel(
     );
     down.disabled = index === original.length - 1;
     buttons.append(
-      toggle,
+      action("編集", `edit:${rule.id}`, () => edit(rule, index)),
       up,
       down,
-      action("編集", `edit:${rule.id}`, () => edit(rule, index)),
       action("削除", `remove:${rule.id}`, () =>
         update(original.filter((entry) => entry.id !== rule.id)),
       ),
     );
-    row.append(conditions, buttons);
+    summary.append(conditions);
+    row.append(toggle, summary, buttons);
     rows.append(row);
   }
   const add = action("ルールを追加", "add-rule", () =>
@@ -505,17 +528,21 @@ export function delegationPanel(
   );
   add.disabled = original.length >= 50;
   rules.controls.append(
-    textElement("p", "上から順に確認し、最初に一致したルールを適用します。"),
+    textElement(
+      "p",
+      "上から順に確認し、最初に一致したルールを適用します。",
+      "meta",
+    ),
     ...(original.length ? [rows] : [textElement("p", "ルールはありません。")]),
     add,
   );
   panel.append(rules.section);
-  const invariants = document.createElement("ul");
+  const invariants = textElement("ul", "", "card");
   invariants.append(
     ...settings.invariants.map((key) =>
-      textElement("li", invariantLabels[key]),
+      textElement("li", invariantLabels[key], "fixed"),
     ),
   );
-  panel.append(textElement("h3", "変わらない条件"), invariants);
+  panel.append(sectionTitle("設定では変わらないこと"), invariants);
   return panel;
 }
