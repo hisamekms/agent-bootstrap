@@ -1519,7 +1519,8 @@ export function createHostPanel(channel?: WorkplaceChannel) {
         if (decisionTab) {
           if (itemResult.status === "fulfilled") {
             inbox?.render(pending, goalLink, goalTitle);
-            focusDecision();
+            // A decision answered meanwhile never gets a card: drop the request.
+            if (!focusDecision()) pendingFocus = undefined;
           }
           const rows =
             history.status === "fulfilled" ? history.value : undefined;

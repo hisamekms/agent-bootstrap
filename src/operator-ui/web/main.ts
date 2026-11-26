@@ -251,7 +251,10 @@ document.addEventListener("keydown", (event) => {
   if (event.defaultPrevented || event.isComposing) return;
   if (
     event.key === "Escape" &&
-    !conversation.contains(document.activeElement)
+    !conversation.contains(document.activeElement) &&
+    !document.activeElement?.closest(
+      "input, textarea, select, [contenteditable]:not([contenteditable=false])",
+    )
   ) {
     if (panel.closeSettings()) event.preventDefault();
     else if (conversation.hidden) {
