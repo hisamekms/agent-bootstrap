@@ -123,10 +123,10 @@ test("Codex Worker diagnostics preserve the default command and report bounded f
     codexRoleCommand(task, { ...options, diagnostics: false }),
     normal,
   );
-  // Hash of the generated script before Worker diagnostics were added.
+  // Hash of the default script with the pinned Codex binary.
   assert.equal(
     createHash("sha256").update(normal.argv[2]!).digest("hex"),
-    "d23c20bd45d4e02aa4d7a7db3ed8ede381c7429ae14ae750f1f7daeec4a62592",
+    "f3d8df57b05ebb71900a47b501c58d771dea04770ee3b72a63a5bd1bd764523e",
   );
 
   const directory = mkdtempSync(join(tmpdir(), "bootstrap-codex-worker-"));

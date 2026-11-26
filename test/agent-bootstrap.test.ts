@@ -57,7 +57,7 @@ function fakeHost(root: string, settingsRoot = root) {
   const host: Host = {
     platform: "darwin",
     arch: "arm64",
-    bun: "1.4.4",
+    bun: "1.4.5",
     env: {
       ...configEnv(settingsRoot),
       MSB_HOME: root,
@@ -270,7 +270,9 @@ describe("agent-bootstrap", () => {
   });
 
   test("invalid commands and refused commands use distinct exits and one JSON object", async () => {
-    const { host } = fakeHost(checkout, "/nonexistent");
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
+    const { host } = fakeHost(root, "/nonexistent");
     for (const [args, exit] of [
       [["nonesuch"], 2],
       [["help", "nonesuch"], 2],
@@ -282,7 +284,7 @@ describe("agent-bootstrap", () => {
       [["approve", "bad-id"], 1],
       [["setup", "--allow-network"], 1],
     ] as const) {
-      const result = await invoke([...args, "--json"], checkout, host);
+      const result = await invoke([...args, "--json"], root, host);
       assert.equal(result.code, exit);
       assert.deepEqual(Object.keys(JSON.parse(result.stdout)), [
         "error",
@@ -347,7 +349,7 @@ describe("agent-bootstrap", () => {
         target: "ok",
         "effective-configuration": "ok",
         verification: "skipped",
-        "artifact:.local/claude-code/2.1.330/linux-arm64-musl/claude":
+        "artifact:.local/claude-code/2.1.332/linux-arm64-musl/claude":
           "missing",
         "image:base": "ok",
         "image:bun": "wrong",
@@ -364,7 +366,7 @@ describe("agent-bootstrap", () => {
           Object.keys(check).filter((key) => key !== "effective"),
           ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
         );
-      assert.equal(result.stderr, "next: mise install bun@1.4.4\n");
+      assert.equal(result.stderr, "next: mise install bun@1.4.5\n");
       const security = calls.filter(({ file }) => file === "/usr/bin/security");
       assert.deepEqual(
         security.map(({ args }) => args),
@@ -550,7 +552,7 @@ describe("agent-bootstrap", () => {
     assert.equal(plan.mode, "plan");
     assert.equal(plan.artifacts.length, artifacts(defaultProfiles).length);
     assert.ok(
-      plan.artifacts[0].url.endsWith("/2.1.330/linux-arm64-musl/claude"),
+      plan.artifacts[0].url.endsWith("/2.1.332/linux-arm64-musl/claude"),
     );
     assert.equal(
       plan.artifacts.every(

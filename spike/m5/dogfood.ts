@@ -561,7 +561,7 @@ async function main() {
     Object.values(actors).includes(harness);
   const claudeBinary =
     process.env.M5_CLAUDE_BINARY ??
-    join(local, "claude-code/2.1.330/linux-arm64-musl/claude");
+    join(local, "claude-code/2.1.332/linux-arm64-musl/claude");
   assert.ok(isAbsolute(claudeBinary));
   const claudeModel = process.env.M5_CLAUDE_MODEL ?? "claude-opus-5-5";
   const auth = claudeAuth(process.env.M5_CLAUDE_AUTH);
@@ -677,7 +677,7 @@ async function main() {
       const binary =
         guest === "debian"
           ? (process.env.M5_CLAUDE_BINARY_GLIBC ??
-            join(local, "claude-code/2.1.330/linux-arm64/claude"))
+            join(local, "claude-code/2.1.332/linux-arm64/claude"))
           : claudeBinary;
       assert.ok(isAbsolute(binary));
       return claudeRoleHarness({

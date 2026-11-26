@@ -767,7 +767,7 @@ async function main() {
           event.decision === "deny",
       );
     const report = {
-      claudeCode: "2.1.330 linux-arm64-musl",
+      claudeCode: "2.1.332 linux-arm64-musl",
       seconds: Math.round((performance.now() - started) / 100) / 10,
       planners: [first.outcome, second.outcome],
       plans: plans.map(

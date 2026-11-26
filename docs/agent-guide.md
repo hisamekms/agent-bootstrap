@@ -18,7 +18,7 @@ Machine-readable errors use `{ error, next }`. Completed doctor and secrets test
 Install the linked command and check this machine and a project checkout.
 
 **Prerequisites**  
-An agent-bootstrap checkout, macOS arm64, Bun 1.4.4, and a local SHA-1 Git target with local main.
+An agent-bootstrap checkout, macOS arm64, Bun 1.4.5, and a local SHA-1 Git target with local main.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts && bun link

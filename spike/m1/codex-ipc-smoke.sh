@@ -9,7 +9,7 @@ case "$codex_binary" in
 esac
 test -f "$codex_binary"
 digest=$(shasum -a 256 <"$codex_binary")
-test "${digest%% *}" = 6a95492ca9d85ee76bd9fc5a4d8f72dd98a6130d1bb409bcfc50e61573106616
+test "${digest%% *}" = 28c24ad7fb3bf29c95cd66a12e72d2219f06170efefae8b02002ceb50e2866b9
 msb=$(command -v msb)
 image=docker.io/library/alpine@sha256:5dda816445facf5f7282dc7689a333278834c74265ba25db2e2eb90509e3a9dd
 
@@ -30,7 +30,7 @@ output=$(env -i PATH=/usr/bin:/bin MSB_BACKEND=local MSB_HOME="$MSB_HOME" "$msb"
 printf '%s\n' "$output" | bun -e '
   import assert from "node:assert/strict";
   const [version, ...lines] = (await Bun.stdin.text()).trim().split("\n");
-  assert.equal(version, "codex-cli 0.170.0");
+  assert.equal(version, "codex-cli 0.172.0");
   const messages = lines.map(line => JSON.parse(line));
   const init = messages.find(message => message.id === 0)?.result;
   assert.equal(init?.platformOs, "linux");
@@ -43,5 +43,5 @@ printf '%s\n' "$output" | bun -e '
   assert.deepEqual(start?.sandbox, { type: "readOnly", networkAccess: false });
   assert.ok(messages.some(message => message.method === "thread/started" &&
     message.params.thread.id === start.thread.id));
-  console.log("Codex 0.170.0 initialized and started a read-only thread inside the guest.");
+  console.log("Codex 0.172.0 initialized and started a read-only thread inside the guest.");
 '

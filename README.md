@@ -9,7 +9,7 @@ integrates approved work into a private Goal branch.
 
 ## Quick start
 
-On an Apple silicon Mac with Bun 1.4.4, clone this repository and link the
+On an Apple silicon Mac with Bun 1.4.5, clone this repository and link the
 command. Put `$HOME/.bun/bin` on your PATH if your shell needs it.
 
 ```sh

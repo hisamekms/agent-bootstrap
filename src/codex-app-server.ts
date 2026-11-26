@@ -140,7 +140,7 @@ const allowedItems = new Set([
   "contextCompaction",
 ]);
 
-/** Known app-server names for the trace. Codex 0.170.0 schema. */
+/** Known app-server names for the trace. Codex 0.170.0 schema, not rechecked for 0.172.0. */
 const knownRequests = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
@@ -185,7 +185,7 @@ function label(value: unknown, known: ReadonlySet<string>): string {
 /** A fixed label for a failed turn's Codex error category, with the HTTP
  * status when Codex reports one. Never includes provider message text. */
 function turnFailure(info: unknown): string {
-  // CodexErrorInfo string variants in the Codex 0.170.0 schema.
+  // CodexErrorInfo string variants in the Codex 0.170.0 schema (not rechecked for 0.172.0).
   const simple = [
     "contextWindowExceeded",
     "sessionBudgetExceeded",

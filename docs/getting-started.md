@@ -6,7 +6,7 @@ for prerequisites and next actions, or paste
 
 ## 1. Set up the operator host
 
-Clone agent-bootstrap on macOS arm64 and install Bun 1.4.4 and mise. From the
+Clone agent-bootstrap on macOS arm64 and install Bun 1.4.5 and mise. From the
 checkout, link the command and run doctor.
 
 ```sh
