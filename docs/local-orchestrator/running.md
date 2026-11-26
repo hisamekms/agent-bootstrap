@@ -26,6 +26,40 @@ for details.
   its service name in the [private config file](../claude-code-auth.md#setup).
   `LO_CLAUDE_MODEL` defaults to `claude-opus-5-5`.
 
+## Run the Executor on Codex
+
+This change adds harness selection and host grant management. The local
+Executor switches to Codex when the runner integration lands. Concierge,
+Planner and Reviewer use Claude.
+
+Use `agent-bootstrap config edit` for the user config or
+`agent-bootstrap config edit --project <name>` for the target's private
+`local.json`. Merge these keys into the existing version 1 file.
+
+```json
+{
+  "version": 1,
+  "actors": { "Executor": "codex" },
+  "codex": { "model": "gpt-6.2-sol", "auth": "siwc" }
+}
+```
+
+Run `agent-bootstrap codex authorize` from a macOS terminal and approve
+Agent Bootstrap in the browser using the eligible ChatGPT account and
+workspace. Run `agent-bootstrap doctor --target <path>` to check the
+selected harnesses and grant presence. Grant presence does not establish
+that the provider will accept a refresh.
+
+To revoke the grant and remove the saved Keychain item, run
+`agent-bootstrap codex forget`. If revocation cannot be confirmed,
+disconnect Agent Bootstrap in ChatGPT settings.
+
+Open ChatGPT Settings → Usage → App limits and look for `agent-bootstrap`.
+The PoC observed the app listing. Usage attribution and the remaining
+Gate B checks for network boundaries, credential exposure and live
+refresh races are still unverified. See the
+[Sign in with ChatGPT evidence record](../codex-subscription-credential-poc.md#gate-a-and-gate-b-status).
+
 ## Start or resume
 
 Update local `main` before starting a session, for example after merging

@@ -8,7 +8,7 @@ import {
   userConfigPath,
   writePrivateConfig,
 } from "../config/layers.ts";
-import { ConfigError, invalid } from "../config/messages.ts";
+import { ActorConfigError, ConfigError, invalid } from "../config/messages.ts";
 import { MsbHomeError, requireMsbHome } from "../config/msb-home.ts";
 import { migrate } from "../config/migrate.ts";
 import {
@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { runCli, type CliIo } from "../local-orchestrator/cli.ts";
 import { runSecretTest } from "../local-orchestrator/secret-test.ts";
 import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
+import { SiwcError, siwcProvider } from "../siwc.ts";
 import {
   ClaudeConfigError,
   parseClaudeAuthMode,
@@ -181,10 +182,17 @@ export async function runBootstrap(
   const { args, json } = includeJson(argv);
   const print = (value: unknown) => io.stdout.write(`${escapedJson(value)}\n`);
   const hint = (next: string) => io.stderr.write(`next: ${next}\n`);
-  const fail = (code: Exclude<Exit, 0>, error: string, next: string) => {
-    if (json) print({ error, next });
+  const fail = (
+    code: Exclude<Exit, 0>,
+    error: string,
+    next: string,
+    details?: { code: string; key?: string },
+  ) => {
+    if (json) print({ error, next, ...details });
     else {
-      io.stderr.write(`${error}\n`);
+      io.stderr.write(
+        `${details && details.code !== error ? `${details.code} ` : ""}${error}\n`,
+      );
       hint(next);
     }
     return code;
@@ -229,6 +237,48 @@ export async function runBootstrap(
         io.stdout.write(
           `agent-bootstrap — Audited, sandboxed coding agents\n\nagent-bootstrap help <topic>\nTopics: ${Object.keys(helpTopics).join(", ")}\n\nRun agent-bootstrap help --agent for the full manual or agent-bootstrap help --json for the command schema.\nnext: agent-bootstrap help start\n`,
         );
+      return 0;
+    }
+
+    if (command === "codex") {
+      const [action, ...extra] = rest;
+      if (extra.length || (action !== "authorize" && action !== "forget"))
+        return usage();
+      if (action === "authorize" && !(io.approvalTTY ?? io.isTTY))
+        return fail(
+          2,
+          "Sign in with ChatGPT requires an operator terminal.",
+          "Run agent-bootstrap codex authorize from a TTY.",
+        );
+      if (host.platform !== "darwin")
+        throw new SiwcError(
+          "siwc-unavailable",
+          "Run this command on a macOS host with Keychain.",
+        );
+
+      const provider = siwcProvider({
+        checkout: root,
+        env: host.env,
+        report: (message) =>
+          (json ? io.stderr : io.stdout).write(`${message}\n`),
+        warn: (message) => io.stderr.write(`${message}\n`),
+      });
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      process.on("SIGINT", cancel);
+      process.on("SIGTERM", cancel);
+      try {
+        if (action === "authorize") await provider.authorize(controller.signal);
+        else if (await provider.forget())
+          throw new SiwcError(
+            "siwc-unavailable",
+            "Disconnect Agent Bootstrap in ChatGPT settings.",
+          );
+      } finally {
+        process.off("SIGINT", cancel);
+        process.off("SIGTERM", cancel);
+      }
+      if (json) print({ status: "ok" });
       return 0;
     }
 
@@ -387,9 +437,9 @@ export async function runBootstrap(
       else {
         const width = Math.max(...checks.map(({ id }) => id.length));
         io.stdout.write(`${"CHECK".padEnd(width)}  STATUS   DETAIL\n`);
-        for (const { id, status, detail, fix, effective } of checks) {
+        for (const { id, status, detail, fix, effective, code } of checks) {
           io.stdout.write(
-            `${id.padEnd(width)}  ${status.padEnd(7)}  ${detail}${fix.length ? ` next: ${fix.join(" && ")}` : ""}\n`,
+            `${id.padEnd(width)}  ${status.padEnd(7)}  ${code ? `${code} ` : ""}${detail}${fix.length ? ` next: ${fix.join(" && ")}` : ""}\n`,
           );
           if (effective) io.stdout.write(escapedJson(effective) + "\n");
         }
@@ -721,6 +771,13 @@ export async function runBootstrap(
     if (operator !== "watch") hint(output.next);
     return 0;
   } catch (error) {
+    if (error instanceof ActorConfigError)
+      return fail(1, error.message, error.next, {
+        code: error.code,
+        key: error.key,
+      });
+    if (error instanceof SiwcError)
+      return fail(1, error.code, error.next, { code: error.code });
     if (error instanceof ConfigError || error instanceof MsbHomeError)
       return fail(1, error.message, error.next);
     if (error instanceof ClaudeConfigError)

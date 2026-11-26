@@ -32,7 +32,7 @@ import {
   userStateDirectory,
   writePrivateConfig,
 } from "../src/config/layers.ts";
-import { ConfigError } from "../src/config/messages.ts";
+import { ActorConfigError, ConfigError } from "../src/config/messages.ts";
 import { migrate } from "../src/config/migrate.ts";
 import {
   addProject,
@@ -75,6 +75,47 @@ function commitDeclaration(repo: string, contents?: string, mode = 0o644) {
 }
 
 const verification = (arg: string) => ({ profile: "bun", argv: ["bun", arg] });
+
+test("actor harness and Codex settings come from private configuration", (t) => {
+  const { repo, env } = fixture(t);
+  const project = addProject(repo, undefined, env);
+  const directory = projectConfigDirectory(project.name, env);
+  const codex = { model: "fixture-model", auth: "siwc" };
+  const user = { version: 1, actors: { Executor: "codex" }, codex };
+  writePrivateConfig(userConfigPath(env), configRoot(env), user);
+  assert.equal(loadConfig(env, directory).actorHarnesses.Executor, "codex");
+  writePrivateConfig(join(directory, "local.json"), configRoot(env), {
+    version: 1,
+    actors: { Executor: "claude" },
+    codex: { ...codex, model: "fixture-override" },
+  });
+  const { config, actorHarnesses, sources } = loadConfig(env, directory);
+  assert.deepEqual(actorHarnesses, localActorHarnesses);
+  assert.equal(config.codex?.model, "fixture-override");
+  assert.equal(sources["actors.Executor"], "local");
+  assert.equal(sources["codex.auth"], "local");
+
+  for (const [layer, contents, key] of [
+    ["approved", { actors: user.actors }, "actors"],
+    ["approved", { codex }, "codex"],
+    ["user", { actors: { Planner: "codex" } }, "actors"],
+    ["local", { actors: { Executor: "PRIVATE VALUE" } }, "actors.Executor"],
+    ["user", { codex: { ...codex, model: "PRIVATE VALUE" } }, "codex.model"],
+    ["local", { codex: { ...codex, auth: "PRIVATE VALUE" } }, "codex.auth"],
+  ] as const) {
+    assert.throws(
+      () => parseConfig({ version: 1, ...contents }, layer),
+      (error) =>
+        error instanceof ActorConfigError &&
+        error.code === "config-invalid" &&
+        error.key === key &&
+        !!error.next &&
+        !error.message.includes("PRIVATE VALUE"),
+    );
+  }
+  commitDeclaration(repo, JSON.stringify(user));
+  assert.throws(() => readDeclaration(project), ActorConfigError);
+});
 
 test("Microsandbox home is an absolute path in user configuration only", (t) => {
   const { repo, env } = fixture(t);

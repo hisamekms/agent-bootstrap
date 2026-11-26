@@ -24,7 +24,7 @@ import {
   fetchArtifact,
 } from "../src/onboarding/artifacts.ts";
 import { runBootstrap, type BootstrapIo } from "../src/onboarding/cli.ts";
-import { type Host } from "../src/onboarding/prerequisites.ts";
+import { type Check, type Host } from "../src/onboarding/prerequisites.ts";
 import { applySetup, setupPlan } from "../src/onboarding/setup.ts";
 import { ALPINE_3_23 } from "../src/image-recipes.ts";
 import { MISE_MSB } from "../src/mise-tools.ts";
@@ -148,6 +148,98 @@ const topics = [
 ];
 
 describe("agent-bootstrap", () => {
+  test("codex authorize refuses a non-TTY before host operations", async () => {
+    const { host, calls } = fakeHost(checkout, "/nonexistent");
+    const result = await invoke(
+      ["codex", "authorize", "--json"],
+      checkout,
+      host,
+    );
+    assert.equal(result.code, 2);
+    assert.match(JSON.parse(result.stdout).next, /codex authorize.*TTY/);
+    assert.deepEqual(calls, []);
+  });
+
+  test("doctor reports selected harnesses and probes SIWC presence without a password", async () => {
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-cli-"));
+    const root = await prepareFixture(temp.path);
+    const { host, calls } = fakeHost(root);
+    const state = userStateDirectory(host.env);
+    const fakeHostId = "urn:uuid:10000000-0000-4000-a000-000000000000";
+    const fakeClientId = "fixture_cli_registration";
+    const fakeSubject = "fixture_cli_subject";
+    const fakeModel = "fixture-cli-model";
+    const user = userConfigPath(host.env);
+    writePrivateConfig(user, configRoot(host.env), {
+      version: 1,
+      actors: { Executor: "codex" },
+      codex: { model: fakeModel, auth: "siwc" },
+    });
+    const stateFile = join(state, "siwc", "registration.json");
+    writePrivateConfig(stateFile, state, {
+      hostId: fakeHostId,
+      clientId: fakeClientId,
+      subjectHash: fakeSubject,
+    });
+    const temporary = join(state, "siwc", ".config-fixture");
+    await writeFile(temporary, "", { mode: 0o600 });
+    const result = await invoke(["doctor", "--json"], root, host);
+    const checks = JSON.parse(result.stdout) as Check[];
+    assert.deepEqual(
+      checks.find(({ id }) => id === "actor-harnesses")?.actorHarnesses,
+      {
+        Concierge: "claude",
+        Planner: "claude",
+        Executor: "codex",
+        Reviewer: "claude",
+      },
+    );
+    assert.deepEqual(
+      checks.find(({ id }) => id === "siwc-grant"),
+      {
+        id: "siwc-grant",
+        status: "ok",
+        detail: "A Sign in with ChatGPT grant is present.",
+        fix: [],
+        needsNetwork: false,
+        needsHuman: false,
+      },
+    );
+    const prefix = "agent-bootstrap.siwc.refresh.";
+    const suffix = createHash("sha256")
+      .update(fakeHostId)
+      .digest("hex")
+      .slice(0, 16);
+    assert.deepEqual(
+      calls.find(({ args }) => args.some((arg) => arg.startsWith(prefix)))
+        ?.args,
+      ["find-generic-password", "-s", prefix + suffix, "-a", "operator"],
+    );
+    for (const privateValue of [
+      fakeHostId,
+      fakeClientId,
+      fakeSubject,
+      fakeModel,
+      prefix + suffix,
+      "never display this",
+    ])
+      assert.ok(!(result.stdout + result.stderr).includes(privateValue));
+    assert.ok((await stat(temporary)).isFile());
+
+    writePrivateConfig(user, configRoot(host.env), {
+      version: 1,
+      actors: { Executor: "invalid" },
+    });
+    const invalid = await invoke(["doctor", "--json"], root, host);
+    const error = (JSON.parse(invalid.stdout) as Check[]).find(
+      ({ id }) => id === "configuration",
+    );
+    assert.ok(error);
+    assert.equal(error.code, "config-invalid");
+    assert.equal(error.key, "actors.Executor");
+    assert.match(error.fix[0] ?? "", /config edit/);
+  });
+
   test("help has stable topics, commands and exit codes", async () => {
     const { host, calls } = fakeHost(checkout, "/nonexistent");
     const result = await invoke(["help", "--json"], checkout, host);
@@ -159,6 +251,7 @@ describe("agent-bootstrap", () => {
     assert.deepEqual(Object.keys(schema.commands), [
       "help",
       "doctor",
+      "codex",
       "setup",
       "concierge",
       "workplace",
@@ -363,7 +456,9 @@ describe("agent-bootstrap", () => {
       });
       for (const check of checks)
         assert.deepEqual(
-          Object.keys(check).filter((key) => key !== "effective"),
+          Object.keys(check).filter(
+            (key) => key !== "effective" && key !== "actorHarnesses",
+          ),
           ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
         );
       assert.equal(result.stderr, "next: mise install bun@1.4.5\n");

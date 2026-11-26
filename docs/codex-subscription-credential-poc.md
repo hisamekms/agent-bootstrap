@@ -111,13 +111,13 @@ that evidence.
      /absolute/path/to/msb /absolute/path/to/codex
    ```
 
-2. Open the displayed URL in a browser on the host. Choose an eligible
+2. In the browser opened on the host, choose an eligible
    ChatGPT account and workspace, then approve plan usage for Agent Bootstrap.
    The launcher uses the documented [Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
    and verifies the app-specific grant. It pipes the access token to the
    M5 runner on the host and requests revocation of the refresh token
-   when the run ends unless Keychain storage is enabled. It stores the app
-   registration and a hash of the validated subject in `.local/siwc-smoke/`.
+   when the run ends unless Keychain storage is enabled. The current
+   launcher shares the host SIWC provider and its private user state.
    A normal Codex CLI login provides a separate session.
 
 3. Record the outcome and confirm application attribution under Settings →
@@ -140,41 +140,87 @@ live VMs. That run had no credential projection.
 
 ### Keeping the refresh token
 
-On macOS, put `--keychain` immediately after `--authorize-and-run-m5` to keep
-the refresh token in the generic-password Keychain item for `$USER`.
-Each checkout has one item, with a service name
-formed by appending a dot and the first 16 hex characters of the registration
-host ID's SHA-256 hash to `agent-bootstrap.siwc.refresh`. The app registration
-and subject hash stay in `.local/siwc-smoke/registration.json`.
+On macOS, run `agent-bootstrap codex authorize` from a terminal to save
+the grant without starting the runner. If the browser cannot be opened,
+open the consent URL printed in the terminal while the command waits.
+The M5 launcher accepts `--keychain` immediately after
+`--authorize-and-run-m5` for grants whose legacy launcher is still active.
+The registration lives at
+`${XDG_STATE_HOME:-~/.local/state}/agent-bootstrap/siwc/registration.json`.
+The state directories use mode 0700 and the registration uses mode 0600.
+The Keychain account is the macOS login user from `userInfo().username`.
+On the first Keychain operation after import, if that account has no item
+and the old launcher's `$USER`
+names a different account with an item, the provider copies the token to
+the login account, verifies read-back, and deletes the old item. An
+interrupted move resumes before the next Keychain operation. Later
+operations use the login account. If both accounts already have items
+when migration starts, the provider records the legacy account and prints a
+`security delete-generic-password` command for manual removal. It leaves both
+items in place. The service name remains
+`agent-bootstrap.siwc.refresh.<hex>`, where `<hex>` is the first 16 hex
+characters of the registration host ID's SHA-256 hash.
 
-The run lock serializes refreshes per checkout. Later runs save the rotated
-token before starting the runner. A missing item leads to browser consent.
-If the provider rejects a refresh with HTTP 400 or 401, the launcher attempts
-revocation, deletes the item, and warns on stderr before starting consent.
-That warning is the only signal that the grant may have been refreshed
-elsewhere. If the registration is missing a client ID or a subject hash, the
-launcher attempts revocation when it has a valid client ID, deletes the saved
-item, and warns before starting consent. An invalid client ID stops the launcher
-before any Keychain access or browser consent.
+On first use, an existing user registration takes precedence. Otherwise the
+provider looks for `.local/siwc-smoke/registration.json` in the primary
+checkout first, then in the linked worktree. It copies
+and verifies the private registration, records the source directory in
+`migratedFrom`, and preserves the host ID used by the Keychain item.
+The provider takes the source checkout's run lock during migration and
+while using the copied registration, as long as that directory exists.
+On fresh consent it retires the source registration so an old launcher
+at that path stops before reaching Keychain with a stale client ID. If
+the recorded directory is missing, the provider records it as retired
+and continues. `agent-bootstrap codex forget` retires a source registration
+with the same host ID and clears the migration link. The compatibility
+launcher stays retired.
+Keep one user state location across checkouts. A moved or copied legacy
+checkout can still have a launcher with the same host ID and Keychain item
+and its own run lock. Using it can race with the user-state provider and
+invalidate the grant. Do not run any moved or copied legacy launcher.
+
+The user-state run lock serializes grant operations across processes.
+A refresh saves the replacement in Keychain and verifies read-back as soon
+as it parses the token, before fetching JWKS or validating the response.
+If fetching the signing keys fails, including an HTTP 5xx response, the
+provider reports `siwc-unavailable` and keeps the saved replacement for the
+next refresh. Access remains blocked until the provider verifies a later
+ID token or the operator forgets the grant and authorizes again. Before
+saving a refresh that needs this check, the provider retires any matching
+source registration because the old launcher cannot enforce the check.
+If identity validation or persistence fails and the provider clears the
+item after attempting revocation, it reports `siwc-rejected` and directs
+the operator to authorize again. Missing grants report `siwc-missing`.
+HTTP 400 or 401 from the refresh exchange triggers a revocation attempt,
+item deletion and `siwc-rejected`. HTTP 5xx or a transport failure at the
+refresh exchange reports `siwc-unavailable` and leaves the item in place.
+These access paths run without opening a browser.
 
 The refresh token has a rolling 30-day lifetime. Any same-user process able
-to run `security` can read the item without a prompt. The launcher accepts
-this trade-off and omits a `-T` restriction to avoid a prompt on every run.
-If the launcher crashes after a successful refresh and before writing to
-Keychain, the new token remains unrevoked. To recover, disconnect Agent
-Bootstrap in ChatGPT settings.
+to run `security` can read the item without a prompt. The provider omits a
+`-T` restriction to avoid a prompt on every run. If the process crashes
+after refresh and before saving the replacement, disconnect Agent Bootstrap
+in ChatGPT settings and authorize again. A `run.lock` in either the user
+state or the migration source records its owner's PID and process start
+identity. The provider reclaims it when that owner is gone, including
+when the PID has been reused. Permission errors checking the owner cause
+the provider to wait. The provider can reclaim an empty lock from an older
+launcher after five minutes, once it confirms no other descriptor is open.
+An old launcher can still unlink the path if it was paused between closing
+its descriptor and removing the file. Stop old launchers before migration
+to avoid that race.
+For an unreadable lock or a failed open-file check, use the path in the
+error. Remove the lock only after confirming that every command and legacy
+launcher using it has stopped.
 
-Run `bun spike/m1/subscription-authorize.ts --forget` in a terminal to revoke
-the grant and remove this checkout's item. Keep
-`.local/siwc-smoke/registration.json` while the item exists. Run `--forget`
-before deleting or recreating the file. If the launcher cannot confirm
-revocation, it still deletes the item and directs you to disconnect Agent
-Bootstrap in ChatGPT settings.
-
-If the registration is lost or unreadable, disconnect Agent Bootstrap in
-ChatGPT settings. The leftover `agent-bootstrap.siwc.refresh.<hex>` item can
-only be removed by hand. Use Keychain Access or run
-`security delete-generic-password -s <service>` with the full service name.
+Run `agent-bootstrap codex forget` to revoke the grant and delete the item.
+The M5 launcher's `--forget` is available before the legacy registration
+is retired. Keep the user registration while the Keychain
+item exists. If the provider cannot confirm revocation it still deletes
+the item and directs the operator to disconnect Agent Bootstrap in ChatGPT
+settings. If the registration is lost or unreadable, disconnect Agent
+Bootstrap and use Keychain Access to remove the leftover
+`agent-bootstrap.siwc.refresh.<hex>` item.
 
 ## Host credential lifecycle
 
@@ -190,9 +236,12 @@ provision a fresh host session before starting another run. The official
 [Codex auth implementation](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/login/src/auth/manager.rs#L2039-L2050)
 describes managed unauthorized recovery. The separately documented
 [ChatGPT plan OAuth refresh](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions#refreshing-tokens)
-uses the issued client ID and serializes rotation. A future host provider
-would refresh once per registered session, atomically persist the
-replacement and give subsequent worker requests the new generation. A
-future delegated resolver must be callable only from the trusted proxy,
-and must avoid replay of an admitted or partially streamed inference
-request. The operator launcher supports opt-in refresh between runs on macOS.
+uses the issued client ID and serializes rotation. The host SIWC provider
+now persists the replacement before making the access token available and
+reports value-free refresh outcomes. The trusted Executor caller can record
+the refresh attempt before exchange and the outcome before consuming access.
+Local fixtures cover serialization
+across processes. The local Executor integration and live Gate B checks
+are pending. A delegated resolver must be callable only from the trusted
+proxy and avoid replay of an admitted or partially streamed inference
+request.
