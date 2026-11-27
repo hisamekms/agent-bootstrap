@@ -572,7 +572,11 @@ export function planningDraft(ref: string, title: string) {
 }
 
 export function activityLabel({ running, queuedCount, yourTurn }: Activity) {
-  const work = running.length ? `AI 作業中 ${running.length}` : "AI は待機中";
+  const work = running.some(({ preparingEnvironment }) => preparingEnvironment)
+    ? "環境を準備中"
+    : running.length
+      ? `AI 作業中 ${running.length}`
+      : "AI は待機中";
   const queue = running.length || queuedCount ? ` · 待ち ${queuedCount}` : "";
   return `${work}${queue}${yourTurn ? ` · あなたの番 ${yourTurn}` : ""}`;
 }

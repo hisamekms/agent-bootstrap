@@ -1,3 +1,4 @@
+import { EnvironmentError } from "./environments/adapter.ts";
 import {
   codexAuthExitCode,
   codexFailureActions,
@@ -188,7 +189,7 @@ type ConciergeTerminal = {
 export interface VerificationPlan {
   readonly sandbox: Pick<
     SandboxSpec,
-    "readOnlyFiles" | "maxLifetimeMs" | "profile" | "repository"
+    "readOnlyFiles" | "maxLifetimeMs" | "profile" | "repository" | "environment"
   >;
   readonly command: SandboxCommand;
 }
@@ -481,6 +482,11 @@ export class TrustedHost {
     return profile;
   }
 
+  requireTaskEnvironmentAudit(id: string): void {
+    if (this.#disabled || this.#required?.audit.isV5Writable !== true)
+      throw new HostAuditError(id);
+  }
+
   async runWorker(
     plan: WorkerPlan,
     id?: string,
@@ -505,11 +511,12 @@ export class TrustedHost {
           key !== "readOnlyFiles" &&
           key !== "maxLifetimeMs" &&
           key !== "profile" &&
-          key !== "repository",
+          key !== "repository" &&
+          key !== "environment",
       )
     )
       throw new Error(
-        "Verification accepts only files, lifetime, profile and repository",
+        "Verification accepts only files, lifetime, profile, repository and environment",
       );
     return this.#readOnly("Verification", plan, id, context, options);
   }
@@ -860,7 +867,10 @@ export class TrustedHost {
   ): Promise<ReviewerRun> {
     // Verification never copies egress or tools, even from a non-enumerable
     // property that the key check in runVerification cannot see.
-    if ("repository" in plan.sandbox && role !== "Verification")
+    if (
+      ("repository" in plan.sandbox || "environment" in plan.sandbox) &&
+      role !== "Verification"
+    )
       throw new Error("Only Worker may use a repository");
     const wide: ReviewerPlan["sandbox"] =
       role === "Verification" ? {} : (plan.sandbox as ReviewerPlan["sandbox"]);
@@ -868,7 +878,13 @@ export class TrustedHost {
       role === "Verification"
         ? (plan.sandbox as VerificationPlan["sandbox"]).repository
         : undefined;
-    const sandbox: ReviewerPlan["sandbox"] & Pick<SandboxSpec, "repository"> = {
+    const environment =
+      role === "Verification"
+        ? (plan.sandbox as VerificationPlan["sandbox"]).environment
+        : undefined;
+    const sandbox: ReviewerPlan["sandbox"] &
+      Pick<SandboxSpec, "repository" | "environment"> = {
+      ...(environment ? { environment } : {}),
       ...(plan.sandbox.readOnlyFiles
         ? {
             readOnlyFiles: plan.sandbox.readOnlyFiles.map((file) => ({
@@ -928,6 +944,16 @@ export class TrustedHost {
       (plan.collectTree !== true || plan.collectPaths.length > 0)
     )
       throw new Error("collectTree excludes collectPaths");
+    if (plan.sandbox.environment !== undefined) {
+      if (
+        !plan.sandbox.repository ||
+        (role !== "Worker" && role !== "Verification")
+      )
+        throw new Error("Environment requires a task repository");
+      this.requireTaskEnvironmentAudit(
+        id ?? context?.executionId ?? randomUUID(),
+      );
+    }
     const validated =
       context === undefined ? undefined : parseExecutionContext(context);
     const invocationId = id ?? validated?.executionId ?? randomUUID();
@@ -2100,7 +2126,10 @@ export class TrustedHost {
                 );
                 if (tree) {
                   await screen("collection", tree);
-                  for (const [path, file] of workspaceFiles(tree))
+                  for (const [path, file] of workspaceFiles(
+                    tree,
+                    sandbox.environment?.outputs,
+                  ))
                     await screen("collection", path, file.bytes);
                 }
               }
@@ -2226,6 +2255,13 @@ export class TrustedHost {
         durationMs: performance.now() - startedAt,
       });
       if ("open" in input && failure) throw failure.error;
+      if (
+        sandbox.environment &&
+        failure?.error instanceof SandboxRuntimeError &&
+        (failure.error.code === "env-output-collision" ||
+          failure.error.code === "env-build-failed")
+      )
+        throw new EnvironmentError(failure.error.code);
       return {
         outcome,
         ...(code ? { code } : {}),

@@ -49,7 +49,8 @@ interface ProvisionerInput {
   readonly allow: readonly string[];
 }
 
-interface ProvisionerHost {
+export interface ProvisionerHost {
+  readonly invocationId?: string;
   readonly env: NodeJS.ProcessEnv;
   readonly store: EnvironmentStore;
   readonly run: ProvisionerCommand;
@@ -182,7 +183,7 @@ export async function provisionEnvironment(
     input,
     host,
   );
-  const invocationId = randomUUID();
+  const invocationId = host.invocationId ?? randomUUID();
   const { key, layout, lock, profileDigest } = identity;
   const started = performance.now();
   const write = (event: Omit<AuditInput, "invocationId" | "role">) =>

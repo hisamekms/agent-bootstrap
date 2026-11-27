@@ -96,7 +96,7 @@ export interface Config {
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
-  environment?: { allow: readonly string[] };
+  environment?: { enabled?: boolean; allow?: readonly string[] };
   mounts?: Record<string, MountDeclaration>;
   volumes?: Record<string, VolumeDefinition>;
   secrets?: Record<string, SecretDefinition>;
@@ -684,10 +684,20 @@ export function parseConfig(
     }
   }
   if ("environment" in raw) {
-    const { allow } = record(raw.environment, "environment", next, ["allow"]);
+    const { allow, enabled } = record(raw.environment, "environment", next, [
+      "allow",
+      "enabled",
+    ]);
+    if (
+      Object.hasOwn(raw.environment as object, "enabled") &&
+      typeof enabled !== "boolean"
+    )
+      invalid("environment.enabled", "Expected a boolean.", next);
     try {
-      if (!Array.isArray(allow) || allow.length > 64) throw new TypeError();
-      allow.forEach(environmentDestination);
+      if (Object.hasOwn(raw.environment as object, "allow")) {
+        if (!Array.isArray(allow) || allow.length > 64) throw new TypeError();
+        allow.forEach(environmentDestination);
+      }
     } catch {
       invalid(
         "environment.allow",
@@ -968,12 +978,19 @@ export function mergeConfig(
         layerFile(layer, env, directory),
       );
     if (current.environment) {
-      const entries = (config.environment ??= { allow: [] }).allow as string[];
-      const origins = (sources["environment.allow"] ??= []) as Layer[];
-      for (const destination of current.environment.allow) {
-        if (entries.includes(destination)) continue;
-        entries.push(destination);
-        origins.push(layer);
+      const environment = (config.environment ??= {});
+      if (current.environment.enabled !== undefined) {
+        environment.enabled = current.environment.enabled;
+        sources["environment.enabled"] = layer;
+      }
+      if (current.environment.allow !== undefined) {
+        const entries = (environment.allow ??= []) as string[];
+        const origins = (sources["environment.allow"] ??= []) as Layer[];
+        for (const destination of current.environment.allow) {
+          if (entries.includes(destination)) continue;
+          entries.push(destination);
+          origins.push(layer);
+        }
       }
     }
     for (const key of ["mounts", "volumes", "secrets", "secretEnv"] as const) {

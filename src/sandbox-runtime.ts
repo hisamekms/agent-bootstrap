@@ -190,6 +190,14 @@ export interface SandboxMount {
   readonly readOnly: boolean;
 }
 
+/** Host-validated packages layer for a repository workspace. */
+export interface SandboxEnvironment {
+  readonly archive: Uint8Array;
+  readonly outputs: readonly string[];
+  readonly linkTargets: readonly string[];
+  readonly pathEntries: readonly string[];
+}
+
 export interface SandboxSpec {
   /** Named VM environment. Default: `base`. */
   readonly profile?: ProfileName;
@@ -206,6 +214,7 @@ export interface SandboxSpec {
     readonly gitDir: string;
     readonly tree: string;
   };
+  readonly environment?: SandboxEnvironment;
   readonly tools?: readonly SandboxTool[];
   /** Legacy fixture field. Real runtimes reject direct host egress. */
   readonly hostTcpPort?: number;

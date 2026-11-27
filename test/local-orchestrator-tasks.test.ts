@@ -1,3 +1,18 @@
+import { SqliteAudit } from "../src/audit.ts";
+import { EnvironmentStore } from "../src/environments/store.ts";
+import { identifyEnvironment } from "../src/environments/adapter.ts";
+import { bunAdapter } from "../src/environments/bun.ts";
+import { operatorActivity } from "../src/local-orchestrator/operator-read.ts";
+import {
+  readTar,
+  writeWorkspaceTar,
+  type TarEntryView,
+} from "../src/oci-image.ts";
+import {
+  environmentLockMismatchNote,
+  environmentOutputCollisionNote,
+} from "../src/reviewed-integration.ts";
+import { activityLabel } from "../src/operator-ui/web/protocol.ts";
 import { codexFailureActions } from "../src/codex-exec.ts";
 import { operatorTask } from "../src/local-orchestrator/operator-read.ts";
 import { projectStateDirectory } from "../src/config/layers.ts";
@@ -41,6 +56,7 @@ import {
   OrchestratorStore,
   OrchestratorStoreError,
 } from "../src/local-orchestrator/store.ts";
+import { taskEnvironment } from "../src/local-orchestrator/task-environment.ts";
 import {
   prepareTargetDirectory,
   resolveTarget,
@@ -99,7 +115,11 @@ function approve(
     digest: proposal.digest,
   });
 }
-function goal(store: OrchestratorStore, policies?: PolicySet) {
+function goal(
+  store: OrchestratorStore,
+  policies?: PolicySet,
+  profile: TaskContent["profile"] = "base",
+) {
   return approve(
     store,
     store.proposeGoal(
@@ -108,8 +128,8 @@ function goal(store: OrchestratorStore, policies?: PolicySet) {
         description: "",
         acceptance: ["Valid docs"],
         scope: {
-          paths: ["docs/"],
-          profiles: ["base"],
+          paths: profile === "bun" ? ["package.json", "packages/"] : ["docs/"],
+          profiles: [profile],
           actors: ["Executor"],
           maxTasks: 8,
           budgets,
@@ -1184,6 +1204,7 @@ test(
       }),
       host: {
         async runWorker(plan, id, _context, options) {
+          assert.equal(Object.hasOwn(plan.sandbox, "environment"), false);
           assert.equal(plan.command.timeoutMs, 125_000);
           assert.match(
             plan.command.argv[2]!,
@@ -1251,6 +1272,7 @@ test(
           };
         },
         async runVerification(plan, id) {
+          assert.equal(Object.hasOwn(plan.sandbox, "environment"), false);
           calls.push("verification");
           invocationIds.push(id!);
           assert.ok(plan.sandbox.repository);
@@ -2940,3 +2962,516 @@ test("a saved guest auth report uses the current execution guidance", () => {
     next: "The Executor reported that the provider rejected the credential. Inspect the execution.",
   });
 });
+
+test("Task environment records failures when the profile or commit is unavailable", async () => {
+  using fixture = orchestratorFixture("task-environment-preflight-");
+  const env = configEnv(fixture.root);
+  const digest = "a".repeat(64);
+  const events: Parameters<OrchestratorStore["recordTaskEnvironment"]>[1][] =
+    [];
+  const executionId = randomUUID();
+  const ensure = taskEnvironment(
+    {
+      profile: {
+        image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
+        recipeDigest: digest,
+        memoryMiB: 2048,
+        cpus: 2,
+      },
+      allow: [],
+      requireAudit(id) {
+        assert.equal(id, executionId);
+      },
+      host: {
+        env,
+        store: new EnvironmentStore("a".repeat(12), env),
+        async run() {
+          assert.fail("unexpected provisioning command");
+        },
+        async openGateway() {
+          assert.fail("unexpected gateway");
+        },
+      },
+    },
+    {
+      recordTaskEnvironment(id, event) {
+        assert.equal(id, executionId);
+        events.push(event);
+      },
+    },
+    join(fixture.root, "missing.git"),
+  );
+
+  for (const profile of ["base", "bun"] as const) {
+    await assert.rejects(
+      ensure({
+        role: "Executor",
+        commit: "a".repeat(40),
+        profile,
+        executionId,
+      }),
+      { code: "env-build-failed" },
+    );
+    assert.equal(events.length, 2);
+    const [started, finished] = events.splice(0);
+    assert.equal(started?.kind, "environment.started");
+    assert.equal(finished?.kind, "environment.finished");
+    assert.equal(finished.invocationId, started.invocationId);
+    assert.equal(started.key, undefined);
+    assert.equal(finished.key, undefined);
+    assert.equal(finished.failure, "env-build-failed");
+  }
+});
+
+for (const scenario of [
+  "build",
+  "workspace outputs",
+  "output collision",
+  "tracked output collision",
+  "mismatch",
+  "invalid manifest",
+  "candidate invalid manifest",
+  "tampered",
+  "truncated",
+  "audit unavailable",
+  "worker failure",
+] as const)
+  test(
+    `local Task environment handles ${scenario}`,
+    gitTestOptions,
+    async () => {
+      using fixture = orchestratorFixture("task-environment-");
+      const { root, store } = fixture;
+      const repoRoot = join(root, "source");
+      mkdirSync(repoRoot);
+      const git = (args: string[]) =>
+        String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
+      git(["init", "--template=", "--initial-branch=main"]);
+      const trackedOutput = scenario === "tracked output collision";
+      const outputCollision = scenario === "output collision" || trackedOutput;
+      const workspace = scenario === "workspace outputs" || outputCollision;
+      const successful = scenario === "build" || workspace;
+      const revise = scenario === "mismatch" || outputCollision;
+      const candidateInvalidManifest =
+        scenario === "candidate invalid manifest";
+      const manifest =
+        scenario === "invalid manifest"
+          ? '{"workspaces":false}'
+          : '{"name":"fixture"}';
+      const changedManifest = workspace
+        ? '{"name":"candidate","workspaces":["packages/*"]}'
+        : '{"name":"candidate"}';
+      const packageManifest = '{"name":"a"}';
+      const bunLock = '{"lockfileVersion":1,"packages":{}}';
+      writeFileSync(join(repoRoot, "package.json"), manifest);
+      writeFileSync(join(repoRoot, "bun.lock"), bunLock);
+      const trackedPath = "packages/a/node_modules/tracked";
+      if (trackedOutput) {
+        mkdirSync(join(repoRoot, "packages/a/node_modules"), {
+          recursive: true,
+        });
+        writeFileSync(join(repoRoot, trackedPath), "tracked in base");
+      }
+      git(["add", "."]);
+      git(["commit", "-m", "base"]);
+
+      const env = configEnv(root);
+      addProject(repoRoot, undefined, env);
+      const target = await resolveTarget(repoRoot, root, env);
+      const { directory } = target;
+      await prepareTargetDirectory(target.bootstrapRoot, directory, env);
+      const goalId = goal(store, undefined, "bun");
+      const taskId = task(store, goalId, {
+        profile: "bun",
+        paths: workspace
+          ? ["package.json", "packages/"]
+          : candidateInvalidManifest
+            ? ["package.json", "node_modules/"]
+            : ["package.json"],
+        budgets: { ...budgets, maxRetries: 1 },
+      });
+      const cache = new EnvironmentStore(target.project.id, env);
+      const digest = "a".repeat(64);
+      const keyFor = async (content: string, workspace = false) =>
+        (
+          await identifyEnvironment(
+            {
+              paths: [
+                "bun.lock",
+                "package.json",
+                ...(workspace ? ["packages/a/package.json"] : []),
+              ],
+              async read(path) {
+                return Buffer.from(
+                  path === "bun.lock"
+                    ? bunLock
+                    : path === "package.json"
+                      ? content
+                      : packageManifest,
+                );
+              },
+            },
+            digest,
+            bunAdapter,
+          )
+        ).key;
+      const baseKey = await keyFor('{"name":"fixture"}');
+      const candidateKey = await keyFor(changedManifest, workspace);
+      const entry = (
+        path: string,
+        type: TarEntryView["type"],
+        content = "",
+      ) => ({
+        path,
+        type,
+        mode: type === "directory" ? 0o755 : 0o644,
+        linkname: "",
+        data: Buffer.from(content),
+      });
+      const archive = writeWorkspaceTar([entry("node_modules", "directory")]);
+      await cache.publish(
+        {
+          key: baseKey,
+          adapter: "bun",
+          profileDigest: digest,
+          hasLock: true,
+          packages: [],
+          size: archive.length,
+          createdAt: new Date().toISOString(),
+        },
+        archive,
+      );
+      if (scenario === "truncated")
+        writeFileSync(
+          join(cache.directory, "entries", baseKey, "outputs.tar"),
+          "",
+        );
+      if (scenario === "tampered")
+        writeFileSync(
+          join(cache.directory, "entries", baseKey, "outputs.tar"),
+          writeWorkspaceTar([entry("outside", "directory")]),
+        );
+
+      let workerRuns = 0;
+      let verifyRuns = 0;
+      const provisioning: string[] = [];
+      const executor = createTaskExecutor({
+        repoRoot,
+        directory,
+        store,
+        worker: () => harness,
+        reviewer: harness,
+        verification: configuredVerification({
+          profile: "bun",
+          argv: ["bun", "test"],
+        }),
+        environment: {
+          profile: {
+            image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
+            recipeDigest: digest,
+            memoryMiB: 2048,
+            cpus: 2,
+          },
+          allow: [],
+          requireAudit() {
+            if (scenario === "audit unavailable")
+              throw new Error("audit unavailable");
+          },
+          host: {
+            env,
+            store: cache,
+            async run(args) {
+              if (args[0] === "create") {
+                assert.match(
+                  activityLabel(operatorActivity({ store, target: repoRoot })),
+                  /環境を準備中/,
+                );
+              }
+              if (
+                args[0] === "exec" &&
+                args.at(-1)?.includes("install") &&
+                scenario === "mismatch"
+              )
+                return { code: 1, stdout: "", stderr: "frozen lockfile" };
+              if (args[0] === "copy")
+                writeFileSync(
+                  args[2]!,
+                  workspace
+                    ? writeWorkspaceTar([
+                        entry("node_modules", "directory"),
+                        entry("packages/a/node_modules", "directory"),
+                      ])
+                    : archive,
+                );
+              return { code: 0, stdout: "" };
+            },
+            async openGateway({ executionId }) {
+              provisioning.push(executionId);
+              return {
+                socksPort: 19100,
+                dnsPort: 19153,
+                username: "fake",
+                password: "fixture",
+                quarantined: false,
+                async close() {},
+              };
+            },
+          },
+        },
+        host: {
+          async runWorker(plan, id) {
+            workerRuns++;
+            assert.ok(plan.sandbox.environment);
+            assert.match(plan.command.argv[2]!, /AGENT_BOOTSTRAP_ENV_PATH/);
+            assert.deepEqual(cache.prune({ keep: 0 }), []);
+            assert.deepEqual(
+              cache.list().map(({ key }) => key),
+              [baseKey],
+            );
+            if (scenario === "worker failure")
+              throw new Error("fixture worker failure");
+            if (workerRuns === 2) {
+              if (trackedOutput) {
+                const previous = readTar(
+                  readFileSync(plan.sandbox.repository!.tree),
+                  undefined,
+                  true,
+                );
+                const tracked = previous.find(
+                  ({ path }) => path === trackedPath,
+                );
+                assert.equal(
+                  Buffer.from(tracked!.data).toString(),
+                  "tracked in base",
+                );
+              }
+              const notes = plan.sandbox.readOnlyFiles?.find(
+                ({ path }) => path === "review-notes.txt",
+              );
+              assert.equal(
+                Buffer.from(notes!.bytes).toString(),
+                outputCollision
+                  ? environmentOutputCollisionNote
+                  : environmentLockMismatchNote,
+              );
+            }
+            return {
+              id: id!,
+              outcome: "ok",
+              artifacts: {
+                files: [],
+                tree: writeWorkspaceTar([
+                  entry(
+                    "package.json",
+                    "file",
+                    candidateInvalidManifest
+                      ? '{"workspaces":false}'
+                      : changedManifest,
+                  ),
+                  entry("bun.lock", "file", bunLock),
+                  entry("node_modules", "directory"),
+                  entry("node_modules/agent-write", "file", "discard this"),
+                  ...(scenario === "workspace outputs"
+                    ? [
+                        entry(
+                          "Node_modules/alias",
+                          "file",
+                          "discard this alias",
+                        ),
+                      ]
+                    : []),
+                  ...(workspace
+                    ? [
+                        entry(
+                          "packages/a/package.json",
+                          "file",
+                          packageManifest,
+                        ),
+                        entry(
+                          "packages/a/node_modules/generated",
+                          "file",
+                          "discard this too",
+                        ),
+                      ]
+                    : []),
+                  ...(scenario === "output collision" && workerRuns === 1
+                    ? [
+                        entry(
+                          "packages/a/Node_modules/alias",
+                          "file",
+                          "remove on revision",
+                        ),
+                      ]
+                    : []),
+                  ...(trackedOutput && workerRuns === 1
+                    ? [entry(trackedPath, "file", "modified in collection")]
+                    : []),
+                ]),
+              },
+            };
+          },
+          async runVerification(plan, id) {
+            verifyRuns++;
+            assert.ok(plan.sandbox.environment);
+            assert.equal(cache.get(candidateKey)?.key, candidateKey);
+            assert.deepEqual(cache.prune({ keep: 0 }), [baseKey]);
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from('{"review":"pass"}'),
+            };
+          },
+          async runReviewer(plan, id) {
+            assert.equal(Object.hasOwn(plan.sandbox, "environment"), false);
+            const diff = plan.sandbox.readOnlyFiles?.find(
+              ({ path }) => path === "candidate.diff",
+            );
+            const text = Buffer.from(diff!.bytes).toString();
+            assert.doesNotMatch(
+              text,
+              /node_modules\/(?:generated|agent-write|alias)/i,
+            );
+            if (trackedOutput)
+              assert.match(
+                text,
+                /--- a\/packages\/a\/node_modules\/tracked\n\+\+\+ \/dev\/null\n/,
+              );
+            if (workspace)
+              assert.match(
+                Buffer.from(diff!.bytes).toString(),
+                /packages\/a\/package\.json/,
+              );
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from('{"result":"{\\"review\\":\\"pass\\"}"}'),
+            };
+          },
+        },
+      });
+      await runTask(store, executor, taskId);
+      const detail = operatorTask(store, taskId)!;
+      if (
+        scenario === "audit unavailable" ||
+        scenario === "tampered" ||
+        scenario === "truncated" ||
+        scenario === "invalid manifest"
+      ) {
+        assert.equal(workerRuns, 0);
+        assert.equal(provisioning.length, 0);
+        if (scenario !== "audit unavailable") {
+          assert.equal(detail.failure?.code, "env-build-failed");
+          assert.equal(
+            detail.executions[0]?.environment?.key,
+            scenario === "invalid manifest" ? undefined : baseKey,
+          );
+        }
+      } else {
+        assert.deepEqual(
+          detail.executions.find(({ mode }) => mode === "task")?.environment,
+          { key: baseKey, cacheHit: true },
+        );
+      }
+      if (scenario === "invalid manifest") {
+        const [started, finished] = store
+          .listEvents({ subjectId: detail.executions[0]!.id, limit: 10 })
+          .filter(({ kind }) => kind.startsWith("environment."))
+          .reverse();
+        assert.equal(started?.kind, "environment.started");
+        assert.equal(finished?.kind, "environment.finished");
+        const start = started.data as { invocationId: string; key?: string };
+        const finish = finished.data as {
+          invocationId: string;
+          key?: string;
+          failure?: string;
+        };
+        assert.equal(finish.invocationId, start.invocationId);
+        assert.equal(start.key, undefined);
+        assert.equal(finish.key, undefined);
+        assert.equal(finish.failure, "env-build-failed");
+      }
+      if (candidateInvalidManifest) {
+        assert.equal(detail.failure?.code, "env-build-failed");
+        const journal = new IntegrationJournal(
+          join(directory, "integrations", taskId),
+          taskId,
+        );
+        const created = (await journal.read()).find(
+          ({ kind }) => kind === "candidate.created",
+        );
+        assert.ok(created?.kind === "candidate.created");
+        const repository = join(directory, "repository.git");
+        assert.equal(
+          String(
+            command(
+              "/usr/bin/git",
+              repository,
+              [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                created.candidate,
+              ],
+              "utf8",
+            ),
+          ).trim(),
+          "package.json",
+        );
+      }
+      if (successful || scenario === "mismatch") {
+        assert.deepEqual(
+          detail.executions.find(({ mode }) => mode === "verification")
+            ?.environment,
+          { key: candidateKey, cacheHit: false },
+        );
+        const journal = new IntegrationJournal(
+          join(directory, "integrations", taskId),
+          taskId,
+        );
+        const events = await journal.read();
+        assert.ok(
+          events.some(({ kind }) => kind === "environment.outputs-excluded"),
+        );
+        if (revise)
+          assert.ok(
+            events.some(
+              (event) =>
+                event.kind === "verification.finished" &&
+                event.review === "revise" &&
+                event.failure ===
+                  (outputCollision
+                    ? "env-output-collision"
+                    : "env-lock-mismatch"),
+            ),
+          );
+        const audit = new SqliteAudit(join(cache.directory, "audit.sqlite"), {
+          readonly: true,
+        });
+        try {
+          assert.ok(
+            audit
+              .read(provisioning[0]!)
+              .some(({ kind }) => kind === "environment.finished"),
+          );
+        } finally {
+          audit.close();
+        }
+      }
+      assert.equal(
+        workerRuns,
+        revise
+          ? 2
+          : successful ||
+              candidateInvalidManifest ||
+              scenario === "worker failure"
+            ? 1
+            : 0,
+      );
+      assert.equal(verifyRuns, successful ? 1 : 0);
+      if (scenario !== "tampered" && scenario !== "truncated")
+        assert.deepEqual(cache.prune({ keep: 0 }), [
+          successful ? candidateKey : baseKey,
+        ]);
+    },
+  );

@@ -1,3 +1,10 @@
+import { spawnSync } from "node:child_process";
+import {
+  readTar,
+  writeWorkspaceTar,
+  type TarEntryView,
+} from "../src/oci-image.ts";
+import { workspaceFiles } from "../src/workspace-tree.ts";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -161,6 +168,7 @@ if (args[0] === '--version') {
     if (mode === 'extract-fail') { process.exitCode = 1; }
     else cpSync(join(guests, name + '.tree'), join(workspace, 'extracted.tar'));
   }
+  else if (command[0] === '/usr/local/bin/bun' || command[3] === 'environment') { /* capture only */ }
   else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -cf')) { if (mode === 'pack-fail') process.exitCode = 1; }
   else if (command[0] === '/bin/sh' && String(command[2]).includes('p=/tmp/agent-bootstrap/commit-message;')) {
     const limit = Number(command[2].match(/head -c ([0-9]+)/)?.[1]);
@@ -1858,4 +1866,126 @@ test("Microsandbox emits both declared mount modes and keeps managed settings re
     (await events()).filter(({ args }) => args[0] === "create").length,
     2,
   );
+});
+
+test("Microsandbox stages packages after the tree and selects only non-environment collection members", async (t) => {
+  const f = await fixture(t);
+  const repository = await repoFixture(f);
+  const runtime = new MicrosandboxRuntime({
+    ...f.config,
+    profiles: new ProfileCatalog({ base: { image }, bun: { image } }),
+  });
+  const directory = (path: string): TarEntryView => ({
+    path,
+    type: "directory",
+    mode: 0o755,
+    linkname: "",
+    data: new Uint8Array(),
+  });
+  const environment = {
+    archive: writeWorkspaceTar([
+      directory("node_modules"),
+      directory("packages/a/node_modules"),
+    ]),
+    outputs: ["node_modules", "packages/a/node_modules"],
+    linkTargets: [],
+    pathEntries: ["node_modules/.bin", "packages/a/node_modules/.bin"],
+  };
+  const plan = { profile: "bun", repository, environment } as const;
+  // A hostile same-size archive and a case alias both fail before backend create.
+  await writeFile(
+    repository.tree,
+    writeWorkspaceTar([directory("Node_Modules")]),
+  );
+  await assert.rejects(runtime.create(plan), { code: "env-output-collision" });
+  await assert.rejects(
+    runtime.create({
+      ...plan,
+      environment: {
+        ...environment,
+        archive: writeWorkspaceTar([
+          directory("outside"),
+          directory("packages/a/node_modules"),
+        ]),
+      },
+    }),
+    { code: "env-build-failed" },
+  );
+  assert.ok(!(await f.events()).some(({ args }) => args[0] === "create"));
+
+  await writeFile(
+    repository.tree,
+    writeWorkspaceTar([directory("packages/a")]),
+  );
+  const handle = await runtime.create(plan);
+  await runtime.exec(handle, { argv: ["bun", "test"], timeoutMs: 10_000 });
+  await runtime.collect(handle, { tree: true });
+  await runtime.destroy(handle);
+
+  const events = await f.events();
+  const create = events.find(({ args }) => args[0] === "create")!;
+  assert.match(
+    create.copyFiles?.at(-1) ?? "",
+    /\/environment\.tar:\/tmp\/agent-bootstrap-environment\.tar$/,
+  );
+  const commands = events
+    .filter(({ args }) => args[0] === "exec")
+    .map(({ args }) => args.slice(args.indexOf("--") + 1));
+  assert.match(
+    commands[0]![2]!,
+    /tar -xf .*tree\.tar .* && tar -xf .*environment\.tar -C \/workspace && rm -f .*environment\.tar/,
+  );
+  assert.match(commands[1]![2]!, /export PATH=/);
+  assert.equal(
+    commands[1]![4],
+    "/workspace/node_modules/.bin:/workspace/packages/a/node_modules/.bin",
+  );
+  assert.deepEqual(commands[1]!.slice(-2), ["bun", "test"]);
+  const pack = commands[2]!;
+  assert.deepEqual(pack.slice(-2), [
+    "./node_modules",
+    "./packages/a/node_modules",
+  ]);
+
+  const workspace = join(f.home, "collection-fixture");
+  const collection = join(f.home, "collection.tar");
+  for (const path of [
+    "node_modules",
+    "packages/a/node_modules",
+    "packages/a/nested/node_modules",
+  ]) {
+    await mkdir(join(workspace, path), { recursive: true });
+    await writeFile(join(workspace, path, "fixture"), "fixture");
+  }
+  await writeFile(join(workspace, "packages/a/source"), "source");
+  const script = pack[4]!
+    .replace('"/workspace"', JSON.stringify(workspace))
+    .replace('"/bin/tar"', '"/usr/bin/tar"')
+    .replace("128 * 1024", "35")
+    .replaceAll(
+      '"/tmp/agent-bootstrap-collect.tar"',
+      JSON.stringify(collection),
+    );
+  const packed = spawnSync(
+    process.execPath,
+    ["--cwd", f.home, "-e", script, ...pack.slice(5)],
+    { env: { ...process.env, COPYFILE_DISABLE: "1" } },
+  );
+  assert.equal(packed.status, 0);
+  const bytes = await readFile(collection);
+  const directories = readTar(bytes)
+    .filter(({ type }) => type === "directory")
+    .map(({ path }) => path)
+    .sort();
+  assert.deepEqual(directories, [
+    "packages",
+    "packages/a",
+    "packages/a/nested",
+    "packages/a/nested/node_modules",
+  ]);
+  const files = workspaceFiles(bytes, environment.outputs);
+  assert.deepEqual([...files.keys()].sort(), [
+    "packages/a/nested/node_modules/fixture",
+    "packages/a/source",
+  ]);
 });

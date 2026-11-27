@@ -1,3 +1,4 @@
+import type { TaskEnvironmentOptions } from "./task-environment.ts";
 import { createHash } from "node:crypto";
 import { codexExecutorOptions, readCodexExecutor } from "./codex-executor.ts";
 import { codexTools } from "../codex-exec.ts";
@@ -135,6 +136,7 @@ export interface ConciergeDeps {
   readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
+  readonly taskEnvironment?: TaskEnvironmentOptions;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
   ) => Promise<Pick<HostApiServer, "close">>;
@@ -468,6 +470,11 @@ export async function startConcierge(
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
   const { config, baseImage } = deps;
+  const environment = config.environment?.enabled
+    ? deps.taskEnvironment
+    : undefined;
+  if (config.environment?.enabled && !environment)
+    throw new Error("Task environment support unavailable");
   const codexOptions = codexExecutorOptions(config);
   const codexInstall = codexOptions
     ? await readCodexExecutor(bootstrapRoot, codexOptions)
@@ -649,6 +656,7 @@ export async function startConcierge(
             },
             reviewer,
             ...(deps.verification ? { verification: deps.verification } : {}),
+            ...(environment ? { environment } : {}),
           })
         : undefined;
 

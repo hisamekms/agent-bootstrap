@@ -1153,7 +1153,11 @@ function runningLine(run: ActivityRow, open: () => void, local?: string) {
     textElement("span", "", "now-dot"),
     ...refNodes(run.taskRef ?? run.goalRef, local),
     modelTitle("span", run.taskTitle ?? run.goalTitle ?? run.actor, "grow"),
-    textElement("span", run.actor, "meta"),
+    textElement(
+      "span",
+      run.preparingEnvironment ? "環境を準備中" : run.actor,
+      "meta",
+    ),
     elapsed,
   );
   if (!run.taskId && !run.goalId) return row;
@@ -1446,10 +1450,11 @@ function taskDetail(
               tokens,
               harness,
               model,
+              environment,
             }) =>
               textElement(
                 "p",
-                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン`,
+                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
                 "meta",
               ),
           )

@@ -1,3 +1,7 @@
+import {
+  digestPattern,
+  type EnvironmentFailure,
+} from "../environments/adapter.ts";
 import type { Harness } from "../actors.ts";
 import { codexFailureActions } from "../codex-exec.ts";
 import {
@@ -124,6 +128,18 @@ export type StoreErrorCode =
   | "session-busy"
   | "reconcile-changed"
   | "integration-uncertain";
+
+function readTaskEnvironment(
+  json: string,
+): { key: string; cacheHit: boolean } | undefined {
+  const { key, cacheHit } = JSON.parse(json);
+  if (
+    typeof key === "string" &&
+    digestPattern.test(key) &&
+    (cacheHit === 0 || cacheHit === 1)
+  )
+    return { key, cacheHit: cacheHit === 1 };
+}
 
 export class OrchestratorStoreError extends Error {
   readonly code: StoreErrorCode;
@@ -3453,14 +3469,65 @@ export class OrchestratorStore {
     );
   }
 
+  recordTaskEnvironment(
+    executionId: string,
+    event: {
+      invocationId: string;
+      key?: string;
+      cacheHit: boolean;
+    } & (
+      | { kind: "environment.started" }
+      | {
+          kind: "environment.finished";
+          durationMs: number;
+          size: number;
+          failure?: EnvironmentFailure;
+        }
+    ),
+  ): void {
+    const id = identifier(executionId);
+    const { kind, ...detail } = event;
+    this.#write((at) => {
+      const row = required(this.#execution(id));
+      if (
+        row.status !== "running" ||
+        !row.taskId ||
+        (row.mode !== "task" && row.mode !== "verification") ||
+        (detail.key === undefined
+          ? detail.cacheHit ||
+            (kind === "environment.finished" && !event.failure)
+          : !digestPattern.test(detail.key))
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      this.#event(
+        at,
+        kind,
+        "execution",
+        id,
+        { ...detail, operation: "build" },
+        { executionId: id },
+      );
+    });
+  }
+
   recentTaskExecutions(taskId: string) {
     return this.#read(() =>
       this.#db
         .query<
-          ExecutionRow & { harness: Harness | null; model: string | null }
+          ExecutionRow & {
+            harness: Harness | null;
+            model: string | null;
+            environmentJson: string | null;
+          }
         >(
-          `SELECT ${executionColumns}, ${executionAgentColumns} FROM executions
-           WHERE task_id = ? ORDER BY rowid DESC LIMIT 10`,
+          `SELECT ${executionColumns}, ${executionAgentColumns},
+           (SELECT json_object('key', json_extract(e.data, '$.key'),
+                    'cacheHit', json_extract(e.data, '$.cacheHit'))
+            FROM events e WHERE e.subject_id = executions.id AND e.subject_kind = 'execution'
+              AND e.kind = 'environment.finished'
+              AND json_extract(e.data, '$.key') IS NOT NULL
+            ORDER BY e.rowid DESC LIMIT 1) AS environmentJson
+           FROM executions WHERE task_id = ? ORDER BY rowid DESC LIMIT 10`,
         )
         .all(this.#taskId(identifier(taskId)))
         .map(
@@ -3472,6 +3539,7 @@ export class OrchestratorStore {
             startedAt,
             finishedAt,
             resultJson,
+            environmentJson,
             harness,
             model,
           }) => ({
@@ -3482,6 +3550,9 @@ export class OrchestratorStore {
             startedAt,
             finishedAt,
             ...(harness && model ? { harness, model } : {}),
+            ...(environmentJson
+              ? { environment: readTaskEnvironment(environmentJson) }
+              : {}),
             tokens: readTokenReport(
               resultJson === null ? null : JSON.parse(resultJson),
               startedAt !== null && finishedAt !== null,
@@ -3537,31 +3608,43 @@ export class OrchestratorStore {
           taskRef: string | null;
           taskTitle: string | null;
           startedAt: string | null;
+          preparingEnvironment: number | null;
         }>(
           `
         WITH active AS MATERIALIZED (
           SELECT rowid, id, actor, mode, status, goal_id, task_id, started_at
           FROM executions WHERE status IN ('queued', 'running')
         )
-        SELECT id, actor, mode, status, goalId, goalRef, goalTitle, taskId, taskRef, taskTitle, startedAt
+        SELECT id, actor, mode, status, goalId, goalRef, goalTitle, taskId, taskRef, taskTitle, startedAt, preparingEnvironment
         FROM (
           SELECT x.id, x.actor, x.mode, x.status, g.id AS goalId, g.ref AS goalRef,
             json_extract(g.content_json, '$.title') AS goalTitle, t.id AS taskId,
             t.ref AS taskRef, json_extract(t.content_json, '$.title') AS taskTitle,
-            x.started_at AS startedAt, 0 AS sourceOrder, x.rowid AS position
+            x.started_at AS startedAt,
+            (SELECT e.kind = 'environment.started' AND json_extract(e.data, '$.cacheHit') = 0
+             FROM events e WHERE e.subject_id = x.id AND e.subject_kind = 'execution'
+               AND e.kind IN ('environment.started', 'environment.finished')
+             ORDER BY e.rowid DESC LIMIT 1) AS preparingEnvironment,
+            0 AS sourceOrder, x.rowid AS position
           FROM active x LEFT JOIN tasks t ON t.id = x.task_id
             LEFT JOIN goals g ON g.id = coalesce(x.goal_id, t.goal_id)
           UNION ALL
           SELECT t.id, json_extract(t.content_json, '$.actor'), 'task', t.status, g.id,
             g.ref, json_extract(g.content_json, '$.title'), t.id,
-            t.ref, json_extract(t.content_json, '$.title'), NULL, 1, t.rowid
+            t.ref, json_extract(t.content_json, '$.title'), NULL, NULL, 1, t.rowid
           FROM tasks t JOIN goals g ON g.id = t.goal_id
           WHERE t.status = 'registered' AND g.status = 'active'
             AND t.id NOT IN (SELECT task_id FROM active WHERE task_id IS NOT NULL)
         ) ORDER BY sourceOrder, position
       `,
         )
-        .all(),
+        .all()
+        .map(({ preparingEnvironment, ...row }) => ({
+          ...row,
+          ...(preparingEnvironment === 1
+            ? { preparingEnvironment: true as const }
+            : {}),
+        })),
     );
   }
 
@@ -3573,6 +3656,7 @@ export class OrchestratorStore {
             `
         SELECT coalesce(max(rowid), 0) AS revision FROM events
         WHERE kind IN ('execution.queued', 'execution.started', 'execution.finished',
+          'environment.started', 'environment.finished',
           'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
           'task.retried', 'task.budget-exceeded',

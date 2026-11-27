@@ -82,6 +82,7 @@ export interface RoleHarness {
     readonly role: "Planner" | "Worker" | "Reviewer";
     readonly prompt: string;
     readonly timeoutMs: number;
+    readonly environment?: boolean;
   }): SandboxCommand;
   readonly reviewerOutput?: (
     response: Uint8Array | undefined,
@@ -150,6 +151,7 @@ export function claudeRoleHarness(options: {
           model: options.model,
           maxTurns: options.maxTurns ?? 8,
           timeoutMs: task.timeoutMs,
+          ...(task.environment ? { environment: true } : {}),
           ...(baseUrl ? { baseUrl } : {}),
           ...(options.shell && task.role === "Worker" ? { shell: true } : {}),
           ...(options.reportWorkerUsage && task.role === "Worker"
