@@ -136,7 +136,7 @@ export interface ConciergeDeps {
   readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
-  readonly taskEnvironment?: TaskEnvironmentOptions;
+  readonly taskEnvironment?: Omit<TaskEnvironmentOptions, "autoBuild">;
   readonly listen?: (
     ...args: Parameters<typeof HostApiServer.listen>
   ) => Promise<Pick<HostApiServer, "close">>;
@@ -470,9 +470,13 @@ export async function startConcierge(
   const target = options.target ?? (await resolveTarget(repoRoot, repoRoot));
   const { bootstrapRoot, volume: stateVolume, env } = target;
   const { config, baseImage } = deps;
-  const environment = config.environment?.enabled
-    ? deps.taskEnvironment
-    : undefined;
+  const environment =
+    config.environment?.enabled && deps.taskEnvironment
+      ? {
+          ...deps.taskEnvironment,
+          autoBuild: config.environment.autoBuild === true,
+        }
+      : undefined;
   if (config.environment?.enabled && !environment)
     throw new Error("Task environment support unavailable");
   const codexOptions = codexExecutorOptions(config);

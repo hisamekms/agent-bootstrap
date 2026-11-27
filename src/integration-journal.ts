@@ -58,7 +58,8 @@ type Base = {
 }[Kind];
 type EventDetails = {
   "verification.finished": {
-    readonly failure?: "env-lock-mismatch" | "env-output-collision";
+    readonly failure?:
+      "env-lock-mismatch" | "env-output-collision" | "env-missing";
     readonly tests?: { readonly passed: number; readonly failed: number };
   };
   "candidate.created": {
@@ -108,11 +109,14 @@ function decode(value: unknown): IntegrationEvent {
   const expected = eventFields[kind as Kind];
   const hasFailure =
     kind === "verification.finished" && Object.hasOwn(data, "failure");
+  const missingEnvironment = hasFailure && data.failure === "env-missing";
   if (
-    hasFailure &&
-    (data.review !== "revise" ||
-      (data.failure !== "env-lock-mismatch" &&
-        data.failure !== "env-output-collision"))
+    missingEnvironment
+      ? data.review !== "failed"
+      : hasFailure &&
+        (data.review !== "revise" ||
+          (data.failure !== "env-lock-mismatch" &&
+            data.failure !== "env-output-collision"))
   )
     throw new Error("Invalid integration event fields");
   const hasTests =
@@ -166,7 +170,8 @@ function decode(value: unknown): IntegrationEvent {
     throw new Error("Invalid integration event fields");
   if (
     hasTests &&
-    (!validTests(data.tests) ||
+    (missingEnvironment ||
+      !validTests(data.tests) ||
       (data.review === "pass" && (data.tests as { failed: number }).failed > 0))
   )
     throw new Error("Invalid integration event fields");
@@ -182,6 +187,7 @@ function decode(value: unknown): IntegrationEvent {
     typeof data.at !== "string" ||
     new Date(data.at).toISOString() !== data.at ||
     expected.some((field) => {
+      if (field === "review" && missingEnvironment) return false;
       const content = data[field];
       return typeof content !== "string" || !fields[field].test(content);
     })

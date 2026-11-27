@@ -13,6 +13,7 @@ import {
 } from "./inbox.ts";
 import { GATES, goalBranch } from "./model.ts";
 import {
+  environmentMissingReason,
   failureLabel,
   failureReason,
   groupProblems,
@@ -501,9 +502,15 @@ export function operatorTask(store: OrchestratorStore, key: string) {
       failure: {
         code: timing?.failureCode ?? "unknown",
         stage: timing?.lastStage ?? "registered",
-        ...(isCodexFailureCode(timing?.failureCode) && {
-          next: codexFailureActions[timing.failureCode],
-        }),
+        ...(timing?.failureCode === "env-missing"
+          ? {
+              next: environmentMissingReason(
+                timing.missingEnvironmentRole === "Verification",
+              ),
+            }
+          : isCodexFailureCode(timing?.failureCode) && {
+              next: codexFailureActions[timing.failureCode],
+            }),
         ...(rejectedPaths && { rejectedPaths }),
       },
     }),
@@ -554,12 +561,18 @@ export function operatorProblems(
     const canRetry = Boolean(row.canRetry && !row.resolved);
     const kind = code === "path-violation" ? "path-violation" : "task-failed";
     const label = failureLabel(code);
+    const reason =
+      code === "env-missing"
+        ? environmentMissingReason(
+            row.missingEnvironmentRole === "Verification",
+          )
+        : `${label ? `Task が${label}で失敗しました` : failureReason(code)}。`;
     return {
       ...problem,
       kind,
       code,
       canRetry,
-      detail: `${label ? `Task が${label}で失敗しました` : failureReason(code)}。${canRetry ? "再試行できます。" : "再試行できません。"}`,
+      detail: `${reason}${canRetry ? "再試行できます。" : "再試行できません。"}`,
       ...(rejectedPaths && { rejectedPaths }),
     };
   });

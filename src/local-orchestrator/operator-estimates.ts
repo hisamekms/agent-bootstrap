@@ -120,6 +120,7 @@ interface TaskTiming {
   endedAt?: number;
   activeExecution?: TimelineEvent;
   failureCode?: string;
+  missingEnvironmentRole?: TimelineEvent["missingEnvironmentRole"];
 }
 
 export function taskTimings(events: readonly TimelineEvent[]) {
@@ -136,7 +137,10 @@ export function taskTimings(events: readonly TimelineEvent[]) {
     if (event.executionStatus === "running") task.activeExecution = event;
     if (status === "failed" || status === "cancelled") {
       task.endedAt = at;
-      if (status === "failed" && event.code) task.failureCode = event.code;
+      if (status === "failed" && event.code) {
+        task.failureCode = event.code;
+        task.missingEnvironmentRole = event.missingEnvironmentRole ?? null;
+      }
       continue;
     }
     // Integration can update the stored status to running without a new claim.

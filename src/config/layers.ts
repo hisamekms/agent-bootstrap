@@ -96,7 +96,11 @@ export interface Config {
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
-  environment?: { enabled?: boolean; allow?: readonly string[] };
+  environment?: {
+    enabled?: boolean;
+    autoBuild?: boolean;
+    allow?: readonly string[];
+  };
   mounts?: Record<string, MountDeclaration>;
   volumes?: Record<string, VolumeDefinition>;
   secrets?: Record<string, SecretDefinition>;
@@ -684,17 +688,20 @@ export function parseConfig(
     }
   }
   if ("environment" in raw) {
-    const { allow, enabled } = record(raw.environment, "environment", next, [
+    const environment = record(raw.environment, "environment", next, [
       "allow",
       "enabled",
+      "autoBuild",
     ]);
-    if (
-      Object.hasOwn(raw.environment as object, "enabled") &&
-      typeof enabled !== "boolean"
-    )
-      invalid("environment.enabled", "Expected a boolean.", next);
+    for (const key of ["enabled", "autoBuild"] as const)
+      if (
+        Object.hasOwn(environment, key) &&
+        typeof environment[key] !== "boolean"
+      )
+        invalid(`environment.${key}`, "Expected a boolean.", next);
     try {
-      if (Object.hasOwn(raw.environment as object, "allow")) {
+      if (Object.hasOwn(environment, "allow")) {
+        const { allow } = environment;
         if (!Array.isArray(allow) || allow.length > 64) throw new TypeError();
         allow.forEach(environmentDestination);
       }
@@ -982,6 +989,10 @@ export function mergeConfig(
       if (current.environment.enabled !== undefined) {
         environment.enabled = current.environment.enabled;
         sources["environment.enabled"] = layer;
+      }
+      if (current.environment.autoBuild !== undefined) {
+        environment.autoBuild = current.environment.autoBuild;
+        sources["environment.autoBuild"] = layer;
       }
       if (current.environment.allow !== undefined) {
         const entries = (environment.allow ??= []) as string[];

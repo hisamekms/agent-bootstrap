@@ -2,7 +2,13 @@ import { SqliteAudit } from "../src/audit.ts";
 import { EnvironmentStore } from "../src/environments/store.ts";
 import { identifyEnvironment } from "../src/environments/adapter.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
-import { operatorActivity } from "../src/local-orchestrator/operator-read.ts";
+import {
+  operatorActivity,
+  operatorProblems,
+  operatorTask,
+} from "../src/local-orchestrator/operator-read.ts";
+import { failureLabel } from "../src/local-orchestrator/operator-attention.ts";
+import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import {
   readTar,
   writeWorkspaceTar,
@@ -14,7 +20,6 @@ import {
 } from "../src/reviewed-integration.ts";
 import { activityLabel } from "../src/operator-ui/web/protocol.ts";
 import { codexFailureActions } from "../src/codex-exec.ts";
-import { operatorTask } from "../src/local-orchestrator/operator-read.ts";
 import { projectStateDirectory } from "../src/config/layers.ts";
 import { addProject } from "../src/config/projects.ts";
 import { configEnv } from "./config-fixture.ts";
@@ -3025,6 +3030,9 @@ test("Task environment records failures when the profile or commit is unavailabl
 
 for (const scenario of [
   "build",
+  "executor cache miss",
+  "verification cache miss",
+  "integration cache miss",
   "workspace outputs",
   "output collision",
   "tracked output collision",
@@ -3039,9 +3047,9 @@ for (const scenario of [
   test(
     `local Task environment handles ${scenario}`,
     gitTestOptions,
-    async () => {
+    async (t) => {
       using fixture = orchestratorFixture("task-environment-");
-      const { root, store } = fixture;
+      const { root, store, filename } = fixture;
       const repoRoot = join(root, "source");
       mkdirSync(repoRoot);
       const git = (args: string[]) =>
@@ -3052,6 +3060,9 @@ for (const scenario of [
       const workspace = scenario === "workspace outputs" || outputCollision;
       const successful = scenario === "build" || workspace;
       const revise = scenario === "mismatch" || outputCollision;
+      const executorMiss = scenario === "executor cache miss";
+      const verificationMiss = scenario === "verification cache miss";
+      const integrationMiss = scenario === "integration cache miss";
       const candidateInvalidManifest =
         scenario === "candidate invalid manifest";
       const manifest =
@@ -3129,18 +3140,19 @@ for (const scenario of [
         data: Buffer.from(content),
       });
       const archive = writeWorkspaceTar([entry("node_modules", "directory")]);
-      await cache.publish(
-        {
-          key: baseKey,
-          adapter: "bun",
-          profileDigest: digest,
-          hasLock: true,
-          packages: [],
-          size: archive.length,
-          createdAt: new Date().toISOString(),
-        },
-        archive,
-      );
+      if (!executorMiss)
+        await cache.publish(
+          {
+            key: baseKey,
+            adapter: "bun",
+            profileDigest: digest,
+            hasLock: true,
+            packages: [],
+            size: archive.length,
+            createdAt: new Date().toISOString(),
+          },
+          archive,
+        );
       if (scenario === "truncated")
         writeFileSync(
           join(cache.directory, "entries", baseKey, "outputs.tar"),
@@ -3154,6 +3166,8 @@ for (const scenario of [
 
       let workerRuns = 0;
       let verifyRuns = 0;
+      let reviewerRuns = 0;
+      let provisionerCommands = 0;
       const provisioning: string[] = [];
       const executor = createTaskExecutor({
         repoRoot,
@@ -3166,6 +3180,7 @@ for (const scenario of [
           argv: ["bun", "test"],
         }),
         environment: {
+          ...(successful || revise ? { autoBuild: true } : {}),
           profile: {
             image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
             recipeDigest: digest,
@@ -3181,6 +3196,7 @@ for (const scenario of [
             env,
             store: cache,
             async run(args) {
+              provisionerCommands++;
               if (args[0] === "create") {
                 assert.match(
                   activityLabel(operatorActivity({ store, target: repoRoot })),
@@ -3230,6 +3246,19 @@ for (const scenario of [
             );
             if (scenario === "worker failure")
               throw new Error("fixture worker failure");
+            if (integrationMiss)
+              await cache.publish(
+                {
+                  key: candidateKey,
+                  adapter: "bun",
+                  profileDigest: digest,
+                  hasLock: true,
+                  packages: [],
+                  size: archive.length,
+                  createdAt: new Date().toISOString(),
+                },
+                archive,
+              );
             if (workerRuns === 2) {
               if (trackedOutput) {
                 const previous = readTar(
@@ -3322,6 +3351,7 @@ for (const scenario of [
             };
           },
           async runReviewer(plan, id) {
+            reviewerRuns++;
             assert.equal(Object.hasOwn(plan.sandbox, "environment"), false);
             const diff = plan.sandbox.readOnlyFiles?.find(
               ({ path }) => path === "candidate.diff",
@@ -3349,8 +3379,148 @@ for (const scenario of [
           },
         },
       });
+      const hold = t.mock.method(cache, "hold");
       await runTask(store, executor, taskId);
+      if (integrationMiss) {
+        const [proposal] = store.pendingIntegrations();
+        assert.ok(proposal?.kind === "integration");
+        assert.deepEqual(cache.prune({ keep: 0 }), [candidateKey]);
+        approve(store, proposal);
+        const finish = t.mock.method(store, "finishIntegration");
+        await executor.integrate!(proposal.id);
+        assert.deepEqual(
+          finish.mock.calls.map(({ arguments: args }) => args),
+          [[proposal.id, "denied", "env-missing"]],
+        );
+        assert.equal(
+          await executor.existingBase!(goalId),
+          proposal.content.base,
+        );
+      }
       const detail = operatorTask(store, taskId)!;
+      if (executorMiss || verificationMiss || integrationMiss) {
+        const key = executorMiss ? baseKey : candidateKey;
+        const mode = executorMiss ? "task" : "verification";
+        const message = executorMiss
+          ? "このキーの環境がありません。agent-bootstrap environment build --target <dir> --allow-network を実行するか、environment.autoBuild を有効にしてください。"
+          : "変更候補のキーの環境がありません。environment build はローカルの main にコミットされた内容だけをビルドします。変更候補が依存関係の宣言を変更して新しい環境が必要な場合は、environment.autoBuild を有効にしてください。";
+        assert.equal(detail.status, "failed");
+        assert.equal(detail.failure?.code, "env-missing");
+        assert.equal(detail.failure?.next, message);
+        assert.equal(failureLabel("env-missing"), "環境が未構築");
+        const inboxItem = projectInbox({ store, target: repoRoot }).find(
+          (item) =>
+            item.kind === "task-failed" && item.subject.taskId === taskId,
+        );
+        assert.equal(
+          inboxItem?.title,
+          `Task ${detail.ref} failed (env-missing)`,
+        );
+        assert.ok(
+          operatorProblems(store).some(
+            (problem) =>
+              problem.kind === "task-failed" &&
+              problem.code === "env-missing" &&
+              problem.detail.startsWith(message),
+          ),
+        );
+        const execution = detail.executions.find(
+          (run) => run.mode === mode && run.status === "failed",
+        );
+        assert.ok(execution);
+        assert.deepEqual(execution.environment, {
+          key,
+          cacheHit: false,
+          failure: "env-missing",
+        });
+        assert.partialDeepStrictEqual(store.getExecution(execution.id), {
+          status: "failed",
+          result: {
+            code: "env-missing",
+            next: message,
+            ...(integrationMiss && { phase: "integration" }),
+          },
+        });
+        const events = store
+          .listEvents({ subjectId: execution.id, limit: 10 })
+          .filter(({ kind }) => kind.startsWith("environment."))
+          .reverse();
+        assert.deepEqual(
+          events.map(({ kind }) => kind),
+          ["environment.started", "environment.finished"],
+        );
+        const [started, finished] = events.map(({ data }) => data);
+        assert.partialDeepStrictEqual(started, { key, cacheHit: false });
+        assert.partialDeepStrictEqual(finished, {
+          key,
+          cacheHit: false,
+          failure: "env-missing",
+          invocationId: (started as { invocationId: string }).invocationId,
+        });
+        assert.equal(provisionerCommands, 0);
+        assert.deepEqual(provisioning, []);
+        assert.equal(workerRuns, executorMiss ? 0 : 1);
+        assert.equal(verifyRuns, integrationMiss ? 1 : 0);
+        assert.equal(reviewerRuns, integrationMiss ? 1 : 0);
+        if (executorMiss) assert.equal(hold.mock.callCount(), 0);
+        if (verificationMiss)
+          assert.deepEqual(cache.prune({ keep: 0 }), [baseKey]);
+        if (!executorMiss) {
+          assert.deepEqual(
+            detail.executions.find((run) => run.mode === "task")?.environment,
+            {
+              key: baseKey,
+              cacheHit: true,
+            },
+          );
+          const journal = new IntegrationJournal(
+            join(directory, "integrations", taskId),
+            taskId,
+          );
+          const integrationEvents = await journal.read();
+          if (integrationMiss)
+            assert.partialDeepStrictEqual(integrationEvents.at(-1), {
+              kind: "denied",
+              reason: "verification",
+            });
+          assert.partialDeepStrictEqual(
+            integrationEvents.at(integrationMiss ? -2 : -1),
+            {
+              kind: "verification.finished",
+              run: execution.id,
+              review: "failed",
+              failure: "env-missing",
+            },
+          );
+          assert.ok(
+            !integrationEvents.some(
+              ({ kind }) => kind === "revision.requested",
+            ),
+          );
+        }
+        let output = "";
+        assert.equal(
+          await runCli(
+            ["--db", filename, "show", taskId],
+            {
+              stdin: new PassThrough(),
+              stdout: {
+                write(text: string) {
+                  output += text;
+                },
+              },
+              stderr: { write() {} },
+              isTTY: true,
+              prompt: () => "",
+            },
+            root,
+            env,
+          ),
+          0,
+        );
+        assert.equal(JSON.parse(output).next, message);
+        return;
+      }
       if (
         scenario === "audit unavailable" ||
         scenario === "tampered" ||

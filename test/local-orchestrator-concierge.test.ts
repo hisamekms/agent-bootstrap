@@ -1,6 +1,7 @@
 import { addProject } from "../src/config/projects.ts";
+import { EnvironmentStore } from "../src/environments/store.ts";
 import { resolveTarget } from "../src/local-orchestrator/target.ts";
-import { configEnv, initConfigRepo } from "./config-fixture.ts";
+import { configEnv, fixtureGit, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -346,6 +347,151 @@ for (const failure of [undefined, ...failures]) {
       });
     },
   );
+}
+
+for (const autoBuild of [undefined, false, true]) {
+  test(`Concierge uses ${autoBuild === undefined ? "the default" : "the explicit"} automatic build setting (${autoBuild === true ? "enabled" : "disabled"}) for Tasks`, async (t) => {
+    await fixture(async (repoRoot, store, target) => {
+      await writeFile(join(repoRoot, "package.json"), '{"name":"fixture"}');
+      await writeFile(
+        join(repoRoot, "bun.lock"),
+        '{"lockfileVersion":1,"packages":{}}',
+      );
+      fixtureGit(repoRoot, "add", "package.json", "bun.lock");
+      fixtureGit(repoRoot, "commit", "-m", "Add Bun inputs");
+      const commit = fixtureGit(repoRoot, "rev-parse", "HEAD");
+      const budgets = { maxExecutionMs: 1000, maxRetries: 0, maxTokens: 500 };
+      const goal = store.proposeGoal(
+        {
+          title: "Goal",
+          description: "",
+          acceptance: ["Pass"],
+          scope: {
+            paths: ["package.json"],
+            profiles: ["bun"],
+            actors: ["Executor"],
+            maxTasks: 1,
+            budgets,
+          },
+        },
+        { kind: "operator" },
+      );
+      const { goalId } = store.decide(goal.id, {
+        decision: "approve",
+        digest: goal.digest,
+        answerer: { kind: "human" },
+      });
+      assert.ok(goalId);
+      const task = store.proposeTask(
+        {
+          goalId,
+          title: "Task",
+          description: "",
+          acceptance: ["Pass"],
+          actor: "Executor",
+          profile: "bun",
+          paths: ["package.json"],
+          dependsOn: [],
+          budgets,
+        },
+        { kind: "host" },
+      );
+      assert.ok(task.status === "registered");
+      const failed = Promise.withResolvers<string>();
+      const failTask = store.failTask.bind(store);
+      t.mock.method(
+        store,
+        "failTask",
+        (...args: Parameters<typeof failTask>) => {
+          failTask(...args);
+          failed.resolve(args[1]);
+        },
+      );
+      let buildAttempts = 0;
+      let workerRuns = 0;
+      const digest = "a".repeat(64);
+      const taskEnvironment = {
+        ...(autoBuild === false && { autoBuild: true }),
+        profile: {
+          image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
+          recipeDigest: digest,
+          memoryMiB: 2048,
+          cpus: 2,
+        },
+        allow: [],
+        requireAudit() {},
+        host: {
+          env: target.env,
+          store: new EnvironmentStore(target.project.id, target.env),
+          async run(): Promise<never> {
+            throw new Error("Unexpected sandbox command");
+          },
+          async openGateway(): Promise<never> {
+            buildAttempts++;
+            throw new Error("Stop fixture build before opening a gateway");
+          },
+        },
+      };
+      await startConcierge(
+        {
+          store,
+          config: {
+            version: 1,
+            environment: {
+              enabled: true,
+              ...(autoBuild !== undefined && { autoBuild }),
+            },
+          },
+          taskEnvironment,
+          baseImage: ALPINE_3_23.reference,
+          auth,
+          install,
+          snapshot: async () => ({
+            dir: await mkdtemp(join(repoRoot, "snapshot-")),
+            commit,
+            files: [],
+          }),
+          async listen() {
+            return { async close() {} };
+          },
+          host: {
+            async prepareConciergeVolume() {
+              return { reused: false };
+            },
+            async runConcierge(_plan, id, use) {
+              await use({
+                async attach() {
+                  await failed.promise;
+                  return { exitCode: 0 };
+                },
+              });
+              return { id, outcome: "ok" };
+            },
+            async runWorker() {
+              workerRuns++;
+              throw new Error("Unexpected Worker");
+            },
+            async runVerification() {
+              throw new Error("Unexpected Verification");
+            },
+            async runPlanner() {
+              throw new Error("Unexpected Planner");
+            },
+            async runReviewer() {
+              throw new Error("Unexpected Reviewer");
+            },
+          },
+        },
+        { repoRoot, target, model },
+      );
+      assert.equal(
+        await failed.promise,
+        autoBuild ? "env-build-failed" : "env-missing",
+      );
+      assert.equal(buildAttempts, autoBuild ? 1 : 0);
+      assert.equal(workerRuns, 0);
+    });
+  });
 }
 
 test("Concierge drains a single active Planner and cancels queued work on exit", async () => {

@@ -47,9 +47,11 @@ Set `"environment": { "enabled": true }` using
 `agent-bootstrap config edit --project <name>` for one target or
 `agent-bootstrap config edit` for all targets. A target's private
 `local.json` can override the user setting with `"enabled": false`. The
-default is off. Repository declarations and approved permissions cannot
-enable automatic builds. If you also set `allow`, keep it in the same
-`environment` object.
+default is off. Enabling delivery uses the local cache and never reaches the
+network. After committing dependency changes to local `main`, run
+`agent-bootstrap environment build --target <dir> --allow-network`. Tasks
+that use the stored environment show a cache hit (「キャッシュ」) in Task
+detail.
 
 Use the `bun` profile for the Executor and the configured Verification
 command. The Executor uses the Task base's environment on every attempt,
@@ -59,9 +61,15 @@ candidate changes key files. Verification requests a revision if dependency
 declarations disagree with a committed lock or generated dependency
 directories collide with the candidate tree.
 
-Enabling this setting authorizes the credential-free Provisioner to use
-package network on cache misses. Its gateway uses the adapter's defaults
-and your private `environment.allow`, and records connections in audit.
+Set `environment.autoBuild` to `true` in private configuration to authorize
+the credential-free Provisioner to use package network for cache misses
+before Executor or Verification starts. This setting defaults to off and
+has an effect only when delivery is enabled. The gateway uses the adapter's
+defaults and your private `environment.allow`, and records connections in
+audit. Without automatic builds, a missing key fails the Task with
+`env-missing` before the corresponding VM starts. A candidate that changes
+dependency declarations and needs a new environment requires automatic
+builds, since `environment build` uses the committed local `main`.
 The Executor retains its model egress policy and Verification stays offline.
 The Task VM unpacks the packages into `/workspace` and adds their
 `.bin` directories to `PATH`. Writes under the output roots declared by

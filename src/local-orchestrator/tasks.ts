@@ -1,4 +1,5 @@
 import { EnvironmentError } from "../environments/adapter.ts";
+import { environmentMissingReason } from "./operator-attention.ts";
 import {
   taskEnvironment,
   type TaskEnvironmentOptions,
@@ -689,6 +690,7 @@ export async function runTask(
   const maxRetries = Math.min(budgets.maxRetries, MAX_REVISIONS);
   let code = "host-error";
   let rejectedPaths: PathViolation[] | undefined;
+  let missingEnvironmentRole: "Executor" | "Verification" = "Executor";
   const begin = (
     actor: "Executor" | "Reviewer",
     mode: TaskRunMode,
@@ -757,11 +759,13 @@ export async function runTask(
         ...(failure ? { code: failure } : {}),
         ...(failure === "unsafe-input-symlink"
           ? { next: unsafeInputSymlinkNext }
-          : isCodexFailureCode(failure)
-            ? { next: codexFailureActions[failure] }
-            : failure === "secret-test-required" && next
-              ? { next }
-              : {}),
+          : failure === "env-missing"
+            ? { next: environmentMissingReason(mode === "verification") }
+            : isCodexFailureCode(failure)
+              ? { next: codexFailureActions[failure] }
+              : failure === "secret-test-required" && next
+                ? { next }
+                : {}),
         ...(observed.revision === undefined
           ? {}
           : { revision: observed.revision }),
@@ -866,6 +870,7 @@ export async function runTask(
         if (verification.failure || verification.value !== true) {
           code = verification.failure ?? "verification-failed";
           if (code === "verification-failed") continue;
+          if (code === "env-missing") missingEnvironmentRole = "Verification";
           break;
         }
         verified = true;
@@ -943,6 +948,7 @@ export async function runTask(
     task.id,
     code,
     code === "path-violation" ? rejectedPaths : undefined,
+    missingEnvironmentRole,
   );
 }
 
@@ -1054,16 +1060,20 @@ export async function integrateApprovedProposal(
                 store.startExecution(id);
                 return id;
               },
-              finish(id, passed) {
+              finish(id, passed, failure) {
                 store.finishExecution(id, passed ? "succeeded" : "failed", {
                   phase: "integration",
                   ...(passed
                     ? {}
                     : {
                         code:
-                          passed === null
+                          failure ??
+                          (passed === null
                             ? "host-error"
-                            : "verification-failed",
+                            : "verification-failed"),
+                        ...(failure && {
+                          next: environmentMissingReason(true),
+                        }),
                       }),
                   tokens: 0,
                   usage: emptyTokenUsage,
@@ -1103,6 +1113,8 @@ export async function integrateApprovedProposal(
       return;
     }
     outcome = (await isPreGitFailure()) ? "denied" : "uncertain";
+    if (error instanceof EnvironmentError && error.code === "env-missing")
+      code = error.code;
   }
   store.finishIntegration(proposalId, outcome, code);
 }

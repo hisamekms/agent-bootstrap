@@ -537,7 +537,11 @@ for the private export layout, view definitions and query examples.
 Use `agent-bootstrap config edit --project <name>` to add
 `"environment": { "enabled": true }` to the target's private `local.json`.
 The same setting in user configuration applies to all targets unless a target
-overrides it. Automatic environment delivery defaults to off.
+overrides it. Environment delivery defaults to off. It uses the local cache
+and never reaches the network. After committing dependency changes to local
+`main`, run `agent-bootstrap environment build --target <dir> --allow-network`.
+Tasks using the stored environment show a cache hit (「キャッシュ」) in Task
+detail.
 
 Use the `bun` profile for Executor and Verification. Executor gets the
 packages for the Task base, and Verification gets the packages for the pinned
@@ -545,7 +549,10 @@ candidate. Both can run commands such as `bun test` with workspace imports
 and tools from `node_modules/.bin`. Packages are excluded from candidate
 changes. The recent executions in Task detail show the keys and cache hits.
 
-This setting authorizes automatic package network for the credential-free
-Provisioner on cache misses. Verification remains offline. See the
+With delivery enabled, set `environment.autoBuild` to `true` in private
+configuration to authorize package network for the credential-free
+Provisioner on cache misses before Executor or Verification starts. By
+default, a missing key fails the Task with `env-missing` before the
+corresponding VM starts. Verification remains offline. See the
 [Bun environment guide](../environments/README.md) for allowed destinations
 and cache management.
