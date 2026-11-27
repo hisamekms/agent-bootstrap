@@ -66,15 +66,17 @@ that use the stored environment show a cache hit (「キャッシュ」) in Task
 detail.
 
 Use the `bun` profile for the Executor and the configured Verification
-command. The Executor uses the Task base's environment on every attempt,
-including revisions that start from the previous candidate's tree.
+command. The Executor uses the Task base's environment on every attempt unless the
+Task declares a dependency update. Revisions start from the previous
+candidate's tree.
 Verification uses the pinned candidate's environment, even when the
-candidate changes key files. Verification requests a revision if dependency
-declarations disagree with a committed lock or generated dependency
-directories collide with the candidate tree.
+candidate changes key files. When declarations and the lock disagree, the host can resolve dependencies
+and write back the lock before Verification. Verification requests a revision
+if resolution fails or generated dependency directories collide with the
+candidate tree.
 
 Set `environment.autoBuild` to `true` in private configuration to authorize
-the credential-free Provisioner to use package network for cache misses
+the credential-free Provisioner to use package network for cache misses and lock resolution
 before Executor or Verification starts. This setting defaults to off and
 has an effect only when delivery is enabled. The gateway uses the adapter's
 defaults and your private `environment.allow`, and records connections in
@@ -87,6 +89,27 @@ The Task VM unpacks the packages into `/workspace` and adds their
 `.bin` directories to `PATH`. Writes under the output roots declared by
 the base or by the collected workspace are excluded from candidate
 changes. Task detail shows each environment key and cache hit.
+
+A Bun Executor Task can declare an update in its content:
+
+```json
+{
+  "environment": {
+    "update": {
+      "adapter": "bun",
+      "packages": ["@scope/package"],
+      "allowMajor": false
+    }
+  }
+}
+```
+
+Include the affected manifests and `bun.lock` in the Task's allowed
+paths. Use `"all"` for updates within existing ranges. Set `allowMajor`
+to `true` only with named packages to update them to their latest
+versions. With `environment.autoBuild` enabled, the Provisioner applies
+the update before the first Executor attempt. Task detail shows the
+declared update and the package diff.
 
 ```sh
 agent-bootstrap environment prune --target /path/to/project --keep 3

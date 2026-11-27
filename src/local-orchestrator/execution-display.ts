@@ -1,3 +1,4 @@
+import { declarationFailureNote } from "../environments/declarations.ts";
 import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 
@@ -28,9 +29,12 @@ export function executionDisplay(result: unknown): {
   if (typeof code !== "string") return {};
   const next = isCodexFailureCode(code)
     ? codexFailureActions[code]
-    : (code === "secret-test-required" || code === "env-missing") &&
-        "next" in result &&
-        typeof result.next === "string"
+    : "next" in result &&
+        typeof result.next === "string" &&
+        (code === "secret-test-required" ||
+          code === "env-missing" ||
+          (code === "env-build-failed" &&
+            result.next === declarationFailureNote))
       ? result.next
       : undefined;
   return {

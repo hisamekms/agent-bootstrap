@@ -1,6 +1,8 @@
+import { DeclarationError } from "./declarations.ts";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
-import { join } from "node:path";
+import { posix, join } from "node:path";
+import { readTar } from "../oci-image.ts";
 import type { AuditInput } from "../audit.ts";
 import { EnvironmentError, type EnvironmentStep } from "./adapter.ts";
 import {
@@ -52,6 +54,7 @@ interface GuestOutput {
   archive?: Uint8Array;
   lock?: Uint8Array;
   outdated?: string;
+  declarations?: ReadonlyMap<string, Uint8Array>;
 }
 
 export async function runProvisionerGuest(
@@ -60,6 +63,7 @@ export async function runProvisionerGuest(
   roots: readonly string[],
   linkTargets: readonly string[],
   staging: string,
+  declarations: readonly string[],
   write: (event: Omit<AuditInput, "invocationId" | "role">) => void,
   run: (args: string[], timeout: number) => Promise<string>,
   packagePhase: (active: boolean) => void,
@@ -84,6 +88,10 @@ export async function runProvisionerGuest(
     }
   };
   const outputs = roots.map(quote).join(" ");
+  const manifests = declarations.map(quote).join(" ");
+  const parents = [...new Set(declarations.map((path) => posix.dirname(path)))]
+    .map(quote)
+    .join(" ");
   const setup = [
     "mkdir -m 0755 /tmp/environment-work",
     `mkdir -m 0700 ${outputDirectory} ${guestHome}`,
@@ -105,6 +113,18 @@ export async function runProvisionerGuest(
       ? [
           "chmod 1777 .",
           "if [ -f bun.lock ]; then chown nobody bun.lock; chmod 0600 bun.lock; fi",
+        ]
+      : []),
+    ...(declarations.length
+      ? [
+          `for file in ${manifests}; do [ ! -L "$file" ] && [ -f "$file" ] || exit 1; done`,
+          ...(step.writesDeclarations
+            ? [
+                `chown nobody -- ${manifests}`,
+                `chmod u+w -- ${manifests}`,
+                `chmod 1777 -- ${parents}`,
+              ]
+            : []),
         ]
       : []),
   ].join("\n");
@@ -177,6 +197,41 @@ if [ -f bun.lock ]; then cat bun.lock; fi`,
       minute,
     );
     result.lock = await readOutput(responseLock, lockLimit);
+  }
+  if (declarations.length) {
+    const nameInGuest = "declarations.tar";
+    const response = join(staging, nameInGuest);
+    await audited(
+      "sandbox.exec",
+      execArgs(
+        name,
+        capture(`tar -cf - -- ${manifests}`, nameInGuest, lockLimit),
+        minute,
+      ),
+      minute * 2,
+    );
+    await audited(
+      "sandbox.collect",
+      ["copy", `${name}:${outputDirectory}/${nameInGuest}`, response],
+      minute,
+    );
+    try {
+      const expected = new Set(declarations);
+      const files = new Map<string, Uint8Array>();
+      for (const entry of readTar(
+        await readOutput(response, lockLimit),
+        lockLimit,
+        true,
+      )) {
+        if (entry.type !== "file" || !expected.delete(entry.path))
+          throw new DeclarationError();
+        files.set(entry.path, entry.data);
+      }
+      if (expected.size) throw new DeclarationError();
+      result.declarations = files;
+    } catch {
+      throw new DeclarationError();
+    }
   }
   return result;
 }

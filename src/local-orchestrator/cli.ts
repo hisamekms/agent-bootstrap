@@ -669,7 +669,8 @@ async function execute(
             budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
             ...(rejectedPaths && { rejectedPaths }),
-            ...(failure?.code === "env-missing" && {
+            ...((failure?.code === "env-missing" ||
+              failure?.code === "env-update-disabled") && {
               code: failure.code,
               next: failure.next,
             }),

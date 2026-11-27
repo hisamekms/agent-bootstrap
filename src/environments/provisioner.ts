@@ -17,13 +17,14 @@ import {
   type EnvironmentTree,
 } from "./adapter.ts";
 import { allowsEmptyLock, bunAdapter, environmentPath } from "./bun.ts";
+import { checkDeclaration } from "./declarations.ts";
 import {
   emptyPackageDiff,
   type EnvironmentEvidence,
   type EnvironmentEvent,
 } from "./events.ts";
 import { runProvisionerGuest } from "./provisioner-guest.ts";
-import { diffPackages, parseBunLock } from "./lock.ts";
+import { diffPackages, parseBunLock, summarizePackageDiff } from "./lock.ts";
 import type { EnvironmentManifest, EnvironmentStore } from "./store.ts";
 
 /** Package managers open many connections at once (Bun up to 16 here, see
@@ -46,6 +47,7 @@ interface ProvisionerInput {
   readonly profile: ProfileLockEntry;
   readonly operation: EnvironmentOperation;
   readonly names?: readonly string[];
+  readonly allowMajor?: boolean;
   readonly allow: readonly string[];
 }
 
@@ -71,9 +73,14 @@ function checkInput(input: ProvisionerInput) {
   if (
     Reflect.ownKeys(input).some(
       (key) =>
-        !["tree", "profile", "operation", "names", "allow"].includes(
-          String(key),
-        ),
+        ![
+          "tree",
+          "profile",
+          "operation",
+          "names",
+          "allowMajor",
+          "allow",
+        ].includes(String(key)),
     ) ||
     Reflect.ownKeys(input.profile).some(
       (key) =>
@@ -134,7 +141,7 @@ class CommandFailure extends EnvironmentError {
 }
 
 async function prepareProvisioner(
-  { tree, profile, operation, names, allow }: ProvisionerInput,
+  { tree, profile, operation, names, allowMajor, allow }: ProvisionerInput,
   { store, openAudit }: ProvisionerHost,
 ) {
   try {
@@ -148,6 +155,7 @@ async function prepareProvisioner(
       operation,
       identity.lock !== undefined,
       names,
+      allowMajor,
     );
     if (!step) throw new EnvironmentError();
     store.prepare();
@@ -207,6 +215,8 @@ export async function provisionEnvironment(
   let release: (() => void) | undefined;
   let staging: string | undefined;
   let archive: Uint8Array | undefined;
+  let declarations: ReadonlyMap<string, Uint8Array> | undefined;
+  const changedPaths: string[] = [];
   let afterLock: Uint8Array | undefined;
   let outdated: string | undefined;
   let failure: EnvironmentError | undefined;
@@ -313,12 +323,16 @@ export async function provisionEnvironment(
               archive,
               lock: afterLock,
               outdated,
+              declarations,
             } = await runProvisionerGuest(
               name,
               step,
               layout.outputs,
               layout.linkTargets,
               runDirectory,
+              step.writesDeclarations || operation === "resolve"
+                ? layout.keyFiles.filter((path) => path !== bunAdapter.lockPath)
+                : [],
               write,
               run,
               (active) => {
@@ -327,12 +341,32 @@ export async function provisionEnvironment(
             ));
           },
         });
+        const restoredDeclarations = new Map<string, Uint8Array>();
+        for (const [path, bytes] of declarations ?? []) {
+          const restored = checkDeclaration(
+            await tree.read(path),
+            bytes,
+            operation === "update" ? input : undefined,
+          );
+          if (restored) {
+            restoredDeclarations.set(path, restored);
+            changedPaths.push(path);
+          }
+        }
+        if (declarations) declarations = restoredDeclarations;
         if (step.writesLock) {
           if (afterLock?.length) packages = parseBunLock(afterLock);
           else if (await allowsEmptyLock(tree, layout.keyFiles.length)) {
             afterLock = undefined;
             packages = [];
           } else throw new EnvironmentError("env-lock-mismatch");
+          if (
+            operation !== "build" &&
+            !Buffer.from(afterLock ?? Buffer.alloc(0)).equals(
+              Buffer.from(lock ?? Buffer.alloc(0)),
+            )
+          )
+            changedPaths.push(bunAdapter.lockPath);
         }
       }
       signal?.throwIfAborted();
@@ -387,7 +421,11 @@ export async function provisionEnvironment(
       destinationsReached: network.reached,
       packageDiff: failure
         ? emptyPackageDiff
-        : diffPackages(previousPackages, manifest?.packages ?? packages),
+        : summarizePackageDiff(
+            diffPackages(previousPackages, manifest?.packages ?? packages),
+          ),
+      ...(!failure &&
+        changedPaths.length > 0 && { changedPaths: changedPaths.sort() }),
       ...(failure && { failure: failure.code }),
       ...(failure?.gatewayStopped && {
         gatewayStopped: failure.gatewayStopped,
@@ -400,6 +438,7 @@ export async function provisionEnvironment(
       manifest,
       archive: manifest ? undefined : archive,
       lock: afterLock,
+      declarations,
       outdated,
     };
   } catch (error) {

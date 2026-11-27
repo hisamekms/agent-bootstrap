@@ -100,6 +100,11 @@ function modelTitle<K extends "h2" | "h3" | "span">(
   return group(tag, classes, aiTag(), textElement("bdi", value));
 }
 
+function packageDiffLines(entries: readonly string[], total: number) {
+  const more = total - entries.length;
+  return more > 0 ? [...entries, `ほか ${more} 件`] : entries;
+}
+
 function modelBox(label: string, lines: readonly string[]) {
   return group(
     "div",
@@ -1194,7 +1199,11 @@ function runningLine(run: ActivityRow, open: () => void, local?: string) {
     modelTitle("span", run.taskTitle ?? run.goalTitle ?? run.actor, "grow"),
     textElement(
       "span",
-      run.preparingEnvironment ? "環境を準備中" : run.actor,
+      run.resolvingDependencies
+        ? "依存を解決中"
+        : run.preparingEnvironment
+          ? "環境を準備中"
+          : run.actor,
       "meta",
     ),
     elapsed,
@@ -1676,6 +1685,58 @@ function taskDetail(
         : []),
       ...(task.description ? [modelBox("説明", [task.description])] : []),
       modelBox("受け入れ条件", task.acceptance),
+      ...(task.environment
+        ? [
+            modelBox("依存の更新", [
+              task.environment.update.packages === "all"
+                ? "すべてのパッケージ"
+                : task.environment.update.packages.join(", "),
+              task.environment.update.allowMajor
+                ? "メジャー更新を許可"
+                : "宣言された範囲内で更新",
+            ]),
+          ]
+        : []),
+      ...(task.packageDiff
+        ? [
+            ...(task.packageDiff.added.length
+              ? [
+                  modelBox(
+                    "追加された依存",
+                    packageDiffLines(
+                      task.packageDiff.added,
+                      task.packageDiff.totals.added,
+                    ),
+                  ),
+                ]
+              : []),
+            ...(task.packageDiff.removed.length
+              ? [
+                  modelBox(
+                    "削除された依存",
+                    packageDiffLines(
+                      task.packageDiff.removed,
+                      task.packageDiff.totals.removed,
+                    ),
+                  ),
+                ]
+              : []),
+            ...(task.packageDiff.changed.length
+              ? [
+                  modelBox(
+                    "変更された依存",
+                    packageDiffLines(
+                      task.packageDiff.changed.map(
+                        ({ name, from, to }) =>
+                          `${from.map((version) => `${name}@${version}`).join(", ")} → ${to.map((version) => `${name}@${version}`).join(", ")}`,
+                      ),
+                      task.packageDiff.totals.changed,
+                    ),
+                  ),
+                ]
+              : []),
+          ]
+        : []),
       sectionTitle("最近の実行"),
       ...(task.executions.length
         ? task.executions.map(

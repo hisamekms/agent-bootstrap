@@ -1,3 +1,4 @@
+import { environmentPath } from "./bun.ts";
 import {
   digestPattern,
   GATEWAY_STOPS,
@@ -11,6 +12,7 @@ import {
   validPackageName,
   validPackageVersion,
   type PackageDiff,
+  type PackageDiffSummary,
 } from "./lock.ts";
 
 export interface EnvironmentEvidence {
@@ -20,7 +22,8 @@ export interface EnvironmentEvidence {
   readonly size: number;
   readonly cacheHit: boolean;
   readonly destinationsReached: readonly string[];
-  readonly packageDiff: PackageDiff;
+  readonly packageDiff: PackageDiff | PackageDiffSummary;
+  readonly changedPaths?: readonly string[];
   readonly warning?: typeof lockMissing;
   readonly failure?: EnvironmentFailure;
   readonly gatewayStopped?: GatewayStop;
@@ -71,11 +74,13 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     cacheHit,
     destinationsReached,
     packageDiff,
+    changedPaths,
     warning,
     failure,
     gatewayStopped,
   } = object(value);
-  const { added, removed, changed } = object(packageDiff);
+  const { added, removed, changed, totals } = object(packageDiff);
+  const counts = totals === undefined ? undefined : object(totals);
   if (
     typeof key !== "string" ||
     !digestPattern.test(key) ||
@@ -83,6 +88,19 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
       operation !== "resolve" &&
       operation !== "update" &&
       operation !== "outdated") ||
+    (changedPaths !== undefined &&
+      ((operation !== "resolve" && operation !== "update") ||
+        failure !== undefined ||
+        !strings(
+          changedPaths,
+          (path) =>
+            typeof path === "string" &&
+            path.length <= 4096 &&
+            environmentPath(path) &&
+            (path === "bun.lock" ||
+              path === "package.json" ||
+              path.endsWith("/package.json")),
+        ))) ||
     !count(durationMs) ||
     !count(size) ||
     typeof cacheHit !== "boolean" ||
@@ -91,6 +109,13 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     !strings(removed, validPackage) ||
     !Array.isArray(changed) ||
     changed.length > 100_000 ||
+    (counts !== undefined &&
+      (!count(counts.added) ||
+        counts.added < added.length ||
+        !count(counts.removed) ||
+        counts.removed < removed.length ||
+        !count(counts.changed) ||
+        counts.changed < changed.length)) ||
     (warning !== undefined && warning !== lockMissing) ||
     (failure !== undefined &&
       failure !== "env-fetch-failed" &&
@@ -109,6 +134,13 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     cacheHit,
     destinationsReached: [...destinationsReached],
     packageDiff: {
+      ...(counts && {
+        totals: {
+          added: counts.added as number,
+          removed: counts.removed as number,
+          changed: counts.changed as number,
+        },
+      }),
       added: [...added],
       removed: [...removed],
       changed: changed.map((value: unknown) => {
@@ -122,6 +154,7 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
         return { name, from: [...from], to: [...to] };
       }),
     },
+    ...(changedPaths && { changedPaths: [...changedPaths] }),
     ...(warning && { warning }),
     ...(failure && { failure }),
     ...(gatewayStopped !== undefined && {

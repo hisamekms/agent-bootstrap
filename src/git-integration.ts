@@ -155,6 +155,7 @@ const workspaceByteLimit = 512 * 1024 * 1024;
 const changeCountLimit = 10_000;
 const changeByteLimit = 256 * 1024 * 1024;
 const messageLimit = 4096;
+const environmentMessageLimit = 64 * 1024;
 const sparseLimit = 256;
 
 /** Relative repository path: no traversal, empty parts, backslashes, NUL, or
@@ -196,11 +197,11 @@ function sparsePath(value: unknown): string {
   return text;
 }
 
-function commitMessage(value: unknown): Buffer {
+function commitMessage(value: unknown, limit = messageLimit): Buffer {
   if (typeof value !== "string" || value === "" || value.includes("\0"))
     throw new GitIntegrationError("invalid-input");
   const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength > messageLimit || bytes.toString("utf8") !== value)
+  if (bytes.byteLength > limit || bytes.toString("utf8") !== value)
     throw new GitIntegrationError("invalid-input");
   return bytes;
 }
@@ -671,12 +672,24 @@ export class LocalGitIntegration {
     return this.#git(["cat-file", "blob", file.blob]);
   }
 
+  async treeBlob(oidValue: string, sizeLimit: number): Promise<Uint8Array> {
+    await this.#repository();
+    return this.#run(["cat-file", "blob", oid(oidValue)], {
+      gitDir: this.#config.repository,
+      cwd: this.#config.repository,
+      maxBuffer: sizeLimit,
+    });
+  }
+
   async candidateMessage(commit: string): Promise<Uint8Array> {
     oid(commit);
     await this.#repository();
     const object = await this.#git(["cat-file", "commit", commit]);
     const separator = object.indexOf("\n\n");
-    if (separator < 0 || object.length - separator - 2 > messageLimit)
+    if (
+      separator < 0 ||
+      object.length - separator - 2 > environmentMessageLimit
+    )
       throw new GitIntegrationError("invalid-candidate");
     return object.subarray(separator + 2);
   }
@@ -1743,15 +1756,22 @@ export class LocalGitIntegration {
    * Creates a pinned candidate commit on top of base without a worktree. A
    * change is either `{ path, mode, bytes }` (add or replace; symlink bytes are
    * the target) or `{ path, deleted: true }` (the path must exist as a file or
-   * symlink in base). Paths must be unique. The host is author and committer.
+   * symlink in the starting tree). Paths must be unique. Normally the starting
+   * tree is base. A host write-back can replace files in an already pinned
+   * candidate while keeping the same sole parent. The host authors the commit.
    */
   async createCandidateTree(
     base: string,
     changes: readonly TreeChange[],
     message: string,
+    startingTree = base,
+    messageKind?: "environment",
   ): Promise<string> {
     oid(base);
-    const text = commitMessage(message);
+    const text = commitMessage(
+      message,
+      messageKind === "environment" ? environmentMessageLimit : messageLimit,
+    );
     if (
       !Array.isArray(changes) ||
       changes.length === 0 ||
@@ -1788,11 +1808,12 @@ export class LocalGitIntegration {
     }
     await this.#repository();
     await this.#commit(base);
+    await this.#commit(startingTree);
     const existing = new Set<string>();
     for (const entry of await this.#entries(
       this.#config.repository,
       this.#config.repository,
-      base,
+      startingTree,
     ))
       existing.add(entry.path);
     for (const path of deletions)
@@ -1822,7 +1843,7 @@ export class LocalGitIntegration {
         cwd: this.#config.repository,
         env,
       };
-      await this.#run(["read-tree", base], options);
+      await this.#run(["read-tree", startingTree], options);
       const objects: string[] = Array.from<string>({ length: updates.length });
       let next = 0;
       const worker = async () => {

@@ -17,7 +17,38 @@ export interface PackageDiff {
   readonly changed: readonly PackageChange[];
 }
 
-const packageName = /^(?:@[a-z0-9_.-]+\/)?[a-z0-9_][a-z0-9_.-]*$/i;
+export interface PackageDiffSummary extends PackageDiff {
+  readonly totals: {
+    readonly added: number;
+    readonly removed: number;
+    readonly changed: number;
+  };
+}
+
+export function summarizePackageDiff(
+  diff: PackageDiff | PackageDiffSummary,
+): PackageDiffSummary {
+  const { added, removed, changed } = diff;
+  return {
+    added: added.slice(0, 64),
+    removed: removed.slice(0, 64),
+    changed: changed.slice(0, 64).map(({ name, from, to }) => ({
+      name,
+      from: from.slice(0, 4),
+      to: to.slice(0, 4),
+    })),
+    totals:
+      "totals" in diff
+        ? diff.totals
+        : {
+            added: added.length,
+            removed: removed.length,
+            changed: changed.length,
+          },
+  };
+}
+
+const packageName = /^(?:@[a-z0-9][a-z0-9_.-]*\/)?[a-z0-9][a-z0-9_.-]*$/;
 const publicVersion = /^\d+\.\d+\.\d+(?:-[\da-z.-]+)?(?:\+[\da-z.-]+)?$/i;
 const privateResolution =
   /^(?:workspace:|file:|link:|https?:|git(?:\+[^:]+)?:|github:|bitbucket:|gitlab:).*$/;
@@ -38,7 +69,11 @@ function resolution(value: string) {
 
 export function validPackageName(value: unknown): value is string {
   return (
-    typeof value === "string" && value.length <= 214 && packageName.test(value)
+    typeof value === "string" &&
+    value.length <= 214 &&
+    value !== "node_modules" &&
+    value !== "favicon.ico" &&
+    packageName.test(value)
   );
 }
 
