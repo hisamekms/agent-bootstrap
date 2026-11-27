@@ -25,7 +25,7 @@ import {
   type GoalContent,
   type TaskContent,
 } from "./model.ts";
-import { rawReviewerAnswer } from "./reviewer-answer.ts";
+import { rawReviewerAnswer, unfenceAnswer } from "./reviewer-answer.ts";
 import { OrchestratorStoreError, type OrchestratorStore } from "./store.ts";
 import { runTask, type TaskExecutor } from "./tasks.ts";
 import { reportedUsage, sumRunMetrics } from "./token-usage.ts";
@@ -201,10 +201,14 @@ function parseAnswer(
   harness: RoleHarness,
   response: Uint8Array | undefined,
 ): unknown {
-  const bytes = harness.reviewerOutput
+  const extracted = harness.reviewerOutput
     ? harness.reviewerOutput(response)
     : response;
-  if (!bytes?.length || bytes.byteLength > 65_536) throw new ContractError();
+  if (!extracted?.length || extracted.byteLength > 65_536)
+    throw new ContractError();
+  // A Claude Code answer may wrap its JSON in one Markdown code fence.
+  const bytes = unfenceAnswer(harness, extracted);
+  if (!bytes?.length) throw new ContractError();
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   } catch {
