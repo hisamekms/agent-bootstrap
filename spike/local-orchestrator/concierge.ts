@@ -1,3 +1,5 @@
+import { EnvironmentStore } from "../../src/environments/store.ts";
+import { systemHost } from "../../src/onboarding/prerequisites.ts";
 import { codexProvider, siwcCodexEndpoint } from "../../src/codex-exec.ts";
 import { siwcProvider, siwcSandboxCredential } from "../../src/siwc.ts";
 import { listenOperatorApi } from "../../src/local-orchestrator/operator-api.ts";
@@ -54,7 +56,12 @@ import {
   resolveTarget,
 } from "../../src/local-orchestrator/target.ts";
 import { configuredVerification } from "../../src/local-orchestrator/verification.ts";
-import { MISE_FLAGS, MSB_TOOL, offlineMiseEnv } from "../../src/mise-tools.ts";
+import {
+  MISE_FLAGS,
+  MISE_MSB,
+  MSB_TOOL,
+  offlineMiseEnv,
+} from "../../src/mise-tools.ts";
 import { parseObservabilityConfig } from "../../src/observability-config.ts";
 import {
   createObservedHost,
@@ -325,12 +332,10 @@ async function launchConcierge(
   setStage("locate runtime");
   const binary = await microsandboxBinary();
   setStage("load runtime profiles");
-  const profiles = profileCatalog(
-    ALPINE_3_23.reference,
-    parseProfileLock(
-      await readFile(join(bootstrapRoot, PROFILE_LOCK_PATH), "utf8"),
-    ),
+  const profileLock = parseProfileLock(
+    await readFile(join(bootstrapRoot, PROFILE_LOCK_PATH), "utf8"),
   );
+  const profiles = profileCatalog(ALPINE_3_23.reference, profileLock);
   if (!profiles.has("concierge"))
     throw new Error("The profile lock must include the Concierge image");
 
@@ -513,6 +518,32 @@ async function launchConcierge(
           auth,
           config: effective.config,
           baseImage,
+          ...(effective.config.environment?.enabled
+            ? {
+                taskEnvironment: {
+                  profile: profileLock.profiles.bun,
+                  allow: effective.config.environment.allow ?? [],
+                  requireAudit: host.requireTaskEnvironmentAudit.bind(host),
+                  host: {
+                    env: target.env,
+                    store: new EnvironmentStore(target.project.id, target.env),
+                    run(args, timeout, extra, signal) {
+                      return systemHost.command(
+                        "mise",
+                        [...MISE_MSB, ...args],
+                        {
+                          ...offlineMiseEnv(target.env),
+                          MSB_HOME: home,
+                          ...extra,
+                        },
+                        timeout,
+                        signal,
+                      );
+                    },
+                  },
+                },
+              }
+            : {}),
           note: (message) => console.error(message),
           ...(verificationConfig
             ? { verification: configuredVerification(verificationConfig) }

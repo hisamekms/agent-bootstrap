@@ -531,3 +531,21 @@ from your usual Git workflow.
 Use `analyze` with the default checkout, the same `--target` argument as the
 launcher, or `--all-targets` to compare projects. See [DuckDB analysis](analysis.md)
 for the private export layout, view definitions and query examples.
+
+## Bun packages in Task VMs
+
+Use `agent-bootstrap config edit --project <name>` to add
+`"environment": { "enabled": true }` to the target's private `local.json`.
+The same setting in user configuration applies to all targets unless a target
+overrides it. Automatic environment delivery defaults to off.
+
+Use the `bun` profile for Executor and Verification. Executor gets the
+packages for the Task base, and Verification gets the packages for the pinned
+candidate. Both can run commands such as `bun test` with workspace imports
+and tools from `node_modules/.bin`. Packages are excluded from candidate
+changes. The recent executions in Task detail show the keys and cache hits.
+
+This setting authorizes automatic package network for the credential-free
+Provisioner on cache misses. Verification remains offline. See the
+[Bun environment guide](../environments/README.md) for allowed destinations
+and cache management.

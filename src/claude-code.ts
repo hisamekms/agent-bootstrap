@@ -243,6 +243,8 @@ export interface ClaudeCodeTask {
   readonly model: string;
   readonly maxTurns: number;
   readonly timeoutMs: number;
+  /** Preserve the delivered environment's tool paths after clearing env. */
+  readonly environment?: boolean;
   /** Override for local fixtures, e.g. `https://host.microsandbox.internal:8443`. */
   readonly baseUrl?: string;
   /** Opt-in Bash for the Worker only. Pre-approved through `--allowedTools`. */
@@ -587,6 +589,10 @@ $(cat /review/review-notes.txt)"
     : "head -c 65536 /tmp/claude-out.json";
   const placeholderCleanup = secretFile && worker;
   const baseUrl = placeholderCleanup ? '"$tool_base_url"' : `'${task.baseUrl}'`;
+  const path = "/usr/bin:/bin:/usr/sbin:/sbin";
+  const guestPath = task.environment
+    ? `"${path}\${AGENT_BOOTSTRAP_ENV_PATH:+:/usr/local/bin:$AGENT_BOOTSTRAP_ENV_PATH}"`
+    : path;
   const script = `
 ${claudeCodeGuestSetup(credential?.variable, guest, secretFile)}    test ! -e /root/.claude
 ${
@@ -611,7 +617,7 @@ ${
       set -- --tools '${tools.tools.join(",")}'
     fi
     claude_status=0
-    env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$claude_home" \\
+    env -i PATH=${guestPath} HOME="$claude_home" \\
       ${secretFile ? `TMPDIR="$claude_tmp" ${secretGitEnv}` : ""} \\
       CLAUDE_CONFIG_DIR="$claude_config" ENABLE_TOOL_SEARCH=false \\
       ${credential ? `${credential.variable}="$${credential.variable}"` : ""} \\

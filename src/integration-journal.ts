@@ -32,6 +32,7 @@ const fields = {
 
 const eventFields = {
   requested: ["target", "base"],
+  "environment.outputs-excluded": ["run"],
   "candidate.authorized": ["run", "digest"],
   "candidate.created": ["candidate", "digest"],
   "candidate.failed": ["cleanup"],
@@ -57,6 +58,7 @@ type Base = {
 }[Kind];
 type EventDetails = {
   "verification.finished": {
+    readonly failure?: "env-lock-mismatch" | "env-output-collision";
     readonly tests?: { readonly passed: number; readonly failed: number };
   };
   "candidate.created": {
@@ -104,6 +106,15 @@ function decode(value: unknown): IntegrationEvent {
   if (typeof kind !== "string" || !Object.hasOwn(eventFields, kind))
     throw new Error("Invalid integration event kind");
   const expected = eventFields[kind as Kind];
+  const hasFailure =
+    kind === "verification.finished" && Object.hasOwn(data, "failure");
+  if (
+    hasFailure &&
+    (data.review !== "revise" ||
+      (data.failure !== "env-lock-mismatch" &&
+        data.failure !== "env-output-collision"))
+  )
+    throw new Error("Invalid integration event fields");
   const hasTests =
     kind === "verification.finished" && Object.hasOwn(data, "tests");
   const hasProtectedCount =
@@ -129,6 +140,7 @@ function decode(value: unknown): IntegrationEvent {
   )
     throw new Error("Invalid integration event fields");
   const optional = [
+    hasFailure,
     hasTests,
     hasProtectedCount,
     hasMessageDigest,
@@ -178,9 +190,9 @@ function decode(value: unknown): IntegrationEvent {
   return value as IntegrationEvent;
 }
 
-// The first candidate and integration take up to 13 events; each revision
-// adds up to 6.
-const eventLimit = 15 + 8 * MAX_REVISIONS;
+// The first candidate and integration take up to 16 events; each revision
+// adds up to 9.
+const eventLimit = 16 + 9 * MAX_REVISIONS;
 
 export class IntegrationJournal {
   readonly #journal: PrivateJournal<IntegrationEvent>;

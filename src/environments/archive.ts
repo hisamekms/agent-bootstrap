@@ -7,10 +7,13 @@ export const environmentArchiveLimit = 256 * 1024 * 1024;
 
 // toUpperCase first so that expansions such as ß → SS fold like the
 // case-insensitive filesystems that may later unpack this archive.
-const foldedPath = (path: string) =>
+export const foldedPath = (path: string) =>
   path.normalize("NFC").toUpperCase().toLowerCase();
 
-function containsRoot(roots: ReadonlySet<string>, path: string): boolean {
+export function containsRoot(
+  roots: ReadonlySet<string>,
+  path: string,
+): boolean {
   if (roots.has(path)) return true;
   for (
     let end = path.lastIndexOf("/");
@@ -69,6 +72,47 @@ function checkLink(
     }
   }
   if (!containsRoot(roots, parts.join("/"))) throw new EnvironmentError();
+}
+
+/** Refuse existing output roots and any non-directory or aliased ancestor. */
+export function checkEnvironmentTree(
+  roots: readonly string[],
+  entries: Iterable<{ path: string; directory: boolean }>,
+): void {
+  const outputs = new Set(roots.map(foldedPath));
+  if (outputs.size !== roots.length)
+    throw new EnvironmentError("env-output-collision");
+  const ancestors = new Map<string, string>();
+  for (const root of roots) {
+    for (
+      let end = root.lastIndexOf("/");
+      end > 0;
+      end = root.lastIndexOf("/", end - 1)
+    ) {
+      const path = root.slice(0, end);
+      const folded = foldedPath(path);
+      const known = ancestors.get(folded);
+      if (outputs.has(folded) || (known !== undefined && known !== path))
+        throw new EnvironmentError("env-output-collision");
+      ancestors.set(folded, path);
+    }
+  }
+  for (const { path, directory } of entries) {
+    const folded = foldedPath(path);
+    if (containsRoot(outputs, folded))
+      throw new EnvironmentError("env-output-collision");
+    // Git's workspace tar can omit directory headers, so also check the
+    // implicit ancestors of every entry.
+    for (let end = path.length; end > 0; end = path.lastIndexOf("/", end - 1)) {
+      const parent = path.slice(0, end);
+      const expected = ancestors.get(foldedPath(parent));
+      if (
+        expected !== undefined &&
+        (parent !== expected || (end === path.length && !directory))
+      )
+        throw new EnvironmentError("env-output-collision");
+    }
+  }
 }
 
 export function validateEnvironmentArchive(

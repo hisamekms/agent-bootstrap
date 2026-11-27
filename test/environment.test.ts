@@ -23,7 +23,10 @@ import {
   identifyEnvironment,
   type EnvironmentTree,
 } from "../src/environments/adapter.ts";
-import { validateEnvironmentArchive } from "../src/environments/archive.ts";
+import {
+  checkEnvironmentTree,
+  validateEnvironmentArchive,
+} from "../src/environments/archive.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
 import { diffBunLocks, parseBunLock } from "../src/environments/lock.ts";
 import { parseEnvironmentEvidence } from "../src/environments/events.ts";
@@ -916,4 +919,50 @@ test("Provisioner classifies Bun download errors as fetch failures without a gat
     assert.equal(error.gatewayStopped, undefined);
     assert.equal(body.gatewayStopped, undefined);
   }
+});
+
+test("environment enabled is a private boolean and local settings override the user", () => {
+  const value = (enabled: unknown) => ({
+    version: 1,
+    environment: { enabled },
+  });
+  const user = parseConfig(value(true), "user");
+  const local = parseConfig(value(false), "local");
+  assert.equal(
+    mergeConfig(user, undefined, { version: 1 }).config.environment?.enabled,
+    true,
+  );
+  assert.equal(
+    mergeConfig(user, undefined, local).config.environment?.enabled,
+    false,
+  );
+  assert.equal(
+    mergeConfig({ version: 1 }, undefined, { version: 1 }).config.environment,
+    undefined,
+  );
+  assert.throws(() => parseConfig(value(true), "approved"), /environment/);
+  assert.throws(
+    () => parseConfig(value("true"), "local"),
+    /environment.enabled/,
+  );
+});
+
+test("environment output collisions include folded roots and implicit parent aliases", () => {
+  for (const [root, path] of [
+    ["node_modules", "Node_Modules/x"],
+    ["café/node_modules", "cafe\u0301/NODE_MODULES/x"],
+    ["packages/a/node_modules", "Packages/a/source"],
+    ["packages/a/node_modules", "packages/a"],
+  ] as const) {
+    assert.throws(
+      () => checkEnvironmentTree([root], [{ path, directory: false }]),
+      { code: "env-output-collision" },
+    );
+  }
+  assert.doesNotThrow(() =>
+    checkEnvironmentTree(
+      ["node_modules"],
+      [{ path: "src/node_modules/a", directory: false }],
+    ),
+  );
 });

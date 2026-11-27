@@ -35,11 +35,38 @@ matches the key. A stale environment has a cached build for a previous key, and
 its size is the size of the most recent entry. A missing environment has no
 cached build and shows zero bytes. Doctor reports a missing environment as
 an optional check. Without a target flag, doctor also lists environments for
-other registered projects. Task runs do not use this cache yet.
+other registered projects.
 
-Cached archives contain the declared `node_modules` paths. Output links must
-resolve inside those paths. A workspace link that points back into the source
-tree fails validation with `env-build-failed`. Archives are limited to 256 MiB.
+Cached archives contain the declared `node_modules` paths. Output links can
+resolve within those paths or directly to a declared workspace package
+directory. Archives are limited to 256 MiB.
+
+## Use environments in Tasks
+
+Set `"environment": { "enabled": true }` using
+`agent-bootstrap config edit --project <name>` for one target or
+`agent-bootstrap config edit` for all targets. A target's private
+`local.json` can override the user setting with `"enabled": false`. The
+default is off. Repository declarations and approved permissions cannot
+enable automatic builds. If you also set `allow`, keep it in the same
+`environment` object.
+
+Use the `bun` profile for the Executor and the configured Verification
+command. The Executor uses the Task base's environment on every attempt,
+including revisions that start from the previous candidate's tree.
+Verification uses the pinned candidate's environment, even when the
+candidate changes key files. Verification requests a revision if dependency
+declarations disagree with a committed lock or generated dependency
+directories collide with the candidate tree.
+
+Enabling this setting authorizes the credential-free Provisioner to use
+package network on cache misses. Its gateway uses the adapter's defaults
+and your private `environment.allow`, and records connections in audit.
+The Executor retains its model egress policy and Verification stays offline.
+The Task VM unpacks the packages into `/workspace` and adds their
+`.bin` directories to `PATH`. Writes under the output roots declared by
+the base or by the collected workspace are excluded from candidate
+changes. Task detail shows each environment key and cache hit.
 
 ```sh
 agent-bootstrap environment prune --target /path/to/project --keep 3

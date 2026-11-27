@@ -4,7 +4,10 @@ import type { HostPort } from "../egress-policy.ts";
 
 export type EnvironmentOperation = "build" | "resolve" | "update" | "outdated";
 export type EnvironmentFailure =
-  "env-fetch-failed" | "env-lock-mismatch" | "env-build-failed";
+  | "env-fetch-failed"
+  | "env-lock-mismatch"
+  | "env-build-failed"
+  | "env-output-collision";
 export const lockMissing = "env-lock-missing";
 
 /** Why the egress gateway stopped every flow of a Provisioner run. */

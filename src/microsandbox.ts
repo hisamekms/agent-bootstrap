@@ -1,3 +1,10 @@
+import { EnvironmentError } from "./environments/adapter.ts";
+import {
+  checkEnvironmentTree,
+  validateEnvironmentArchive,
+} from "./environments/archive.ts";
+import { environmentPath } from "./environments/bun.ts";
+import { readTar } from "./oci-image.ts";
 import {
   CLAUDE_MANAGED_PATH,
   CLAUDE_MANAGED_STAGING,
@@ -188,8 +195,83 @@ export const MICROSANDBOX_LIMITS = {
   treeStepTimeoutMs: 120_000,
 } as const;
 
-const TREE_GUEST = "/tmp/agent-bootstrap-tree.tar";
 const COLLECT_GUEST = "/tmp/agent-bootstrap-collect.tar";
+const TREE_GUEST = "/tmp/agent-bootstrap-tree.tar";
+const ENVIRONMENT_GUEST = "/tmp/agent-bootstrap-environment.tar";
+
+// Pass literal operands to BusyBox tar. Use bounded batches so a wide
+// checkout cannot exceed the Linux argv limit.
+const collectWithEnvironment = `
+  const { closeSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
+  const roots = new Set(process.argv.slice(2));
+  const ancestors = new Set();
+  for (const root of roots) {
+    for (let i = root.lastIndexOf("/"); i > 0; i = root.lastIndexOf("/", i - 1))
+      ancestors.add(root.slice(0, i));
+  }
+  process.chdir("/workspace");
+  const temporary = mkdtempSync("/tmp/agent-bootstrap-pack-");
+  const batchTar = temporary + "/batch.tar";
+  const directories = temporary + "/directories";
+  const output = openSync("${COLLECT_GUEST}", "w", 0o600);
+  const limit = ${MICROSANDBOX_LIMITS.collectedTreeBytes};
+  let written = 0;
+  let members = [];
+  let argumentBytes = 0;
+  function append(operands) {
+    const result = Bun.spawnSync(["/bin/tar", "-cf", batchTar, ...operands],
+      { stdout: "ignore", stderr: "ignore" });
+    if (result.exitCode !== 0 || statSync(batchTar).size > limit) throw new Error();
+    const bytes = readFileSync(batchTar);
+    // Keep whole tar records and drop only the end marker and its padding.
+    // Within the collection size limit, tar entry sizes fit the octal field.
+    let offset = 0;
+    for (;;) {
+      const block = bytes.subarray(offset, offset + 512);
+      if (block.length !== 512) throw new Error();
+      if (block.every((byte) => byte === 0)) break;
+      const size = block.toString("ascii", 124, 136).replace(/\\0.*$/, "").trim();
+      if (!/^[0-7]+$/.test(size)) throw new Error();
+      offset += 512 + Math.ceil(Number.parseInt(size, 8) / 512) * 512;
+    }
+    written += offset;
+    if (written + 1024 > limit) throw new Error();
+    writeFileSync(output, bytes.subarray(0, offset));
+  }
+  function flush() {
+    if (!members.length) return;
+    append(["--exclude", "./.git", "--exclude", ".git", ...members]);
+    members = [];
+    argumentBytes = 0;
+  }
+  function visit(path) {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = path + "/" + entry.name;
+      if (entry.name === ".git" || roots.has(child)) continue;
+      if (ancestors.has(child) && entry.isDirectory()) {
+        // Archive the directory headers from empty stubs to avoid recursing
+        // into the delivered outputs with BusyBox tar.
+        mkdirSync(directories + "/" + child);
+        visit(child);
+        continue;
+      }
+      const argumentSize = Buffer.byteLength(child) + 16;
+      if (argumentBytes + argumentSize > 128 * 1024) flush();
+      members.push(child);
+      argumentBytes += argumentSize;
+    }
+  }
+  try {
+    mkdirSync(directories);
+    visit(".");
+    flush();
+    append(["-C", directories, "."]);
+    writeFileSync(output, Buffer.alloc(1024));
+  } finally {
+    closeSync(output);
+    rmSync(temporary, { recursive: true, force: true });
+  }
+`;
 
 /** Total bytes of a directory of plain files and directories. Any symlink or
  * special file, or exceeding a bound, is invalid input. */
@@ -242,6 +324,7 @@ type State = {
   directory: string;
   deadline: number;
   interactive: boolean;
+  environment?: { outputs: readonly string[]; path: string };
   terminal?: { stop(): void; finished: Promise<{ exitCode: number | null }> };
   busy: boolean;
   closed: boolean;
@@ -992,6 +1075,37 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       : undefined;
     if (spec.repository !== undefined && (!repository || spec.files?.length))
       invalid();
+    const environment = spec.environment && {
+      ...spec.environment,
+      outputs: [...spec.environment.outputs],
+      linkTargets: [...spec.environment.linkTargets],
+      pathEntries: [...spec.environment.pathEntries],
+    };
+    if (
+      environment &&
+      (!repository ||
+        spec.profile !== "bun" ||
+        interactive ||
+        !environment.pathEntries.every(
+          (path) =>
+            environmentPath(path) &&
+            environment.outputs.some((root) => path.startsWith(root + "/")),
+        ))
+    )
+      invalid();
+    let archive: Uint8Array | undefined;
+    if (environment) {
+      try {
+        archive = validateEnvironmentArchive(
+          environment.archive,
+          environment.outputs,
+          undefined,
+          environment.linkTargets,
+        );
+      } catch {
+        throw new SandboxRuntimeError("env-build-failed");
+      }
+    }
     const fileGroups = [spec.files ?? [], spec.readOnlyFiles ?? []];
     if (fileGroups.flat().length > MICROSANDBOX_LIMITS.files) invalid();
     let total = 0;
@@ -1120,6 +1234,32 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           }
         }
       }
+      let stagedEnvironment: string | undefined;
+      if (archive && environment && stagedTree) {
+        try {
+          const entries = readTar(
+            await readFile(stagedTree),
+            MICROSANDBOX_LIMITS.treeBytes,
+            true,
+          );
+          checkEnvironmentTree(
+            environment.outputs,
+            entries.map(({ path, type }) => ({
+              path,
+              directory: type === "directory",
+            })),
+          );
+          stagedEnvironment = join(directory, "environment.tar");
+          await writeFile(stagedEnvironment, archive, {
+            mode: 0o600,
+            flag: "wx",
+          });
+        } catch (error) {
+          throw new SandboxRuntimeError(
+            error instanceof EnvironmentError ? error.code : "env-build-failed",
+          );
+        }
+      }
       const current: State = {
         id: sandboxId,
         ...(bound
@@ -1129,6 +1269,16 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         deadline: performance.now() + lifetime,
         interactive:
           requestedInteractive !== undefined || spec.debugMounts !== undefined,
+        ...(environment
+          ? {
+              environment: {
+                outputs: [...environment.outputs],
+                path: environment.pathEntries
+                  .map((path) => "/workspace/" + path)
+                  .join(":"),
+              },
+            }
+          : {}),
         busy: false,
         closed: false,
         removed: true,
@@ -1167,6 +1317,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           `${staged[index]}:${tool.guestPath}`,
         ]),
         ...(stagedTree ? ["--copy-file", `${stagedTree}:${TREE_GUEST}`] : []),
+        ...(stagedEnvironment
+          ? ["--copy-file", `${stagedEnvironment}:${ENVIRONMENT_GUEST}`]
+          : []),
         profile.image,
       ];
       await this.#createBackend(
@@ -1186,7 +1339,10 @@ export class MicrosandboxRuntime implements SandboxRuntime {
           [
             "/bin/sh",
             "-ec",
-            `tar -xf ${TREE_GUEST} -C /workspace && rm -f ${TREE_GUEST} && test -d /workspace/.git`,
+            `tar -xf ${TREE_GUEST} -C /workspace && rm -f ${TREE_GUEST} && test -d /workspace/.git` +
+              (stagedEnvironment
+                ? ` && tar -xf ${ENVIRONMENT_GUEST} -C /workspace && rm -f ${ENVIRONMENT_GUEST}`
+                : ""),
           ],
           MICROSANDBOX_LIMITS.treeStepTimeoutMs,
         );
@@ -1273,7 +1429,16 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       )
     )
       invalid();
-    const argv = [...command.argv];
+    const argv = state.environment?.path
+      ? [
+          "/bin/sh",
+          "-ec",
+          'export AGENT_BOOTSTRAP_ENV_PATH="$1"; shift; export PATH="$PATH:/usr/local/bin:$AGENT_BOOTSTRAP_ENV_PATH"; exec "$@"',
+          "environment",
+          state.environment.path,
+          ...command.argv,
+        ]
+      : [...command.argv];
     state.busy = true;
     try {
       const result = await this.#execute(
@@ -1573,11 +1738,22 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     try {
       const packed = await this.#execute(
         state,
-        [
-          "/bin/sh",
-          "-ec",
-          `cd /workspace && tar -cf ${COLLECT_GUEST} --exclude ./.git --exclude .git .`,
-        ],
+        state.environment
+          ? [
+              "/usr/local/bin/bun",
+              "--cwd",
+              "/",
+              "-e",
+              collectWithEnvironment,
+              "--",
+              "collect",
+              ...state.environment.outputs.map((path) => "./" + path),
+            ]
+          : [
+              "/bin/sh",
+              "-ec",
+              `cd /workspace && tar -cf ${COLLECT_GUEST} --exclude ./.git --exclude .git .`,
+            ],
         MICROSANDBOX_LIMITS.treeStepTimeoutMs,
       );
       if (packed.status !== "exited" || packed.exitCode !== 0)

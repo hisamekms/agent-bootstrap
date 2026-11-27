@@ -46,6 +46,15 @@ test("the CLI command takes the prompt only as one argv entry, with fixed flags"
     /test "\$ANTHROPIC_API_KEY" = '\$MSB_ANTHROPIC_API_KEY'/,
   );
   assert.match(script, /env -i /);
+  const path = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+  const environmentPath =
+    'PATH="/usr/bin:/bin:/usr/sbin:/sbin${AGENT_BOOTSTRAP_ENV_PATH:+:/usr/local/bin:$AGENT_BOOTSTRAP_ENV_PATH}"';
+  const withEnvironment = claudeCodeCommand({ ...task, environment: true })
+    .argv[2]!;
+  assert.ok(script.includes(`env -i ${path} HOME=`));
+  assert.doesNotMatch(script, /AGENT_BOOTSTRAP_ENV_PATH/);
+  assert.ok(withEnvironment.includes(`env -i ${environmentPath} HOME=`));
+  assert.equal(withEnvironment.replace(environmentPath, path), script);
   assert.match(script, /printf '%s' '\{"tool":"collect"\}'/);
   assert.ok(script.includes(CLAUDE_CODE.sha256));
   for (const item of CLAUDE_CODE_GUEST_PACKAGES)

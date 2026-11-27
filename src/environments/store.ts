@@ -6,6 +6,8 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
+  fstatSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -21,6 +23,7 @@ import {
 import { publishPrivateFile, uuidPattern } from "../private-journal.ts";
 import { privateDirectory } from "../volumes/volume.ts";
 import { digestPattern, EnvironmentError } from "./adapter.ts";
+import { environmentArchiveLimit } from "./archive.ts";
 import { maxEnvironmentPackages, validPackage } from "./lock.ts";
 
 export interface EnvironmentManifest {
@@ -283,6 +286,47 @@ export class EnvironmentStore {
         return value;
       } finally {
         rmSync(stage, { recursive: true, force: true });
+      }
+    } catch {
+      throw new EnvironmentError();
+    }
+  }
+
+  /** Read under a hold. Callers validate these bytes against the current layout. */
+  readArchive(key: string): Uint8Array {
+    const manifest = this.get(key);
+    if (!manifest || manifest.size > environmentArchiveLimit)
+      throw new EnvironmentError();
+    try {
+      const fd = openSync(
+        join(this.#entry(key), "outputs.tar"),
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const info = fstatSync(fd);
+        if (
+          !info.isFile() ||
+          (process.getuid && info.uid !== process.getuid()) ||
+          (info.mode & 0o777) !== 0o600 ||
+          info.size !== manifest.size
+        )
+          throw new EnvironmentError();
+        const bytes = Buffer.alloc(info.size);
+        for (let offset = 0; offset < bytes.length;) {
+          const length = readSync(
+            fd,
+            bytes,
+            offset,
+            bytes.length - offset,
+            offset,
+          );
+          if (!length) throw new EnvironmentError();
+          offset += length;
+        }
+        if (fstatSync(fd).size !== info.size) throw new EnvironmentError();
+        return bytes;
+      } finally {
+        closeSync(fd);
       }
     } catch {
       throw new EnvironmentError();

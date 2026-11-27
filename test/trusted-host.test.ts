@@ -18,6 +18,8 @@ import test from "node:test";
 import { createRequire } from "node:module";
 import { type AuditSink, SqliteAudit, auditSchemaSql } from "../src/audit.ts";
 import { HostRequests } from "../src/host-requests.ts";
+import { bunAdapter } from "../src/environments/bun.ts";
+import { writeWorkspaceTar } from "../src/oci-image.ts";
 import type {
   ExecResult,
   SandboxEgressGateway,
@@ -1328,6 +1330,103 @@ test("secret host audits delivery and closes the channel before collection, with
     "published",
     "closed",
   ]);
+});
+
+test("secret host collects a workspace tree with delivered Bun workspace outputs", async (t) => {
+  const secret = secretRunFixture(t);
+  const manifest = Buffer.from('{"workspaces":["packages/*"]}');
+  const layout = await bunAdapter.layout({
+    paths: ["package.json", "packages/a/package.json"],
+    async read() {
+      return manifest;
+    },
+  });
+  assert.deepEqual(layout.outputs, ["node_modules", "packages/a/node_modules"]);
+  const directory = (path: string) => ({
+    path,
+    type: "directory" as const,
+    mode: 0o755,
+    linkname: "",
+    data: new Uint8Array(),
+  });
+  const file = (path: string, data: Uint8Array) => ({
+    path,
+    type: "file" as const,
+    mode: 0o644,
+    linkname: "",
+    data,
+  });
+  const tree = writeWorkspaceTar([
+    directory("packages"),
+    directory("packages/a"),
+    file("package.json", manifest),
+    file("packages/a/package.json", Buffer.from('{"name":"a"}')),
+  ]);
+  const treePath = fixture(t) + ".tar";
+  writeFileSync(treePath, tree);
+  const collected = writeWorkspaceTar([
+    directory("packages"),
+    directory("packages/a"),
+    file("packages/a/package.json", Buffer.from('{"name":"edited"}')),
+    // A sparse guest archive can still contain output entries. The host
+    // screens the raw archive, then excludes those outputs from file reads.
+    file("packages/a/node_modules/generated", Buffer.from("fixture")),
+  ]);
+  let screenedFile = false;
+  const observed = observedFixture(
+    t,
+    {
+      async exec() {
+        await secret.deliver();
+        return {
+          status: "exited",
+          exitCode: 0,
+          stdout: Buffer.from('{"tool":"collect"}'),
+          stderr: Buffer.alloc(0),
+        };
+      },
+      async collect(_handle, spec) {
+        assert.deepEqual(spec, { tree: true });
+        return { files: [], tree: collected };
+      },
+    },
+    undefined,
+    { claude: secret.policy },
+  );
+  const run = await observed.host.runWorker(
+    {
+      ...secret.plan,
+      sandbox: {
+        ...secret.plan.sandbox,
+        repository: { gitDir: dirname(treePath), tree: treePath },
+        environment: {
+          ...layout,
+          archive: writeWorkspaceTar(layout.outputs.map(directory)),
+        },
+      },
+      collectPaths: [],
+      collectTree: true,
+    },
+    undefined,
+    undefined,
+    {
+      secretFile: {
+        ...secret.channel,
+        get acknowledged() {
+          return secret.channel.acknowledged;
+        },
+        matches(data) {
+          if (data === "packages/a/package.json") screenedFile = true;
+          assert.notEqual(data, "packages/a/node_modules/generated");
+          return secret.channel.matches(data);
+        },
+      },
+      secretTest: "passed",
+    },
+  );
+  assert.equal(run.outcome, "ok");
+  assert.deepEqual(run.artifacts?.tree, collected);
+  assert.equal(screenedFile, true);
 });
 
 test("secret host rejects added egress before arming", async (t) => {

@@ -1,3 +1,4 @@
+import { containsRoot } from "./environments/archive.ts";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
@@ -108,8 +109,14 @@ export function parseLsTree(output: Uint8Array): Map<string, TreeEntry> {
  * A hardlink takes its target's data and mode (same inode). Symlinks become
  * 120000 with the UTF-8 link name as content. Devices and fifos are rejected.
  */
-export function workspaceFiles(tar: Uint8Array): Map<string, WorkspaceFile> {
-  const entries = readTar(tar);
+export function workspaceFiles(
+  tar: Uint8Array,
+  excludedRoots: readonly string[] = [],
+): Map<string, WorkspaceFile> {
+  const roots = new Set(excludedRoots);
+  const entries = readTar(tar, undefined, roots.size > 0).filter(
+    ({ path }) => !containsRoot(roots, path),
+  );
   const regular = new Map<string, WorkspaceFile>();
   for (const e of entries) {
     if (e.type === "file") {

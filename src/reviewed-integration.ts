@@ -1,3 +1,6 @@
+import { EnvironmentError } from "./environments/adapter.ts";
+import { containsRoot, foldedPath } from "./environments/archive.ts";
+import { bunAdapter } from "./environments/bun.ts";
 import { createHash } from "node:crypto";
 import type { HostService } from "./egress-policy.ts";
 import type {
@@ -15,6 +18,7 @@ import type { ProfileName } from "./sandbox-profiles.ts";
 import type {
   SandboxCommand,
   SandboxFile,
+  SandboxEnvironment,
   SandboxSpec,
 } from "./sandbox-runtime.ts";
 import type {
@@ -160,7 +164,20 @@ function copyTree(input: TreePlan): TreePlan {
   };
 }
 
+export type EnsureTaskEnvironment = (input: {
+  role: "Executor" | "Verification";
+  commit: string;
+  profile: ProfileName | undefined;
+  executionId: string | undefined;
+}) => Promise<{ environment: SandboxEnvironment; release(): void }>;
+
+export const environmentLockMismatchNote =
+  "The dependency declarations and bun.lock disagree. Make them consistent before Verification runs again.";
+export const environmentOutputCollisionNote =
+  "Remove generated dependency directories from the change before Verification runs again.";
+
 type Plan = {
+  readonly ensureEnvironment?: EnsureTaskEnvironment;
   /** Single-file mode: one top-level file. Exclusive with `tree`. */
   readonly path?: string;
   /** Tree mode: the Worker edits a whole repository workspace. */
@@ -377,7 +394,7 @@ function preReviewVerification(
     finished?.kind === "verification.finished" &&
     finished.digest === pin.digest
   )
-    return finished.review;
+    return finished;
   return undefined;
 }
 
@@ -432,6 +449,9 @@ export class ReviewedIntegration {
     this.#plan = {
       ...(plan.path !== undefined ? { path: plan.path } : {}),
       ...(plan.tree !== undefined ? { tree: copyTree(plan.tree) } : {}),
+      ...(plan.ensureEnvironment
+        ? { ensureEnvironment: plan.ensureEnvironment }
+        : {}),
       worker: copy(plan.worker),
       reviewer: copy(plan.reviewer),
       verification,
@@ -640,10 +660,47 @@ export class ReviewedIntegration {
       ...(previous !== undefined ? { previous } : {}),
       ...(scope ? { sparsePaths: scope.map((p) => p.replace(/\/$/, "")) } : {}),
     });
+    let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
     const readChanges = async (tree: Uint8Array) => {
+      const baseOutputs = held?.environment.outputs;
+      const workspace = workspaceFiles(tree, baseOutputs);
+      const baseFiles = parseLsTree(await this.#git.listTree(base));
+      if (baseOutputs) {
+        // A revision must be able to unpack the same base environment over
+        // the candidate, including on case-insensitive filesystems.
+        const delivered = new Set(baseOutputs.map(foldedPath));
+        for (const path of workspace.keys())
+          if (containsRoot(delivered, foldedPath(path))) workspace.delete(path);
+        // A candidate with unreadable declarations (broken package.json, a
+        // symlinked manifest, an unsupported workspace pattern) keeps only
+        // the base exclusion; Verification then reports the identify failure
+        // instead of the change disappearing as "no eligible change".
+        const layout = await bunAdapter
+          .layout({
+            paths: [...workspace.keys()],
+            async read(path) {
+              const file = workspace.get(path);
+              if (file?.mode === "120000") throw new EnvironmentError();
+              return file?.bytes;
+            },
+          })
+          .catch((error: unknown) => {
+            if (error instanceof EnvironmentError) return undefined;
+            throw error;
+          });
+        // The delivered roots were excluded while reading the tar.
+        const outputs = new Set(layout?.outputs ?? []);
+        for (const path of workspace.keys()) {
+          if (!containsRoot(outputs, path)) continue;
+          workspace.delete(path);
+          // Ignoring a generated path must not delete a tracked file that
+          // was still present in the collected tree.
+          baseFiles.delete(path);
+        }
+      }
       const result = diffWorkspace({
-        base: parseLsTree(await this.#git.listTree(base)),
-        workspace: workspaceFiles(tree),
+        base: baseFiles,
+        workspace,
         ...(scope ? { scope } : {}),
         ...(protectedPaths ? { protectedPaths } : {}),
       });
@@ -670,6 +727,13 @@ export class ReviewedIntegration {
         }
       : this.#workerOptions();
     try {
+      // Revisions edit the previous candidate with the original base's environment.
+      held = await this.#plan.ensureEnvironment?.({
+        role: "Executor",
+        commit: base,
+        profile,
+        executionId: id,
+      });
       const worker = await this.#host.runWorker(
         {
           sandbox: {
@@ -677,6 +741,7 @@ export class ReviewedIntegration {
             ...(profile !== undefined ? { profile } : {}),
             maxLifetimeMs: 300_000,
             repository: { gitDir: prepared.gitDir, tree: prepared.tree },
+            ...(held ? { environment: held.environment } : {}),
             ...(allReadOnly.length ? { readOnlyFiles: allReadOnly } : {}),
           },
           command: this.#plan.worker,
@@ -690,6 +755,11 @@ export class ReviewedIntegration {
       let changes: TreeChange[] = [];
       let flagged = 0;
       if (worker.outcome === "ok" && worker.artifacts?.tree) {
+        if (held)
+          await append({
+            kind: "environment.outputs-excluded",
+            run: worker.id,
+          });
         try {
           ({ changes, flagged } =
             inspected ?? (await readChanges(worker.artifacts.tree)));
@@ -744,7 +814,11 @@ export class ReviewedIntegration {
       });
       return pin;
     } finally {
-      await this.#cleanup(prepared);
+      try {
+        held?.release();
+      } finally {
+        await this.#cleanup(prepared);
+      }
     }
   }
 
@@ -769,7 +843,7 @@ export class ReviewedIntegration {
     const pin = candidatePin(events, target);
     const verification = preReviewVerification(events, pin);
     const verificationFailed =
-      verification !== undefined && verification !== "pass";
+      verification !== undefined && verification.review !== "pass";
     const review =
       rejected || verificationFailed ? undefined : latestPin(events, target);
     if (rejected && last.digest !== pin.digest)
@@ -792,7 +866,11 @@ export class ReviewedIntegration {
       ? last.notes
       : verificationFailed
         ? await this.#journal.saveNote(
-            "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
+            verification.failure === "env-lock-mismatch"
+              ? environmentLockMismatchNote
+              : verification.failure === "env-output-collision"
+                ? environmentOutputCollisionNote
+                : "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
           )
         : noted?.kind === "review.noted" && noted.run === review?.run
           ? noted.notes
@@ -871,7 +949,7 @@ export class ReviewedIntegration {
     const last = events.at(-1);
     if (
       last?.kind !== "candidate.created" &&
-      preReviewVerification(events, pin) !== "pass"
+      preReviewVerification(events, pin)?.review !== "pass"
     )
       throw new Error("Candidate review has already been attempted");
     const diff = await this.#git.diff(
@@ -1091,13 +1169,21 @@ export class ReviewedIntegration {
       ? await this.#git.prepareWorkspace({ base: pin.candidate })
       : undefined;
     let verification: ReviewerRun;
+    let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
     try {
+      held = await this.#plan.ensureEnvironment?.({
+        role: "Verification",
+        commit: pin.candidate,
+        profile,
+        executionId: id,
+      });
       verification = await this.#host.runVerification(
         {
           sandbox: {
             maxLifetimeMs: 300_000,
             readOnlyFiles: files,
             ...(profile !== undefined ? { profile } : {}),
+            ...(held ? { environment: held.environment } : {}),
             ...(prepared
               ? { repository: { gitDir: prepared.gitDir, tree: prepared.tree } }
               : {}),
@@ -1106,8 +1192,28 @@ export class ReviewedIntegration {
         },
         id,
       );
+    } catch (error) {
+      if (
+        !id ||
+        !(error instanceof EnvironmentError) ||
+        (error.code !== "env-lock-mismatch" &&
+          error.code !== "env-output-collision")
+      )
+        throw error;
+      await append({
+        kind: "verification.finished",
+        run: id,
+        digest: pin.digest,
+        review: "revise",
+        failure: error.code,
+      });
+      return false;
     } finally {
-      if (prepared) await this.#cleanup(prepared);
+      try {
+        held?.release();
+      } finally {
+        if (prepared) await this.#cleanup(prepared);
+      }
     }
     const { review: verified, tests } = verificationResult(verification);
     await append({
