@@ -1,5 +1,9 @@
 import { EnvironmentError } from "../environments/adapter.ts";
-import { parseEnvironmentArgs, runEnvironmentCommand } from "./environment.ts";
+import {
+  EnvironmentBuildBusyError,
+  parseEnvironmentArgs,
+  runEnvironmentCommand,
+} from "./environment.ts";
 import {
   configRoot,
   projectConfigDirectory,
@@ -796,6 +800,10 @@ export async function runBootstrap(
     if (operator !== "watch") hint(output.next);
     return 0;
   } catch (error) {
+    if (error instanceof EnvironmentBuildBusyError)
+      return fail(1, error.message, "Retry after the build finishes.", {
+        code: error.code,
+      });
     if (error instanceof EnvironmentError)
       return fail(
         1,

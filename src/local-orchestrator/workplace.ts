@@ -19,7 +19,10 @@ export function parseWorkplaceArgs(args: readonly string[]) {
 
 export async function runWorkplace<T>(
   options: Omit<Parameters<typeof listenOperatorApi>[0], "terminal">,
-  run: (terminal: ConciergeTerminalHub) => Promise<T>,
+  run: (
+    terminal: ConciergeTerminalHub,
+    stopOperatorWrites: () => Promise<void>,
+  ) => Promise<T>,
   dev?: {
     loadAssets(): Promise<Parameters<typeof startDevBridge>[0]["assets"]>;
     printUrl(url: string): void;
@@ -36,12 +39,17 @@ export async function runWorkplace<T>(
       });
       dev.printUrl(bridge.url);
     }
-    return await run(terminal);
+    return await run(terminal, api.stopWrites);
   } finally {
     try {
-      await bridge?.close();
+      await api.stopWrites();
+      await options.environment?.close();
     } finally {
-      await api.close();
+      try {
+        await bridge?.close(true);
+      } finally {
+        await api.close();
+      }
     }
   }
 }
@@ -83,6 +91,9 @@ export function workplaceStop(
   lifeline?.once("close", terminate);
   return {
     signal: controller.signal,
+    stop() {
+      if (exitCode === undefined) stop(0);
+    },
     get exitCode() {
       return exitCode;
     },

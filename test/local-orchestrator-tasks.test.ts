@@ -73,6 +73,7 @@ import {
 import { configuredVerification } from "../src/local-orchestrator/verification.ts";
 import {
   createTaskExecutor,
+  previewGoalBaseUpdate,
   previewGoalBranchExport,
   runTask,
   type TaskExecutor,
@@ -686,6 +687,68 @@ function goalBaseFixture(
     head: () => bareGit(["rev-parse", ref]),
   };
 }
+
+test(
+  "Workplace Goal base update binds both commits and requires an eligible Goal",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-ui-base-");
+    const { store } = state;
+    const f = goalBaseFixture(state);
+    const target = { target: f.repoRoot };
+    const read = () => readOperatorGoal(store, f.directory, f.goalId, target);
+    const { ref } = store.getGoal(f.goalId)!;
+    const confirm = `update-goal-base ${ref} ${f.next.slice(0, 12)}`;
+    const params = { id: ref, confirm, from: f.base, to: f.next };
+    const submit = (input: object) =>
+      operatorAction(store, f.directory, "goal.updateBase", input, target);
+    assert.deepEqual((await read())?.baseUpdatePreview, {
+      from: f.base,
+      to: f.next,
+    });
+    assert.deepEqual(await submit({ ...params, to: "bad" }), {
+      error: { code: "invalid-params" },
+    });
+    assert.deepEqual(await submit({ ...params, confirm: "yes" }), {
+      error: { code: "confirmation-mismatch" },
+    });
+    assert.deepEqual(await submit({ ...params, to: f.base }), {
+      error: { code: "stale-base" },
+    });
+    const taskId = task(store, f.goalId);
+    assert.ok(store.claimTask(taskId));
+    assert.equal((await read())?.baseUpdatePreview, undefined);
+    assert.deepEqual(await submit(params), {
+      error: { code: "goal-base-ineligible" },
+    });
+    assert.equal(f.head(), f.base);
+    store.failTask(taskId, "review-concern");
+    const preview = await previewGoalBaseUpdate(
+      store,
+      f.repoRoot,
+      f.directory,
+      f.goalId,
+      "operator-ui",
+    );
+    f.git(["update-ref", "refs/heads/main", f.base, f.next]);
+    await assert.rejects(preview.apply(), { code: "stale-base" });
+    assert.deepEqual(await submit(params), { error: { code: "stale-base" } });
+    assert.equal(f.head(), f.base);
+    assert.deepEqual(f.events(), []);
+    f.git(["update-ref", "refs/heads/main", f.next, f.base]);
+    assert.deepEqual(await submit(params), {
+      result: { id: f.goalId, ref, from: f.base, to: f.next },
+    });
+    assert.equal(f.head(), f.next);
+    assert.equal((await read())?.baseUpdatePreview, undefined);
+    assert.deepEqual(await submit(params), { error: { code: "stale-base" } });
+    assert.deepEqual(f.events()[0]?.data, {
+      from: f.base,
+      to: f.next,
+      origin: "operator-ui",
+    });
+  },
+);
 
 test(
   "update-goal-base confirms current local main, imports it and records the new base",
@@ -1813,6 +1876,16 @@ test("out-of-scope symlink targets fail before review and in-scope links require
           decision,
           digest: proposal.digest,
           answerer: { kind: "agent", executionId: approval.id, model },
+        }),
+      { code: "approval-forbidden" },
+    );
+    assert.throws(
+      () =>
+        store.decide(proposal.id, {
+          decision,
+          digest: proposal.digest,
+          answerer: { kind: "human", channel: "operator-ui" },
+          takeover: true,
         }),
       { code: "approval-forbidden" },
     );

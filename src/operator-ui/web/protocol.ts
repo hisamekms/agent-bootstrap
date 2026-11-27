@@ -15,6 +15,7 @@ import type {
 import type { Gate, Policy } from "../../local-orchestrator/model.ts";
 import type { readOperatorGoal } from "../../local-orchestrator/operator-api.ts";
 import type { OrchestratorStore } from "../../local-orchestrator/store.ts";
+import type { WorkplaceEnvironment } from "../../local-orchestrator/workplace-environment.ts";
 import type {
   goalStatuses,
   operatorGoalList,
@@ -263,6 +264,30 @@ export interface Methods {
       from: string | null;
       to: string;
     };
+  };
+  "goal.updateBase": {
+    params: { id: string; confirm: string; from: string; to: string };
+    result: { id: string; ref: string; from: string; to: string };
+  };
+  "workplace.stopPreview": {
+    params: Record<string, never>;
+    result: { runningTasks: number; revision: string };
+  };
+  "workplace.stop": {
+    params: { confirm: string; revision: string };
+    result: { stopping: true };
+  };
+  "environment.status": {
+    params: Record<string, never>;
+    result: Awaited<ReturnType<WorkplaceEnvironment["status"]>>;
+  };
+  "environment.buildPreview": {
+    params: Record<string, never>;
+    result: Awaited<ReturnType<WorkplaceEnvironment["preview"]>>;
+  };
+  "environment.build": {
+    params: { confirmation: string };
+    result: Awaited<ReturnType<WorkplaceEnvironment["start"]>>;
   };
   "concierge.draft": {
     params: { text: string };

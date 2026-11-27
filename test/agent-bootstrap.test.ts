@@ -240,6 +240,15 @@ describe("agent-bootstrap", () => {
       "--allow-network",
       "--json",
     ];
+    const unlock = store.tryLockBuild();
+    assert.ok(unlock);
+    try {
+      const busy = await invoke(build.slice(0, -1), root, host);
+      assert.equal(busy.code, 1);
+      assert.match(busy.stderr, /Another environment build is running/);
+    } finally {
+      unlock();
+    }
     const one = await invoke(build, root, host);
     assert.equal(one.code, 0);
     assert.equal(JSON.parse(one.stdout).cacheHit, true);

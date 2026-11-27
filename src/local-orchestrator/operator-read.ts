@@ -1,4 +1,5 @@
 import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
+import { executionDisplay } from "./execution-display.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import {
   builtInCredentialScanner,
@@ -111,7 +112,8 @@ export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
     if (proposal?.status !== "pending") return item;
     const approve = permitsPanelAnswer(proposal.origin, proposal, "approve");
     const reject = permitsPanelAnswer(proposal.origin, proposal, "reject");
-    if (!approve && !reject) return item;
+    const takeover = proposal.policy === "agent" && (!approve || !reject);
+    if (!approve && !reject && !takeover) return item;
     const title =
       proposal.kind === "integration"
         ? store.getTask(proposal.content.taskId)?.content.title
@@ -128,6 +130,7 @@ export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
         agentGates: GATES.filter((gate) => policies?.[gate] === "agent"),
         approve,
         reject,
+        ...(takeover && { takeover: true as const }),
       },
     };
   });
@@ -497,7 +500,12 @@ export function operatorTask(store: OrchestratorStore, key: string) {
     }),
     tokensUsed: usage.tokens,
     tokensIncomplete: usage.usage === "unavailable",
-    executions: store.recentTaskExecutions(id),
+    executions: store
+      .recentTaskExecutions(id)
+      .map(({ result, ...execution }) => ({
+        ...execution,
+        ...executionDisplay(result),
+      })),
     ...(task.status === "failed" && {
       failure: {
         code: timing?.failureCode ?? "unknown",

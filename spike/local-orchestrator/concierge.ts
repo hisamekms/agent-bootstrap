@@ -38,6 +38,7 @@ import {
   runWorkplace,
   workplaceStop,
 } from "../../src/local-orchestrator/workplace.ts";
+import { createWorkplaceEnvironment } from "../../src/local-orchestrator/workplace-environment.ts";
 import { loadWorkplaceAssets } from "../../src/operator-ui/assets.ts";
 import {
   loadClaudeConfig,
@@ -201,7 +202,6 @@ async function main(args: readonly string[]) {
       },
       lifeline,
     );
-    const controller = { signal: stopControl.signal };
     let stage = "resolve target";
     try {
       await launchConcierge(
@@ -210,12 +210,13 @@ async function main(args: readonly string[]) {
           stage = next;
         },
         {
-          signal: controller.signal,
+          signal: stopControl.signal,
+          stop: stopControl.stop,
           devBridge: flags.devBridge,
         },
       );
     } catch (error) {
-      if (!controller.signal.aborted || error !== controller.signal.reason)
+      if (!stopControl.signal.aborted || error !== stopControl.signal.reason)
         throw new Error(conciergeFailure(stage, error));
     } finally {
       stopControl.dispose();
@@ -264,7 +265,7 @@ async function main(args: readonly string[]) {
 async function launchConcierge(
   flags: ReturnType<typeof parseConciergeArgs>,
   setStage: (stage: string) => void,
-  workplace?: { signal: AbortSignal; devBridge: boolean },
+  workplace?: { signal: AbortSignal; stop(): void; devBridge: boolean },
 ) {
   const { LO_CLAUDE_BINARY } = process.env;
   const target = await resolveTarget(flags.target ?? bootstrapCheckout);
@@ -431,7 +432,7 @@ async function launchConcierge(
     if (!volumeShell)
       store = OrchestratorStore.open(join(directory, "state.db"));
     console.log(`Audit database ${displayedAuditPath}`);
-    if (!volumeShell)
+    if (!volumeShell && !workplace)
       console.log(
         target.isDefault
           ? `Inspect proposals and approvals from another host terminal with ${operatorCli}`
@@ -505,7 +506,10 @@ async function launchConcierge(
       ...(scan ? { scan } : {}),
     };
     const launchSession = (
-      sessionOptions: Pick<ConciergeOptions, "terminal" | "signal"> = {},
+      sessionOptions: Pick<
+        ConciergeOptions,
+        "terminal" | "signal" | "stopOperatorWrites"
+      > = {},
     ) => {
       setStage("launch or clean up session");
       return startConcierge(
@@ -565,8 +569,23 @@ async function launchConcierge(
     if (workplace) {
       workplace.signal.throwIfAborted();
       result = await runWorkplace(
-        apiOptions,
-        (terminal) => launchSession({ terminal, signal: workplace.signal }),
+        {
+          ...apiOptions,
+          workplace,
+          environment: createWorkplaceEnvironment({
+            target,
+            profile: profileLock.profiles.bun,
+            host: systemHost,
+            signal: workplace.signal,
+            journal: store,
+          }),
+        },
+        (terminal, stopOperatorWrites) =>
+          launchSession({
+            terminal,
+            signal: workplace.signal,
+            stopOperatorWrites,
+          }),
         workplace.devBridge
           ? {
               loadAssets: loadWorkplaceAssets,

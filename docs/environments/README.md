@@ -37,6 +37,18 @@ cached build and shows zero bytes. Doctor reports a missing environment as
 an optional check. Without a target flag, doctor also lists environments for
 other registered projects.
 
+Workplace shows the same status with a shortened key. For a stale or missing
+environment, select 「環境を作る」 and review the destinations the Provisioner
+VM can reach. Workplace and the CLI share the first-build responsibility
+notice for each target. If local `main` or the permitted destinations change
+before the build starts, review the updated confirmation. 「いま」 shows
+「環境を準備中」 during the build and then shows the result, including any
+failure code or gateway stop reason. Workplace, CLI builds, and automatic
+Task builds share one build slot per target. A Task waits up to five minutes
+for the slot, then fails with `env-build-failed` if it is still occupied.
+The local runner works on one job at a time, so other Tasks, approvals and
+Planner runs wait behind a Task that is waiting for or running a build.
+
 Cached archives contain the declared `node_modules` paths. Output links can
 resolve within those paths or directly to a declared workspace package
 directory. Archives are limited to 256 MiB.

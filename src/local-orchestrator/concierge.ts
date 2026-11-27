@@ -150,6 +150,7 @@ export interface ConciergeOptions {
   readonly continue?: boolean;
   readonly lifetimeMs?: number;
   readonly onSession?: (sessionId: string) => void;
+  readonly stopOperatorWrites?: () => Promise<void>;
   readonly terminal?: ConciergeTerminalHub;
   readonly signal?: AbortSignal;
 }
@@ -475,6 +476,17 @@ export async function startConcierge(
       ? {
           ...deps.taskEnvironment,
           autoBuild: config.environment.autoBuild === true,
+          host: {
+            ...deps.taskEnvironment.host,
+            ...(options.signal && {
+              signal: deps.taskEnvironment.host.signal
+                ? AbortSignal.any([
+                    options.signal,
+                    deps.taskEnvironment.host.signal,
+                  ])
+                : options.signal,
+            }),
+          },
         }
       : undefined;
   if (config.environment?.enabled && !environment)
@@ -556,6 +568,7 @@ export async function startConcierge(
   let drainFailed = false;
   let scheduler: ReturnType<typeof setInterval> | undefined;
   let stopping = false;
+  const isStopping = () => stopping || options.signal?.aborted === true;
   let failed = false;
   let outcome: Awaited<ReturnType<ConciergeHost["runConcierge"]>>["outcome"];
   let exitCode: number | null = null;
@@ -669,9 +682,9 @@ export async function startConcierge(
       store,
       ...(tasks ? { tasks } : {}),
       autoApproveRegistrations: true,
-      canScheduleTasks: () => !stopping,
+      canScheduleTasks: () => !isStopping(),
       runPlanner: (...args) => {
-        if (stopping) throw new Error("Concierge session ended");
+        if (isStopping()) throw new Error("Concierge session ended");
         return runPlanner(...args);
       },
       runReviewer,
@@ -699,7 +712,7 @@ export async function startConcierge(
     });
     let drainRequested = false;
     const scheduleDrain = () => {
-      if (stopping || drainFailed) return;
+      if (isStopping() || drainFailed) return;
       drainRequested = true;
       if (drain) return;
       drainRequested = false;
@@ -707,7 +720,7 @@ export async function startConcierge(
       void drain.then(
         () => {
           drain = undefined;
-          if (drainRequested && !stopping) scheduleDrain();
+          if (drainRequested && !isStopping()) scheduleDrain();
         },
         () => {
           drainFailed = true;
@@ -728,13 +741,13 @@ export async function startConcierge(
       ...(tasks ? { onTaskRegistered: scheduleDrain } : {}),
       requester: {
         async requestPlanner(input) {
-          if (stopping) throw new Error("Concierge session ended");
+          if (isStopping()) throw new Error("Concierge session ended");
           if (drainFailed) throw new Error("concierge-runner-failed");
           for (const id of queued)
             if (store.getExecution(id)?.status !== "queued") queued.delete(id);
           const id = await runner.requestPlanner(input);
           queued.add(id);
-          if (stopping || drainFailed) cancelQueued(id);
+          if (isStopping() || drainFailed) cancelQueued(id);
           else scheduleDrain();
           return id;
         },
@@ -810,6 +823,9 @@ export async function startConcierge(
         cleanupErrors.push(code);
       }
     };
+    await cleanup("concierge-operator-drain-failed", () =>
+      options.stopOperatorWrites?.(),
+    );
     await cleanup("concierge-end-session-failed", () =>
       store.endSession(sessionId, {
         mode,

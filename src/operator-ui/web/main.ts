@@ -1,3 +1,4 @@
+import { workplaceEndedCode } from "../session-end.ts";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { WorkplaceChannel } from "./channel.ts";
@@ -266,12 +267,17 @@ if (channel) {
           }
         });
     });
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", ({ code }) => {
       if (socket !== workplaceChannel.socket) return;
-      reconnect.disabled = false;
-      setTerminalState("unavailable");
+      const ended = code === workplaceEndedCode;
+      reconnect.disabled = ended;
+      setTerminalState(ended ? "ended" : "unavailable");
       panel.disconnect();
-      connectionState("disconnected", "切断されました");
+      if (ended) panel.sessionEnded();
+      connectionState(
+        "disconnected",
+        ended ? "Workplace は終了しました。" : "切断されました",
+      );
     });
   }
 } else {

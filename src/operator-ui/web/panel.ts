@@ -35,6 +35,7 @@ import {
   type AnswerableProposal,
   type GoalDetail,
   type GoalSummary,
+  type Methods,
   type PanelInboxItem,
   type Problem,
   type Proposal,
@@ -444,6 +445,7 @@ export function createInboxPanel(
     decision: PanelAnswer["decision"],
     status: HTMLElement,
     done: () => void,
+    takeover?: true,
   ) {
     if (answering) return;
     answering = true;
@@ -455,6 +457,7 @@ export function createInboxPanel(
       id,
       digest,
       decision,
+      ...(takeover && { takeover }),
     }));
     function report(code: string) {
       const message = textElement("p", answerError(code), "status-error");
@@ -527,7 +530,7 @@ export function createInboxPanel(
   function confirm(
     container: HTMLElement,
     pinned: PanelInboxItem[],
-    decision: PanelAnswer["decision"],
+    decision: PanelAnswer["decision"] | "takeover",
     trigger: HTMLElement,
     actions: HTMLElement,
     status = results,
@@ -540,42 +543,60 @@ export function createInboxPanel(
     const first = answers[0];
     const integration = first?.kind === "integration";
     const reject = decision === "reject";
+    const takeover = decision === "takeover";
+    const rejectOnly = reject || (takeover && first?.approve);
     const title = first?.title ?? pinned[0]?.modelText ?? "提案";
-    const message = reject
-      ? `「${title}」を却下します。`
-      : pinned.length > 1
-        ? `${pinned.length} 件を承認します。`
-        : `「${title}」を${integration ? "統合" : "承認"}します。`;
+    const message = takeover
+      ? `「${title}」に AI の代わりに回答します。`
+      : reject
+        ? `「${title}」を却下します。`
+        : pinned.length > 1
+          ? `${pinned.length} 件を承認します。`
+          : `「${title}」を${integration ? "統合" : "承認"}します。`;
     const msg = textElement("bdi", message, "q");
     const cancel = action("戻す", "cancel-answer", () => {
       close();
       trigger.focus();
     });
-    const submit = action(
-      reject
-        ? "却下を確定"
-        : integration && pinned.length === 1
-          ? "承認して統合を確定"
-          : "承認を確定",
-      "submit-answer",
-      () => {
-        if (submit.disabled || cancelConfirmation !== close || answering)
-          return;
-        submit.disabled = cancel.disabled = true;
-        void send(pinned, decision, status, () => {
-          if (cancelConfirmation === close) {
-            close();
-            trigger.focus({ preventScroll: true });
-          }
-        });
-      },
-      reject ? "btn danger" : "btn primary",
-    );
+    const approval =
+      integration && pinned.length === 1 ? "承認して統合を確定" : "承認を確定";
+    const submit = submitButton(rejectOnly ? "reject" : "approve");
+    const decline =
+      takeover && !rejectOnly && !first?.reject
+        ? submitButton("reject")
+        : undefined;
+    function submitButton(answer: PanelAnswer["decision"]) {
+      const button = action(
+        answer === "reject" ? "却下を確定" : approval,
+        takeover ? `submit-takeover:${answer}` : "submit-answer",
+        () => {
+          if (button.disabled || cancelConfirmation !== close || answering)
+            return;
+          submit.disabled = cancel.disabled = true;
+          if (decline) decline.disabled = true;
+          void send(
+            pinned,
+            answer,
+            status,
+            () => {
+              if (cancelConfirmation === close) {
+                close();
+                trigger.focus({ preventScroll: true });
+              }
+            },
+            takeover ? true : undefined,
+          );
+        },
+        answer === "reject" ? "btn danger" : "btn primary",
+      );
+      return button;
+    }
     const strip = group(
       "div",
-      reject ? "confirm reject" : "confirm",
+      rejectOnly ? "confirm reject" : "confirm",
       msg,
       cancel,
+      ...(decline ? [decline] : []),
       submit,
     );
     strip.setAttribute("role", "group");
@@ -592,7 +613,7 @@ export function createInboxPanel(
       if (cancelConfirmation === close) cancelConfirmation = undefined;
     }
 
-    if (!reject) {
+    if (!rejectOnly) {
       submit.disabled = true;
       void Promise.all(
         pinned.map(async (item) => {
@@ -654,7 +675,11 @@ export function createInboxPanel(
     }
     const reason = textElement(
       "span",
-      needsReview ? answerError("stale-digest") : "確認が必要です。",
+      needsReview
+        ? answerError("stale-digest")
+        : answer?.takeover && !answer.approve && !answer.reject
+          ? "AI の判断待ちです。"
+          : "確認が必要です。",
     );
     const kind = proposalLabels[item.kind] ?? item.title;
     const top = group(
@@ -687,7 +712,7 @@ export function createInboxPanel(
       command.text,
       group("div", "actions", command.copy, command.status),
     );
-    fallback.hidden = Boolean(answer?.approve);
+    fallback.hidden = Boolean(answer?.approve || answer?.takeover);
     detail.append(fallback);
     const toggle = action(
       "",
@@ -717,9 +742,11 @@ export function createInboxPanel(
     let viewed: Proposal | undefined;
     let approve: HTMLButtonElement | undefined;
     let reject: HTMLButtonElement | undefined;
+    let takeover: HTMLButtonElement | undefined;
     let sending = false;
     function updateButtons() {
       if (reject) reject.disabled = answering;
+      if (takeover) takeover.disabled = answering;
       if (approve)
         approve.disabled =
           answering ||
@@ -790,6 +817,18 @@ export function createInboxPanel(
         "btn primary",
       );
       approve = button;
+      actions.append(button);
+    }
+    if (answer?.takeover) {
+      const button = action("自分で答える", `takeover:${item.id}`, () => {
+        if (answering) return;
+        detail.hidden = false;
+        expanded.add(item.id);
+        updateDisclosure();
+        void load();
+        confirm(answerArea, [item], "takeover", button, actions, status);
+      });
+      takeover = button;
       actions.append(button);
     }
     if (options.batch) controls.push(updateButtons);
@@ -1182,7 +1221,7 @@ function goalDetail(
   activity: PanelInboxItem[],
   selectTask: (id: string) => void,
   watch: Watch,
-  exportControls: Node,
+  goalControls: Node[],
 ) {
   const scope = goal.scope;
   const details = group(
@@ -1241,7 +1280,7 @@ function goalDetail(
     ...now,
     ...decisions,
     ...problem,
-    exportControls,
+    ...goalControls,
     sectionTitle("Task"),
     goal.tasks.length
       ? group(
@@ -1650,11 +1689,19 @@ function taskDetail(
               harness,
               model,
               environment,
+              code,
+              next,
             }) =>
-              textElement(
-                "p",
-                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.failure ? failureReason(environment.failure) : environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
-                "meta",
+              group(
+                "div",
+                "stack",
+                textElement(
+                  "p",
+                  `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.failure ? failureReason(environment.failure) : environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
+                  "meta",
+                ),
+                ...(code ? [textElement("code", code)] : []),
+                ...(next ? [textElement("p", next, "meta")] : []),
               ),
           )
         : [textElement("p", "実行はありません。", "meta")]),
@@ -1669,6 +1716,232 @@ function taskDetail(
 }
 
 type OperatorRequest = Pick<WorkplaceChannel, "request">;
+
+function confirmedAction(
+  label: string,
+  key: string,
+  getPreview: () => Promise<{
+    lines: string[];
+    phrase?: string;
+    apply: (confirm: string) => Promise<unknown>;
+  }>,
+  refresh: () => void,
+) {
+  const panel = group("div", "stack");
+  const status = textElement("p", "", "meta");
+  status.setAttribute("role", "status");
+  status.hidden = true;
+  const start = action(label, key, () => {
+    start.disabled = true;
+    panel.dataset.operatorConfirming = "true";
+    status.hidden = true;
+    void getPreview()
+      .then(({ lines, phrase, apply }) => {
+        const input = phrase ? document.createElement("input") : undefined;
+        if (input) {
+          input.type = "text";
+          input.setAttribute("aria-label", "確認の文言");
+          input.autocomplete = "off";
+        }
+        const cancel = action("キャンセル", `${key}:cancel`, () => {
+          reset();
+          start.focus();
+          refresh();
+        });
+        const submit = action(
+          label,
+          `${key}:confirm`,
+          () => {
+            if (submit.disabled) return;
+            submit.disabled = cancel.disabled = true;
+            void apply(input?.value ?? label)
+              .then(() => {
+                reset();
+                refresh();
+              })
+              .catch(failed);
+          },
+          "btn primary",
+        );
+        if (input) {
+          submit.disabled = true;
+          input.addEventListener("input", () => {
+            submit.disabled = input.value !== phrase;
+          });
+        }
+        confirmation.append(
+          ...lines.map((line) => textElement("p", line)),
+          ...(phrase && input ? [textElement("code", phrase), input] : []),
+          group("div", "actions", cancel, submit),
+        );
+        (input ?? cancel).focus();
+      })
+      .catch(failed);
+  });
+  const confirmation = group("div", "stack");
+  panel.append(start, status, confirmation);
+  return panel;
+
+  function reset() {
+    confirmation.replaceChildren();
+    start.disabled = false;
+    delete panel.dataset.operatorConfirming;
+  }
+
+  function failed(error: unknown) {
+    const code = error instanceof Error ? error.message : "";
+    reset();
+    status.hidden = false;
+    if (
+      key === "workplace:stop" &&
+      ["write-failed", "read-failed", "closed"].includes(code)
+    ) {
+      status.textContent =
+        "終了を記録できませんでした。Workplace のターミナルで Ctrl-C を押してください。";
+      return;
+    }
+    status.textContent =
+      code === "environment-build-running"
+        ? "別の環境の準備が進行中です"
+        : code === "workplace-stopping"
+          ? "Workplace を終了しています。"
+          : [
+                "stale-base",
+                "stale-confirmation",
+                "confirmation-mismatch",
+                "goal-base-stale",
+                "goal-base-ineligible",
+                "environment-current",
+              ].includes(code)
+            ? "状況が変わりました。最新の内容を確認してください。"
+            : "操作を完了できませんでした。";
+    refresh();
+  }
+}
+
+export function goalBaseUpdate(
+  channel: OperatorRequest,
+  goal: GoalDetail,
+  refresh: () => void,
+) {
+  if (!goal.baseUpdatePreview) return [];
+  return [
+    group(
+      "section",
+      "card",
+      confirmedAction(
+        "ベースを更新する",
+        `base:${goal.id}`,
+        async () => {
+          const updated = await channel.request("goal.get", { id: goal.id });
+          const preview = updated.baseUpdatePreview;
+          if (!preview) throw new Error("stale-base");
+          const { from, to } = preview;
+          return {
+            lines: [`ベースコミット ${from.slice(0, 12)} → ${to.slice(0, 12)}`],
+            phrase: `update-goal-base ${goal.ref} ${to.slice(0, 12)}`,
+            apply: (confirm) =>
+              channel.request("goal.updateBase", {
+                id: goal.id,
+                confirm,
+                from,
+                to,
+              }),
+          };
+        },
+        refresh,
+      ),
+    ),
+  ];
+}
+
+export function environmentControls(
+  channel: OperatorRequest,
+  { status, build }: Methods["environment.status"]["result"],
+  refresh: () => void,
+) {
+  if (!status && !build) return [];
+  const label = { current: "最新", stale: "古い", missing: "未作成" };
+  const buildResult =
+    build?.state === "running"
+      ? "環境を準備中"
+      : build?.state === "succeeded"
+        ? `${build.key.slice(0, 12)} · ${build.size} バイト · ${build.cacheHit ? "キャッシュ" : "ビルド"}${build.warning ? ` · ${build.warning}` : ""}`
+        : build?.state === "failed"
+          ? `${build.key.slice(0, 12)} · ${build.failure}${build.gatewayStopped ? ` · ゲートウェイ停止 ${build.gatewayStopped}` : ""}`
+          : "";
+  return [
+    sectionTitle("環境"),
+    ...(status
+      ? [
+          textElement(
+            "p",
+            `${label[status.state]} · ${status.key.slice(0, 12)} · ロック ${status.hasLock ? "あり" : "なし"} · ${status.size} バイト`,
+            "meta",
+          ),
+        ]
+      : []),
+    ...(buildResult ? [textElement("p", buildResult, "meta")] : []),
+    ...(status && status.state !== "current" && build?.state !== "running"
+      ? [
+          confirmedAction(
+            "環境を作る",
+            "environment:build",
+            async () => {
+              const preview = await channel.request(
+                "environment.buildPreview",
+                {},
+              );
+              return {
+                lines: [
+                  preview.destinations.length
+                    ? `Provisioner VM がネットワークに接続します。接続先は ${preview.destinations.join("、")} です。`
+                    : "Provisioner VM に許可されたネットワーク接続先はありません。",
+                  ...(preview.responsibilityNotice
+                    ? [preview.responsibilityNotice]
+                    : []),
+                ],
+                apply: () =>
+                  channel.request("environment.build", {
+                    confirmation: preview.confirmation,
+                  }),
+              };
+            },
+            refresh,
+          ),
+        ]
+      : []),
+  ];
+}
+
+export function workplaceStopControls(
+  channel: OperatorRequest,
+  refresh: () => void,
+) {
+  return confirmedAction(
+    "Workplace を終える",
+    "workplace:stop",
+    async () => {
+      const { runningTasks, revision } = await channel.request(
+        "workplace.stopPreview",
+        {},
+      );
+      return {
+        lines: [
+          "Workplace のセッションを終了します。",
+          ...(runningTasks
+            ? [
+                `実行中の Task が ${runningTasks} 件あります。終了処理に時間がかかる場合があります。`,
+              ]
+            : []),
+        ],
+        apply: (confirm) =>
+          channel.request("workplace.stop", { confirm, revision }),
+      };
+    },
+    refresh,
+  );
+}
 
 function draftButton(
   channel: OperatorRequest,
@@ -2080,6 +2353,7 @@ export function createHostPanel(
   let problems: Problem[][] = [];
   let lastGoal: GoalDetail | undefined;
   const exportMessages = new Map<string, string>();
+  let environment: Methods["environment.status"]["result"] | undefined;
   const nowButton = element("now-toggle");
   const nowPopover = element("now-popover");
   const now = disclosure(nowButton, nowPopover, () =>
@@ -2249,11 +2523,16 @@ export function createHostPanel(
   }
 
   function renderNow(pending: PanelInboxItem[]) {
-    nowButton.textContent = activityLabel({
-      ...activity,
-      yourTurn: pending.length + problems.length,
-    });
-    nowButton.dataset.running = String(activity.running.length > 0);
+    const preparing = environment?.build?.state === "running";
+    nowButton.textContent = preparing
+      ? "環境を準備中"
+      : activityLabel({
+          ...activity,
+          yourTurn: pending.length + problems.length,
+        });
+    nowButton.dataset.running = String(
+      preparing || activity.running.length > 0,
+    );
     if (nowPopover.hidden) return;
     const snapshot = JSON.stringify([
       activity,
@@ -2262,8 +2541,13 @@ export function createHostPanel(
       inbox?.revision,
       pending.map(({ subject }) => goalTitle(subject.goalId)),
       problems,
+      environment,
     ]);
-    if (snapshot === previousNow) return;
+    if (
+      snapshot === previousNow ||
+      nowPopover.querySelector("[data-operator-confirming]")
+    )
+      return;
     previousNow = snapshot;
     const refs = [
       ...new Set(
@@ -2326,6 +2610,16 @@ export function createHostPanel(
               ),
             );
           }),
+          ...(channel && environment
+            ? environmentControls(
+                channel,
+                environment,
+                () => void refresh(false),
+              )
+            : []),
+          ...(channel
+            ? [workplaceStopControls(channel, () => void refresh(false))]
+            : []),
         );
       },
       nowPopover,
@@ -2599,7 +2893,7 @@ export function createHostPanel(
     );
     if (
       snapshot === previousView ||
-      panel.querySelector("[data-policy-editing]")
+      panel.querySelector("[data-policy-editing], [data-operator-confirming]")
     )
       return;
     previousView = snapshot;
@@ -2658,6 +2952,7 @@ export function createHostPanel(
           policy,
           history,
           activityResult,
+          environmentResult,
         ] = await Promise.allSettled([
           refreshBadges || loadWork
             ? channel.request("inbox.list", {})
@@ -2679,6 +2974,7 @@ export function createHostPanel(
             : undefined,
           decisionTab ? channel.request("decision.history", {}) : undefined,
           channel.request("activity.get", {}),
+          channel.request("environment.status", {}),
         ] as const);
         if (disconnected || socket !== channel.socket) continue;
         if (itemResult.status === "fulfilled" && itemResult.value) {
@@ -2692,6 +2988,8 @@ export function createHostPanel(
           goals = goalResult.value;
         if (activityResult.status === "fulfilled")
           activity = activityResult.value;
+        if (environmentResult.status === "fulfilled")
+          environment = environmentResult.value;
         const pending = pendingDecisions(items);
         for (const [id, { ref }] of tracks) {
           const goal = goals.find((entry) => entry.ref === ref);
@@ -2891,11 +3189,14 @@ export function createHostPanel(
                 (taskId) =>
                   navigate({ tab: "goals", goalId: detail.id, taskId }),
                 watch,
-                goalExport(channel, detail, exportMessage, (message) => {
-                  exportMessages.set(detail.id, message);
-                  previousView = "";
-                  void refresh(false);
-                }),
+                [
+                  goalExport(channel, detail, exportMessage, (message) => {
+                    exportMessages.set(detail.id, message);
+                    previousView = "";
+                    void refresh(false);
+                  }),
+                  ...goalBaseUpdate(channel, detail, () => void refresh(false)),
+                ],
               ),
             undefined,
             detail,
@@ -3058,6 +3359,12 @@ export function createHostPanel(
     },
     disconnect() {
       disconnected = true;
+    },
+    sessionEnded() {
+      now.close(false);
+      nowButton.setAttribute("disabled", "");
+      nowButton.textContent = "Workplace は終了しました";
+      notice.textContent = "Workplace は終了しました。";
     },
   };
 }

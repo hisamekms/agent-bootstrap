@@ -4,6 +4,7 @@ import {
 } from "../environments/adapter.ts";
 import type { Harness } from "../actors.ts";
 import { codexFailureActions } from "../codex-exec.ts";
+import { environmentDestination } from "../config/layers.ts";
 import {
   GOAL_POLICIES,
   TASK_POLICIES,
@@ -22,7 +23,7 @@ import {
 } from "./delegation.ts";
 import type { InboxRow } from "./inbox.ts";
 import { readPathViolations, type PathViolation } from "./path-violations.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, lstatSync, openSync } from "node:fs";
 import { createRequire } from "node:module";
 import {
@@ -127,6 +128,7 @@ export type StoreErrorCode =
   | "context-mismatch"
   | "session-busy"
   | "reconcile-changed"
+  | "stale-confirmation"
   | "integration-uncertain";
 
 function readTaskEnvironment(
@@ -178,7 +180,10 @@ type ApprovalPolicy = EffectivePolicy;
 type SettingsOrigin = "cli" | "operator-ui";
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 7;
+const schemaVersion = 8;
+const environmentBuildAuthorization = "environment.build-authorized";
+const eventDataLimit = 4096;
+const environmentAuthorizationLimit = 64 * 1024;
 const refsMigration = `
   ALTER TABLE goals ADD COLUMN ref TEXT NOT NULL DEFAULT '';
   ALTER TABLE tasks ADD COLUMN ref TEXT NOT NULL DEFAULT '';
@@ -246,7 +251,24 @@ const delegationSchema = `
     proposal_id TEXT PRIMARY KEY REFERENCES proposals(id),
     changed_files INTEGER NOT NULL, changed_lines INTEGER
   ) STRICT;
+`;
+const eventDefinition = `
+  id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
+  subject_id TEXT NOT NULL, session_id TEXT, execution_id TEXT,
+  data TEXT NOT NULL CHECK (
+    length(CAST(data AS BLOB)) <= CASE WHEN kind = '${environmentBuildAuthorization}'
+      THEN ${environmentAuthorizationLimit} ELSE ${eventDataLimit} END
+    AND json_valid(data)
+  )
+`;
+const eventGuards = `
+  CREATE INDEX events_subject ON events(subject_id);
   CREATE INDEX events_decisions_at ON events(at) WHERE kind = 'proposal.decided';
+  CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER events_no_replace BEFORE INSERT ON events
+    WHEN EXISTS (SELECT 1 FROM events WHERE id = NEW.id OR rowid = NEW.rowid)
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 `;
 const schema = `
   ${inboxSeenSchema}
@@ -277,17 +299,8 @@ const schema = `
     status TEXT NOT NULL CHECK (status IN ('active', 'ended')), started_at TEXT NOT NULL, ended_at TEXT,
     snapshot_commit TEXT
   ) STRICT;
-  CREATE TABLE events (
-    id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
-    subject_id TEXT NOT NULL, session_id TEXT, execution_id TEXT,
-    data TEXT NOT NULL CHECK (length(CAST(data AS BLOB)) <= 4096 AND json_valid(data))
-  ) STRICT;
-  CREATE INDEX events_subject ON events(subject_id);
-  CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-  CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-  CREATE TRIGGER events_no_replace BEFORE INSERT ON events
-    WHEN EXISTS (SELECT 1 FROM events WHERE id = NEW.id OR rowid = NEW.rowid)
-    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TABLE events (${eventDefinition}) STRICT;
+  ${eventGuards}
   ${delegationSchema}
 `;
 
@@ -461,7 +474,7 @@ const taskBudgetResolved = `t.status IN ('succeeded', 'cancelled') OR EXISTS (
         AND queued.kind = 'execution.queued' LIMIT 1
     )
 )`;
-const executionOverBudget = `(
+const executionOverBudget = `json_extract(x.result_json, '$.code') IS NOT 'approval-superseded' AND (
   (json_type(x.result_json, '$.tokens') = 'integer'
     AND json_extract(x.result_json, '$.tokens') <= 9007199254740991
     AND json_extract(x.result_json, '$.tokens') > coalesce(
@@ -559,12 +572,11 @@ export function permitsPanelAnswer(
   origin: Origin,
   requirements: Parameters<typeof permitsAgentAnswer>[1],
   decision: Decision,
+  takeover = false,
 ): boolean {
-  // The panel handles decisions reserved to a human, including gate invariants.
-  return (
-    requirements.policy !== null &&
-    !permitsAgentAnswer(origin, requirements, decision)
-  );
+  // A human can explicitly take over a delegated decision, just as in the CLI.
+  if (requirements.policy === null) return false;
+  return permitsAgentAnswer(origin, requirements, decision) === takeover;
 }
 
 function goalRecord({ contentJson, ...row }: GoalRow) {
@@ -704,6 +716,7 @@ export class OrchestratorStore {
               version !== 4 &&
               version !== 5 &&
               version !== 6 &&
+              version !== 7 &&
               version !== schemaVersion
             ) {
               throw new Error();
@@ -715,7 +728,7 @@ export class OrchestratorStore {
                 ALTER TABLE goals ADD COLUMN base_commit TEXT;
               `);
             }
-            if (version !== 6 && version !== schemaVersion) {
+            if (version < 6) {
               if (version !== 5) connection.exec(inboxSeenSchema);
               // Legacy defaults keep their precedence until explicitly set again.
               connection.exec(`
@@ -730,10 +743,19 @@ export class OrchestratorStore {
               if (connection.query("PRAGMA foreign_key_check").get())
                 throw new Error();
             }
-            if (version !== schemaVersion)
-              connection.exec(
-                `${refsMigration} PRAGMA user_version=${schemaVersion};`,
-              );
+            if (version < 7) connection.exec(refsMigration);
+            if (version < schemaVersion) {
+              // Activity revisions and event ordering use the original rowids.
+              connection.exec(`
+                CREATE TABLE next_events (${eventDefinition}) STRICT;
+                INSERT INTO next_events (rowid, id, at, kind, subject_kind, subject_id, session_id, execution_id, data)
+                  SELECT rowid, id, at, kind, subject_kind, subject_id, session_id, execution_id, data FROM events;
+                DROP TABLE events;
+                ALTER TABLE next_events RENAME TO events;
+                ${eventGuards}
+                PRAGMA user_version=${schemaVersion};
+              `);
+            }
           }
         })
         .immediate();
@@ -812,7 +834,12 @@ export class OrchestratorStore {
       subjectId,
       correlation.sessionId ?? null,
       correlation.executionId ?? null,
-      canonicalJson(data, 4096),
+      canonicalJson(
+        data,
+        kind === environmentBuildAuthorization
+          ? environmentAuthorizationLimit
+          : eventDataLimit,
+      ),
     );
   }
 
@@ -1457,13 +1484,28 @@ export class OrchestratorStore {
       decision: Decision;
       answerer: Answerer;
       reasons?: readonly string[];
+      takeover?: true;
     },
   ): DecisionReceipt {
     const id = identifier(proposalId);
-    const input = fields(answer, ["digest", "decision", "answerer", "reasons"]);
+    const input = fields(answer, [
+      "digest",
+      "decision",
+      "answerer",
+      "reasons",
+      "takeover",
+    ]);
     if (typeof input.digest !== "string") throw new ContractError();
     const decision = oneOf(input.decision, ["approve", "reject"]);
     const answerer = parseAnswerer(input.answerer);
+    const takeover = input.takeover;
+    if (
+      Object.hasOwn(input, "takeover") &&
+      (takeover !== true ||
+        answerer.kind !== "human" ||
+        answerer.channel !== "operator-ui")
+    )
+      throw new ContractError();
     const reasons = input.reasons;
     if (
       reasons !== undefined &&
@@ -1515,7 +1557,7 @@ export class OrchestratorStore {
       if (
         answerer.kind === "human" &&
         answerer.channel === "operator-ui" &&
-        !permitsPanelAnswer(origin, requirements, decision)
+        !permitsPanelAnswer(origin, requirements, decision, takeover === true)
       )
         throw new OrchestratorStoreError("approval-forbidden");
       if (answerer.kind === "agent") {
@@ -1595,6 +1637,7 @@ export class OrchestratorStore {
           ...setting,
           decision,
           answererKind: answerer.kind,
+          ...(takeover === true && { takeover }),
           ...(answerer.kind === "human" &&
             answerer.channel && {
               origin: { kind: "operator", channel: answerer.channel },
@@ -1608,6 +1651,28 @@ export class OrchestratorStore {
         },
         correlation,
       );
+      if (takeover === true) {
+        const queued = this.#db
+          .query<{ id: string }>(
+            `UPDATE executions SET status = 'cancelled', finished_at = ?,
+               result_json = '{"code":"approval-superseded"}'
+             WHERE status = 'queued' AND id IN (
+               SELECT execution_id FROM proposal_approval_runs WHERE proposal_id = ?
+             ) RETURNING id`,
+          )
+          .all(at, id);
+        for (const { id: executionId } of queued)
+          this.#event(
+            at,
+            "execution.finished",
+            "execution",
+            executionId,
+            {
+              status: "cancelled",
+            },
+            { executionId },
+          );
+      }
       if (integration) {
         if (decision === "reject")
           this.#setTaskStatus(
@@ -2217,6 +2282,22 @@ export class OrchestratorStore {
     });
   }
 
+  #approvalSuperseded(executionId: string) {
+    return (
+      this.#db
+        .query(
+          `SELECT 1 FROM events WHERE subject_id = (
+           SELECT proposal_id FROM proposal_approval_runs WHERE execution_id = ?
+         ) AND kind = 'proposal.decided' AND json_extract(data, '$.takeover') = 1`,
+        )
+        .get(executionId) !== null
+    );
+  }
+
+  approvalSuperseded(executionId: string) {
+    return this.#read(() => this.#approvalSuperseded(identifier(executionId)));
+  }
+
   createExecution(request: {
     actor: ActorKind;
     mode: string;
@@ -2398,18 +2479,36 @@ export class OrchestratorStore {
     result?: unknown,
   ): void {
     const id = identifier(executionId);
-    const next = oneOf(status, finalExecutionStatuses);
+    const requested = oneOf(status, finalExecutionStatuses);
     const resultJson =
       result === undefined ? null : canonicalJson(result, 256 * 1024);
     this.#write((at) => {
       const row = required(this.#execution(id));
+      const superseded =
+        row.mode === "approval" && this.#approvalSuperseded(id);
+      const next = superseded ? "cancelled" : requested;
       if (
         row.status !== "running" &&
         !(row.status === "queued" && next === "cancelled")
       )
         throw new OrchestratorStoreError("invalid-transition");
-      const recorded: unknown =
+      let recorded: unknown =
         resultJson === null ? null : JSON.parse(resultJson);
+      if (superseded) {
+        const original =
+          recorded && typeof recorded === "object"
+            ? (recorded as { code?: unknown })
+            : {};
+        // Keep the Reviewer's own failure, such as credential-leak, visible.
+        recorded = {
+          ...original,
+          code: "approval-superseded",
+          ...(typeof original.code === "string" &&
+          original.code !== "approval-superseded"
+            ? { supersededCode: original.code }
+            : {}),
+        };
+      }
       const report = this.#executionUsage(row, recorded);
       const taskId = row.taskId;
       const maxTokens = report.maxTokens;
@@ -2425,7 +2524,9 @@ export class OrchestratorStore {
         typeof recorded === "object" &&
         Object.hasOwn(recorded, "usage")
           ? canonicalJson({ ...recorded, ...report }, 256 * 1024)
-          : resultJson;
+          : superseded
+            ? canonicalJson(recorded, 256 * 1024)
+            : resultJson;
       this.#run(
         "UPDATE executions SET status = ?, result_json = ?, finished_at = ? WHERE id = ?",
         next,
@@ -2628,12 +2729,31 @@ export class OrchestratorStore {
     );
   }
 
+  authorizeGoalBaseUpdate(
+    goalId: string,
+    from: string,
+    to: string,
+    legacyBase: boolean,
+  ) {
+    const id = identifier(goalId);
+    this.#write((at) => {
+      if (this.#eligibleGoalBase(id) !== (legacyBase ? null : from))
+        throw new OrchestratorStoreError("goal-base-stale");
+      this.#event(at, "goal.base-update-authorized", "goal", id, {
+        from: gitCommit(from),
+        to: gitCommit(to),
+        origin: "operator-ui",
+      });
+    });
+  }
+
   async updateGoalBase(
     goalId: string,
     from: string,
     to: string,
     moveRef: () => Promise<void>,
     legacyBase = false,
+    channel: "cli" | "operator-ui" = "cli",
   ) {
     const id = this.#read(() => this.#goalId(identifier(goalId)));
     gitCommit(from);
@@ -2650,6 +2770,7 @@ export class OrchestratorStore {
           from,
           to,
           ...(legacyBase && { legacyBase: true }),
+          ...(channel === "operator-ui" && { origin: channel }),
         });
       },
       "goal-base-record-failed",
@@ -2829,6 +2950,64 @@ export class OrchestratorStore {
     );
   }
 
+  #workplaceStopPreview() {
+    const tasks = this.#db
+      .query<{ id: string }>(
+        "SELECT id FROM tasks WHERE status = 'running' ORDER BY id",
+      )
+      .all()
+      .map(({ id }) => id);
+    return {
+      runningTasks: tasks.length,
+      revision: createHash("sha256")
+        .update(JSON.stringify(tasks))
+        .digest("hex"),
+    };
+  }
+
+  workplaceStopPreview() {
+    return this.#read(() => this.#workplaceStopPreview());
+  }
+
+  recordWorkplaceStop(expected: string) {
+    this.#write((at) => {
+      const { runningTasks, revision } = this.#workplaceStopPreview();
+      if (revision !== expected)
+        throw new OrchestratorStoreError("stale-confirmation");
+      this.#event(at, "workplace.stop-authorized", "policy", "workplace", {
+        runningTasks,
+        origin: "operator-ui",
+      });
+    });
+  }
+
+  recordWorkplaceEnvironmentBuild(input: {
+    commit: string;
+    key: string;
+    destinations: readonly string[];
+    noticeShown: boolean;
+  }) {
+    const commit = gitCommit(input.commit);
+    if (
+      !digestPattern.test(input.key) ||
+      typeof input.noticeShown !== "boolean"
+    )
+      throw new ContractError();
+    const destinations = input.destinations.map((value) => {
+      const { hostname, port } = environmentDestination(value);
+      return `${hostname}:${port}`;
+    });
+    this.#write((at) => {
+      this.#event(at, environmentBuildAuthorization, "policy", "workplace", {
+        commit,
+        key: input.key,
+        destinations,
+        noticeShown: input.noticeShown,
+        origin: "operator-ui",
+      });
+    });
+  }
+
   interruptedIntegrations(taskIds: readonly string[]) {
     return this.#read(() =>
       taskIds.flatMap((taskId) => {
@@ -2872,9 +3051,13 @@ export class OrchestratorStore {
         );
       }
       for (const { id } of rows.executions) {
+        const superseded = this.#approvalSuperseded(id);
+        const status = superseded ? "cancelled" : "failed";
+        const code = superseded ? "approval-superseded" : "interrupted";
         this.#run(
-          "UPDATE executions SET status = 'failed', result_json = ?, finished_at = ? WHERE id = ?",
-          '{"code":"interrupted"}',
+          "UPDATE executions SET status = ?, result_json = ?, finished_at = ? WHERE id = ?",
+          status,
+          canonicalJson({ code }),
           at,
           id,
         );
@@ -2883,7 +3066,7 @@ export class OrchestratorStore {
           "execution.finished",
           "execution",
           id,
-          { status: "failed", code: "interrupted", origin: "operator" },
+          { status, code, origin: "operator" },
           { executionId: id },
         );
       }
@@ -3586,22 +3769,27 @@ export class OrchestratorStore {
             environmentJson,
             harness,
             model,
-          }) => ({
-            id,
-            actor,
-            mode,
-            status,
-            startedAt,
-            finishedAt,
-            ...(harness && model ? { harness, model } : {}),
-            ...(environmentJson
-              ? { environment: readTaskEnvironment(environmentJson) }
-              : {}),
-            tokens: readTokenReport(
-              resultJson === null ? null : JSON.parse(resultJson),
-              startedAt !== null && finishedAt !== null,
-            ).tokens,
-          }),
+          }) => {
+            const result: unknown =
+              resultJson === null ? null : JSON.parse(resultJson);
+            return {
+              id,
+              actor,
+              mode,
+              status,
+              startedAt,
+              finishedAt,
+              ...(harness && model ? { harness, model } : {}),
+              ...(environmentJson
+                ? { environment: readTaskEnvironment(environmentJson) }
+                : {}),
+              result,
+              tokens: readTokenReport(
+                result,
+                startedAt !== null && finishedAt !== null,
+              ).tokens,
+            };
+          },
         ),
     );
   }

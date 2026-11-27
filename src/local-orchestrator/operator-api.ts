@@ -57,9 +57,14 @@ import {
 } from "./store.ts";
 import {
   previewGoalBranchExport,
+  previewGoalBaseUpdate,
   previewGoalDiscard,
   readGoalBranchHead,
 } from "./tasks.ts";
+import {
+  WorkplaceEnvironmentError,
+  type WorkplaceEnvironment,
+} from "./workplace-environment.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -68,6 +73,8 @@ interface OperatorApiOptions extends InboxSource {
   maxLineBytes?: number;
   pollMs?: number;
   terminal?: ConciergeTerminalHub;
+  workplace?: { signal: AbortSignal; stop(): void };
+  environment?: WorkplaceEnvironment;
 }
 
 type GoalExportTarget = Pick<
@@ -87,6 +94,7 @@ type OperatorGoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
     target: string;
   } | null;
   exportBlockReason: ExportBlockReason | null;
+  baseUpdatePreview?: { from: string; to: string };
 };
 type ErrorCode =
   | StoreErrorCode
@@ -101,6 +109,9 @@ type ErrorCode =
   | ExportBlockReason
   | "already-exported"
   | "credential-leak"
+  | "workplace-unavailable"
+  | "workplace-stopping"
+  | WorkplaceEnvironmentError["code"]
   | "stale-base";
 type Reply = { result: unknown } | { error: { code: ErrorCode } };
 type Client = {
@@ -123,6 +134,24 @@ const maxClients = 8;
 const maxPendingBytes = 1024 * 1024;
 const maxTerminalInputBytes = 16 * 1024;
 const maxDraftCharacters = 2000;
+const shutdownBlockedMethods = new Set([
+  "task.retry",
+  "goal.discard",
+  "goal.export",
+  "goal.updateBase",
+  "proposal.answer",
+  "proposal.answerMany",
+  "environment.build",
+  "workplace.stop",
+  "inbox.markSeen",
+  "goal.setPolicy",
+  "task.setIntegrationPolicy",
+  "policy.setDefault",
+  "policy.setRules",
+  "concierge.draft",
+  "concierge.input",
+  "concierge.resize",
+]);
 
 export function draftToConcierge(
   store: OrchestratorStore,
@@ -164,6 +193,19 @@ export async function readOperatorGoal(
     (head) => ({ head, headAvailable: true }),
     () => ({ head: null, headAvailable: false }),
   );
+  const baseUpdate =
+    destination && goal.status === "active" && head.head
+      ? await previewGoalBaseUpdate(
+          store,
+          destination.target,
+          stateDirectory,
+          goal.id,
+        )
+          .then(({ from, to }) =>
+            from === to ? {} : { baseUpdatePreview: { from, to } },
+          )
+          .catch(() => ({}))
+      : {};
   if (destination?.scan && goal.turn.reason.kind === "exportable") {
     try {
       const { branch, from, to } = await previewGoalBranchExport(
@@ -190,13 +232,19 @@ export async function readOperatorGoal(
       };
     }
   }
-  return { ...goal, ...head, exportPreview: null, exportBlockReason: null };
+  return {
+    ...goal,
+    ...head,
+    ...baseUpdate,
+    exportPreview: null,
+    exportBlockReason: null,
+  };
 }
 
 export async function operatorAction(
   store: OrchestratorStore,
   stateDirectory: string,
-  method: "task.retry" | "goal.discard" | "goal.export",
+  method: "task.retry" | "goal.discard" | "goal.export" | "goal.updateBase",
   params: unknown,
   destination?: GoalExportTarget,
 ): Promise<Reply> {
@@ -210,6 +258,29 @@ export async function operatorAction(
           "operator-ui",
         ),
       };
+    }
+    if (method === "goal.updateBase") {
+      const input = fields(params, ["id", "confirm", "from", "to"]);
+      const id = identifier(input.id);
+      const expectedFrom = gitCommit(input.from);
+      const expectedTo = gitCommit(input.to);
+      if (typeof input.confirm !== "string") throw new ContractError();
+      if (!destination) return failure("workplace-unavailable");
+      const goal = store.getGoal(id);
+      if (!goal) return failure("not-found");
+      const { from, to, apply } = await previewGoalBaseUpdate(
+        store,
+        destination.target,
+        stateDirectory,
+        goal.id,
+        "operator-ui",
+      );
+      if (from !== expectedFrom || to !== expectedTo || from === to)
+        return failure("stale-base");
+      if (input.confirm !== `update-goal-base ${goal.ref} ${to.slice(0, 12)}`)
+        return failure("confirmation-mismatch");
+      await apply();
+      return { result: { id: goal.id, ref: goal.ref, from, to } };
     }
     const { id, confirm, expectedHead } = fields(params, [
       "id",
@@ -275,6 +346,85 @@ export async function operatorAction(
     if (error instanceof ClaudeRunError && error.code === "credential-leak")
       return failure("credential-leak");
     return failure("write-failed");
+  }
+}
+
+export function workplaceStopAction(
+  store: OrchestratorStore,
+  workplace: OperatorApiOptions["workplace"],
+  method: "workplace.stopPreview" | "workplace.stop",
+  params: unknown,
+): Reply {
+  try {
+    const input = fields(
+      params,
+      method === "workplace.stop" ? ["confirm", "revision"] : [],
+    );
+    if (!workplace) return failure("workplace-unavailable");
+    if (workplace.signal.aborted) return failure("workplace-stopping");
+    if (method === "workplace.stopPreview")
+      return { result: store.workplaceStopPreview() };
+    if (
+      typeof input.confirm !== "string" ||
+      typeof input.revision !== "string" ||
+      !/^[a-f0-9]{64}$/.test(input.revision)
+    )
+      throw new ContractError();
+    if (input.confirm !== "Workplace を終える")
+      return failure("confirmation-mismatch");
+    try {
+      store.recordWorkplaceStop(input.revision);
+    } catch (error) {
+      if (
+        error instanceof OrchestratorStoreError &&
+        error.code === "stale-confirmation"
+      )
+        return failure(error.code);
+      return failure("write-failed");
+    }
+    workplace.stop();
+    return { result: { stopping: true } };
+  } catch (error) {
+    return failure(
+      error instanceof ContractError
+        ? "invalid-params"
+        : error instanceof OrchestratorStoreError
+          ? error.code
+          : "write-failed",
+    );
+  }
+}
+
+export async function workplaceEnvironmentAction(
+  environment: WorkplaceEnvironment | undefined,
+  method:
+    "environment.status" | "environment.buildPreview" | "environment.build",
+  params: unknown,
+): Promise<Reply> {
+  try {
+    const { confirmation } = fields(
+      params,
+      method === "environment.build" ? ["confirmation"] : [],
+    );
+    if (
+      method === "environment.build" &&
+      (typeof confirmation !== "string" || !/^[a-f0-9]{64}$/.test(confirmation))
+    )
+      throw new ContractError();
+    if (!environment) return failure("environment-unavailable");
+    if (method === "environment.status")
+      return { result: await environment.status() };
+    if (method === "environment.buildPreview")
+      return { result: await environment.preview() };
+    return { result: await environment.start(confirmation as string) };
+  } catch (error) {
+    return failure(
+      error instanceof ContractError
+        ? "invalid-params"
+        : error instanceof WorkplaceEnvironmentError
+          ? error.code
+          : "write-failed",
+    );
   }
 }
 
@@ -489,7 +639,19 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         case "task.retry":
         case "goal.discard":
         case "goal.export":
+        case "goal.updateBase":
           return operatorAction(store, stateDirectory, method, params, options);
+        case "workplace.stopPreview":
+        case "workplace.stop":
+          return workplaceStopAction(store, options.workplace, method, params);
+        case "environment.status":
+        case "environment.buildPreview":
+        case "environment.build":
+          return workplaceEnvironmentAction(
+            options.environment,
+            method,
+            params,
+          );
         case "activity.get":
           fields(params, []);
           return { result: operatorActivity(options) };
@@ -611,6 +773,22 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
     }
   }
 
+  let writesStopped = false;
+  const pendingWrites = new Set<Promise<Reply>>();
+  function dispatchRequest(method: string, params: unknown) {
+    if (!shutdownBlockedMethods.has(method)) return dispatch(method, params);
+    const result = dispatch(method, params).finally(() =>
+      pendingWrites.delete(result),
+    );
+    pendingWrites.add(result);
+    return result;
+  }
+
+  async function stopWrites() {
+    writesStopped = true;
+    await Promise.all(pendingWrites);
+  }
+
   async function serve(socket: Socket, client: Client) {
     const line = Buffer.allocUnsafe(maxLine);
     let length = 0;
@@ -639,16 +817,16 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
             !Object.hasOwn(message, "params")
           )
             throw new ContractError();
-          const terminalReply = terminalRequest(
-            message.method,
-            message.params,
-            client,
-          );
+          const terminalReply =
+            (writesStopped || options.workplace?.signal.aborted) &&
+            shutdownBlockedMethods.has(message.method)
+              ? failure("workplace-stopping")
+              : terminalRequest(message.method, message.params, client);
           if (terminalReply) {
             // Send the replay without yielding to live output first.
             reply = terminalReply;
           } else {
-            reply = await dispatch(message.method, message.params);
+            reply = await dispatchRequest(message.method, message.params);
             if ("result" in reply) {
               try {
                 if (message.method === "inbox.subscribe")
@@ -664,7 +842,10 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                   message.method !== "proposal.answerMany" &&
                   message.method !== "task.retry" &&
                   message.method !== "goal.discard" &&
-                  message.method !== "goal.export"
+                  message.method !== "goal.export" &&
+                  message.method !== "goal.updateBase" &&
+                  message.method !== "workplace.stop" &&
+                  message.method !== "environment.build"
                 ) {
                   const serialized = JSON.stringify(reply.result);
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
@@ -692,6 +873,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
     }
   }
 
+  const requests = new Set<Promise<void>>();
   const server = createServer({ allowHalfOpen: true }, (socket) => {
     socket.on("error", () => {});
     if (clients.size >= maxClients) {
@@ -708,9 +890,13 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       terminal?.detach(client.send);
       clients.delete(socket);
     });
-    void serve(socket, client)
+    const serving = serve(socket, client)
       .catch(() => {})
-      .finally(() => socket.destroy());
+      .finally(() => {
+        requests.delete(serving);
+        socket.destroy();
+      });
+    requests.add(serving);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -738,7 +924,11 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       clearInterval(timer);
       for (const socket of clients.keys()) socket.destroy();
       server.close((error) => (error ? reject(error) : resolve()));
-    }).finally(removeSocket);
+    })
+      .then(async () => {
+        await Promise.all(requests);
+      })
+      .finally(removeSocket);
     return closing;
   }
   server.on("error", () => void close().catch(() => {}));
@@ -793,7 +983,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       }
     }, pollMs);
     timer.unref();
-    return { path, close };
+    return { path, close, stopWrites };
   } catch (error) {
     await close();
     throw error;

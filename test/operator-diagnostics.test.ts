@@ -21,6 +21,7 @@ import { ConfigError } from "../src/config/messages.ts";
 import { MsbHomeError } from "../src/config/msb-home.ts";
 import { GitIntegrationError } from "../src/git-integration.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
+import { operatorTask } from "../src/local-orchestrator/operator-read.ts";
 import { exportOrchestrator } from "../src/local-orchestrator/export.ts";
 import {
   secretTestWarnings,
@@ -379,6 +380,12 @@ test("expired actor self-tests warn and refuse with the same target command", as
   const execution = JSON.parse(await show("show-execution", executionId));
   assert.equal(execution.result.code, "secret-test-required");
   assert.equal(execution.result.next, next);
+  const shown = operatorTask(store, taskId)!.executions.find(
+    ({ id }) => id === executionId,
+  );
+  assert.equal(shown?.code, "secret-test-required");
+  assert.equal(shown?.next, next);
+  assert.ok(shown && !Object.hasOwn(shown, "result"));
   assert.ok(
     (await show("show-execution", executionId, false)).endsWith(
       `next: ${next}\n`,

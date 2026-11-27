@@ -176,7 +176,9 @@ On a closed decision card, **承認** opens a one-line confirmation. Open
 records approval for the runner to integrate the candidate. Select two
 to twenty proposals to approve them together. If a proposal changes,
 the card reopens with the refreshed details. Withheld fields block
-approval from Workplace. Use the TTY CLI with the same target for
+approval from Workplace. If a delegated decision is still pending,
+**自分で答える** opens the evidence and asks you to confirm that you are
+answering in place of the AI. Use the TTY CLI with the same target for
 on-behalf answers.
 
 After approving a Goal, its card tracks planning until the next decision
@@ -190,9 +192,14 @@ head. If the Goal changes, review the updated Goal before confirming again.
 
 `F6` moves focus between the terminal and panel. `F` toggles the
 panel's fullscreen view. `Esc` closes the activity popover first.
-Closing the browser leaves the session running. To end it, press Ctrl-C
-or send SIGTERM to the workplace process. The launcher closes the
-operator API and the bridge at shutdown. If that shutdown hangs, press
+Open **いま** for environment status, including the key, lock and size.
+For a missing or stale environment, **環境を作る** previews the network
+destinations and builds in the background after confirmation.
+
+Closing the browser leaves the session running. Choose **Workplace を終える**
+in **いま** to end it. The confirmation shows the number of running Tasks
+when any are active. The page reports when the session has ended. Ctrl-C
+and SIGTERM initiate the same cleanup from the host. If shutdown hangs, press
 Ctrl-C again to exit at once without cleanup, then run
 `agent-bootstrap doctor`. A third Ctrl-C kills the launcher. The launcher
 also stops when the workplace command ends for any reason, including
@@ -372,6 +379,10 @@ After confirming the launcher has stopped, run the operator CLI from a
 host terminal. If you use an explicit database, pass the same `--db`
 you use for the other operator commands.
 
+The session slot records unfinished work even after a crash. It does
+not establish that its owner has exited, so Workplace leaves crash
+recovery to the operator who can verify that the launcher has stopped.
+
 ```sh
 agent-bootstrap reconcile
 ```
@@ -393,6 +404,12 @@ custom `--db`, pass `--target <path>` before `reconcile` so it can locate the
 target's private repository.
 
 ## Diagnose and retry a failed Task
+
+In Workplace, open the Task and expand **Task の詳細** to see recent
+execution result codes, guidance for known failures, and the environment
+key and cache/build status when available. Use **やり直す** in **問題**
+to confirm a retry. For `env-missing`, check the environment in **いま**
+and build it before retrying.
 
 Use the Reviewer execution ID from the Concierge status or operator
 events to inspect a failed review or invalid agent approval verdict.
@@ -438,7 +455,10 @@ dependency arguments also take short refs.
 
 Keep your local `main` current before starting the launcher. If an active
 Goal already has a pinned branch and its Tasks need changes from a newer
-local `main`, update it from a host terminal.
+local `main`, open Goal detail and choose **ベースを更新する**. Review the
+short hashes for the old and new bases and type the displayed phrase.
+If either commit changes before submission, review and confirm again.
+The CLI also accepts the same confirmation format.
 
 ```sh
 agent-bootstrap update-goal-base <goalId>

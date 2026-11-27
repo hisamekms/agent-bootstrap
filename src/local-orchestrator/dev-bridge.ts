@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { connect, type Socket } from "node:net";
 import { boundedLines } from "../lines.ts";
 import { fields, identifier } from "./model.ts";
+import { workplaceEndedCode } from "../operator-ui/session-end.ts";
 
 const csp =
   "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -31,6 +32,12 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "goal.get",
   "goal.discard",
   "goal.export",
+  "goal.updateBase",
+  "environment.status",
+  "environment.buildPreview",
+  "environment.build",
+  "workplace.stopPreview",
+  "workplace.stop",
   "task.list",
   "task.get",
   "task.retry",
@@ -93,6 +100,7 @@ export function startDevBridge(options: {
   ).toString("hex");
   const expected = Buffer.from(token);
   const connections = new Set<Socket>();
+  const browsers = new Set<WebSocket>();
   // Count only connections that have not authenticated yet, so they cannot
   // take the slots of the operator's authenticated page.
   let unauthenticated = 0;
@@ -180,6 +188,7 @@ export function startDevBridge(options: {
       closeOnBackpressureLimit: true,
       idleTimeout: 0,
       open(ws) {
+        browsers.add(ws);
         ws.data.pending = true;
         unauthenticated++;
         ws.data.timer = setTimeout(() => reject(ws, 1008), authTimeoutMs);
@@ -253,6 +262,7 @@ export function startDevBridge(options: {
         socket.write(line + "\n");
       },
       close(ws) {
+        browsers.delete(ws);
         settle(ws);
         clearTimeout(ws.data.timer);
         ws.data.socket?.destroy();
@@ -263,9 +273,12 @@ export function startDevBridge(options: {
   let closing: Promise<void> | undefined;
   return {
     url: `http://${address}:${server.port}/#${token}`,
-    close() {
+    close(sessionEnded = false) {
       if (!closing) {
-        closing = server.stop(true);
+        if (sessionEnded)
+          for (const browser of browsers)
+            browser.close(browser.data.socket ? workplaceEndedCode : 1001);
+        closing = server.stop(!sessionEnded);
         for (const socket of connections) socket.destroy();
       }
       return closing;

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   lstat,
@@ -372,6 +373,47 @@ async function fixture(t: TestContext) {
   const env = { XDG_STATE_HOME: root };
   return { root, env, store: new EnvironmentStore(project, env) };
 }
+
+test("build locks exclude other processes per target and recover dead markers", async (t) => {
+  const { env, store } = await fixture(t);
+  const moduleUrl = new URL("../src/environments/store.ts", import.meta.url);
+  const child = (target: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `import { EnvironmentStore } from ${JSON.stringify(moduleUrl.href)};
+       process.exit(new EnvironmentStore(${JSON.stringify(target)}).tryLockBuild() ? 0 : 1);`,
+      ],
+      { env, stdio: "ignore", timeout: 5_000 },
+    );
+
+  const release = store.tryLockBuild();
+  assert.ok(release);
+  try {
+    assert.equal(child(project).status, 1);
+    assert.equal(child("abcdefabcdef").status, 0);
+  } finally {
+    release();
+  }
+  // The child exits without releasing the marker it acquired.
+  assert.equal(child(project).status, 0);
+  assert.equal(
+    (await readdir(store.directory)).filter((name) =>
+      name.startsWith(".build-"),
+    ).length,
+    1,
+  );
+  const afterExit = store.tryLockBuild();
+  assert.ok(afterExit);
+  afterExit();
+  assert.deepEqual(
+    (await readdir(store.directory)).filter((name) =>
+      name.startsWith(".build-"),
+    ),
+    [],
+  );
+});
 
 test("store publishes private per-target entries and prunes by count or age with holds", async (t) => {
   const { env, store } = await fixture(t);

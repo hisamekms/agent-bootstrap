@@ -357,6 +357,111 @@ test("an eligible Reviewer can reject a goal that loosens integration policy", (
   );
 });
 
+test("takeover cannot authorize policy loosening or answer for a Concierge proposal", () => {
+  store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+  const loosening = store.proposeGoal(
+    { ...goal, policies: { integration: "agent" } },
+    operator,
+  );
+  const concierge = store.proposeGoal(goal, {
+    kind: "actor",
+    actor: "Concierge",
+  });
+  for (const [proposal, decision] of [
+    [loosening, "approve"],
+    [concierge, "approve"],
+    [concierge, "reject"],
+  ] as const) {
+    assert.throws(
+      () =>
+        store.decide(proposal.id, {
+          digest: proposal.digest,
+          decision,
+          answerer: { kind: "human", channel: "operator-ui" },
+          takeover: true,
+        }),
+      { code: "approval-forbidden" },
+    );
+    assert.equal(store.getProposal(proposal.id)?.status, "pending");
+  }
+});
+
+test("completion and recovery recognize a durable takeover", () => {
+  store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+  for (const completion of ["failed", "succeeded", "reconcile"] as const) {
+    const proposal = store.proposeGoal(goal, operator);
+    const { executionId } = startReviewer({ approvalProposalId: proposal.id });
+    store.decide(proposal.id, {
+      digest: proposal.digest,
+      decision: "reject",
+      answerer: { kind: "human", channel: "operator-ui" },
+      takeover: true,
+    });
+    if (completion === "reconcile")
+      store.reconcile(store.reconciliationPreview());
+    else store.finishExecution(executionId, completion);
+    assert.partialDeepStrictEqual(store.getExecution(executionId), {
+      status: "cancelled",
+      result: { code: "approval-superseded" },
+    });
+  }
+  const proposal = store.proposeGoal(goal, operator);
+  const { executionId } = startReviewer({ approvalProposalId: proposal.id });
+  store.decide(proposal.id, {
+    digest: proposal.digest,
+    decision: "approve",
+    answerer: { kind: "human", channel: "operator-ui" },
+    takeover: true,
+  });
+  store.finishExecution(executionId, "failed", { code: "credential-leak" });
+  assert.partialDeepStrictEqual(store.getExecution(executionId), {
+    status: "cancelled",
+    result: { code: "approval-superseded", supersededCode: "credential-leak" },
+  });
+});
+
+test("version 7 event migration preserves ordering and accepts a full environment authorization", () => {
+  store.setProjectDefaults({ "goal-registration": "agent" }, operator);
+  store.proposeGoal(goal, operator);
+  const revision = store.activityRevision();
+  const prior = store.listEvents({ limit: 10 });
+  store.close();
+  const db = new Database(filename);
+  try {
+    db.exec("PRAGMA user_version=7");
+  } finally {
+    db.close();
+  }
+  store = OrchestratorStore.open(filename);
+  assert.equal(store.activityRevision(), revision);
+  assert.deepEqual(store.listEvents({ limit: 10 }), prior);
+  const destinations = Array.from(
+    { length: 128 },
+    (_, i) =>
+      `registry-${i}.${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(45)}.example:443`,
+  );
+  const authorization = {
+    commit: "a".repeat(40),
+    key: "b".repeat(64),
+    destinations,
+    noticeShown: false,
+  };
+  store.recordWorkplaceEnvironmentBuild(authorization);
+  assert.partialDeepStrictEqual(
+    store.listEvents({ subjectId: "workplace", limit: 1 })[0],
+    {
+      kind: "environment.build-authorized",
+      data: { ...authorization, origin: "operator-ui" },
+    },
+  );
+  const migrated = new Database(filename);
+  try {
+    assert.throws(() => migrated.exec("DELETE FROM events"), /append-only/);
+  } finally {
+    migrated.close();
+  }
+});
+
 test("rejects fabricated, non-Reviewer, non-approval, queued and finished executions", () => {
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
   const proposal = store.proposeGoal(goal, operator);
