@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "allow": ["Bash(MSB_HOME=/private/tmp/wmsb msb *)"]
+  }
+}

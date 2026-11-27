@@ -115,9 +115,13 @@ async function layout(tree: EnvironmentTree): Promise<EnvironmentLayout> {
   }
 }
 
+// Bun opens up to 64 requests at once by default. Keep it well inside the
+// Provisioner gateway's attempt burst (provisioner.ts).
+const networkConcurrency = "--network-concurrency=16";
+
 export const bunAdapter: EnvironmentAdapter = {
   name: "bun",
-  recipeVersion: 1,
+  recipeVersion: 2,
   lockPath: "bun.lock",
   defaultEgress: [{ hostname: "registry.npmjs.org", port: 443 }],
   layout,
@@ -134,8 +138,8 @@ export const bunAdapter: EnvironmentAdapter = {
       case "build":
         return {
           argv: hasLock
-            ? ["bun", "install", "--frozen-lockfile"]
-            : ["bun", "install"],
+            ? ["bun", "install", "--frozen-lockfile", networkConcurrency]
+            : ["bun", "install", networkConcurrency],
           archive: true,
           writesLock: !hasLock,
           reportsOutdated: false,
@@ -143,14 +147,14 @@ export const bunAdapter: EnvironmentAdapter = {
         };
       case "resolve":
         return {
-          argv: ["bun", "install"],
+          argv: ["bun", "install", networkConcurrency],
           archive: true,
           writesLock: true,
           reportsOutdated: false,
         };
       case "update":
         return {
-          argv: ["bun", "update", ...names],
+          argv: ["bun", "update", networkConcurrency, ...names],
           archive: true,
           writesLock: true,
           reportsOutdated: false,

@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { SqliteAudit, type AuditInput, type NetworkEvent } from "../audit.ts";
 import { environmentDestination } from "../config/layers.ts";
-import type { EgressGatewayOptions } from "../egress-gateway.ts";
+import { EgressGateway, type EgressGatewayOptions } from "../egress-gateway.ts";
 import { EgressPolicy } from "../egress-policy.ts";
 import { withBuildSandbox } from "../image-build-sandbox.ts";
 import { publishPrivateFile } from "../private-journal.ts";
@@ -11,6 +11,7 @@ import type { ProfileLockEntry } from "../profile-lock.ts";
 import type { HostGateway } from "../trusted-host.ts";
 import {
   EnvironmentError,
+  GATEWAY_STOPS,
   identifyEnvironment,
   type EnvironmentOperation,
   type EnvironmentTree,
@@ -24,6 +25,14 @@ import {
 import { runProvisionerGuest } from "./provisioner-guest.ts";
 import { diffPackages, parseBunLock } from "./lock.ts";
 import type { EnvironmentManifest, EnvironmentStore } from "./store.ts";
+
+/** Package managers open many connections at once (Bun up to 16 here, see
+ * bun.ts), so the Provisioner gets more headroom than a task VM. */
+export const provisionerGatewayLimits = Object.freeze({
+  attemptBurst: 128,
+  attemptsPerSecond: 64,
+  maxNetworkRows: 65_536,
+});
 
 export type ProvisionerCommand = (
   args: readonly string[],
@@ -198,6 +207,7 @@ export async function provisionEnvironment(
   let afterLock: Uint8Array | undefined;
   let outdated: string | undefined;
   let failure: EnvironmentError | undefined;
+  let gateway: HostGateway | undefined;
   let packages: readonly string[] = [];
   let previousPackages: readonly string[] = [];
   let manifest: EnvironmentManifest | undefined;
@@ -261,8 +271,20 @@ export async function provisionEnvironment(
           memoryMiB: profile.memoryMiB,
           cpus: profile.cpus,
           env,
-          provisioner: { audit, invocationId, policy, inputDirectory: source },
-          ...(host.openGateway && { openGateway: host.openGateway }),
+          provisioner: {
+            audit,
+            invocationId,
+            policy,
+            inputDirectory: source,
+            limits: provisionerGatewayLimits,
+          },
+          async openGateway(options) {
+            const opened = await (host.openGateway ?? EgressGateway.open)(
+              options,
+            );
+            gateway = opened;
+            return opened;
+          },
           async run(args, timeoutMs, environment, signal) {
             const result = await host.run(args, timeoutMs, environment, signal);
             if (result.code !== 0) {
@@ -270,7 +292,7 @@ export async function provisionEnvironment(
               const diagnostic = packageCommand ? (result.stderr ?? "") : "";
               throw new CommandFailure(
                 packageCommand,
-                /\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|FailedToDownload)\b/i.test(
+                /\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|FailedToDownload|ConnectionRefused|ConnectionClosed)\b|failed to (?:download|resolve)/i.test(
                   diagnostic,
                 ) ||
                   /error: (?:GET|POST) .* - (?:401|403|404|429|5\d\d)\b/.test(
@@ -336,6 +358,20 @@ export async function provisionEnvironment(
       network.failed
     )
       failure = new EnvironmentError("env-fetch-failed");
+    // A gateway that stopped every flow explains the failure better than the
+    // package manager's own message.
+    const stopped = gateway?.quarantineReason;
+    const gatewayStopped = GATEWAY_STOPS.find((reason) => reason === stopped);
+    // Only budget stops are fetch problems; audit and listener stops are host
+    // faults, so they keep their code and only add the reason.
+    if (failure && gatewayStopped)
+      failure = new EnvironmentError(
+        gatewayStopped === "rate-limited" ||
+          gatewayStopped === "network-row-limit"
+          ? "env-fetch-failed"
+          : failure.code,
+        gatewayStopped,
+      );
     const size = manifest?.size ?? archive?.byteLength ?? 0;
     const detail = {
       ...initial,
@@ -347,6 +383,9 @@ export async function provisionEnvironment(
         ? emptyPackageDiff
         : diffPackages(previousPackages, manifest?.packages ?? packages),
       ...(failure && { failure: failure.code }),
+      ...(failure?.gatewayStopped && {
+        gatewayStopped: failure.gatewayStopped,
+      }),
     };
     await record("environment.finished", detail);
     if (failure) throw failure;

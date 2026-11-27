@@ -19,13 +19,18 @@ import test, { type TestContext } from "node:test";
 import { SqliteAudit } from "../src/audit.ts";
 import { mergeConfig, parseConfig } from "../src/config/layers.ts";
 import {
+  EnvironmentError,
   identifyEnvironment,
   type EnvironmentTree,
 } from "../src/environments/adapter.ts";
 import { validateEnvironmentArchive } from "../src/environments/archive.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
 import { diffBunLocks, parseBunLock } from "../src/environments/lock.ts";
-import { provisionEnvironment } from "../src/environments/provisioner.ts";
+import { parseEnvironmentEvidence } from "../src/environments/events.ts";
+import {
+  provisionEnvironment,
+  provisionerGatewayLimits,
+} from "../src/environments/provisioner.ts";
 import {
   EnvironmentStore,
   type EnvironmentManifest,
@@ -97,7 +102,12 @@ test("environment key covers profile, recipe, lock and matching manifests only",
   assert.notEqual((await get(unlocked)).key, initial.key);
   assert.notEqual((await get(contents, "b".repeat(64))).key, initial.key);
   assert.notEqual(
-    (await get(contents, digest, { ...bunAdapter, recipeVersion: 2 })).key,
+    (
+      await get(contents, digest, {
+        ...bunAdapter,
+        recipeVersion: bunAdapter.recipeVersion + 1,
+      })
+    ).key,
     initial.key,
   );
 });
@@ -134,15 +144,18 @@ test("workspace globs reject absolute paths and parent traversal", async () => {
     "bun",
     "install",
     "--frozen-lockfile",
+    "--network-concurrency=16",
   ]);
   assert.equal(bunAdapter.command("build", false)?.warning, "env-lock-missing");
   assert.deepEqual(bunAdapter.command("resolve", false)?.argv, [
     "bun",
     "install",
+    "--network-concurrency=16",
   ]);
   assert.deepEqual(bunAdapter.command("update", true, ["@scope/a"])?.argv, [
     "bun",
     "update",
+    "--network-concurrency=16",
     "@scope/a",
   ]);
   assert.deepEqual(bunAdapter.command("outdated", true)?.argv, [
@@ -707,8 +720,9 @@ test("Provisioner audits gateway reaches, packs outputs and records lock fallbac
       } else if (args[0] === "exec") assert.equal(extra, undefined);
       return { code: 0, stdout: "guest output not recorded" };
     },
-    async openGateway({ policy, executionId, audit, sandboxLabel }) {
+    async openGateway({ policy, executionId, audit, sandboxLabel, limits }) {
       id = executionId;
+      assert.deepEqual(limits, provisionerGatewayLimits);
       assert.deepEqual(policy.allow, [
         { hostname: "internal.registry.example", port: 8443 },
         { hostname: "registry.npmjs.org", port: 443 },
@@ -797,4 +811,109 @@ test("Provisioner audits gateway reaches, packs outputs and records lock fallbac
     !body.includes("guest output") &&
       !body.includes("internal.registry.example"),
   );
+});
+
+function stoppingGateway(reason?: string) {
+  // Healthy until the package command runs, then stopped, as the real
+  // gateway quarantines itself while the package manager is fetching.
+  const state = { created: false };
+  return {
+    state,
+    async openGateway() {
+      return {
+        socksPort: 19100,
+        dnsPort: 19153,
+        username: "fake",
+        password: "fixture",
+        get quarantined() {
+          return state.created && reason !== undefined;
+        },
+        get quarantineReason() {
+          return state.created ? reason : undefined;
+        },
+        async close() {},
+      };
+    },
+  };
+}
+
+async function failingInstall(
+  t: TestContext,
+  reason: string | undefined,
+  stderr: string,
+) {
+  const { env, store } = await fixture(t);
+  const gateway = stoppingGateway(reason);
+  let installRan = false;
+  const error = await provisionEnvironment(input, {
+    env,
+    store,
+    async run(args) {
+      if (
+        args[0] === "exec" &&
+        args.join(" ").includes("--network-concurrency")
+      ) {
+        installRan = true;
+        // The gateway stops while the package manager is fetching.
+        gateway.state.created = true;
+        return { code: 1, stdout: "", stderr };
+      }
+      return { code: 0, stdout: "" };
+    },
+    openGateway: gateway.openGateway,
+  }).then(
+    () => assert.fail("build must fail"),
+    (caught: unknown) => caught,
+  );
+  assert.ok(installRan, "the package command must run");
+  assert.ok(error instanceof EnvironmentError);
+  const [name] = (await readdir(store.directory)).filter((file) =>
+    file.endsWith(".finished.json"),
+  );
+  const body = JSON.parse(await readFile(join(store.directory, name!), "utf8"));
+  return { error, body };
+}
+
+test("Provisioner reports a mid-run gateway budget stop as a fetch failure with its reason", async (t) => {
+  const { error, body } = await failingInstall(
+    t,
+    "rate-limited",
+    "error: failed to download pkg@1.0.0: ConnectionRefused",
+  );
+  assert.equal(error.code, "env-fetch-failed");
+  assert.equal(error.gatewayStopped, "rate-limited");
+  assert.equal(body.failure, "env-fetch-failed");
+  assert.equal(body.gatewayStopped, "rate-limited");
+  assert.equal(parseEnvironmentEvidence(body).gatewayStopped, "rate-limited");
+  assert.throws(() =>
+    parseEnvironmentEvidence({ ...body, failure: undefined }),
+  );
+  assert.throws(() =>
+    parseEnvironmentEvidence({ ...body, gatewayStopped: "other" }),
+  );
+  assert.ok(!JSON.stringify(body).includes("ConnectionRefused"));
+});
+
+test("Provisioner keeps the code for host-side gateway stops and records the reason", async (t) => {
+  const { error, body } = await failingInstall(
+    t,
+    "audit-failure",
+    "error: lockfile had changes, but lockfile is frozen",
+  );
+  assert.equal(error.code, "env-lock-mismatch");
+  assert.equal(error.gatewayStopped, "audit-failure");
+  assert.equal(body.gatewayStopped, "audit-failure");
+});
+
+test("Provisioner classifies Bun download errors as fetch failures without a gateway stop", async (t) => {
+  for (const stderr of [
+    "error: failed to download pkg@1.0.0: ConnectionRefused",
+    "error: ConnectionClosed while fetching",
+    "error: failed to resolve pkg",
+  ]) {
+    const { error, body } = await failingInstall(t, undefined, stderr);
+    assert.equal(error.code, "env-fetch-failed", stderr);
+    assert.equal(error.gatewayStopped, undefined);
+    assert.equal(body.gatewayStopped, undefined);
+  }
 });

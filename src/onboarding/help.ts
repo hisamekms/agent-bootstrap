@@ -70,7 +70,7 @@ export const helpTopics = {
       `agent-bootstrap environment prune --target ${exampleTarget} --keep 3`,
     ],
     output:
-      "Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days.",
+      "Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days. A failed build prints its code; when the egress gateway stopped every flow it also prints the reason (rate-limited, network-row-limit, audit-failure or listener-error).",
     next: "Use environment status to check the committed target.",
     human:
       "Authorize registry access before building. Review the target's dependencies and install scripts.",

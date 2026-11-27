@@ -55,6 +55,7 @@ export async function withBuildSandbox<T>({
     readonly invocationId: string;
     readonly policy: EgressPolicy;
     readonly inputDirectory: string;
+    readonly limits?: EgressGatewayOptions["limits"];
   };
 }): Promise<T> {
   if (provisioner && (profile !== "bun" || smoke || packageDir !== undefined))
@@ -149,6 +150,7 @@ export async function withBuildSandbox<T>({
         sandboxLabel: sandboxId,
         policy,
         audit,
+        ...(provisioner?.limits && { limits: provisioner.limits }),
       });
     ensureAudit();
     const passwordEnv = "AGENT_GATEWAY_BUILD_SECRET";

@@ -1,7 +1,9 @@
 import {
   digestPattern,
+  GATEWAY_STOPS,
   lockMissing,
   type EnvironmentFailure,
+  type GatewayStop,
   type EnvironmentOperation,
 } from "./adapter.ts";
 import {
@@ -21,6 +23,7 @@ export interface EnvironmentEvidence {
   readonly packageDiff: PackageDiff;
   readonly warning?: typeof lockMissing;
   readonly failure?: EnvironmentFailure;
+  readonly gatewayStopped?: GatewayStop;
 }
 
 export type EnvironmentEvent = EnvironmentEvidence & {
@@ -70,6 +73,7 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     packageDiff,
     warning,
     failure,
+    gatewayStopped,
   } = object(value);
   const { added, removed, changed } = object(packageDiff);
   if (
@@ -91,7 +95,10 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     (failure !== undefined &&
       failure !== "env-fetch-failed" &&
       failure !== "env-lock-mismatch" &&
-      failure !== "env-build-failed")
+      failure !== "env-build-failed") ||
+    (gatewayStopped !== undefined &&
+      (failure === undefined ||
+        !GATEWAY_STOPS.includes(gatewayStopped as GatewayStop)))
   )
     throw new TypeError("Invalid environment evidence");
   return {
@@ -117,5 +124,8 @@ export function parseEnvironmentEvidence(value: unknown): EnvironmentEvidence {
     },
     ...(warning && { warning }),
     ...(failure && { failure }),
+    ...(gatewayStopped !== undefined && {
+      gatewayStopped: gatewayStopped as GatewayStop,
+    }),
   };
 }

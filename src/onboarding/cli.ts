@@ -797,9 +797,17 @@ export async function runBootstrap(
     return 0;
   } catch (error) {
     if (error instanceof EnvironmentError)
-      return fail(1, error.code, "Run agent-bootstrap help environment.", {
-        code: error.code,
-      });
+      return fail(
+        1,
+        error.gatewayStopped
+          ? `${error.code} (egress gateway stopped: ${error.gatewayStopped})`
+          : error.code,
+        "Run agent-bootstrap help environment.",
+        {
+          code: error.code,
+          ...(error.gatewayStopped && { gatewayStopped: error.gatewayStopped }),
+        },
+      );
     if (error instanceof ActorConfigError)
       return fail(1, error.message, error.next, {
         code: error.code,

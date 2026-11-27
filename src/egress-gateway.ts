@@ -56,7 +56,7 @@ const MAX_EARLY_DATA_BYTES = 65536;
 const MAX_ANSWER_TTL = 300;
 type EndReason = NetworkFinishedInput["endReason"];
 type Result = NetworkFinishedInput["result"];
-type QuarantineReason =
+export type QuarantineReason =
   "audit-failure" | "listener-error" | "rate-limited" | "network-row-limit";
 
 interface AuditSink {

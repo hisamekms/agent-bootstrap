@@ -161,6 +161,12 @@ agent-bootstrap changes.
 - **Journal.** `environment.started` and `environment.finished` record
   the key, the operation, duration, size, cache hit, the destinations
   reached, and a package diff computed from the locks.
+- **Gateway stops.** When the egress gateway stops every flow of a run, the
+  evidence records `gatewayStopped` (`rate-limited`, `network-row-limit`,
+  `audit-failure` or `listener-error`) and the CLI prints it. The two budget
+  stops count as `env-fetch-failed`. The Provisioner gateway has larger
+  attempt and row budgets than a task VM, because package managers open
+  many connections at once.
 - **Failure codes.** `env-fetch-failed`, `env-lock-mismatch`,
   `env-build-failed` and `env-lock-missing` (a warning).
 - **doctor.** It shows the environment state for each target (current,
