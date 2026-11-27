@@ -9,3 +9,6 @@
 *.log
 .DS_Store
 /docs/claude-handoff.md
+
+# Local Claude Code settings stay on the machine.
+.claude/settings.local.json
