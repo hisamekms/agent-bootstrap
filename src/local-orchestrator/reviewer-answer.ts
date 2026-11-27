@@ -25,6 +25,14 @@ export function taskReviewerOutput(
   const answer = harness.reviewerOutput
     ? harness.reviewerOutput(response)
     : response;
+  return unfenceAnswer(harness, answer);
+}
+
+/** Removes one Markdown code fence around a whole Claude Code answer. */
+export function unfenceAnswer(
+  harness: RoleHarness,
+  answer: Uint8Array | undefined,
+): Uint8Array | undefined {
   if (!answer || harness.harness !== "claude") return answer;
   let text: string;
   try {

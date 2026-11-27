@@ -876,6 +876,34 @@ test("Reviewer rechecks policy before recording an in-flight verdict", async () 
   assert.equal(store.getProposal(proposal.id)?.status, "pending");
 });
 
+test("Reviewer and Planner answers wrapped in one JSON code fence are accepted", async () => {
+  using state = orchestratorFixture("local-runner-");
+  const { store } = state;
+  enableGoalAgentApproval(store);
+  const fenced = (id: string, answer: unknown): ReviewerRun => ({
+    id,
+    outcome: "ok",
+    response: Buffer.from(
+      JSON.stringify({
+        result: "```json\n" + JSON.stringify(answer) + "\n```",
+      }),
+    ),
+  });
+  const work = runner(store, {
+    runPlanner: async (_, id) => fenced(id, { goals: [goal] }),
+    runReviewer: async (_, id) =>
+      fenced(id, { decision: "approve", reasons: ["Fits the goal"] }),
+  });
+  const planned = await work.requestPlanner(goalRequest);
+  await work.drain();
+  assert.equal(store.getExecution(planned)?.status, "succeeded");
+  const proposal = store.proposeGoal(goal, plannerOrigin);
+  const id = await work.requestApproval(proposal.id);
+  await work.drain();
+  assert.equal(store.getExecution(id)?.status, "succeeded");
+  assert.equal(store.getProposal(proposal.id)?.status, "approved");
+});
+
 test("Reviewer rejects an invalid verdict without retrying or deciding the proposal", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;
