@@ -688,7 +688,13 @@ test(
         assert.partialDeepStrictEqual(
           await client.request("goal.get", { id: "g1" }),
           {
-            result: { id: goalId, ref: "G1", head: null },
+            result: {
+              id: goalId,
+              ref: "G1",
+              head: null,
+              exportPreview: null,
+              exportBlockReason: null,
+            },
           },
         );
         assert.deepEqual(
@@ -741,6 +747,16 @@ test(
         assert.deepEqual(
           (await client.request("concierge.draft", { text: "draft" })).error,
           { code: "terminal-unavailable" },
+        );
+        assert.deepEqual(
+          (
+            await client.request("goal.export", {
+              id: "g1",
+              confirm: "export-goal-branch G1 111111111111",
+              expectedHead: "1".repeat(40),
+            })
+          ).error,
+          { code: "export-unavailable" },
         );
       } finally {
         client.reader.close();

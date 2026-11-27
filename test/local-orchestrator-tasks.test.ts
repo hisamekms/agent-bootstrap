@@ -49,6 +49,10 @@ import { CLAUDE_WORKER_USAGE_MARKER } from "../src/claude-code.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import { IntegrationJournal } from "../src/integration-journal.ts";
 import { runCli } from "../src/local-orchestrator/cli.ts";
+import {
+  operatorAction,
+  readOperatorGoal,
+} from "../src/local-orchestrator/operator-api.ts";
 import { snapshotConciergeRepo } from "../src/local-orchestrator/concierge.ts";
 import {
   contentDigest,
@@ -2521,6 +2525,12 @@ for (const updated of [false, true]) {
       );
       assert.equal(store.getTask(f.taskId)?.code, "integration-uncertain");
       assert.equal(store.getTask(next)?.status, "registered");
+      const detail = await readOperatorGoal(store, f.directory, f.goalId, {
+        target: f.repoRoot,
+        scan: async () => {},
+      });
+      assert.equal(detail?.exportPreview, null);
+      assert.equal(detail?.exportBlockReason, null);
 
       if (updated)
         f.bareGit(["update-ref", f.ref, proposal.content.candidate, f.base]);
@@ -2615,10 +2625,338 @@ test(
     assert.equal(refused.code, 1);
     assert.match(refused.stderr.join(""), /non-fast-forward/);
     assert.equal(operator(["rev-parse", f.ref]), f.next);
+    assert.match(refused.stderr.join(""), /commits that are not in the Goal/);
     operator(["-c", "core.hooksPath=/dev/null", "switch", branch]);
     const checkedOut = await exportAt(proposal.content.candidate);
     assert.equal(checkedOut.code, 1);
     assert.match(checkedOut.stderr.join(""), /branch-checked-out/);
+    assert.match(checkedOut.stderr.join(""), /Switch that worktree/);
+
+    operator(["-c", "core.hooksPath=/dev/null", "switch", "--detach", f.base]);
+    operator(["-c", "core.hooksPath=/dev/null", "update-ref", f.ref, f.base]);
+    const switched = await f.cli(args, true, () => {
+      operator(["-c", "core.hooksPath=/dev/null", "switch", branch]);
+      return `export-goal-branch ${key} ${proposal.content.candidate.slice(0, 12)}`;
+    });
+    assert.equal(switched.code, 1);
+    assert.equal(switched.questions.length, 1);
+    assert.match(switched.stderr.join(""), /branch-checked-out/);
+    assert.equal(operator(["rev-parse", f.ref]), f.base);
+  },
+);
+
+test(
+  "a checkout made during the fetch stops export before the ref transaction",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const f = goalBaseFixture(state);
+    const branch = goalBranch(f.goalId);
+    f.git(["push", f.bare, `${f.next}:${f.ref}`]);
+    f.git(["branch", branch, f.base]);
+    const binary = join(state.root, "git-export-test");
+    writeFileSync(
+      binary,
+      `#!/bin/sh
+for arg do
+  case "$arg" in
+    --no-write-fetch-head)
+      /usr/bin/git "$@" || exit $?
+      exec /usr/bin/git switch --quiet ${branch}
+      ;;
+    update-ref) touch "$0.update-ref" ;;
+  esac
+done
+exec /usr/bin/git "$@"
+`,
+      { mode: 0o700 },
+    );
+    const git = new LocalGitIntegration({
+      binary,
+      branch,
+      repository: f.bare,
+      stagingRoot: join(f.directory, "worktrees"),
+    });
+    const preview = await git.previewGoalExport(f.repoRoot, f.next);
+    let authorized = false;
+    await assert.rejects(
+      preview.apply(() => {
+        authorized = true;
+      }),
+      { code: "branch-checked-out" },
+    );
+    assert.equal(authorized, true);
+    assert.equal(f.git(["symbolic-ref", "HEAD"]), f.ref);
+    assert.equal(f.git(["rev-parse", f.ref]), f.base);
+    assert.equal(existsSync(binary + ".update-ref"), false);
+  },
+);
+
+test(
+  "operator export previews read-only, checks confirmation and scanning, and audits like the CLI",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-tasks-");
+    const { root, store } = state;
+    const f = stage3Fixture(state);
+    const proposal = await f.proposal();
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, f.goalId, {
+        target: f.repoRoot,
+        scan: async () => {},
+      }),
+      { head: f.base, exportPreview: null, exportBlockReason: null },
+    );
+    approve(store, proposal);
+    await f.work.drain();
+    const to = proposal.content.candidate;
+    const branch = goalBranch(f.goalId);
+    const { ref } = store.getGoal(f.goalId)!;
+    const confirm = `export-goal-branch ${ref} ${to.slice(0, 12)}`;
+    const params = { id: ref.toLowerCase(), confirm, expectedHead: to };
+    let scans = 0;
+    const destination = {
+      target: f.repoRoot,
+      repository: { project: "demo", repositoryPath: "source" },
+      scan: async () => {
+        scans++;
+      },
+    };
+    const call = (input: object, options = destination) =>
+      operatorAction(store, f.directory, "goal.export", input, options);
+    const exportedRef = () =>
+      f.git(["for-each-ref", "--format=%(objectname)", f.ref]);
+    const audit = () =>
+      store
+        .listEvents({ subjectId: f.goalId, limit: 50 })
+        .filter(
+          ({ kind }) =>
+            kind === "goal.exported" || kind === "goal.export-authorized",
+        )
+        .map(({ kind, subjectKind, subjectId, data }) => ({
+          kind,
+          subjectKind,
+          subjectId,
+          data,
+        }));
+
+    const detail = await readOperatorGoal(store, f.directory, ref, destination);
+    assert.deepEqual(detail?.exportPreview, {
+      branch,
+      from: null,
+      to,
+      target: "demo",
+    });
+    assert.equal(scans, 0);
+    assert.equal(exportedRef(), "");
+    assert.deepEqual(audit(), []);
+
+    assert.deepEqual(await call({ ...params, checkout: root }), {
+      error: { code: "invalid-params" },
+    });
+    assert.deepEqual(
+      await operatorAction(store, f.directory, "goal.export", params, {
+        target: f.repoRoot,
+      }),
+      {
+        error: { code: "export-unavailable" },
+      },
+    );
+    assert.deepEqual(await call({ ...params, confirm: "yes" }), {
+      error: { code: "confirmation-mismatch" },
+    });
+    assert.deepEqual(await call({ ...params, expectedHead: f.base }), {
+      error: { code: "stale-base" },
+    });
+    assert.equal(scans, 0);
+    f.bareGit(["update-ref", f.ref, f.base, to]);
+    assert.deepEqual(await call(params), { error: { code: "stale-base" } });
+    f.bareGit(["update-ref", f.ref, to, f.base]);
+    assert.deepEqual(
+      await call(params, {
+        ...destination,
+        scan: async () => {
+          f.bareGit(["update-ref", f.ref, f.base, to]);
+        },
+      }),
+      { error: { code: "stale-base" } },
+    );
+    f.bareGit(["update-ref", f.ref, to, f.base]);
+
+    f.git(["update-ref", f.ref, f.next]);
+    assert.deepEqual(await call(params), {
+      error: { code: "non-fast-forward" },
+    });
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, ref, destination),
+      { exportPreview: null, exportBlockReason: "non-fast-forward" },
+    );
+    f.git(["update-ref", "-d", f.ref, f.next]);
+
+    const checkout = join(root, "export-checkout");
+    f.git(["worktree", "add", "-b", branch, checkout, f.base]);
+    assert.deepEqual(await call(params), {
+      error: { code: "branch-checked-out" },
+    });
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, ref, destination),
+      { exportPreview: null, exportBlockReason: "branch-checked-out" },
+    );
+    f.git(["worktree", "remove", checkout]);
+    assert.deepEqual(
+      await call(params, {
+        ...destination,
+        scan: async () => {
+          f.git(["worktree", "add", checkout, branch]);
+        },
+      }),
+      { error: { code: "branch-checked-out" } },
+    );
+    assert.equal(exportedRef(), f.base);
+    f.git(["worktree", "remove", checkout]);
+    f.git(["update-ref", "-d", f.ref, f.base]);
+
+    const cancelled = goal(store);
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, cancelled, destination),
+      { exportPreview: null, exportBlockReason: null },
+    );
+    assert.deepEqual(
+      await operatorAction(store, f.directory, "goal.discard", {
+        id: cancelled,
+        confirm: store.getGoal(cancelled)!.ref,
+        expectedHead: null,
+      }),
+      {
+        result: {
+          id: cancelled,
+          ref: store.getGoal(cancelled)!.ref,
+          status: "cancelled",
+        },
+      },
+    );
+    assert.deepEqual(await call({ ...params, id: cancelled }), {
+      error: { code: "goal-inactive" },
+    });
+    const legacy = new Database(state.filename);
+    legacy
+      .query("UPDATE goals SET base_commit = NULL WHERE id = ?")
+      .run(f.goalId);
+    legacy.close();
+    assert.equal(store.getGoal(f.goalId)?.baseCommit, null);
+    assert.deepEqual(
+      await call(params, {
+        ...destination,
+        scan: createCredentialScanner(
+          { leakPatterns: ["Candidate 1"] },
+          root,
+          () => {},
+        ),
+      }),
+      { error: { code: "credential-leak" } },
+    );
+    assert.deepEqual(
+      await call(params, {
+        ...destination,
+        scan: async () => {
+          throw new Error("fixture scanner failed");
+        },
+      }),
+      { error: { code: "write-failed" } },
+    );
+    assert.equal(exportedRef(), "");
+    assert.deepEqual(audit(), []);
+    const bothScanned = Promise.withResolvers<void>();
+    const overlapping = {
+      ...destination,
+      async scan() {
+        if (++scans === 2) bothScanned.resolve();
+        await bothScanned.promise;
+      },
+    };
+    const concurrent = await Promise.all([
+      call({ ...params, id: f.goalId }, overlapping),
+      call(params, overlapping),
+    ]);
+    assert.deepEqual(
+      concurrent.find((reply) => "result" in reply),
+      {
+        result: { id: f.goalId, ref, branch, from: null, to },
+      },
+    );
+    assert.deepEqual(
+      concurrent.find((reply) => "error" in reply),
+      {
+        error: { code: "stale-base" },
+      },
+    );
+    assert.equal(exportedRef(), to);
+    const uiAudit = audit();
+    assert.deepEqual(
+      uiAudit.map(({ kind, data }) => ({ kind, data })),
+      [
+        { kind: "goal.exported", data: { branch, from: null, to } },
+        { kind: "goal.export-authorized", data: { branch, from: null, to } },
+      ],
+    );
+
+    assert.deepEqual(
+      (await readOperatorGoal(store, f.directory, ref, destination))
+        ?.exportPreview,
+      { branch, from: to, to, target: "demo" },
+    );
+    assert.deepEqual(await call(params), {
+      error: { code: "already-exported" },
+    });
+    const noOp = await f.cli(["export-goal-branch", ref], true, () => confirm);
+    assert.equal(noOp.code, 1);
+    assert.deepEqual(noOp.questions, []);
+    assert.match(noOp.stderr.join(""), /already points to the Goal head/);
+    assert.deepEqual(audit(), uiAudit);
+
+    f.git(["update-ref", "-d", f.ref, to]);
+    const cli = await f.cli(["export-goal-branch", ref], true, () => confirm);
+    assert.equal(cli.code, 0);
+    assert.deepEqual(audit(), [...uiAudit, ...uiAudit]);
+
+    f.git(["update-ref", "-d", f.ref, to]);
+    const db = new Database(state.filename);
+    try {
+      db.exec(`
+        CREATE TRIGGER reject_export_authorization BEFORE INSERT ON events
+        WHEN NEW.kind = 'goal.export-authorized'
+        BEGIN SELECT RAISE(ABORT, 'audit failure'); END
+      `);
+      assert.deepEqual(await call(params), { error: { code: "write-failed" } });
+      assert.equal(exportedRef(), "");
+      assert.deepEqual(audit(), [...uiAudit, ...uiAudit]);
+      db.exec(`
+        DROP TRIGGER reject_export_authorization;
+        CREATE TRIGGER reject_export_completion BEFORE INSERT ON events
+        WHEN NEW.kind = 'goal.exported'
+        BEGIN SELECT RAISE(ABORT, 'audit failure'); END
+      `);
+      // An audit write failure quarantines that store connection.
+      const reopened = OrchestratorStore.open(state.filename);
+      try {
+        assert.deepEqual(
+          await operatorAction(
+            reopened,
+            f.directory,
+            "goal.export",
+            params,
+            destination,
+          ),
+          { error: { code: "goal-export-record-failed" } },
+        );
+      } finally {
+        reopened.close();
+      }
+      assert.equal(exportedRef(), to);
+      assert.deepEqual(audit(), [uiAudit[1], ...uiAudit, ...uiAudit]);
+    } finally {
+      db.close();
+    }
   },
 );
 

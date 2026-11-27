@@ -66,6 +66,8 @@ The API offers:
 - inbox and status reads, and a stream of inbox changes;
 - proposal details with the pinned digest and the integration diff;
 - the gate answer (D5);
+- Goal discard and local branch export, each with its own head-bound
+  confirmation;
 - the Concierge PTY stream (input, output, resize).
 
 The socket's file permissions are the client boundary. The API is

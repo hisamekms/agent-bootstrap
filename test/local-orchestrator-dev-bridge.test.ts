@@ -121,7 +121,7 @@ async function openWebSocket(url: URL) {
   };
 }
 
-test("the delegation methods are explicitly allowlisted on the bridge", () => {
+test("delegation and Goal export methods are explicitly allowlisted on the bridge", () => {
   for (const method of [
     "policy.get",
     "policy.setDefault",
@@ -129,6 +129,7 @@ test("the delegation methods are explicitly allowlisted on the bridge", () => {
     "goal.setPolicy",
     "task.setIntegrationPolicy",
     "decision.history",
+    "goal.export",
   ])
     assert.equal(operatorBridgeMethods.has(method), true);
   assert.equal(operatorBridgeMethods.has("policy.reset"), false);

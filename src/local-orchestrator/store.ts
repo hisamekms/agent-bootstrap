@@ -2083,6 +2083,20 @@ export class OrchestratorStore {
     );
   }
 
+  goalIntegrationBase(goalId: string): string | null {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ base: string | null }>(
+            `SELECT json_extract(events.data, '$.base') AS base FROM events
+       JOIN tasks ON tasks.id = events.subject_id
+       WHERE events.kind = 'task.integrated' AND events.subject_kind = 'task' AND tasks.goal_id = ?
+       ORDER BY events.rowid ASC LIMIT 1`,
+          )
+          .get(this.#goalId(identifier(goalId)))?.base ?? null,
+    );
+  }
+
   auditGoalExport(
     goalId: string,
     branch: string,

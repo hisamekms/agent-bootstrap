@@ -78,7 +78,7 @@ Even while other Tasks run, a failed Task makes the Goal turn `stopped`
 when no approval takes precedence. A human must act on the failure.
 `turn` is derived from store state and does not write a Goal status.
 
-## Problems actions
+## Operator actions
 
 Each request uses the existing operator socket and bridge permissions.
 
@@ -105,6 +105,30 @@ it cannot read the head. It applies the CLI eligibility checks and returns
 from the current head. The
 host writes `goal.discard-authorized` before deleting the branch with a
 Git compare-and-swap, then records the resulting cancellation.
+
+Export uses `goal.export` with `id`, `confirm`, and `expectedHead`.
+When Goal detail is exportable and a preview is available, `goal.get`
+includes `exportPreview` with `branch`, `from`, `to`, and a display name
+for the launcher target. `from` is null when the local branch is absent.
+The preview reads state without creating a ref or an audit event.
+If the destination is checked out or has diverged, `goal.get` returns a
+null preview and sets `exportBlockReason` to `branch-checked-out` or
+`non-fast-forward`. A preview with equal `from` and `to` indicates that
+the destination already points to the Goal head.
+
+Submit the full `to` as `expectedHead` and type the same phrase as
+the CLI invoked with the returned ref, for example
+`export-goal-branch G12 123456789abc`. The host chooses the checkout from
+the launch target. The confirmation binds the Goal head. On submission,
+the host checks the current destination ref for a fast-forward and uses
+that ref for the Git compare-and-swap. A changed Goal head or a stale
+destination ref returns `stale-base`. A checked-out or divergent branch
+returns the corresponding block reason. An export with equal `from` and
+`to` returns `already-exported` without writing audit events. A cancelled Goal returns
+`goal-inactive`, and a missing scanner returns `export-unavailable`.
+After screening the Goal changes, the host records `goal.export-authorized`
+before writing the local branch and `goal.exported` after it succeeds.
+The receipt contains `id`, `ref`, `branch`, `from`, and `to`.
 
 Draft requires a ready terminal and the client's input ownership. It strips
 controls, format characters, and Unicode line separators, then takes up to

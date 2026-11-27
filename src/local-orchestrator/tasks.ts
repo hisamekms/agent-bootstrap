@@ -322,6 +322,7 @@ export async function previewGoalBranchExport(
   directory: string,
   id: string,
   scan?: CredentialScanner,
+  checkHead?: (to: string) => void,
 ) {
   const goal = store.getGoal(id);
   if (!goal) throw new OrchestratorStoreError("not-found");
@@ -340,15 +341,20 @@ export async function previewGoalBranchExport(
       to
   )
     throw new GitIntegrationError("export-head-mismatch");
-  if (scan && goal.baseCommit && goal.baseCommit !== to) {
-    const { stdout } = await gitCommandHistory(directory, goal.baseCommit, to);
-    let base = goal.baseCommit;
-    for (const commit of stdout.trim().split("\n").map(gitCommit)) {
-      await scan(
-        await git.diff(base, commit),
-        await git.candidateMessage(commit),
-      );
-      base = commit;
+  checkHead?.(to);
+  if (scan && from !== to) {
+    // Older Goals can have integration events without a pinned base.
+    let base = goal.baseCommit ?? store.goalIntegrationBase(goalId);
+    if (base === null) throw new GitIntegrationError("invalid-object");
+    if (base !== to) {
+      const { stdout } = await gitCommandHistory(directory, base, to);
+      for (const commit of stdout.trim().split("\n").map(gitCommit)) {
+        await scan(
+          await git.diff(base, commit),
+          await git.candidateMessage(commit),
+        );
+        base = commit;
+      }
     }
   }
   return {

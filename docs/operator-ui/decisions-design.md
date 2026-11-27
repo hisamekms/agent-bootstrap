@@ -125,7 +125,11 @@ into Concierge and transfer focus to its terminal.
 Problems allow retrying the same Task or confirming a Goal discard. Retry
 submits the displayed retry count. Opening the discard confirmation reads
 the current branch head. A stale head requires another confirmation with a
-fresh read. The host contract is documented in [Activity and actions](activity-api.md).
+fresh read. Export from Goal detail reads the current commit range for
+the launch target and opens a separate confirmation. The host screens
+the changes before writing the local branch. If the Goal changes, the
+panel refreshes the detail before another confirmation. The host
+contract is documented in [Activity and actions](activity-api.md).
 
 ### Proposal details and connection
 

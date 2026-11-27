@@ -164,8 +164,10 @@ With `--dev-bridge`, open the private loopback URL printed at startup.
 Keep the URL private. The page shows the Concierge terminal beside a
 host panel. Open the **いま** pill to see running work, queue refs and
 decisions you can answer in place. **Goal** groups work by whose turn it
-is. Each Goal detail shows its running Tasks, decisions, failures and a
-copyable export command when the Goal is ready to export. Goal and Task
+is. Each Goal detail shows its running Tasks, decisions and failures.
+When the Goal is ready to export, **ブランチを書き出す** opens a
+confirmation for the local branch in the launch target. A copyable
+CLI command is available below the action. Goal and Task
 refs can be used in the CLI. Within a Goal detail, `#m` is shorthand for
 the Task with that number in the Goal.
 
@@ -508,7 +510,16 @@ running launcher polls for decisions, and approved proposals can also be
 picked up on its next launch. Use `show <taskId>` to check for
 `succeeded` and `events --subject <taskId>` to see the integrated head.
 
-When the Goal branch is ready for handoff, run:
+When the Goal branch is ready for handoff, open its detail in Workplace
+and choose **ブランチを書き出す**. Review the destination, branch name and
+commit range, then choose **書き出しを確定**. If the Goal changes, review
+the refreshed detail and confirm again. The host screens the Goal's
+changes for credentials before exporting and records the same export
+events as the CLI. When a Goal has a null `baseCommit`, scanning starts
+from the first integration's base commit. If that base is missing,
+the host refuses export with `invalid-object`.
+
+To export from a host terminal, run:
 
 ```sh
 agent-bootstrap [--target <path>] export-goal-branch <goalId> [--target <checkout>]
@@ -521,8 +532,10 @@ export writes the branch into that repository by default. A trailing
 `--repo` as an alias in either position. If you set a custom database path,
 supply both the leading `--db <path>` and `--target <path>`.
 
-The branch is created or fast-forwarded locally. A divergent branch or
-one checked out in any worktree must be resolved before exporting.
+Both commands create or fast-forward the branch locally. Switch away
+from the destination branch in any worktree where it is checked out.
+A branch with commits outside the Goal cannot be fast-forwarded.
+If the branch already points to the Goal head, there is nothing to export.
 Review the exported branch, then push it and open a PR to `main`
 from your usual Git workflow.
 
