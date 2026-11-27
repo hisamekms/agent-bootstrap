@@ -32,7 +32,10 @@ import {
 } from "./inbox.ts";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { GitIntegrationError } from "../git-integration.ts";
+import {
+  GitIntegrationError,
+  type GitIntegrationCode,
+} from "../git-integration.ts";
 import {
   analyze,
   escapeTerminalControls,
@@ -496,6 +499,7 @@ async function execute(
         command.id,
         scan,
       );
+      if (from === to) throw new GitIntegrationError("already-exported");
       await writeCheckedJson({
         goalId: command.id,
         checkout,
@@ -950,8 +954,18 @@ export async function runCli(
     if (
       command.kind === "export-goal-branch" &&
       error instanceof GitIntegrationError
-    )
-      return refuse(io, `Goal branch export refused (${error.code}).`);
+    ) {
+      const reasons: Partial<Record<GitIntegrationCode, string>> = {
+        "branch-checked-out":
+          "The branch is checked out in a worktree. Switch that worktree to another branch first.",
+        "non-fast-forward":
+          "The branch has commits that are not in the Goal, so it cannot be moved.",
+        "already-exported": "The branch already points to the Goal head.",
+      };
+      const reason = reasons[error.code];
+      const message = `Goal branch export refused (${error.code}).`;
+      return refuse(io, reason ? `${message} ${reason}` : message);
+    }
     if (
       command.kind === "export-goal-branch" &&
       error instanceof OrchestratorStoreError

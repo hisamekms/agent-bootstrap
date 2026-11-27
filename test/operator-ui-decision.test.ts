@@ -4,11 +4,13 @@ import { disclosure } from "../src/operator-ui/web/dom.ts";
 import {
   createHostPanel,
   createInboxPanel,
+  goalExport,
   problemActions,
 } from "../src/operator-ui/web/panel.ts";
 import type { WorkplaceChannel } from "../src/operator-ui/web/channel.ts";
 import type {
   Activity,
+  GoalDetail,
   Methods,
   PanelInboxItem,
   Proposal,
@@ -636,6 +638,184 @@ test("discard binds the confirmed branch head, requires reconfirmation, and refu
     root.textContent,
     /Goal のブランチを確認できないため、取り消せません。/,
   );
+});
+
+test("Goal export confirms the local branch and refreshes a conflict before reconfirming", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const branch = "lo/goal-12345678";
+  const preview = (to: string, from: string | null = null) => ({
+    branch,
+    target: "demo",
+    from,
+    to,
+  });
+  const first = "1".repeat(40);
+  const second = "2".repeat(40);
+  let goal = {
+    id: "goal-id",
+    ref: "G10",
+    turn: { owner: "done", reason: { kind: "exportable" } },
+    exportPreview: preview(first),
+    exportBlockReason: null,
+  } as GoalDetail;
+  const calls: Array<[string, unknown]> = [];
+  const root = new TestElement();
+  let refreshes = 0;
+  let failureCode = "";
+  const channel = {
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      calls.push([method, params]);
+      if (method === "goal.get") return goal as Methods[M]["result"];
+      assert.equal(method, "goal.export");
+      if (failureCode) throw new Error(failureCode);
+      const result = {
+        id: goal.id,
+        ref: goal.ref,
+        ...goal.exportPreview,
+      } as Methods[M]["result"];
+      const head = goal.exportPreview!.to;
+      goal = { ...goal, exportPreview: preview(head, head) };
+      return result;
+    },
+  };
+  const render = (detail: GoalDetail, message = "") =>
+    root.replaceChildren(
+      goalExport(channel, detail, message, async (notice) => {
+        refreshes++;
+        const current = await channel.request("goal.get", { id: detail.id });
+        render(current, notice);
+      }) as unknown as TestElement,
+    );
+  render({ ...goal, turn: { owner: "idle", reason: { kind: "idle" } } });
+  assert.equal(findAction("export:goal-id", root), undefined);
+  render({ ...goal, exportPreview: null });
+  assert.equal(findAction("export:goal-id", root), undefined);
+  assert.match(root.textContent, /agent-bootstrap export-goal-branch G10/);
+
+  render(goal);
+  assert.equal(
+    findAction("export:goal-id", root)?.textContent,
+    "ブランチを書き出す",
+  );
+  click("export:goal-id", root);
+  await settle();
+  assert.match(
+    root.querySelector(".confirm")!.textContent,
+    /lo\/goal-12345678.*demo.*なし → 111111111111.*ローカルブランチ.*プッシュは行いません/,
+  );
+  click("back-export:goal-id", root);
+  assert.deepEqual(calls, [["goal.get", { id: "goal-id" }]]);
+  click("export:goal-id", root);
+  await settle();
+  goal = { ...goal, exportPreview: preview(second, first) };
+  failureCode = "stale-base";
+  click("confirm-export:goal-id", root);
+  assert.equal(findAction("confirm-export:goal-id", root)?.disabled, true);
+  await settle();
+  assert.equal(refreshes, 1);
+  assert.equal(root.querySelector(".confirm"), undefined);
+  assert.match(root.textContent, /更新した内容を確認してください/);
+
+  failureCode = "";
+  click("export:goal-id", root);
+  await settle();
+  assert.match(
+    root.querySelector(".confirm")!.textContent,
+    /111111111111 → 222222222222/,
+  );
+  click("confirm-export:goal-id", root);
+  await settle();
+  assert.deepEqual(
+    calls.filter(([method]) => method === "goal.export"),
+    [first, second].map((head) => [
+      "goal.export",
+      {
+        id: "goal-id",
+        confirm: `export-goal-branch G10 ${head.slice(0, 12)}`,
+        expectedHead: head,
+      },
+    ]),
+  );
+  assert.match(
+    root.textContent,
+    /demo で lo\/goal-12345678 をレビュー.*プッシュし、main へのプルリクエストを作成/,
+  );
+  assert.equal(findAction("export:goal-id", root), undefined);
+  assert.match(root.textContent, /すでに Goal の先端（222222222222）/);
+
+  for (const [reason, message] of [
+    [
+      "branch-checked-out",
+      /ワークツリーでチェックアウトされています。先に別のブランチに切り替えてください。/,
+    ],
+    [
+      "non-fast-forward",
+      /Goal に含まれないコミットがあるため、ブランチを移動できません。/,
+    ],
+  ] as const) {
+    const blocked = { ...goal, exportPreview: null, exportBlockReason: reason };
+    render(blocked);
+    assert.match(root.textContent, message);
+    assert.match(root.textContent, /agent-bootstrap export-goal-branch G10/);
+    assert.equal(findAction("export:goal-id", root), undefined);
+
+    goal = {
+      ...goal,
+      exportPreview: preview(second, first),
+      exportBlockReason: null,
+    };
+    render(goal);
+    click("export:goal-id", root);
+    await settle();
+    goal = blocked;
+    failureCode = reason;
+    click("confirm-export:goal-id", root);
+    await settle();
+    assert.match(root.textContent, message);
+    assert.doesNotMatch(root.textContent, /更新した内容を確認してください/);
+    assert.match(root.textContent, /agent-bootstrap export-goal-branch G10/);
+    assert.equal(findAction("export:goal-id", root), undefined);
+    assert.equal(root.querySelector(".confirm"), undefined);
+
+    // Once the blocker is gone, its earlier message no longer shows.
+    const blockerText = [
+      "書き出し先のブランチはワークツリーでチェックアウトされています。先に別のブランチに切り替えてください。",
+      "書き出し先のブランチに Goal に含まれないコミットがあるため、ブランチを移動できません。",
+    ].find((text) => message.test(text))!;
+    failureCode = "";
+    render(
+      {
+        ...goal,
+        exportPreview: preview(second, first),
+        exportBlockReason: null,
+      },
+      blockerText,
+    );
+    assert.doesNotMatch(root.textContent, message);
+    assert.ok(findAction("export:goal-id", root));
+  }
+
+  goal = {
+    ...goal,
+    exportPreview: preview(second, first),
+    exportBlockReason: null,
+  };
+  render(goal);
+  click("export:goal-id", root);
+  await settle();
+  goal = { ...goal, exportPreview: preview(second, second) };
+  failureCode = "goal-export-record-failed";
+  click("confirm-export:goal-id", root);
+  await settle();
+  assert.match(
+    root.textContent,
+    /demo の lo\/goal-12345678 は更新されましたが、書き出しの完了を記録できませんでした。ブランチはすでに Goal の先端にあるので、書き出し直す必要はありません。監査記録を確認してください。/,
+  );
+  assert.match(root.textContent, /すでに Goal の先端（222222222222）/);
+  assert.equal(findAction("export:goal-id", root), undefined);
 });
 
 test("the popover groups problems and resets confirmations while tracking approved Goal planning", async (t) => {

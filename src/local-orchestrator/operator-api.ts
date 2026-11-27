@@ -7,11 +7,12 @@ import {
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { connect, createServer, type Socket } from "node:net";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { GitIntegrationError } from "../git-integration.ts";
 import { privatePath } from "../config/layers.ts";
 import { isTerminalSize } from "../sandbox-runtime.ts";
 import { escapeTerminalControls } from "./analysis.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import {
@@ -54,7 +55,11 @@ import {
   type OrchestratorStore,
   type StoreErrorCode,
 } from "./store.ts";
-import { previewGoalDiscard, readGoalBranchHead } from "./tasks.ts";
+import {
+  previewGoalBranchExport,
+  previewGoalDiscard,
+  readGoalBranchHead,
+} from "./tasks.ts";
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
@@ -65,7 +70,24 @@ interface OperatorApiOptions extends InboxSource {
   terminal?: ConciergeTerminalHub;
 }
 
+type GoalExportTarget = Pick<
+  OperatorApiOptions,
+  "target" | "repository" | "scan"
+>;
+
 type RequestId = string | number;
+type ExportBlockReason = "branch-checked-out" | "non-fast-forward";
+type OperatorGoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
+  head: string | null;
+  headAvailable: boolean;
+  exportPreview: {
+    branch: string;
+    from: string | null;
+    to: string;
+    target: string;
+  } | null;
+  exportBlockReason: ExportBlockReason | null;
+};
 type ErrorCode =
   | StoreErrorCode
   | "invalid-request"
@@ -75,6 +97,10 @@ type ErrorCode =
   | "terminal-exited"
   | "terminal-read-only"
   | "confirmation-mismatch"
+  | "export-unavailable"
+  | ExportBlockReason
+  | "already-exported"
+  | "credential-leak"
   | "stale-base";
 type Reply = { result: unknown } | { error: { code: ErrorCode } };
 type Client = {
@@ -85,6 +111,14 @@ type Client = {
 };
 
 const failure = (code: ErrorCode): Reply => ({ error: { code } });
+function exportBlockReason(error: unknown): ExportBlockReason | null {
+  return error instanceof GitIntegrationError &&
+    (error.code === "branch-checked-out" || error.code === "non-fast-forward")
+    ? error.code
+    : null;
+}
+
+class ConfirmationMismatchError extends Error {}
 const maxClients = 8;
 const maxPendingBytes = 1024 * 1024;
 const maxTerminalInputBytes = 16 * 1024;
@@ -122,25 +156,49 @@ export async function readOperatorGoal(
   store: OrchestratorStore,
   stateDirectory: string,
   id: string,
-) {
+  destination?: GoalExportTarget,
+): Promise<OperatorGoalDetail | null> {
   const goal = operatorGoal(store, id);
   if (!goal) return null;
-  try {
-    return {
-      ...goal,
-      head: await readGoalBranchHead(stateDirectory, goal.id),
-      headAvailable: true,
-    };
-  } catch {
-    return { ...goal, head: null, headAvailable: false };
+  const head = await readGoalBranchHead(stateDirectory, goal.id).then(
+    (head) => ({ head, headAvailable: true }),
+    () => ({ head: null, headAvailable: false }),
+  );
+  if (destination?.scan && goal.turn.reason.kind === "exportable") {
+    try {
+      const { branch, from, to } = await previewGoalBranchExport(
+        store,
+        destination.target,
+        stateDirectory,
+        goal.id,
+      );
+      const target = escapeTerminalControls(
+        destination.repository?.project ?? basename(destination.target),
+      );
+      return {
+        ...goal,
+        ...head,
+        exportPreview: { branch, from, to, target },
+        exportBlockReason: null,
+      };
+    } catch (error) {
+      return {
+        ...goal,
+        ...head,
+        exportPreview: null,
+        exportBlockReason: exportBlockReason(error),
+      };
+    }
   }
+  return { ...goal, ...head, exportPreview: null, exportBlockReason: null };
 }
 
 export async function operatorAction(
   store: OrchestratorStore,
   stateDirectory: string,
-  method: "task.retry" | "goal.discard",
+  method: "task.retry" | "goal.discard" | "goal.export",
   params: unknown,
+  destination?: GoalExportTarget,
 ): Promise<Reply> {
   try {
     if (method === "task.retry") {
@@ -159,9 +217,29 @@ export async function operatorAction(
       "expectedHead",
     ]);
     if (typeof confirm !== "string") throw new ContractError();
-    const expected = expectedHead === null ? null : gitCommit(expectedHead);
+    const expected =
+      method === "goal.discard" && expectedHead === null
+        ? null
+        : gitCommit(expectedHead);
     const goal = store.getGoal(identifier(id));
     if (!goal) return failure("not-found");
+    if (method === "goal.export") {
+      if (!destination?.scan) return failure("export-unavailable");
+      const { branch, from, to, apply } = await previewGoalBranchExport(
+        store,
+        destination.target,
+        stateDirectory,
+        goal.id,
+        destination.scan,
+        (to) => {
+          if (expected !== to) throw new GitIntegrationError("stale-base");
+          if (confirm !== `export-goal-branch ${goal.ref} ${to.slice(0, 12)}`)
+            throw new ConfirmationMismatchError();
+        },
+      );
+      await apply();
+      return { result: { id: goal.id, ref: goal.ref, branch, from, to } };
+    }
     if (confirm !== goal.ref) return failure("confirmation-mismatch");
     const { head, apply } = await previewGoalDiscard(
       store,
@@ -174,9 +252,28 @@ export async function operatorAction(
     return { result: { id: goal.id, ref: goal.ref, status: "cancelled" } };
   } catch (error) {
     if (error instanceof ContractError) return failure("invalid-params");
-    if (error instanceof OrchestratorStoreError) return failure(error.code);
-    if (error instanceof GitIntegrationError && error.code === "stale-base")
+    if (error instanceof ConfirmationMismatchError)
+      return failure("confirmation-mismatch");
+    if (error instanceof OrchestratorStoreError)
+      return failure(
+        error.code === "export-head-mismatch" ? "stale-base" : error.code,
+      );
+    if (
+      error instanceof GitIntegrationError &&
+      (error.code === "stale-base" || error.code === "export-head-mismatch")
+    )
       return failure("stale-base");
+    if (method === "goal.export") {
+      const reason = exportBlockReason(error);
+      if (reason) return failure(reason);
+      if (
+        error instanceof GitIntegrationError &&
+        error.code === "already-exported"
+      )
+        return failure(error.code);
+    }
+    if (error instanceof ClaudeRunError && error.code === "credential-leak")
+      return failure("credential-leak");
     return failure("write-failed");
   }
 }
@@ -391,7 +488,8 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
       switch (method) {
         case "task.retry":
         case "goal.discard":
-          return operatorAction(store, stateDirectory, method, params);
+        case "goal.export":
+          return operatorAction(store, stateDirectory, method, params, options);
         case "activity.get":
           fields(params, []);
           return { result: operatorActivity(options) };
@@ -452,6 +550,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
             store,
             stateDirectory,
             identifier(id),
+            options,
           );
           return result ? { result } : failure("not-found");
         }
@@ -557,14 +656,15 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                 else if (message.method === "activity.subscribe")
                   subscribedActivityRevision =
                     operatorActivityRevision(options);
-                // Decision receipts carry fixed codes and IDs (screened before
-                // writing for answerMany; the caller's own ID for answer).
+                // Screen decision inputs before writing. Operator action
+                // receipts contain host-generated IDs, refs and commits.
                 else if (
                   message.method !== "inbox.markSeen" &&
                   message.method !== "proposal.answer" &&
                   message.method !== "proposal.answerMany" &&
                   message.method !== "task.retry" &&
-                  message.method !== "goal.discard"
+                  message.method !== "goal.discard" &&
+                  message.method !== "goal.export"
                 ) {
                   const serialized = JSON.stringify(reply.result);
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)

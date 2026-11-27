@@ -33,7 +33,8 @@ export type GitIntegrationCode =
   | "cleanup-failed"
   | "export-head-mismatch"
   | "branch-checked-out"
-  | "non-fast-forward";
+  | "non-fast-forward"
+  | "already-exported";
 
 export class GitIntegrationError extends Error {
   readonly code: GitIntegrationCode;
@@ -61,6 +62,7 @@ const fileLimit = 256 * 1024;
 const outputLimit = 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}$/;
 const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const pendingGoalExports = new Map<string, Promise<void>>();
 type FileExpectation = { readonly path: string };
 
 export function workerGitConfig(sparse?: "cone" | "patterns"): string {
@@ -1070,16 +1072,18 @@ export class LocalGitIntegration {
   async #changeGoalBranch(
     from: string | null,
     to: string | null,
+    checkout?: string,
   ): Promise<void> {
-    if ((await this.#reference(this.#ref)) !== from)
+    if ((await this.#reference(this.#ref, checkout)) !== from)
       throw new GitIntegrationError("stale-base");
+    if (checkout) await this.#requireBranchNotCheckedOut(checkout);
     try {
-      await this.#compareAndSwap(this.#ref, to, from);
+      await this.#compareAndSwap(this.#ref, to, from, checkout);
     } catch (error) {
       if (
         error instanceof GitIntegrationError &&
         error.code === "git-failed" &&
-        (await this.#reference(this.#ref)) !== from
+        (await this.#reference(this.#ref, checkout)) !== from
       )
         throw new GitIntegrationError("stale-base");
       throw error;
@@ -1126,8 +1130,8 @@ export class LocalGitIntegration {
     )
       throw new GitIntegrationError("invalid-input");
     const from = await this.#reference(this.#ref, checkout);
-    await this.#requireBranchNotCheckedOut(checkout);
-    if (from !== null) {
+    if (from !== to) await this.#requireBranchNotCheckedOut(checkout);
+    if (from !== null && from !== to) {
       // The trusted source has the complete ancestry of 'to'. A local
       // object missing there cannot be its ancestor.
       const history = await this.#git([
@@ -1153,37 +1157,53 @@ export class LocalGitIntegration {
       to,
       branch: this.#config.branch,
       apply: async (authorize: () => void) => {
-        await requireSourceHead();
-        if ((await this.#reference(this.#ref, checkout)) !== from)
-          throw new GitIntegrationError("stale-base");
-        authorize();
-        await this.#run(
-          [
-            "-c",
-            "fetch.fsckObjects=true",
-            "-c",
-            "fetch.writeCommitGraph=false",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-prune",
-            "--no-prune-tags",
-            "--no-write-fetch-head",
-            "--no-auto-maintenance",
-            "--no-recurse-submodules",
-            "--refmap=",
-            "--",
-            this.#config.repository,
-            to,
-          ],
-          {
-            cwd: checkout,
-            env: { GIT_ALLOW_PROTOCOL: "file" },
-            timeout: 120_000,
-          },
-        );
-        await requireSourceHead();
-        await this.#compareAndSwap(this.#ref, to, from, checkout);
+        if (from === to) throw new GitIntegrationError("already-exported");
+        // Serialize exports of this private Goal within the host process so
+        // overlapping requests recheck the destination before authorizing.
+        const key = `${this.#config.repository}\0${this.#ref}`;
+        const previous = pendingGoalExports.get(key) ?? Promise.resolve();
+        const pending = previous.then(async () => {
+          await requireSourceHead();
+          if ((await this.#reference(this.#ref, checkout)) !== from)
+            throw new GitIntegrationError("stale-base");
+          await this.#requireBranchNotCheckedOut(checkout);
+          authorize();
+          await this.#run(
+            [
+              "-c",
+              "fetch.fsckObjects=true",
+              "-c",
+              "fetch.writeCommitGraph=false",
+              "fetch",
+              "--quiet",
+              "--no-tags",
+              "--no-prune",
+              "--no-prune-tags",
+              "--no-write-fetch-head",
+              "--no-auto-maintenance",
+              "--no-recurse-submodules",
+              "--refmap=",
+              "--",
+              this.#config.repository,
+              to,
+            ],
+            {
+              cwd: checkout,
+              env: { GIT_ALLOW_PROTOCOL: "file" },
+              timeout: 120_000,
+            },
+          );
+          await requireSourceHead();
+          await this.#changeGoalBranch(from, to, checkout);
+        });
+        const settled = pending.catch(() => {});
+        pendingGoalExports.set(key, settled);
+        try {
+          await pending;
+        } finally {
+          if (pendingGoalExports.get(key) === settled)
+            pendingGoalExports.delete(key);
+        }
       },
     };
   }

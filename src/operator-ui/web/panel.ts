@@ -1182,6 +1182,7 @@ function goalDetail(
   activity: PanelInboxItem[],
   selectTask: (id: string) => void,
   watch: Watch,
+  exportControls: Node,
 ) {
   const scope = goal.scope;
   const details = group(
@@ -1240,9 +1241,7 @@ function goalDetail(
     ...now,
     ...decisions,
     ...problem,
-    ...(goal.turn.reason.kind === "exportable"
-      ? [exportCommand(goal.ref)]
-      : []),
+    exportControls,
     sectionTitle("Task"),
     goal.tasks.length
       ? group(
@@ -1271,14 +1270,214 @@ function goalDetail(
   ];
 }
 
-function exportCommand(ref: string) {
+const exportBlockMessages = {
+  "branch-checked-out":
+    "書き出し先のブランチはワークツリーでチェックアウトされています。先に別のブランチに切り替えてください。",
+  "non-fast-forward":
+    "書き出し先のブランチに Goal に含まれないコミットがあるため、ブランチを移動できません。",
+};
+
+const alreadyExported = (head: string) =>
+  `書き出し先のブランチはすでに Goal の先端（${head.slice(0, 12)}）を指しています。`;
+
+export function goalExport(
+  channel: Pick<WorkplaceChannel, "request">,
+  goal: GoalDetail,
+  message: string,
+  refresh: (message: string) => void,
+) {
+  // A blocker message from an earlier attempt is stale once the blocker is gone.
+  const stale = (Object.values(exportBlockMessages) as string[]).includes(
+    message,
+  );
+  if (
+    stale &&
+    (!goal.exportBlockReason ||
+      exportBlockMessages[goal.exportBlockReason] !== message)
+  )
+    message = "";
+  const area = group("div", "stack");
+  const feedback = textElement("p", message, "meta decision-event");
+  feedback.setAttribute("role", "status");
+  if (goal.turn.reason.kind !== "exportable") {
+    if (message) area.append(feedback);
+    else area.hidden = true;
+    return area;
+  }
+  const preview = goal.exportPreview;
+  if (preview && preview.from === preview.to) {
+    const status = alreadyExported(preview.to);
+    area.append(textElement("p", status, "meta"));
+    if (message && message !== status) area.append(feedback);
+    return group("section", "card", area);
+  }
+  const blocker = goal.exportBlockReason
+    ? exportBlockMessages[goal.exportBlockReason]
+    : null;
+  if (blocker) area.append(textElement("p", blocker, "meta"));
+
+  const key = goal.id;
   const { text, copy, status } = commandControls(
-    `agent-bootstrap export-goal-branch ${ref}`,
-    "コピー",
+    `agent-bootstrap export-goal-branch ${goal.ref}`,
+    "CLI コマンドをコピー",
     "export-goal",
     true,
   );
-  return group("div", "card", text, group("div", "actions", copy, status));
+  const fallback = group(
+    "div",
+    "stack",
+    text,
+    group("div", "actions", copy, status),
+  );
+  const start = action(
+    "ブランチを書き出す",
+    `export:${key}`,
+    () => {
+      if (start.disabled) return;
+      start.disabled = true;
+      feedback.hidden = false;
+      feedback.textContent = "書き出し先とブランチを確認しています…";
+      void channel
+        .request("goal.get", { id: key })
+        .then((current) => {
+          if (current.ref !== goal.ref) {
+            changed();
+            return;
+          }
+          const preview = current.exportPreview;
+          if (current.exportBlockReason)
+            refreshStatus(exportBlockMessages[current.exportBlockReason]);
+          else if (!preview) changed();
+          else if (preview.from === preview.to)
+            refreshStatus(alreadyExported(preview.to));
+          else confirm(preview);
+        })
+        .catch(() => {
+          feedback.textContent = "書き出しの内容を確認できませんでした。";
+          start.disabled = false;
+        });
+    },
+    "btn primary",
+  );
+  feedback.hidden = !message || message === blocker;
+  if (preview) area.append(group("div", "actions", start));
+  area.append(feedback);
+
+  function refreshStatus(text: string) {
+    start.hidden = true;
+    feedback.textContent = text;
+    feedback.hidden = false;
+    refresh(text);
+  }
+
+  function changed() {
+    const message =
+      "Goal または書き出し先のブランチが変わりました。更新した内容を確認してください。";
+    feedback.textContent = message;
+    refresh(message);
+  }
+
+  function confirm({
+    branch,
+    target,
+    from,
+    to,
+  }: NonNullable<GoalDetail["exportPreview"]>) {
+    feedback.textContent = "";
+    feedback.hidden = true;
+    start.hidden = true;
+    const cancel = action("戻す", `back-export:${key}`, () => reset());
+    const submit = action(
+      "書き出しを確定",
+      `confirm-export:${key}`,
+      () => {
+        if (submit.disabled) return;
+        submit.disabled = cancel.disabled = true;
+        void channel
+          .request("goal.export", {
+            id: key,
+            confirm: `export-goal-branch ${goal.ref} ${to.slice(0, 12)}`,
+            expectedHead: to,
+          })
+          .then(({ branch }) => {
+            strip.remove();
+            const message = `${target} で ${branch} をレビューしてください。準備ができたらプッシュし、main へのプルリクエストを作成してください。`;
+            feedback.textContent = message;
+            feedback.hidden = false;
+            refresh(message);
+          })
+          .catch((error: unknown) => {
+            feedback.hidden = false;
+            const code = error instanceof Error ? error.message : "";
+            if (code === "branch-checked-out" || code === "non-fast-forward") {
+              strip.remove();
+              refreshStatus(exportBlockMessages[code]);
+              return;
+            }
+            if (code === "already-exported") {
+              strip.remove();
+              refreshStatus(alreadyExported(to));
+              return;
+            }
+            if (
+              code === "stale-base" ||
+              code === "goal-inactive" ||
+              code === "integration-uncertain" ||
+              code === "not-found"
+            ) {
+              strip.remove();
+              changed();
+              return;
+            }
+            if (code === "goal-export-record-failed") {
+              strip.remove();
+              const message = `${target} の ${branch} は更新されましたが、書き出しの完了を記録できませんでした。ブランチはすでに Goal の先端にあるので、書き出し直す必要はありません。監査記録を確認してください。`;
+              feedback.textContent = message;
+              refresh(message);
+              return;
+            }
+            reset();
+            feedback.textContent =
+              code === "credential-leak"
+                ? "資格情報の検査でブロックされたため、ブランチを書き出せませんでした。"
+                : "ブランチの書き出しを確定できませんでした。";
+          });
+      },
+      "btn primary",
+    );
+    const strip = group(
+      "div",
+      "confirm",
+      group(
+        "div",
+        "q",
+        facts([
+          ["ブランチ", branch],
+          ["書き出し先", target],
+          ["コミット", `${from?.slice(0, 12) ?? "なし"} → ${to.slice(0, 12)}`],
+        ]),
+        textElement(
+          "p",
+          "ローカルブランチを作成または更新します。プッシュは行いません。",
+        ),
+      ),
+      cancel,
+      submit,
+    );
+    strip.setAttribute("role", "group");
+    strip.setAttribute("aria-label", "ブランチの書き出しの確認");
+    area.append(strip);
+    cancel.focus();
+
+    function reset() {
+      strip.remove();
+      start.hidden = false;
+      start.disabled = false;
+      start.focus();
+    }
+  }
+
+  return group("section", "card", area, fallback);
 }
 
 function tokenBudget(task: TaskDetail) {
@@ -1880,6 +2079,7 @@ export function createHostPanel(
   let goals: GoalSummary[] = [];
   let problems: Problem[][] = [];
   let lastGoal: GoalDetail | undefined;
+  const exportMessages = new Map<string, string>();
   const nowButton = element("now-toggle");
   const nowPopover = element("now-popover");
   const now = disclosure(nowButton, nowPopover, () =>
@@ -2613,6 +2813,7 @@ export function createHostPanel(
           }
         } else if (goal.status === "fulfilled" && goal.value) {
           const detail = (lastGoal = goal.value);
+          const exportMessage = exportMessages.get(detail.id) ?? "";
           const tasks = new Set(detail.tasks.map(({ id }) => id));
           const related = (item: PanelInboxItem) =>
             item.subject.goalId === detail.id ||
@@ -2646,6 +2847,7 @@ export function createHostPanel(
               running,
               problem,
               draftedPlans.has(detail.ref),
+              exportMessage,
             ],
             () =>
               goalDetail(
@@ -2689,6 +2891,11 @@ export function createHostPanel(
                 (taskId) =>
                   navigate({ tab: "goals", goalId: detail.id, taskId }),
                 watch,
+                goalExport(channel, detail, exportMessage, (message) => {
+                  exportMessages.set(detail.id, message);
+                  previousView = "";
+                  void refresh(false);
+                }),
               ),
             undefined,
             detail,

@@ -13,10 +13,10 @@ import type {
   RuleConditions,
 } from "../../local-orchestrator/delegation.ts";
 import type { Gate, Policy } from "../../local-orchestrator/model.ts";
+import type { readOperatorGoal } from "../../local-orchestrator/operator-api.ts";
 import type { OrchestratorStore } from "../../local-orchestrator/store.ts";
 import type {
   goalStatuses,
-  operatorGoal,
   operatorGoalList,
   operatorInbox,
   operatorProblems,
@@ -38,10 +38,9 @@ type Repository = { project: string; repositoryPath: string };
 export type Status = ReturnType<typeof operatorStatus> &
   (Repository | { project?: never; repositoryPath?: never });
 export type GoalSummary = ReturnType<typeof operatorGoalList>[number];
-export type GoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
-  head: string | null;
-  headAvailable: boolean;
-};
+export type GoalDetail = NonNullable<
+  Awaited<ReturnType<typeof readOperatorGoal>>
+>;
 export type Activity = ReturnType<typeof operatorActivity>;
 export type ActivityRow = Activity["running"][number];
 export type TaskSummary = NonNullable<
@@ -254,6 +253,16 @@ export interface Methods {
   "goal.discard": {
     params: { id: string; confirm: string; expectedHead: string | null };
     result: { id: string; ref: string; status: "cancelled" };
+  };
+  "goal.export": {
+    params: { id: string; confirm: string; expectedHead: string };
+    result: {
+      id: string;
+      ref: string;
+      branch: string;
+      from: string | null;
+      to: string;
+    };
   };
   "concierge.draft": {
     params: { text: string };

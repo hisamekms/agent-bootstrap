@@ -30,6 +30,7 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "goal.list",
   "goal.get",
   "goal.discard",
+  "goal.export",
   "task.list",
   "task.get",
   "task.retry",
