@@ -1,3 +1,5 @@
+import { EnvironmentError } from "../environments/adapter.ts";
+import { parseEnvironmentArgs, runEnvironmentCommand } from "./environment.ts";
 import {
   configRoot,
   projectConfigDirectory,
@@ -417,6 +419,23 @@ export async function runBootstrap(
       return 0;
     }
 
+    if (command === "environment") {
+      let options: ReturnType<typeof parseEnvironmentArgs>;
+      try {
+        options = parseEnvironmentArgs(rest);
+      } catch {
+        return usage();
+      }
+      if (options.command === "build" && !options.allowNetwork)
+        return fail(
+          2,
+          "Environment builds require --allow-network.",
+          "Run agent-bootstrap help environment.",
+        );
+      await runEnvironmentCommand(options, root, host, io, print, json);
+      return 0;
+    }
+
     if (command === "doctor") {
       let path: string | undefined;
       let override: ClaudeAuthMode | undefined;
@@ -777,6 +796,10 @@ export async function runBootstrap(
     if (operator !== "watch") hint(output.next);
     return 0;
   } catch (error) {
+    if (error instanceof EnvironmentError)
+      return fail(1, error.code, "Run agent-bootstrap help environment.", {
+        code: error.code,
+      });
     if (error instanceof ActorConfigError)
       return fail(1, error.message, error.next, {
         code: error.code,

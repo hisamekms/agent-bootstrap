@@ -24,7 +24,8 @@ export type ProfileRole =
   | "Worker"
   | "Reviewer"
   | "Verification"
-  | "Concierge";
+  | "Concierge"
+  | "Provisioner";
 
 /** Which profiles each role may request. */
 export const ROLE_PROFILES: Readonly<
@@ -36,6 +37,7 @@ export const ROLE_PROFILES: Readonly<
   Worker: Object.freeze(["base", "db", "browser", "bun"] as const),
   Verification: Object.freeze(["base", "db", "browser", "bun"] as const),
   Concierge: Object.freeze(["concierge"] as const),
+  Provisioner: Object.freeze(["bun"] as const),
 });
 
 const IMAGE = /^[a-zA-Z0-9][a-zA-Z0-9._/:-]*@sha256:([a-f0-9]{64})$/;

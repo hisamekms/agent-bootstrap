@@ -1392,6 +1392,54 @@ export class LocalGitIntegration {
     return entries;
   }
 
+  /** Read a pinned local commit without checkout, archive attributes or Git history. */
+  static async committedTree(repository: string, commit?: string) {
+    const git = new LocalGitIntegration({
+      binary: "/usr/bin/git",
+      repository,
+      stagingRoot: repository,
+      branch: "main",
+    });
+    const options = { gitDir: repository, cwd: repository };
+    const base = commit ?? (await git.#reference("refs/heads/main"));
+    if (!base) throw new GitIntegrationError("invalid-object");
+    await git.#commit(base);
+    const entries = await git.#entries(repository, repository, base);
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+    return {
+      paths: [...byPath.keys()],
+      async read(path: string) {
+        const entry = byPath.get(path);
+        if (!entry) return;
+        if (entry.mode !== "100644" && entry.mode !== "100755")
+          throw new GitIntegrationError("unsupported-entry");
+        if (entry.size > 16 * 1024 * 1024)
+          throw new GitIntegrationError("output-limit");
+        return git.#run(["cat-file", "blob", entry.oid], {
+          ...options,
+          maxBuffer: Math.max(entry.size, 1024 * 1024),
+        });
+      },
+      async pack(output: string) {
+        if (
+          entries.length > workspaceFileLimit ||
+          entries.reduce((total, entry) => total + entry.size, 0) >
+            workspaceByteLimit
+        )
+          throw new GitIntegrationError("output-limit");
+        for (const entry of entries) {
+          treePath(entry.path);
+          if (!["100644", "100755", "120000"].includes(entry.mode))
+            throw new GitIntegrationError("unsupported-entry");
+        }
+        await git.#checkInputSymlinks(
+          entries.filter(({ mode }) => mode === "120000"),
+        );
+        await git.#tar(repository, repository, output, entries);
+      },
+    };
+  }
+
   /**
    * Builds a private workspace without checking anything out on the host:
    * `git/` is a full-history git directory (base at refs/heads/base, HEAD at

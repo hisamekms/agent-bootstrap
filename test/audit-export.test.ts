@@ -524,9 +524,9 @@ test("checked audit export screens projected records before publication", async 
   assert.equal(lines(dir)[0]?.actor, "Worker");
 });
 
-test("reopens a v7 audit with legacy Claude details, appends, and exports", (t) => {
+test("reopens a current audit with legacy Claude details, appends, and exports", (t) => {
   const { db, obs, dir, audit } = fixture(t);
-  assert.equal(audit.schemaVersion, 7);
+  assert.equal(audit.schemaVersion, 8);
   audit.close();
   const conciergeId = randomUUID();
   const reviewer = { invocationId, role: "Reviewer" } as const;
@@ -599,7 +599,7 @@ test("reopens a v7 audit with legacy Claude details, appends, and exports", (t) 
 
   const reopened = new SqliteAudit(db);
   t.after(() => reopened.close());
-  assert.equal(reopened.schemaVersion, 7);
+  assert.equal(reopened.schemaVersion, 8);
   for (const id of [invocationId, conciergeId]) {
     const expected = legacyEvents
       .filter((event) => event.invocationId === id)

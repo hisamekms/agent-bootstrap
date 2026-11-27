@@ -1,3 +1,4 @@
+import { environmentDoctor, type EnvironmentStatus } from "./environment.ts";
 import {
   codexExecutorOptions,
   readCodexExecutor,
@@ -65,6 +66,7 @@ import { siwcGrantPresence } from "../siwc.ts";
 export type Status = "ok" | "missing" | "wrong" | "skipped";
 
 export interface Check {
+  environment?: EnvironmentStatus;
   effective?: { sources: Record<string, Layer | Layer[] | "env" | "default"> };
   actorHarnesses?: LocalActorHarnesses;
   code?: string;
@@ -94,6 +96,7 @@ export interface Host {
     args: readonly string[],
     env?: NodeJS.ProcessEnv,
     timeout?: number,
+    signal?: AbortSignal,
   ): Promise<CommandResult>;
   fetch: typeof fetch;
 }
@@ -103,7 +106,7 @@ export const systemHost: Host = {
   arch: process.arch,
   bun: process.versions.bun ?? "",
   env: process.env,
-  command(file, args, env, timeout = 15_000) {
+  command(file, args, env, timeout = 15_000, signal) {
     // Always discard Keychain metadata too. Never request the password.
     if (file === "/usr/bin/security") {
       return new Promise((resolve) => {
@@ -121,7 +124,7 @@ export const systemHost: Host = {
       execFile(
         file,
         args,
-        { env, timeout, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
+        { env, timeout, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, signal },
         (error, stdout, stderr) =>
           resolve({
             code: error
@@ -405,6 +408,24 @@ export async function doctor(
         ? undefined
         : await resolveConfigTarget(path, root, host.env);
     layers = loadConfig(host.env, target?.configDirectory, host.actorHarnesses);
+    if (!concierge && lock?.profiles.bun) {
+      if (target)
+        add(await environmentDoctor(target, lock.profiles.bun), false);
+      if (path === undefined) {
+        for (const project of projects) {
+          if (project.id === target?.project.id || projectMissing(project))
+            continue;
+          add(
+            await environmentDoctor(
+              { project, env: host.env },
+              lock.profiles.bun,
+              `environment-${project.name}`,
+            ),
+            false,
+          );
+        }
+      }
+    }
     if (target) {
       secretTestTarget = target.repoRoot;
       add(

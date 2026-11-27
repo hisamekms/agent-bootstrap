@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
  */
 
 const BLOCK = 512;
+const LINK_NAME_BYTES = 100;
 export const MAX_INPUT_BYTES = 1024 ** 3;
 const MAX_ENTRIES = 200_000;
 
@@ -176,6 +177,8 @@ function parseTar(
     const data = tar.subarray(start, start + size);
     pos = start + Math.ceil(size / BLOCK) * BLOCK;
 
+    if (workspace && ["L", "K", "x", "g"].includes(flag) && size > 64 * 1024)
+      fail("tar: workspace metadata is too large");
     if (flag === "L") {
       longName = gnuName(data);
       continue;
@@ -202,11 +205,20 @@ function parseTar(
     let name = dec.decode(cstr(header, 0, 100));
     const prefix = dec.decode(cstr(header, 345, 155));
     if (prefix !== "") name = `${prefix}/${name}`;
-    const headerLink = dec.decode(cstr(header, 157, 100));
-    if (workspace && (name.startsWith("/") || headerLink.startsWith("/")))
+    const headerLink = cstr(header, 157, LINK_NAME_BYTES);
+    if (workspace && (name.startsWith("/") || headerLink[0] === 0x2f))
       fail("tar: absolute workspace entry name");
     name = pax?.get("path") ?? longName ?? name;
-    const linkname = pax?.get("linkpath") ?? longLink ?? headerLink;
+    const extendedLink = pax?.get("linkpath") ?? longLink;
+    const linkname = extendedLink ?? dec.decode(headerLink);
+    if (workspace && extendedLink !== undefined && headerLink.length) {
+      const truncated = enc.encode(extendedLink).subarray(0, LINK_NAME_BYTES);
+      if (
+        headerLink.length !== truncated.length ||
+        headerLink.some((byte, index) => byte !== truncated[index])
+      )
+        fail("tar: ambiguous workspace link target");
+    }
     const uid = pax?.has("uid")
       ? strictInt(pax.get("uid"))
       : parseNumber(header, 108, 8);
@@ -217,8 +229,14 @@ function parseTar(
 
     if (workspace && (name.startsWith("/") || linkname.startsWith("/")))
       fail("tar: absolute workspace entry name");
-    if (workspace && headerLink && headerLink !== linkname)
-      fail("tar: ambiguous workspace link target");
+    if (
+      workspace &&
+      [name, linkname].some(
+        (path) =>
+          enc.encode(path).length > 4096 || path.split("/").length > 128,
+      )
+    )
+      fail("tar: workspace path is too long");
     const path = normalizePath(name);
     if (path === "") {
       // Root directory entry: not representable, dropped.
@@ -269,7 +287,7 @@ function header(f: {
   gid: number;
   size: number;
   type: string;
-  linkname: string;
+  linkname: Uint8Array;
   devmajor: number;
   devminor: number;
 }): Uint8Array {
@@ -281,7 +299,7 @@ function header(f: {
   writeOctal(block, 124, 12, f.size);
   writeOctal(block, 136, 12, 0);
   block[156] = f.type.charCodeAt(0);
-  block.set(enc.encode(f.linkname).subarray(0, 100), 157);
+  block.set(f.linkname, 157);
   block.set(enc.encode("ustar\0" + "00"), 257);
   writeOctal(block, 329, 8, f.devmajor);
   writeOctal(block, 337, 8, f.devminor);
@@ -321,7 +339,8 @@ function writeTar(entries: TarEntry[]): Uint8Array {
     const name = e.type === "5" ? `${e.path}/` : e.path;
     const records: Uint8Array[] = [];
     if (enc.encode(name).length > 100) records.push(paxRecord("path", name));
-    if (enc.encode(e.linkname).length > 100) {
+    const linkname = enc.encode(e.linkname);
+    if (linkname.length > LINK_NAME_BYTES) {
       records.push(paxRecord("linkpath", e.linkname));
     }
     if (records.length > 0) {
@@ -334,7 +353,7 @@ function writeTar(entries: TarEntry[]): Uint8Array {
           gid: 0,
           size: data.length,
           type: "x",
-          linkname: "",
+          linkname: new Uint8Array(0),
           devmajor: 0,
           devminor: 0,
         }),
@@ -349,7 +368,7 @@ function writeTar(entries: TarEntry[]): Uint8Array {
         gid: e.gid,
         size: e.data.length,
         type: e.type,
-        linkname: e.linkname,
+        linkname: linkname.subarray(0, LINK_NAME_BYTES),
         devmajor: e.devmajor,
         devminor: e.devminor,
       }),
@@ -440,6 +459,37 @@ export function readTar(
         data: e.data,
       }),
     ),
+  );
+}
+
+/** Re-encode validated workspace entries without guest ownership or metadata. */
+export function writeWorkspaceTar(
+  entries: readonly TarEntryView[],
+): Uint8Array {
+  const flags = {
+    file: "0",
+    hardlink: "1",
+    symlink: "2",
+    directory: "5",
+  } as const;
+  const sorted = [
+    ...entries.filter((entry) => entry.type !== "hardlink"),
+    ...entries.filter((entry) => entry.type === "hardlink"),
+  ];
+  return writeTar(
+    sorted.map((entry): TarEntry => {
+      if (!(entry.type in flags)) fail("tar: unsupported workspace entry");
+      const type = flags[entry.type as keyof typeof flags];
+      return {
+        ...entry,
+        type,
+        mode: type === "5" || entry.mode & 0o111 ? 0o755 : 0o644,
+        uid: 0,
+        gid: 0,
+        devmajor: 0,
+        devminor: 0,
+      };
+    }),
   );
 }
 

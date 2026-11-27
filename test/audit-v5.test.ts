@@ -41,7 +41,7 @@ function fixture(t: TestContext): string {
   return join(directory, "audit.sqlite");
 }
 
-function legacy(filename: string, version: 1 | 2 | 3 | 4 | 5 | 6): void {
+function legacy(filename: string, version: 1 | 2 | 3 | 4 | 5 | 6 | 7): void {
   const db = new Database(filename, { create: true });
   try {
     db.exec("PRAGMA journal_mode=WAL");
@@ -148,11 +148,11 @@ function v5Appends(audit: SqliteAudit): (() => void)[] {
   ];
 }
 
-test("fresh v7 stores and reopens every kind of evidence", (t) => {
+test("fresh v8 stores and reopens every kind of evidence", (t) => {
   const filename = fixture(t);
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 7);
+  assert.equal(audit.schemaVersion, 8);
   assert.equal(audit.isV5Writable, true);
   audit.append(started);
   audit.claimRequest(claim);
@@ -160,7 +160,7 @@ test("fresh v7 stores and reopens every kind of evidence", (t) => {
   audit.close();
 
   withDb(filename, (db) => {
-    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 7);
+    assert.equal(db.query("PRAGMA user_version").get()?.user_version, 8);
     assert.equal(db.query("PRAGMA journal_mode").get()?.journal_mode, "wal");
     assert.equal(db.query("PRAGMA quick_check").get()?.quick_check, "ok");
   });
@@ -288,7 +288,7 @@ test("read-only v4 is preserved and write-open upgrades without changing existin
 
   const writer = new SqliteAudit(filename);
   t.after(() => writer.close());
-  assert.equal(writer.schemaVersion, 7);
+  assert.equal(writer.schemaVersion, 8);
   assert.deepEqual(writer.readExecution(invocationId), expected);
   assert.equal(writer.claimRequest(claim).replayed, true);
   writer.appendExecutionContext(context);
@@ -626,7 +626,7 @@ test("v5 upgrade preserves existing history, the sequence watermark and append-o
 
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 7);
+  assert.equal(audit.schemaVersion, 8);
   assert.deepEqual(audit.readSince({}), oldRows);
   audit.append({
     invocationId,
@@ -692,7 +692,7 @@ test("v6 upgrade preserves Concierge detail and accepts Bun profile evidence", (
 
   const audit = new SqliteAudit(filename);
   t.after(() => audit.close());
-  assert.equal(audit.schemaVersion, 7);
+  assert.equal(audit.schemaVersion, 8);
   audit.append({
     invocationId,
     kind: "operation.requested",
@@ -705,4 +705,40 @@ test("v6 upgrade preserves Concierge detail and accepts Bun profile evidence", (
   assert.deepEqual(migrated, concierge);
   assert.equal(bun?.profile, "bun");
   assert.equal(bun?.sequence, 31);
+});
+
+test("audit v7 migration preserves evidence and adds Provisioner events", (t) => {
+  const filename = fixture(t);
+  legacy(filename, 7);
+  withDb(filename, (old) => {
+    old
+      .query(
+        "INSERT INTO audit_events (recorded_at, invocation_id, role, kind) VALUES (?, ?, 'Verification', 'invocation.started')",
+      )
+      .run(new Date().toISOString(), invocationId);
+  });
+  const audit = new SqliteAudit(filename);
+  t.after(() => audit.close());
+  assert.equal(audit.schemaVersion, 8);
+  audit.append({
+    invocationId,
+    role: "Provisioner",
+    kind: "environment.started",
+    detail: {
+      key: digest,
+      operation: "build",
+      durationMs: 0,
+      size: 0,
+      cacheHit: false,
+      destinationsReached: [],
+      packageDiff: { added: [], removed: [], changed: [] },
+    },
+  });
+  assert.deepEqual(
+    audit.read(invocationId).map(({ role, kind }) => [role, kind]),
+    [
+      ["Verification", "invocation.started"],
+      ["Provisioner", "environment.started"],
+    ],
+  );
 });
