@@ -23,7 +23,7 @@ import { PROFILE_LOCK_PATH, parseProfileLock } from "../profile-lock.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { userStateDirectory } from "../config/layers.ts";
 import { secretTestFacts } from "./secret-test-record.ts";
-import { operatorStatus } from "./operator-read.ts";
+import { operatorStatus, operatorTask } from "./operator-read.ts";
 import {
   changedInboxIds,
   formatInboxItem,
@@ -539,6 +539,7 @@ async function execute(
       if (
         !io.json &&
         (result?.code === "secret-test-required" ||
+          result?.code === "env-missing" ||
           isCodexFailureCode(result?.code)) &&
         typeof result.next === "string"
       )
@@ -675,6 +676,10 @@ async function execute(
         const task = store.getTask(command.id);
         if (task) {
           const usage = store.taskUsage(task.id);
+          const failure =
+            task.status === "failed"
+              ? operatorTask(store, task.id)?.failure
+              : undefined;
           const rejectedPaths =
             task.status === "failed"
               ? store.taskPathViolations(task.id)
@@ -685,6 +690,10 @@ async function execute(
             budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
             ...(rejectedPaths && { rejectedPaths }),
+            ...(failure?.code === "env-missing" && {
+              code: failure.code,
+              next: failure.next,
+            }),
           });
           writePathSummary(rejectedPaths);
           return 0;

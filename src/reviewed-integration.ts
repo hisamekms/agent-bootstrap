@@ -842,6 +842,8 @@ export class ReviewedIntegration {
     const rejected = last?.kind === "candidate.rejected";
     const pin = candidatePin(events, target);
     const verification = preReviewVerification(events, pin);
+    if (verification?.failure === "env-missing")
+      throw new EnvironmentError("env-missing");
     const verificationFailed =
       verification !== undefined && verification.review !== "pass";
     const review =
@@ -1075,7 +1077,11 @@ export class ReviewedIntegration {
       allowUnverified?: true;
       verificationObserver?: {
         begin(): string;
-        finish(id: string, passed: boolean | null): void;
+        finish(
+          id: string,
+          passed: boolean | null,
+          failure?: "env-missing",
+        ): void;
       };
     },
   ): Promise<"completed" | "denied" | "uncertain"> {
@@ -1125,13 +1131,27 @@ export class ReviewedIntegration {
       const observer = options?.verificationObserver;
       const verificationId = observer?.begin() ?? id;
       let passed: boolean | null = null;
+      let missingEnvironment: EnvironmentError | undefined;
       try {
         passed = await this.#verify(pin, diff, append, verificationId);
+      } catch (error) {
+        if (
+          !verificationId ||
+          !(error instanceof EnvironmentError) ||
+          error.code !== "env-missing"
+        )
+          throw error;
+        missingEnvironment = error;
       } finally {
-        if (observer) observer.finish(verificationId!, passed);
+        observer?.finish(
+          verificationId!,
+          passed,
+          missingEnvironment ? "env-missing" : undefined,
+        );
       }
       if (!passed) {
         await append({ kind: "denied", reason: "verification" });
+        if (missingEnvironment) throw missingEnvironment;
         return "denied";
       }
     }
@@ -1197,16 +1217,18 @@ export class ReviewedIntegration {
         !id ||
         !(error instanceof EnvironmentError) ||
         (error.code !== "env-lock-mismatch" &&
-          error.code !== "env-output-collision")
+          error.code !== "env-output-collision" &&
+          error.code !== "env-missing")
       )
         throw error;
       await append({
         kind: "verification.finished",
         run: id,
         digest: pin.digest,
-        review: "revise",
+        review: error.code === "env-missing" ? "failed" : "revise",
         failure: error.code,
       });
+      if (error.code === "env-missing") throw error;
       return false;
     } finally {
       try {

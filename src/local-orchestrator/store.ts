@@ -131,14 +131,18 @@ export type StoreErrorCode =
 
 function readTaskEnvironment(
   json: string,
-): { key: string; cacheHit: boolean } | undefined {
-  const { key, cacheHit } = JSON.parse(json);
+): { key: string; cacheHit: boolean; failure?: "env-missing" } | undefined {
+  const { key, cacheHit, failure } = JSON.parse(json);
   if (
     typeof key === "string" &&
     digestPattern.test(key) &&
     (cacheHit === 0 || cacheHit === 1)
   )
-    return { key, cacheHit: cacheHit === 1 };
+    return {
+      key,
+      cacheHit: cacheHit === 1,
+      ...(failure === "env-missing" && { failure }),
+    };
 }
 
 export class OrchestratorStoreError extends Error {
@@ -1697,6 +1701,7 @@ export class OrchestratorStore {
     at: string,
     proposalId?: string,
     rejectedPaths?: readonly PathViolation[],
+    missingEnvironmentRole?: InboxRow["missingEnvironmentRole"],
   ) {
     this.#run("UPDATE tasks SET status = ? WHERE id = ?", status, id);
     this.#event(at, "task.status", "task", id, {
@@ -1704,6 +1709,7 @@ export class OrchestratorStore {
       code,
       ...(proposalId && { proposalId }),
       ...(rejectedPaths && { rejectedPaths }),
+      ...(missingEnvironmentRole && { missingEnvironmentRole }),
     });
   }
 
@@ -1725,13 +1731,24 @@ export class OrchestratorStore {
     taskId: string,
     code: string,
     rejectedPaths?: readonly PathViolation[],
+    missingEnvironmentRole: NonNullable<
+      InboxRow["missingEnvironmentRole"]
+    > = "Executor",
   ) {
     const reason = identifier(code);
     this.#write((at) => {
       const { id, status } = required(this.#task(identifier(taskId)));
       if (status !== "running")
         throw new OrchestratorStoreError("invalid-transition");
-      this.#setTaskStatus(id, "failed", reason, at, undefined, rejectedPaths);
+      this.#setTaskStatus(
+        id,
+        "failed",
+        reason,
+        at,
+        undefined,
+        rejectedPaths,
+        reason === "env-missing" ? missingEnvironmentRole : undefined,
+      );
     });
   }
 
@@ -2039,7 +2056,16 @@ export class OrchestratorStore {
         this.#integrationSucceeded(at, id, proposal.content);
       else if (outcome === "uncertain")
         this.#setTaskStatus(taskId, "running", "integration-uncertain", at, id);
-      else this.#setTaskStatus(taskId, "failed", identifier(code), at);
+      else
+        this.#setTaskStatus(
+          taskId,
+          "failed",
+          identifier(code),
+          at,
+          undefined,
+          undefined,
+          code === "env-missing" ? "Verification" : undefined,
+        );
     });
   }
 
@@ -3438,6 +3464,7 @@ export class OrchestratorStore {
           at: string;
           status: TaskRow["status"] | null;
           code: string | null;
+          missingEnvironmentRole?: InboxRow["missingEnvironmentRole"];
           actor: ActorKind | null;
           mode: string | null;
           executionStatus: ExecutionStatus | null;
@@ -3447,16 +3474,18 @@ export class OrchestratorStore {
              WHERE status = 'succeeded' OR (goal_id = ?1 AND (?2 IS NULL OR id = ?2))
            )
            SELECT 0 AS position, id AS taskId, created_at AS at, 'registered' AS status,
-                  NULL AS code, NULL AS actor, NULL AS mode, NULL AS executionStatus
+                  NULL AS code, NULL AS missingEnvironmentRole, NULL AS actor,
+                  NULL AS mode, NULL AS executionStatus
            FROM relevant
            UNION ALL
            SELECT e.rowid, t.id, e.at, json_extract(e.data, '$.status'),
                   json_extract(e.data, '$.code') AS code,
+                  json_extract(e.data, '$.missingEnvironmentRole'),
                   NULL AS actor, NULL AS mode, NULL AS executionStatus
            FROM relevant AS t JOIN events AS e ON e.subject_id = t.id
            WHERE e.subject_kind = 'task' AND e.kind = 'task.status'
            UNION ALL
-           SELECT e.rowid, x.task_id, e.at, NULL, NULL, x.actor, x.mode, x.status
+           SELECT e.rowid, x.task_id, e.at, NULL, NULL, NULL, x.actor, x.mode, x.status
            FROM executions AS x JOIN relevant AS t ON x.task_id = t.id
              JOIN events AS e ON e.subject_id = x.id
            WHERE e.subject_kind = 'execution' AND e.kind = 'execution.started'
@@ -3522,7 +3551,8 @@ export class OrchestratorStore {
         >(
           `SELECT ${executionColumns}, ${executionAgentColumns},
            (SELECT json_object('key', json_extract(e.data, '$.key'),
-                    'cacheHit', json_extract(e.data, '$.cacheHit'))
+                    'cacheHit', json_extract(e.data, '$.cacheHit'),
+                    'failure', json_extract(e.data, '$.failure'))
             FROM events e WHERE e.subject_id = executions.id AND e.subject_kind = 'execution'
               AND e.kind = 'environment.finished'
               AND json_extract(e.data, '$.key') IS NOT NULL
@@ -3915,6 +3945,9 @@ export class OrchestratorStore {
                                    THEN taskId || ':' ELSE '' END || version AS id,
                kind, at, goalId, taskId, proposalId, executionId, modelText, resolved, code,
                rejectedCount, canRetry, rejectedPathsJson,
+               CASE WHEN code = 'env-missing' THEN json_extract(
+                 (SELECT data FROM events WHERE events.id = ranked.version), '$.missingEnvironmentRole'
+               ) END AS missingEnvironmentRole,
                (SELECT ref FROM goals WHERE id = ranked.goalId OR proposal_id = ranked.proposalId) AS goalRef,
                (SELECT ref FROM tasks WHERE id = ranked.taskId OR proposal_id = ranked.proposalId) AS taskRef,
                (SELECT count(*) FROM events WHERE subject_id = ranked.taskId

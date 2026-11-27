@@ -33,6 +33,7 @@ export interface InboxRow {
   code: string | null;
   rejectedCount: number | null;
   rejectedPathsJson: string | null;
+  missingEnvironmentRole: "Executor" | "Verification" | null;
   canRetry: 0 | 1;
 }
 

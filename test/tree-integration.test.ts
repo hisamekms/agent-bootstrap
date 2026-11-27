@@ -503,6 +503,30 @@ test("the journal accepts only a lowercase SHA-256 candidate message digest", as
   assert.equal((await journal.read())[0]?.kind, "candidate.created");
 });
 
+test("the journal rejects inconsistent missing-environment verification events", async (t) => {
+  const { journal } = await fixture(t, {});
+  const event = {
+    kind: "verification.finished" as const,
+    run: randomUUID(),
+    digest: "a".repeat(64),
+  };
+  for (const details of [
+    { review: "revise", failure: "env-missing" },
+    {
+      review: "failed",
+      failure: "env-missing",
+      tests: { passed: 0, failed: 0 },
+    },
+    { review: "failed" },
+  ] as const) {
+    await assert.rejects(
+      journal.append(0, { ...event, ...details }),
+      /Invalid integration event fields/,
+    );
+  }
+  assert.deepEqual(await journal.read(), []);
+});
+
 test("a change outside the scope is denied, and nothing is left behind", async (t) => {
   const f = await fixture(t, { scope: ["SRC/"] });
   f.edits.push(async (dir) => {

@@ -30,6 +30,7 @@ const failureLabels = new Map([
   ["candidate-mismatch", "変更候補の不一致"],
   ["config-invalid", "設定エラー"],
   ["credential-leak", "機密情報の検出"],
+  ["env-missing", "環境が未構築"],
   ["goal-base-mismatch", "Goal のベースの不一致"],
   ["host-error", "ホストエラー"],
   ["integration-rejected", "統合の却下"],
@@ -56,4 +57,10 @@ export function failureReason(code: string | null) {
   return (
     failureLabel(code) ?? (code ? `失敗（コード: ${code}）` : "実行エラー")
   );
+}
+
+export function environmentMissingReason(verification: boolean): string {
+  return verification
+    ? "変更候補のキーの環境がありません。environment build はローカルの main にコミットされた内容だけをビルドします。変更候補が依存関係の宣言を変更して新しい環境が必要な場合は、environment.autoBuild を有効にしてください。"
+    : "このキーの環境がありません。agent-bootstrap environment build --target <dir> --allow-network を実行するか、environment.autoBuild を有効にしてください。";
 }

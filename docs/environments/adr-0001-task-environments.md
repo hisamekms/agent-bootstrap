@@ -124,11 +124,14 @@ adapter's key files at the base commit)`
 | Trigger                          | Action                                                                  |
 | -------------------------------- | ----------------------------------------------------------------------- |
 | `setup` or `environment build`   | Build explicitly. This needs `--allow-network`, as `setup` does today.  |
-| Before a Task starts             | Compute the key from the base commit, then reuse it or build it.        |
+| Before a Task starts             | Compute the key from the base commit and use the stored environment.    |
 | The candidate changes a key file | Before Verification, `resolve`, write the lock back (E7), then rebuild. |
 
 Verification always runs in the environment of the candidate it
 verifies.
+
+Automatic builds need `environment.autoBuild`. Otherwise, a missing
+environment fails the Task with `env-missing`.
 
 ### E7. Updating dependencies
 
@@ -167,7 +170,7 @@ agent-bootstrap changes.
   stops count as `env-fetch-failed`. The Provisioner gateway has larger
   attempt and row budgets than a task VM, because package managers open
   many connections at once.
-- **Failure codes.** `env-fetch-failed`, `env-lock-mismatch`,
+- **Failure codes.** `env-missing`, `env-fetch-failed`, `env-lock-mismatch`,
   `env-build-failed` and `env-lock-missing` (a warning).
 - **doctor.** It shows the environment state for each target (current,
   stale or missing), its key, and whether locks exist.

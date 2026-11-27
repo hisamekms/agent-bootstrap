@@ -947,6 +947,27 @@ test("environment enabled is a private boolean and local settings override the u
   );
 });
 
+test("environment autoBuild is a private boolean with per-layer sources", () => {
+  const value = (autoBuild: unknown) => ({
+    version: 1,
+    environment: { autoBuild },
+  });
+  const user = parseConfig(value(true), "user");
+  const local = parseConfig(value(false), "local");
+  const inherited = mergeConfig(user, undefined, { version: 1 });
+  assert.deepEqual(inherited.config.environment, { autoBuild: true });
+  assert.equal(inherited.sources["environment.autoBuild"], "user");
+  const overridden = mergeConfig(user, undefined, local);
+  assert.deepEqual(overridden.config.environment, { autoBuild: false });
+  assert.equal(overridden.sources["environment.autoBuild"], "local");
+  assert.throws(() => parseConfig(value(true), "approved"), /environment/);
+  for (const layer of ["user", "local"] as const)
+    assert.throws(
+      () => parseConfig(value("true"), layer),
+      /environment.autoBuild/,
+    );
+});
+
 test("environment output collisions include folded roots and implicit parent aliases", () => {
   for (const [root, path] of [
     ["node_modules", "Node_Modules/x"],

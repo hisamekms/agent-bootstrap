@@ -1454,7 +1454,7 @@ function taskDetail(
             }) =>
               textElement(
                 "p",
-                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
+                `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.failure ? failureReason(environment.failure) : environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
                 "meta",
               ),
           )
@@ -1714,6 +1714,9 @@ function goalProblem(
           `「${problem.title}」が${"code" in problem ? failureReason(problem.code) : "実行エラー"}で失敗しました。`,
         ),
       ),
+      ...("code" in problem && problem.code === "env-missing"
+        ? [textElement("p", problem.detail, "reason")]
+        : []),
       group(
         "div",
         "actions",
@@ -2112,6 +2115,9 @@ export function createHostPanel(
                 ? modelTitle("span", title, "grow")
                 : textElement("span", taskId ?? goalId ?? "実行", "grow"),
               chip(problemReason(rows), "danger"),
+              ...rows
+                .filter((row) => "code" in row && row.code === "env-missing")
+                .map(({ detail }) => textElement("p", detail, "reason")),
               action(
                 "問題を見る ›",
                 `now-problem:${taskId ?? executionId ?? goalId}`,

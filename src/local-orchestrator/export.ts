@@ -51,6 +51,7 @@ const failureCodes = [
   "closed",
   "context-mismatch",
   "contract-violation",
+  "env-missing",
   "evidence",
   "file-limits",
   "goal-base-mismatch",

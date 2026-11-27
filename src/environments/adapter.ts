@@ -4,6 +4,7 @@ import type { HostPort } from "../egress-policy.ts";
 
 export type EnvironmentOperation = "build" | "resolve" | "update" | "outdated";
 export type EnvironmentFailure =
+  | "env-missing"
   | "env-fetch-failed"
   | "env-lock-mismatch"
   | "env-build-failed"

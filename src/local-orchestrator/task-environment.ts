@@ -19,6 +19,7 @@ import type { OrchestratorStore } from "./store.ts";
 
 export type TaskEnvironmentOptions = {
   readonly profile: ProfileLockEntry | undefined;
+  readonly autoBuild?: boolean;
   readonly allow: readonly string[];
   readonly host: ProvisionerHost;
   readonly requireAudit: (executionId: string) => void;
@@ -54,7 +55,15 @@ export function taskEnvironment(
           outputs,
           tree.paths.map((path) => ({ path, directory: false })),
         );
-      cacheHit = host.store.get(key) !== undefined;
+      if (host.store.get(key)) {
+        try {
+          release = host.store.hold(key);
+          cacheHit = true;
+        } catch (error) {
+          // Pruning can remove the entry between the lookup and the hold.
+          if (host.store.get(key)) throw error;
+        }
+      }
       journal.recordTaskEnvironment(executionId, {
         kind: "environment.started",
         invocationId,
@@ -63,6 +72,8 @@ export function taskEnvironment(
       });
       recordedStart = true;
       if (!cacheHit) {
+        if (options.autoBuild !== true)
+          throw new EnvironmentError("env-missing");
         checkTree();
         const result = await provisionEnvironment(
           {
@@ -77,7 +88,7 @@ export function taskEnvironment(
           throw new EnvironmentError();
         cacheHit = result.cacheHit;
       }
-      release = host.store.hold(key);
+      release ??= host.store.hold(key);
       const archive = validateEnvironmentArchive(
         host.store.readArchive(key),
         outputs,
