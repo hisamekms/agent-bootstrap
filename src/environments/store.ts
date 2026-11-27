@@ -202,6 +202,30 @@ export class EnvironmentStore {
       privateDirectory(path);
   }
 
+  /** Reserve the target through Provisioner teardown, regardless of cache key. */
+  tryLockBuild(): (() => void) | undefined {
+    this.prepare();
+    const name = `.build-${randomUUID()}`;
+    const path = join(this.directory, name);
+    writeMarker(path);
+    const release = () => rmSync(path, { force: true });
+    let acquired = false;
+    try {
+      const now = Date.now();
+      // Publish before checking for contenders. Unique names let concurrent
+      // stale-marker cleanup leave new claims alone.
+      acquired = !readdirSync(this.directory).some(
+        (other) =>
+          other !== name &&
+          other.startsWith(".build-") &&
+          activeMarker(join(this.directory, other), now, true),
+      );
+      if (acquired) return release;
+    } finally {
+      if (!acquired) release();
+    }
+  }
+
   #entry(key: string) {
     if (!digestPattern.test(key)) throw new EnvironmentError();
     return join(this.#entries, key);

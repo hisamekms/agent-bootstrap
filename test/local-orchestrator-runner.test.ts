@@ -119,6 +119,53 @@ function enableGoalAgentApproval(store: OrchestratorStore) {
   store.setProjectDefaults({ "goal-registration": "agent" }, operator);
 }
 
+test(
+  "takeover cancels running and queued approval executions",
+  { timeout: 5_000 },
+  async () => {
+    using state = orchestratorFixture("local-runner-");
+    const { store } = state;
+    enableGoalAgentApproval(store);
+    const entered = Promise.withResolvers<void>();
+    const work = runner(store, {
+      async runReviewer(plan, id) {
+        assert.ok(plan.command.signal);
+        const aborted = new Promise<void>((resolve) =>
+          plan.command.signal!.addEventListener("abort", () => resolve(), {
+            once: true,
+          }),
+        );
+        entered.resolve();
+        await aborted;
+        return { id, outcome: "cancelled" };
+      },
+    });
+    const running = store.proposeGoal(goal, plannerOrigin);
+    const queued = store.proposeGoal(goal, plannerOrigin);
+    const runningId = await work.requestApproval(running.id);
+    const queuedId = await work.requestApproval(queued.id);
+    const drained = work.drain();
+    await Promise.race([
+      entered.promise,
+      drained.then(() => assert.fail("Reviewer did not run")),
+    ]);
+    for (const { id, digest } of [queued, running])
+      store.decide(id, {
+        digest,
+        decision: "reject",
+        answerer: { kind: "human", channel: "operator-ui" },
+        takeover: true,
+      });
+    assert.equal(store.getExecution(queuedId)?.status, "cancelled");
+    await drained;
+    for (const id of [runningId, queuedId])
+      assert.partialDeepStrictEqual(store.getExecution(id), {
+        status: "cancelled",
+        result: { code: "approval-superseded" },
+      });
+  },
+);
+
 test("Planner keeps the brief and context in files, records usage and submits a pending goal", async () => {
   using state = orchestratorFixture("local-runner-");
   const { store } = state;

@@ -4,8 +4,11 @@ import { disclosure } from "../src/operator-ui/web/dom.ts";
 import {
   createHostPanel,
   createInboxPanel,
+  environmentControls,
+  goalBaseUpdate,
   goalExport,
   problemActions,
+  workplaceStopControls,
 } from "../src/operator-ui/web/panel.ts";
 import type { WorkplaceChannel } from "../src/operator-ui/web/channel.ts";
 import type {
@@ -25,6 +28,7 @@ class TestElement extends EventTarget {
   disabled = false;
   hidden = false;
   checked = false;
+  value = "";
   attributes = new Map<string, string>();
 
   get parentElement() {
@@ -178,6 +182,151 @@ function decisionDocument(t: TestContext, ids: string[] = []) {
 const id = "proposal";
 const first = "a".repeat(64);
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("Goal base controls show both commits and require the fresh preview phrase", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const first = { from: "1".repeat(40), to: "2".repeat(40) };
+  const fresh = { from: first.from, to: "3".repeat(40) };
+  const goal = {
+    id: "goal-id",
+    ref: "G1",
+    baseUpdatePreview: first,
+  } as GoalDetail;
+  const requests: unknown[] = [];
+  let refreshes = 0;
+  const [card] = goalBaseUpdate(
+    {
+      async request<M extends keyof Methods>(
+        method: M,
+        params: Methods[M]["params"],
+      ) {
+        if (method === "goal.get")
+          return { ...goal, baseUpdatePreview: fresh } as Methods[M]["result"];
+        requests.push(params);
+        throw new Error("stale-base");
+      },
+    },
+    goal,
+    () => {
+      refreshes++;
+    },
+  );
+  const root = card as unknown as TestElement;
+  click("base:goal-id", root);
+  await settle();
+  assert.match(root.textContent, /111111111111 → 333333333333/);
+  assert.ok(findAction("base:goal-id:confirm", root)?.disabled);
+  const input = root.find(
+    (node) => node.attributes.get("aria-label") === "確認の文言",
+  )!;
+  input.value = "update-goal-base G1 333333333333";
+  input.dispatchEvent(new Event("input"));
+  click("base:goal-id:confirm", root);
+  await settle();
+  assert.deepEqual(requests, [
+    { id: "goal-id", confirm: input.value, ...fresh },
+  ]);
+  assert.match(root.textContent, /状況が変わりました/);
+  assert.equal(refreshes, 1);
+});
+
+test("Workplace environment and shutdown confirm before dispatching", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const key = "a".repeat(64);
+  const confirmation = "b".repeat(64);
+  const revision = "c".repeat(64);
+  const calls: Array<[string, unknown]> = [];
+  let destinations = ["registry.npmjs.org:443", "registry.example.org:8443"];
+  let failStop = false;
+  const request = {
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      calls.push([method, params]);
+      if (method === "workplace.stop" && failStop)
+        throw new Error("write-failed");
+      if (method === "environment.build" && destinations.length === 0)
+        throw new Error("environment-build-running");
+      const replies = {
+        "environment.buildPreview": {
+          key,
+          confirmation,
+          destinations,
+          responsibilityNotice: "You are responsible for install scripts.",
+        },
+        "environment.build": { state: "running", key },
+        "workplace.stopPreview": { runningTasks: 2, revision },
+        "workplace.stop": { stopping: true },
+      };
+      return replies[method as keyof typeof replies] as Methods[M]["result"];
+    },
+  };
+  const root = new TestElement();
+  root.append(
+    ...(environmentControls(
+      request,
+      {
+        status: { key, state: "missing", hasLock: true, size: 0 },
+        build: null,
+      },
+      () => {},
+    ) as unknown as TestElement[]),
+  );
+  root.append(
+    workplaceStopControls(request, () => {}) as unknown as TestElement,
+  );
+  click("environment:build", root);
+  await settle();
+  assert.match(root.textContent, /Provisioner VM がネットワークに接続します/);
+  assert.match(
+    root.textContent,
+    /registry.npmjs.org:443、registry.example.org:8443/,
+  );
+  assert.match(root.textContent, /You are responsible for install scripts/);
+  assert.deepEqual(calls, [["environment.buildPreview", {}]]);
+  click("environment:build:confirm", root);
+  await settle();
+  assert.deepEqual(calls.at(-1), ["environment.build", { confirmation }]);
+  destinations = [];
+  click("environment:build", root);
+  await settle();
+  assert.match(root.textContent, /許可されたネットワーク接続先はありません/);
+  click("environment:build:confirm", root);
+  await settle();
+  assert.match(root.textContent, /別の環境の準備が進行中です/);
+  root.replaceChildren(
+    ...(environmentControls(
+      request,
+      {
+        status: { key, state: "missing", hasLock: true, size: 0 },
+        build: { state: "running", key },
+      },
+      () => {},
+    ) as unknown as TestElement[]),
+  );
+  assert.match(root.textContent, /環境を準備中/);
+  assert.equal(findAction("environment:build", root), undefined);
+  root.append(
+    workplaceStopControls(request, () => {}) as unknown as TestElement,
+  );
+  click("workplace:stop", root);
+  await settle();
+  assert.match(root.textContent, /実行中の Task が 2 件あります/);
+  assert.deepEqual(calls.at(-1), ["workplace.stopPreview", {}]);
+  click("workplace:stop:confirm", root);
+  await settle();
+  assert.deepEqual(calls.at(-1), [
+    "workplace.stop",
+    { confirm: "Workplace を終える", revision },
+  ]);
+  failStop = true;
+  click("workplace:stop", root);
+  await settle();
+  click("workplace:stop:confirm", root);
+  await settle();
+  assert.match(root.textContent, /終了を記録できませんでした。.*Ctrl-C/);
+});
 
 function details(digest: string): Extract<Proposal, { kind: "goal" }> {
   return {
@@ -344,6 +493,103 @@ test("withheld proposal fields block confirmation while rejection remains availa
   click("submit-answer");
   await settle();
   assert.deepEqual(submitted, [{ id, digest: first, decision: "reject" }]);
+});
+
+test("answering instead of the AI requires confirmation and preserves credential withholding", async (t) => {
+  const { inbox, click, findAction } = decisionDocument(t);
+  const submitted: Methods["proposal.answer"]["params"][] = [];
+  let blocked = false;
+  const panel = createInboxPanel(
+    {
+      async request<M extends keyof Methods>(
+        method: M,
+        params: Methods[M]["params"],
+      ) {
+        if (method === "proposal.get") {
+          const proposal = {
+            ...details(first),
+            effectivePolicy: "agent",
+            ...(submitted[0]?.decision === "approve" && {
+              status: "approved",
+              goalRef: "G1",
+            }),
+          };
+          if (!blocked) return proposal as Methods[M]["result"];
+          return {
+            ...proposal,
+            modelText: {
+              ...proposal.modelText,
+              acceptance: { withheld: true },
+            },
+          } as Methods[M]["result"];
+        }
+        assert.equal(method, "proposal.answer");
+        const answer = params as Methods["proposal.answer"]["params"];
+        submitted.push(answer);
+        return { id: answer.id, ok: true } as Methods[M]["result"];
+      },
+    },
+    () => {},
+    () => {},
+    () => {},
+  );
+  function render() {
+    const item = row(first, blocked ? "blocked" : id);
+    assert.ok("answer" in item);
+    panel.render(
+      [
+        {
+          ...item,
+          answer: {
+            ...item.answer,
+            approve: false,
+            reject: false,
+            takeover: true,
+          },
+        },
+      ],
+      () => [],
+      () => undefined,
+    );
+  }
+
+  render();
+  assert.equal(findAction("choose:goal-registration:proposal"), undefined);
+  assert.equal(findAction("approve:goal-registration:proposal"), undefined);
+  assert.equal(
+    findAction("takeover:goal-registration:proposal")?.textContent,
+    "自分で答える",
+  );
+  click("takeover:goal-registration:proposal");
+  assert.match(inbox.textContent, /AI の代わりに回答します/);
+  assert.ok(findAction("submit-takeover:approve")?.disabled);
+  await settle();
+  assert.match(inbox.textContent, /Before/);
+  assert.deepEqual(submitted, []);
+  click("cancel-answer");
+  assert.equal(findAction("submit-takeover:approve"), undefined);
+  click("takeover:goal-registration:proposal");
+  await settle();
+  click("submit-takeover:approve");
+  await settle();
+  assert.deepEqual(submitted, [
+    { id, digest: first, decision: "approve", takeover: true },
+  ]);
+
+  blocked = true;
+  render();
+  click("takeover:goal-registration:blocked");
+  await settle();
+  assert.ok(findAction("submit-takeover:approve")?.disabled);
+  assert.match(inbox.textContent, /隠した項目があるため/);
+  click("submit-takeover:reject");
+  await settle();
+  assert.deepEqual(submitted[1], {
+    id: "blocked",
+    digest: first,
+    decision: "reject",
+    takeover: true,
+  });
 });
 
 test("the closed card confirms on one line; opening detail approves the viewed digest directly", async (t) => {

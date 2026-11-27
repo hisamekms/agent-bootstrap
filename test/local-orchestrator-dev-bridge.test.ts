@@ -130,10 +130,17 @@ test("delegation and Goal export methods are explicitly allowlisted on the bridg
     "task.setIntegrationPolicy",
     "decision.history",
     "goal.export",
+    "goal.updateBase",
+    "environment.status",
+    "environment.buildPreview",
+    "environment.build",
+    "workplace.stopPreview",
+    "workplace.stop",
   ])
     assert.equal(operatorBridgeMethods.has(method), true);
   assert.equal(operatorBridgeMethods.has("policy.reset"), false);
   assert.equal(operatorBridgeMethods.has("draft_task"), false);
+  assert.equal(operatorBridgeMethods.has("reconcile"), false);
 });
 
 test("workplace assets contain no remote URLs", async () => {

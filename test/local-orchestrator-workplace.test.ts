@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadWorkplaceAssets } from "../src/operator-ui/assets.ts";
@@ -9,6 +10,14 @@ import {
   workplaceStop,
 } from "../src/local-orchestrator/workplace.ts";
 import { orchestratorFixture } from "./local-orchestrator-fixture.ts";
+import { workplaceStopAction } from "../src/local-orchestrator/operator-api.ts";
+
+const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
+  Database: new (filename: string) => {
+    exec(sql: string): void;
+    close(): void;
+  };
+};
 
 test(
   "workplace keeps the API and optional bridge open until Concierge exits",
@@ -128,4 +137,74 @@ test("disposing the stop control does not count as a stop", () => {
   stop.dispose();
   assert.equal(stop.signal.aborted, false);
   assert.equal(stop.exitCode, undefined);
+});
+
+test("confirmed Workplace stop is audited, state-bound and idempotent", () => {
+  using fixture = orchestratorFixture("lo-work-stop-");
+  const { store } = fixture;
+  const signals = new EventEmitter();
+  const control = workplaceStop(signals, () => assert.fail("forced exit"));
+  try {
+    const call = (params: object) =>
+      workplaceStopAction(store, control, "workplace.stop", params);
+    assert.deepEqual(
+      workplaceStopAction(store, undefined, "workplace.stopPreview", {}),
+      {
+        error: { code: "workplace-unavailable" },
+      },
+    );
+    const { revision } = store.workplaceStopPreview();
+    assert.deepEqual(
+      workplaceStopAction(store, control, "workplace.stopPreview", {}),
+      {
+        result: { runningTasks: 0, revision },
+      },
+    );
+    const input = { confirm: "Workplace を終える", revision };
+    assert.deepEqual(call({ ...input, revision: "x" }), {
+      error: { code: "invalid-params" },
+    });
+    assert.deepEqual(call({ ...input, confirm: "yes" }), {
+      error: { code: "confirmation-mismatch" },
+    });
+    assert.deepEqual(call({ ...input, revision: "1".repeat(64) }), {
+      error: { code: "stale-confirmation" },
+    });
+    assert.equal(control.signal.aborted, false);
+    assert.deepEqual(call(input), { result: { stopping: true } });
+    assert.equal(control.signal.aborted, true);
+    assert.deepEqual(call(input), { error: { code: "workplace-stopping" } });
+    assert.deepEqual(
+      store
+        .listEvents({ subjectId: "workplace", limit: 10 })
+        .map(({ data }) => data),
+      [{ runningTasks: 0, origin: "operator-ui" }],
+    );
+  } finally {
+    control.dispose();
+  }
+});
+
+test("Workplace stop cannot begin when its authorization record fails", () => {
+  using fixture = orchestratorFixture("lo-work-stop-audit-");
+  const db = new Database(fixture.filename);
+  try {
+    db.exec(`CREATE TRIGGER reject_stop BEFORE INSERT ON events
+      WHEN NEW.kind = 'workplace.stop-authorized'
+      BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END`);
+    const { revision } = fixture.store.workplaceStopPreview();
+    const control = {
+      signal: new AbortController().signal,
+      stop: () => assert.fail("stopped"),
+    };
+    assert.deepEqual(
+      workplaceStopAction(fixture.store, control, "workplace.stop", {
+        revision,
+        confirm: "Workplace を終える",
+      }),
+      { error: { code: "write-failed" } },
+    );
+  } finally {
+    db.close();
+  }
 });

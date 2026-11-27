@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout } from "node:timers/promises";
 import {
   EnvironmentError,
   identifyEnvironment,
@@ -16,6 +17,8 @@ import { LocalGitIntegration } from "../git-integration.ts";
 import type { ProfileLockEntry } from "../profile-lock.ts";
 import type { EnsureTaskEnvironment } from "../reviewed-integration.ts";
 import type { OrchestratorStore } from "./store.ts";
+
+const buildWaitMs = 5 * 60 * 1000;
 
 export type TaskEnvironmentOptions = {
   readonly profile: ProfileLockEntry | undefined;
@@ -55,15 +58,17 @@ export function taskEnvironment(
           outputs,
           tree.paths.map((path) => ({ path, directory: false })),
         );
-      if (host.store.get(key)) {
+      const holdCached = () => {
+        if (!host.store.get(identity.key)) return;
         try {
-          release = host.store.hold(key);
+          release = host.store.hold(identity.key);
           cacheHit = true;
         } catch (error) {
           // Pruning can remove the entry between the lookup and the hold.
-          if (host.store.get(key)) throw error;
+          if (host.store.get(identity.key)) throw error;
         }
-      }
+      };
+      holdCached();
       journal.recordTaskEnvironment(executionId, {
         kind: "environment.started",
         invocationId,
@@ -75,18 +80,41 @@ export function taskEnvironment(
         if (options.autoBuild !== true)
           throw new EnvironmentError("env-missing");
         checkTree();
-        const result = await provisionEnvironment(
-          {
-            tree,
-            profile: options.profile,
-            operation: "build",
-            allow: options.allow,
-          },
-          { ...host, invocationId },
-        );
-        if (result.key !== key || !result.manifest)
-          throw new EnvironmentError();
-        cacheHit = result.cacheHit;
+        const deadline = performance.now() + buildWaitMs;
+        let unlock = host.store.tryLockBuild();
+        while (!unlock) {
+          const remaining = deadline - performance.now();
+          if (remaining <= 0 || host.signal?.aborted)
+            throw new EnvironmentError();
+          await setTimeout(Math.min(100, remaining), undefined, {
+            signal: host.signal,
+          }).catch(() => {
+            throw new EnvironmentError();
+          });
+          if (performance.now() >= deadline) throw new EnvironmentError();
+          unlock = host.store.tryLockBuild();
+        }
+        try {
+          holdCached();
+          if (!cacheHit) {
+            options.requireAudit(executionId);
+            const result = await provisionEnvironment(
+              {
+                tree,
+                profile: options.profile,
+                operation: "build",
+                allow: options.allow,
+              },
+              { ...host, invocationId },
+            );
+            if (result.key !== key || !result.manifest)
+              throw new EnvironmentError();
+            cacheHit = result.cacheHit;
+            release = host.store.hold(key);
+          }
+        } finally {
+          unlock();
+        }
       }
       release ??= host.store.hold(key);
       const archive = validateEnvironmentArchive(

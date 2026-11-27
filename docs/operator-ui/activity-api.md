@@ -130,6 +130,28 @@ After screening the Goal changes, the host records `goal.export-authorized`
 before writing the local branch and `goal.exported` after it succeeds.
 The receipt contains `id`, `ref`, `branch`, `from`, and `to`.
 
+An eligible Goal with a newer local main has a `baseUpdatePreview` in
+`goal.get`. Submit its full `from` and `to` commits to `goal.updateBase`
+with the Goal `id` and a confirmation such as
+`update-goal-base G12 123456789abc`. The host reuses the CLI eligibility
+and ref checks. It records `goal.base-update-authorized` before changing
+the private repository. A changed preview needs a fresh confirmation.
+
+`environment.status` reports the target's environment and the current
+Workplace build result. `environment.buildPreview` lists the destinations,
+the first-use responsibility notice when applicable, and an opaque
+confirmation bound to that preview. Pass the confirmation to
+`environment.build`. Before starting the audited Provisioner, the host
+records `environment.build-authorized` with the commit, key, allowed
+host and port pairs, and whether the first-use notice was shown. The
+panel refreshes status during and after the build.
+
+`workplace.stopPreview` reports the running Task count and a revision
+bound to the set of running Tasks. `workplace.stop` takes that revision
+and the confirmation `Workplace を終える`. Once authorized, the launcher
+starts its graceful shutdown. The loopback connection closes with an
+application code that tells the page the session ended.
+
 Draft requires a ready terminal and the client's input ownership. It strips
 controls, format characters, and Unicode line separators, then takes up to
 2,000 Unicode code points. An empty sanitized draft returns

@@ -54,6 +54,7 @@ export interface ProvisionerHost {
   readonly env: NodeJS.ProcessEnv;
   readonly store: EnvironmentStore;
   readonly run: ProvisionerCommand;
+  readonly signal?: AbortSignal;
   readonly openGateway?: (
     options: EgressGatewayOptions,
   ) => Promise<HostGateway>;
@@ -178,7 +179,8 @@ export async function provisionEnvironment(
 ) {
   checkInput(input);
   const { tree, profile, operation } = input;
-  const { env, store } = host;
+  const { env, store, signal } = host;
+  if (signal?.aborted) throw new EnvironmentError();
   const { policy, identity, step, audit } = await prepareProvisioner(
     input,
     host,
@@ -237,6 +239,7 @@ export async function provisionEnvironment(
       cacheHit: !!cache,
     });
     try {
+      signal?.throwIfAborted();
       const before = lock ? parseBunLock(lock) : [];
       packages = cache?.packages ?? before;
       previousPackages =
@@ -272,6 +275,7 @@ export async function provisionEnvironment(
           memoryMiB: profile.memoryMiB,
           cpus: profile.cpus,
           env,
+          ...(signal && { signal }),
           provisioner: {
             audit,
             invocationId,
@@ -331,6 +335,7 @@ export async function provisionEnvironment(
           } else throw new EnvironmentError("env-lock-mismatch");
         }
       }
+      signal?.throwIfAborted();
       if (!audit.isV5Writable) throw new EnvironmentError();
       if (operation === "build" && archive)
         manifest = await store.publish(

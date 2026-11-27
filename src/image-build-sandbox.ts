@@ -38,6 +38,7 @@ export async function withBuildSandbox<T>({
   use,
   openGateway = EgressGateway.open,
   provisioner,
+  signal,
 }: {
   profile: ProfileName;
   image: string;
@@ -49,6 +50,7 @@ export async function withBuildSandbox<T>({
   env: NodeJS.ProcessEnv;
   run: Run;
   use: (name: string, run: Run) => Promise<T>;
+  signal?: AbortSignal;
   openGateway?: (options: EgressGatewayOptions) => Promise<HostGateway>;
   provisioner?: {
     readonly audit: SqliteAudit;
@@ -58,6 +60,7 @@ export async function withBuildSandbox<T>({
     readonly limits?: EgressGatewayOptions["limits"];
   };
 }): Promise<T> {
+  signal?.throwIfAborted();
   if (provisioner && (profile !== "bun" || smoke || packageDir !== undefined))
     throw new Error("Invalid Provisioner sandbox");
   const plan = provisioner ? undefined : buildSandboxPlan(profile, env);
@@ -89,10 +92,14 @@ export async function withBuildSandbox<T>({
   let created = false;
   let outcome: "ok" | "failed" = "failed";
   const abort = new AbortController();
+  const runSignal = signal
+    ? AbortSignal.any([signal, abort.signal])
+    : abort.signal;
   // Smoke tests run with no network at all, like task VMs: a gateway with an
   // empty allowlist would quarantine on a browser's startup lookups.
   const gatewayDown = () => !smoke && gateway?.quarantined !== false;
   const ensureAudit = () => {
+    runSignal.throwIfAborted();
     if (!audit.isV5Writable || gatewayDown())
       throw new Error("Image build gateway or audit unavailable");
   };
@@ -144,6 +151,7 @@ export async function withBuildSandbox<T>({
             : "image-build",
       },
     });
+    runSignal.throwIfAborted();
     if (!smoke)
       gateway = await openGateway({
         executionId: invocationId,
@@ -214,7 +222,7 @@ export async function withBuildSandbox<T>({
           ],
           300_000,
           password === undefined ? {} : { [passwordEnv]: password },
-          abort.signal,
+          runSignal,
         );
       } catch (error) {
         write({
@@ -232,7 +240,7 @@ export async function withBuildSandbox<T>({
       });
       const result = await use(sandboxId, async (args, timeout) => {
         ensureAudit();
-        const output = await run(args, timeout, undefined, abort.signal);
+        const output = await run(args, timeout, undefined, runSignal);
         ensureAudit();
         return output;
       });

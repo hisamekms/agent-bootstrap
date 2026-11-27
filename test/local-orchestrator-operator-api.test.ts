@@ -313,6 +313,7 @@ test("operator API answers return per-item errors in order and audit the panel o
     { ...pending, delegate: {} },
     { ...pending, choice: "option" },
     { ...pending, decision: "abstain" },
+    { ...pending, takeover: false },
     { ...pending, digest: "a".repeat(12) },
     { ...pending, id: "invalid id" },
   ]) {
@@ -330,6 +331,18 @@ test("operator API answers return per-item errors in order and audit the panel o
       answerManyFromPanel(store, root, { answers }),
       /Invalid local orchestrator input/,
     );
+  assert.deepEqual(parsePanelAnswer({ ...pending, takeover: true }), {
+    id: third.id,
+    digest: third.digest,
+    decision: "approve",
+    takeover: true,
+  });
+  await assert.rejects(
+    answerManyFromPanel(store, root, {
+      answers: [pending, { ...pending, takeover: true }],
+    }),
+    /Invalid local orchestrator input/,
+  );
   await assert.rejects(
     answerManyFromPanel(
       store,
@@ -374,9 +387,16 @@ test("operator API enforces decision-specific human requirements under an agent 
     store,
     projectInbox({ store, target: "/fixture" }),
   );
-  assert.equal(
-    "answer" in inbox.find(({ subject }) => subject.proposalId === normal.id)!,
-    false,
+  assert.partialDeepStrictEqual(
+    inbox.find(({ subject }) => subject.proposalId === normal.id),
+    {
+      answer: {
+        digest: normal.digest,
+        approve: false,
+        reject: false,
+        takeover: true,
+      },
+    },
   );
   assert.partialDeepStrictEqual(
     inbox.find(({ subject }) => subject.proposalId === loosening.id),
@@ -384,6 +404,7 @@ test("operator API enforces decision-specific human requirements under an agent 
       answer: {
         approve: true,
         reject: false,
+        takeover: true,
         digest: loosening.digest,
         title: goal.title,
         agentGates: ["integration"],
@@ -402,6 +423,15 @@ test("operator API enforces decision-specific human requirements under an agent 
 
   store.setProjectDefaults({ "goal-registration": "human" }, operator);
   assert.deepEqual(
+    await answerFromPanel(store, root, {
+      id: normal.id,
+      digest: normal.digest,
+      decision: "approve",
+      takeover: true,
+    }),
+    { id: normal.id, error: { code: "approval-forbidden" } },
+  );
+  assert.deepEqual(
     await answerFromPanel(
       store,
       root,
@@ -417,6 +447,94 @@ test("operator API enforces decision-specific human requirements under an agent 
     { id: normal.id, error: { code: "approval-forbidden" } },
   );
   assert.equal(store.getProposal(normal.id)?.status, "pending");
+});
+
+test("panel takeover and a pinned Reviewer race like a human CLI answer", async () => {
+  using fixture = orchestratorFixture("lo-op-takeover-");
+  const { root, store } = fixture;
+  const host = { kind: "host" } as const;
+  store.setProjectDefaults(
+    { "goal-registration": "agent" },
+    { kind: "operator" },
+  );
+  for (const reviewerFirst of [false, true]) {
+    const { id, digest } = store.proposeGoal(goal, host);
+    const execution = store.createExecution({
+      actor: "Reviewer",
+      mode: "approval",
+      requestedBy: host,
+      approvalProposalId: id,
+    });
+    store.startExecution(execution.id);
+    const reviewer = () =>
+      store.decide(id, {
+        digest,
+        decision: "approve",
+        answerer: {
+          kind: "agent",
+          executionId: execution.id,
+          model: "reviewer",
+        },
+      });
+    assert.throws(
+      () =>
+        store.decide(id, {
+          digest,
+          decision: "approve",
+          answerer: {
+            kind: "agent",
+            executionId: execution.id,
+            model: "reviewer",
+          },
+          takeover: true,
+        }),
+      /Invalid local orchestrator input/,
+    );
+    const params = { id, digest, decision: "reject", takeover: true } as const;
+    assert.deepEqual(
+      await answerFromPanel(store, root, { ...params, digest: "0".repeat(64) }),
+      { id, error: { code: "stale-digest" } },
+    );
+    // The Reviewer can close the proposal between the panel preview and write.
+    const result = await answerFromPanel(store, root, params, async () => {
+      if (reviewerFirst) reviewer();
+    });
+    if (reviewerFirst) {
+      assert.deepEqual(result, { id, error: { code: "invalid-transition" } });
+    } else {
+      assert.deepEqual(result, { id, ok: true });
+      assert.throws(reviewer, { code: "invalid-transition" });
+      store.finishExecution(execution.id, "failed", { code: "actor-failed" });
+      assert.partialDeepStrictEqual(store.getExecution(execution.id), {
+        status: "cancelled",
+        result: { code: "approval-superseded" },
+      });
+    }
+    const decisions = store
+      .listEvents({ subjectId: id, limit: 10 })
+      .filter(({ kind }) => kind === "proposal.decided");
+    assert.equal(decisions.length, 1);
+    assert.partialDeepStrictEqual(decisions[0], {
+      data: reviewerFirst
+        ? {
+            digest,
+            decision: "approve",
+            answererKind: "agent",
+            policy: "agent",
+          }
+        : {
+            digest,
+            decision: "reject",
+            answererKind: "human",
+            policy: "agent",
+            origin: { kind: "operator", channel: "operator-ui" },
+          },
+    });
+    assert.equal(
+      store.getProposal(id)?.status,
+      reviewerFirst ? "approved" : "rejected",
+    );
+  }
 });
 
 function socketFixture() {

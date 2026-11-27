@@ -248,6 +248,7 @@ export async function previewGoalBaseUpdate(
   repoRoot: string,
   directory: string,
   id: string,
+  channel: "cli" | "operator-ui" = "cli",
 ) {
   const goal = store.getGoal(id);
   if (!goal) throw new OrchestratorStoreError("goal-base-ineligible");
@@ -270,6 +271,8 @@ export async function previewGoalBaseUpdate(
         (await git.branchHead()) !== from
       )
         throw new GitIntegrationError("stale-base");
+      if (channel === "operator-ui")
+        store.authorizeGoalBaseUpdate(goalId, from, to, recordedBase === null);
       await importGoalBase(repoRoot, repository, to);
       await store.updateGoalBase(
         goalId,
@@ -277,6 +280,7 @@ export async function previewGoalBaseUpdate(
         to,
         () => git.updateGoalBranch(from, to),
         recordedBase === null,
+        channel,
       );
     },
   };

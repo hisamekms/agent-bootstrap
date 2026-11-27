@@ -1427,6 +1427,7 @@ export class LocalGitIntegration {
     const entries = await git.#entries(repository, repository, base);
     const byPath = new Map(entries.map((entry) => [entry.path, entry]));
     return {
+      commit: base,
       paths: [...byPath.keys()],
       async read(path: string) {
         const entry = byPath.get(path);

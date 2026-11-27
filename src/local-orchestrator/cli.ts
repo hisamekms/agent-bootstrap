@@ -1,4 +1,4 @@
-import { isCodexFailureCode } from "../codex-exec.ts";
+import { boundField, executionDisplay } from "./execution-display.ts";
 import {
   GOAL_POLICIES,
   RULE_GATES,
@@ -92,7 +92,6 @@ type ProposalDetails = NonNullable<
 >;
 type ProposalStatus = ProposalDetails["status"];
 const statuses = ["pending", "approved", "rejected", "registered"] as const;
-const maxFieldLength = 4000;
 const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--target <path>] <command>
   bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] analyze [--audit <file>] [--out <dir>] [--sql <file>]
   bun run src/local-orchestrator/cli.ts [--target <path> | --all-targets] denials [--since <iso>] [--limit <1-1000>]
@@ -338,22 +337,6 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
   throw new ContractError();
 }
 
-function boundField(value: string): string {
-  // Bound the displayed string even when escaping expands its contents.
-  const length = (text: string) =>
-    escapeTerminalControls(JSON.stringify(text)).length;
-  let end = Math.min(value.length, maxFieldLength);
-  if (end === value.length && length(value) <= maxFieldLength) return value;
-
-  let start = 0;
-  while (start < end) {
-    const middle = Math.ceil((start + end) / 2);
-    if (length(`${value.slice(0, middle)}…`) <= maxFieldLength) start = middle;
-    else end = middle - 1;
-  }
-  return `${value.slice(0, start)}…`;
-}
-
 function writeJson(io: CliIo, value: unknown): void {
   const json = JSON.stringify(
     value,
@@ -540,16 +523,8 @@ async function execute(
       } | null;
       if (result?.code === "path-violation")
         writePathSummary(readPathViolations(result.rejectedPaths));
-      if (
-        !io.json &&
-        (result?.code === "secret-test-required" ||
-          result?.code === "env-missing" ||
-          isCodexFailureCode(result?.code)) &&
-        typeof result.next === "string"
-      )
-        io.stdout.write(
-          `next: ${escapeTerminalControls(boundField(result.next))}\n`,
-        );
+      const { next } = executionDisplay(result);
+      if (!io.json && next) io.stdout.write(`next: ${next}\n`);
       return 0;
     }
     case "reconcile": {

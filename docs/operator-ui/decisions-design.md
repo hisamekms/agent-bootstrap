@@ -71,11 +71,16 @@ choice?}` and `proposal.answerMany` with a list of the same. The bridge
   A batch asks once for the whole list.
 - The host records the answer as the operator's, with origin
   `operator-ui`, the digest and the chosen alternative.
-- Only gates whose effective policy is "human" are answered here.
-  This includes decisions reserved to a human by the gate invariants
-  under an inherited agent policy. A proposal that loosens policy under an
-  agent policy can be approved here; rejecting it is still a CLI answer.
-  On-behalf answers keep their CLI path.
+- The regular panel actions answer decisions reserved to a human,
+  including decisions held for a human by an invariant under an
+  inherited agent policy. For a pending gate the AI may answer, the
+  secondary action 「自分で答える」 opens the proposal and asks the
+  operator to confirm approval or rejection in the AI's place. The
+  single answer sends `takeover: true` with the pinned digest. This
+  records a human answer without changing the gate's policy or the AI's
+  permissions. The first valid answer recorded by the host closes the
+  proposal, as with a human CLI answer racing the AI. Batch approval uses
+  the regular panel actions. On-behalf answers remain CLI-only.
 - No extra presence check for now. A loopback page that holds the
   per-launch token can answer. On one operator's machine this matches the
   TTY CLI: any process running as the operator can already drive the CLI
@@ -157,9 +162,9 @@ fields and the Git stat. A failed check replaces the field with a marker.
 If the changed paths are withheld, the display also withholds their Git
 stat. A withheld field blocks approval from Workplace. Rejection remains
 available, and the card directs the operator to the CLI to review the
-proposal. This block is a Workplace safeguard. The host does not refuse
-`proposal.answer` or `proposal.answerMany` for a proposal with withheld
-fields, because the caller is the authenticated operator.
+proposal. The panel keeps the raw fields off the browser connection,
+including when the operator answers in the AI's place. Host approvals
+also require the proposal preview to pass any configured credential scan.
 
 The connection settings show the project and its repository path
 relative to the configured repository root. The page keeps the bridge

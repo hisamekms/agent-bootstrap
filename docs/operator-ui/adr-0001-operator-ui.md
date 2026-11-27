@@ -68,6 +68,9 @@ The API offers:
 - the gate answer (D5);
 - Goal discard and local branch export, each with its own head-bound
   confirmation;
+- Goal base updates with a commit-bound confirmation, Task execution
+  diagnostics, and target environment status and confirmed builds;
+- Workplace shutdown with a confirmation that includes running Tasks;
 - the Concierge PTY stream (input, output, resize).
 
 The socket's file permissions are the client boundary. The API is

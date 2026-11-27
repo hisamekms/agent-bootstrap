@@ -529,10 +529,21 @@ export class ActorRunner {
     const { store } = this.#deps;
     if (store.getExecution(job.id)?.status === "cancelled") return;
     const { harness, plannerHarness } = this.#deps;
-    store.startExecution(
-      job.id,
-      job.kind === "planner" ? (plannerHarness ?? harness) : harness,
-    );
+    try {
+      store.startExecution(
+        job.id,
+        job.kind === "planner" ? (plannerHarness ?? harness) : harness,
+      );
+    } catch (error) {
+      if (
+        job.kind === "approval" &&
+        error instanceof OrchestratorStoreError &&
+        error.code === "invalid-transition" &&
+        store.approvalSuperseded(job.id)
+      )
+        return;
+      throw error;
+    }
     let attempts = 0;
     const results: (ClaudeCodeResult | null)[] = [];
     const recordResult = (result: ClaudeCodeResult | null) => {
@@ -828,14 +839,38 @@ export class ActorRunner {
         return { status: "failed", result: { code: "session-ended" } };
     }
     await this.#deps.scan?.(...files.map(({ bytes }) => bytes));
-    const run = await this.#deps.runReviewer(
-      this.#plan(
-        "Reviewer",
-        boundedFiles(files),
-        task?.content.budgets.maxExecutionMs,
-      ),
-      id,
+    const plan = this.#plan(
+      "Reviewer",
+      boundedFiles(files),
+      task?.content.budgets.maxExecutionMs,
     );
+    const cancel = new AbortController();
+    const signal = plan.command.signal
+      ? AbortSignal.any([plan.command.signal, cancel.signal])
+      : cancel.signal;
+    const checkTakeover = () => {
+      if (store.approvalSuperseded(id)) cancel.abort();
+    };
+    checkTakeover();
+    const monitor = setInterval(() => {
+      try {
+        checkTakeover();
+      } catch {
+        // The transactional completion still checks for a recorded takeover.
+      }
+    }, 100);
+    let run: ReviewerRun;
+    try {
+      cancel.signal.throwIfAborted();
+      run = await this.#deps.runReviewer(
+        { ...plan, command: { ...plan.command, signal } },
+        id,
+      );
+    } finally {
+      clearInterval(monitor);
+    }
+    checkTakeover();
+    cancel.signal.throwIfAborted();
     if (run.id !== id)
       return { status: "failed", result: { code: "host-error" } };
     const result =

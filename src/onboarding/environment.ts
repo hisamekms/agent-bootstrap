@@ -1,3 +1,5 @@
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
 import { loadConfig } from "../config/layers.ts";
 import { type Project } from "../config/projects.ts";
 import { resolveMsbHome } from "../config/msb-home.ts";
@@ -7,7 +9,10 @@ import {
   type EnvironmentTree,
 } from "../environments/adapter.ts";
 import { bunAdapter } from "../environments/bun.ts";
-import { provisionEnvironment } from "../environments/provisioner.ts";
+import {
+  provisionEnvironment,
+  type ProvisionerHost,
+} from "../environments/provisioner.ts";
 import { EnvironmentStore } from "../environments/store.ts";
 import { LocalGitIntegration } from "../git-integration.ts";
 import { resolveTarget } from "../local-orchestrator/target.ts";
@@ -26,8 +31,21 @@ export interface EnvironmentStatus {
   readonly size: number;
 }
 
-const responsibility =
+export const environmentResponsibilityNotice =
   "You are responsible for the packages and tools declared by the target, including install scripts. Agent-bootstrap isolates the build from host credentials, other targets, host paths and the audit record.";
+
+const responsibilityRecord = "responsibility-shown";
+export class EnvironmentBuildBusyError extends Error {
+  readonly code = "environment-build-running";
+
+  constructor() {
+    super("Another environment build is running for this target.");
+  }
+}
+
+type BuildTarget = Target & { configDirectory: string };
+type BuildHost = Pick<Host, "env" | "actorHarnesses" | "command"> &
+  Pick<ProvisionerHost, "openGateway">;
 
 function integer(value: string | undefined) {
   if (!value || !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))
@@ -92,7 +110,16 @@ export async function environmentStatus(
   profile: ProfileLockEntry,
   store = new EnvironmentStore(target.project.id, target.env),
 ): Promise<EnvironmentStatus> {
-  return statusForTree(await committedTree(target), profile, store);
+  return (await inspectEnvironment(target, profile, store)).status;
+}
+
+export async function inspectEnvironment(
+  target: Target,
+  profile: ProfileLockEntry,
+  store: EnvironmentStore,
+) {
+  const tree = await committedTree(target);
+  return { tree, status: await statusForTree(tree, profile, store) };
 }
 
 async function statusForTree(
@@ -161,6 +188,89 @@ export async function environmentDoctor(
   }
 }
 
+export function environmentBuildConfig(target: BuildTarget, host: BuildHost) {
+  return loadConfig(host.env, target.configDirectory, host.actorHarnesses)
+    .config;
+}
+
+export async function environmentResponsibilityShown(store: EnvironmentStore) {
+  let record;
+  try {
+    record = await lstat(join(store.directory, responsibilityRecord));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (
+    !record.isFile() ||
+    (record.mode & 0o777) !== 0o600 ||
+    (process.getuid && record.uid !== process.getuid()) ||
+    record.size !== 2
+  )
+    throw new EnvironmentError();
+  return true;
+}
+
+export async function buildEnvironment(
+  target: BuildTarget,
+  profile: ProfileLockEntry,
+  host: BuildHost,
+  options: {
+    store: EnvironmentStore;
+    tree?: Awaited<ReturnType<typeof committedTree>>;
+    config?: ReturnType<typeof environmentBuildConfig>;
+    showResponsibility?: (notice: string) => void;
+    signal?: AbortSignal;
+  },
+) {
+  const { store, signal } = options;
+  signal?.throwIfAborted();
+  const config = options.config ?? environmentBuildConfig(target, host);
+  const home = await resolveMsbHome(host.env, config);
+  signal?.throwIfAborted();
+  if (!("path" in home)) throw new EnvironmentError();
+  store.prepare();
+  try {
+    await publishPrivateFile(store.directory, responsibilityRecord, "1\n");
+    options.showResponsibility?.(environmentResponsibilityNotice);
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+      !(await environmentResponsibilityShown(store))
+    )
+      throw error;
+  }
+  const result = await provisionEnvironment(
+    {
+      tree: options.tree ?? (await committedTree(target)),
+      profile,
+      operation: "build",
+      allow: config.environment?.allow ?? [],
+    },
+    {
+      env: host.env,
+      store,
+      ...(signal && { signal }),
+      ...(host.openGateway && { openGateway: host.openGateway }),
+      run(args, timeout, extra, signal) {
+        return host.command(
+          "mise",
+          [...MISE_MSB, ...args],
+          {
+            ...offlineMiseEnv(host.env),
+            MSB_HOME: home.path,
+            ...extra,
+          },
+          timeout,
+          signal,
+        );
+      },
+    },
+  );
+  const { key, cacheHit, size, warning } = result;
+  return { key, cacheHit, size, ...(warning && { warning }) };
+}
+
 export async function runEnvironmentCommand(
   options: ReturnType<typeof parseEnvironmentArgs>,
   root: string,
@@ -186,47 +296,14 @@ export async function runEnvironmentCommand(
     return;
   }
   if (!options.allowNetwork) throw new EnvironmentError();
-  const { config } = loadConfig(
-    host.env,
-    target.configDirectory,
-    host.actorHarnesses,
-  );
-  const home = await resolveMsbHome(host.env, config);
-  if (!("path" in home)) throw new EnvironmentError();
-  store.prepare();
-  try {
-    await publishPrivateFile(store.directory, "responsibility-shown", "1\n");
-    io.stderr.write(`${responsibility}\n`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-  const result = await provisionEnvironment(
-    {
-      tree: await committedTree(target),
-      profile,
-      operation: "build",
-      allow: config.environment?.allow ?? [],
-    },
-    {
-      env: host.env,
-      store,
-      run(args, timeout, extra, signal) {
-        return host.command(
-          "mise",
-          [...MISE_MSB, ...args],
-          {
-            ...offlineMiseEnv(host.env),
-            MSB_HOME: home.path,
-            ...extra,
-          },
-          timeout,
-          signal,
-        );
-      },
-    },
-  );
+  const release = store.tryLockBuild();
+  if (!release) throw new EnvironmentBuildBusyError();
+  const result = await buildEnvironment(target, profile, host, {
+    store,
+    showResponsibility: (notice) => io.stderr.write(`${notice}\n`),
+  }).finally(release);
   const { key, cacheHit, size, warning } = result;
-  if (json) print({ key, cacheHit, size, ...(warning && { warning }) });
+  if (json) print(result);
   else {
     io.stdout.write(
       `${key}  ${size} bytes  ${cacheHit ? "cached" : "built"}\n`,

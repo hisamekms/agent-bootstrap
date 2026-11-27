@@ -23,13 +23,17 @@ export function displayProposal({
 const maxPanelAnswers = 20;
 
 export function parsePanelAnswer(params: unknown) {
-  const { id, digest, decision } = fields(params, ["id", "digest", "decision"]);
+  const input = fields(params, ["id", "digest", "decision", "takeover"]);
+  const { id, digest, decision, takeover } = input;
   if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest))
+    throw new ContractError();
+  if (Object.hasOwn(input, "takeover") && takeover !== true)
     throw new ContractError();
   return {
     id: identifier(id),
     digest,
     decision: oneOf(decision, ["approve", "reject"]),
+    ...(takeover === true && { takeover }),
   };
 }
 
@@ -51,6 +55,7 @@ export async function answerManyFromPanel(
   )
     throw new ContractError();
   const parsed = answers.map(parsePanelAnswer);
+  if (parsed.some(({ takeover }) => takeover)) throw new ContractError();
   // Batch receipts echo caller IDs, including those that do not exist.
   await scan?.(JSON.stringify(parsed.map(({ id }) => id)));
   const results: PanelAnswerResult[] = [];
@@ -82,7 +87,7 @@ export async function proposalDecisionPreview(
 export async function answerFromPanel(
   store: OrchestratorStore,
   directory: string,
-  { id, digest, decision }: PanelAnswer,
+  { id, digest, decision, takeover }: PanelAnswer,
   scan?: CredentialScanner,
 ): Promise<PanelAnswerResult> {
   try {
@@ -92,7 +97,7 @@ export async function answerFromPanel(
       throw new OrchestratorStoreError("stale-digest");
     if (proposal.status !== "pending")
       throw new OrchestratorStoreError("invalid-transition");
-    if (!permitsPanelAnswer(proposal.origin, proposal, decision))
+    if (!permitsPanelAnswer(proposal.origin, proposal, decision, takeover))
       throw new OrchestratorStoreError("approval-forbidden");
     const preview = await proposalDecisionPreview(
       directory,
@@ -106,6 +111,7 @@ export async function answerFromPanel(
       digest,
       decision,
       answerer: { kind: "human", channel: "operator-ui" },
+      ...(takeover === true && { takeover }),
     });
     return { id, ok: true };
   } catch (error) {
