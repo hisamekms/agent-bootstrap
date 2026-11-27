@@ -219,6 +219,7 @@ export interface HostGateway {
   readonly username: string;
   readonly password: string;
   readonly quarantined: boolean;
+  readonly quarantineReason?: string | undefined;
   close(): Promise<void>;
 }
 

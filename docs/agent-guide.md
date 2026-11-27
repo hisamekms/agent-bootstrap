@@ -75,7 +75,7 @@ agent-bootstrap environment prune --target /path/to/project --keep 3
 ```
 
 **Expected output**  
-Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days.
+Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days. A failed build prints its code; when the egress gateway stopped every flow it also prints the reason (rate-limited, network-row-limit, audit-failure or listener-error).
 
 **Next action**  
 Use environment status to check the committed target.
