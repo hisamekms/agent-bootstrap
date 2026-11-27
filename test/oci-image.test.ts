@@ -6,6 +6,8 @@ import {
   normalizeLayer,
   ociImage,
   readOciLayout,
+  readTar,
+  writeWorkspaceTar,
 } from "../src/oci-image.ts";
 
 const enc = new TextEncoder();
@@ -25,6 +27,7 @@ interface In {
   minor?: number;
   pax?: Record<string, string>;
   gnuLong?: boolean;
+  gnuLongLink?: string;
 }
 
 function oct(v: number, len: number): string {
@@ -91,6 +94,10 @@ function tar(entries: In[]): Uint8Array {
       parts.push(hdr("././@LongLink", {}, l.length, "L"), ...pad(l));
       name = name.slice(0, 99);
     }
+    if (e.gnuLongLink) {
+      const link = enc.encode(e.gnuLongLink + "\0");
+      parts.push(hdr("././@LongLink", {}, link.length, "K"), ...pad(link));
+    }
     parts.push(
       hdr(name, e, type === "0" ? data.length : 0, type, e.link),
       ...pad(data),
@@ -106,6 +113,49 @@ function tar(entries: In[]): Uint8Array {
   }
   return out;
 }
+
+test("workspace tar accepts a GNU long link with a byte-truncated header", () => {
+  const target = "a".repeat(99) + "é" + "b".repeat(49);
+  const link = { name: "link", type: "2", gnuLongLink: target };
+  assert.equal(
+    readTar(tar([{ ...link, link: target }]), undefined, true)[0]!.linkname,
+    target,
+  );
+  assert.throws(
+    () =>
+      readTar(tar([{ ...link, link: target.slice(0, 99) }]), undefined, true),
+    /ambiguous workspace link target/,
+  );
+});
+
+test("workspace tar accepts PAX long links with a truncated or empty header", () => {
+  const target = "a".repeat(150);
+  const link = { name: "link", type: "2", pax: { linkpath: target } };
+  for (const header of [target, ""])
+    assert.equal(
+      readTar(tar([{ ...link, link: header }]), undefined, true)[0]!.linkname,
+      target,
+    );
+  assert.throws(
+    () => readTar(tar([{ ...link, link: "b".repeat(100) }]), undefined, true),
+    /ambiguous workspace link target/,
+  );
+});
+
+test("workspace tar round-trips a 150-byte symlink target", () => {
+  const target = "a".repeat(150);
+  const bytes = writeWorkspaceTar([
+    {
+      path: "link",
+      type: "symlink",
+      mode: 0o755,
+      linkname: target,
+      data: new Uint8Array(),
+    },
+  ]);
+  assert.equal(read(bytes)[0]!.link, target.slice(0, 100));
+  assert.equal(readTar(bytes, undefined, true)[0]!.linkname, target);
+});
 
 // Minimal reader to inspect output.
 function read(t: Uint8Array) {

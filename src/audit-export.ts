@@ -1,3 +1,4 @@
+import type { PackageDiff } from "./environments/lock.ts";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { join, resolve } from "node:path";
@@ -56,6 +57,7 @@ type AuditLine = {
       | boolean
       | null
       | readonly string[]
+      | PackageDiff
       | readonly { name: string; mode: string; path: string }[]
     >
   >;
@@ -150,8 +152,11 @@ function project(rows: AuditExportRecord[], watermark: AuditSequenceWatermark) {
     switch (row.table) {
       case "audit_events": {
         line.actor = row.role ?? "host";
-        line.action = row.operation ?? "invocation";
+        line.action = row.kind.startsWith("environment.")
+          ? row.kind
+          : (row.operation ?? "invocation");
         switch (row.kind) {
+          case "environment.started":
           case "invocation.started":
           case "operation.requested":
             line.phase = "intent";
@@ -162,7 +167,12 @@ function project(rows: AuditExportRecord[], watermark: AuditSequenceWatermark) {
             line.result = row.kind === "operation.allowed" ? "allow" : "deny";
             break;
           default:
-            line.result = row.outcome ?? null;
+            line.result =
+              row.kind === "environment.finished" &&
+              row.detail &&
+              "key" in row.detail
+                ? (row.detail.failure ?? "ok")
+                : (row.outcome ?? null);
         }
         if (row.profile && row.image) {
           line.attributes = { profile: row.profile, image: row.image };

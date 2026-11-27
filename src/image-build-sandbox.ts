@@ -37,6 +37,7 @@ export async function withBuildSandbox<T>({
   run,
   use,
   openGateway = EgressGateway.open,
+  provisioner,
 }: {
   profile: ProfileName;
   image: string;
@@ -49,16 +50,32 @@ export async function withBuildSandbox<T>({
   run: Run;
   use: (name: string, run: Run) => Promise<T>;
   openGateway?: (options: EgressGatewayOptions) => Promise<HostGateway>;
+  provisioner?: {
+    readonly audit: SqliteAudit;
+    readonly invocationId: string;
+    readonly policy: EgressPolicy;
+    readonly inputDirectory: string;
+  };
 }): Promise<T> {
-  const plan = buildSandboxPlan(profile, env);
-  privateDirectory(userStateDirectory(env));
-  privateDirectory(join(userStateDirectory(env), "builds"));
-  const policy = new EgressPolicy({ allow: smoke ? [] : plan.allow });
-  const audit = new SqliteAudit(plan.auditPath);
-  const invocationId = randomUUID();
+  if (provisioner && (profile !== "bun" || smoke || packageDir !== undefined))
+    throw new Error("Invalid Provisioner sandbox");
+  const plan = provisioner ? undefined : buildSandboxPlan(profile, env);
+  if (plan) {
+    privateDirectory(userStateDirectory(env));
+    privateDirectory(join(userStateDirectory(env), "builds"));
+  }
+  const policy =
+    provisioner?.policy ??
+    new EgressPolicy({ allow: smoke ? [] : plan!.allow });
+  const audit = provisioner?.audit ?? new SqliteAudit(plan!.auditPath);
+  const invocationId = provisioner?.invocationId ?? randomUUID();
   const sandboxId = `bootstrap-${randomUUID()}`;
   const write = (event: Omit<AuditInput, "invocationId">) =>
-    audit.append({ ...event, invocationId, role: "Verification" });
+    audit.append({
+      ...event,
+      invocationId,
+      role: provisioner ? "Provisioner" : "Verification",
+    });
   const authorize = (operation: "sandbox.create" | "sandbox.destroy") => {
     write({
       kind: "operation.requested",
@@ -118,7 +135,13 @@ export async function withBuildSandbox<T>({
     write({ kind: "invocation.started" });
     audit.appendExecutionContext({
       executionId: invocationId,
-      attributes: { purpose: smoke ? "image-smoke" : "image-build" },
+      attributes: {
+        purpose: provisioner
+          ? "environment"
+          : smoke
+            ? "image-smoke"
+            : "image-build",
+      },
     });
     if (!smoke)
       gateway = await openGateway({
@@ -178,6 +201,12 @@ export async function withBuildSandbox<T>({
             String(cpus),
             "--max-duration",
             "900s",
+            ...(provisioner
+              ? [
+                  "--copy-dir",
+                  `${provisioner.inputDirectory}:/tmp/environment-input`,
+                ]
+              : []),
             ...(packageDir ? ["--copy-dir", `${packageDir}:/tmp/pkgs`] : []),
             image,
           ],
@@ -221,7 +250,7 @@ export async function withBuildSandbox<T>({
       try {
         write({ kind: "invocation.finished", outcome });
       } finally {
-        audit.close();
+        if (!provisioner) audit.close();
       }
     }
   }

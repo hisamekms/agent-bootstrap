@@ -2,11 +2,11 @@
 
 Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.
 
-Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, setup, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
+Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, setup, an environment subcommand, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.
 
 Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.
 
-Machine-readable errors use `{ error, next }`. Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.
+Machine-readable errors use `{ error, next }`. Environment and Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.
 
 - `0` Success.
 - `1` Command failed or was refused.
@@ -60,6 +60,28 @@ API-key mode is the default. Enter the API key at the Keychain prompt, then run 
 
 **Human involvement**  
 Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.
+
+## environment
+
+Build, inspect or prune a registered target's Bun environment.
+
+**Prerequisites**  
+Register the target and prepare the pinned Bun profile with setup.
+
+```sh
+agent-bootstrap environment build --target /path/to/project --allow-network
+agent-bootstrap environment status --target /path/to/project --json
+agent-bootstrap environment prune --target /path/to/project --keep 3
+```
+
+**Expected output**  
+Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days.
+
+**Next action**  
+Use environment status to check the committed target.
+
+**Human involvement**  
+Authorize registry access before building. Review the target's dependencies and install scripts.
 
 ## concierge
 
@@ -391,6 +413,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap doctor [--target <path>] [--claude-auth <api-key|external>] [--json]` → Array of checks with layer sources, actor harnesses, and Sign in with ChatGPT grant presence. Exit 3 also returns the array. The next action goes to stderr.
 - `agent-bootstrap codex authorize | codex forget [--json]` → Grant management on the macOS host. Authorize requires a TTY and browser consent. JSON success is { status }.
 - `agent-bootstrap setup [--target <path>] [--allow-network] [--yes] [--profiles] [--json]` → { mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.
+- `agent-bootstrap environment build --target <path> --allow-network | environment status --target <path> [--json] | environment prune --target <path> [--keep <count>] [--max-age-days <days>]` → Build reports key, cacheHit, size and any warning. Status reports key, state, hasLock and size. Prune reports removed keys.
 - `agent-bootstrap concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]` → { status, next } after an interactive TTY session. Transcript goes to stderr.
 - `agent-bootstrap workplace --target <path> [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--dev-bridge]` → Text output with the optional loopback URL.
 - `agent-bootstrap sandbox shell [--profile <name>] [--allow <host:port>]... [--mount-dir <host>:<guest>[:ro]]... [--json | --run]` → A plan with the pinned image, egress allowlist, requested mounts, lifetime and audit path. Use --run from an operator TTY to start the VM.

@@ -45,6 +45,7 @@
   parses backend metrics. `workspace-tree.ts` owns workspace diffs. `oci-image.ts`,
   `image-recipes.ts`, and `profile-lock.ts` own OCI image assembly, recipes, and
   profile locks.
+  `src/environments/` owns adapter recipes, environment caching and the Provisioner.
   `src/local-orchestrator/` owns the local orchestrator (see `docs/local-orchestrator/`).
   `test/` owns executable
   examples and fake agents and sandbox. `docs/` owns the trust model and

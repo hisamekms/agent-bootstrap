@@ -60,6 +60,21 @@ export const helpTopics = {
     human:
       "Authorize network access and VM builds. Agents may pass --allow-network --yes only with explicit authorization. Provision Keychain from the operator terminal.",
   },
+  environment: {
+    purpose: "Build, inspect or prune a registered target's Bun environment.",
+    prerequisites:
+      "Register the target and prepare the pinned Bun profile with setup.",
+    commands: [
+      `agent-bootstrap environment build --target ${exampleTarget} --allow-network`,
+      `agent-bootstrap environment status --target ${exampleTarget} --json`,
+      `agent-bootstrap environment prune --target ${exampleTarget} --keep 3`,
+    ],
+    output:
+      "Status reports the key, state, committed lock presence and bytes. Prune accepts --keep and --max-age-days.",
+    next: "Use environment status to check the committed target.",
+    human:
+      "Authorize registry access before building. Review the target's dependencies and install scripts.",
+  },
   concierge: {
     purpose:
       "Open or resume the interactive Concierge that drafts plans and runs the local actor queue.",
@@ -397,6 +412,11 @@ export const onboardingOutputs = {
       "setup [--target <path>] [--allow-network] [--yes] [--profiles] [--json]",
     json: "{ mode, artifacts, images, keychain, next } and result when applied. Output paths are relative to the bootstrap checkout.",
   },
+  environment: {
+    usage:
+      "environment build --target <path> --allow-network | environment status --target <path> [--json] | environment prune --target <path> [--keep <count>] [--max-age-days <days>]",
+    json: "Build reports key, cacheHit, size and any warning. Status reports key, state, hasLock and size. Prune reports removed keys.",
+  },
   concierge: {
     usage:
       "concierge [--target <path>] [--claude-auth <api-key|external>] [--continue] [--mode <m>] [--json]",
@@ -469,11 +489,11 @@ export function renderAgentGuide(): string {
     "",
     "Run these commands on the operator host. Paste this manual into the agent's context when it will drive the workflow.",
     "",
-    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, setup, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
+    "Use a leading `--target <path>` for operator commands. Use `--all-targets` for analyze or denials. Put `--target <path>` after doctor, setup, an environment subcommand, concierge, volume shell, or secrets test. Custom databases use leading `--db <file>` where supported. Put `--json` before the verification command's `--` delimiter.",
     "",
     "Replace shell variables such as `$task_id` with full IDs from status and use the same target throughout.",
     "",
-    "Machine-readable errors use `{ error, next }`. Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.",
+    "Machine-readable errors use `{ error, next }`. Environment and Sign in with ChatGPT errors include `code` and actor configuration errors include `code` and `key`. Completed doctor and secrets test runs report check results. Other next hints may appear on stderr.",
     "",
     ...Object.entries(exitCodes).map(
       ([code, label]) => `- \`${code}\` ${label}.`,

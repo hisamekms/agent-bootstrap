@@ -1,7 +1,8 @@
+import { EnvironmentStore } from "../src/environments/store.ts";
 import { CODEX, codexBinaryPath } from "../src/codex-exec.ts";
 import { mkdtempDisposableSync, realpathSync } from "node:fs";
 import { addProject } from "../src/config/projects.ts";
-import { configEnv, initConfigRepo } from "./config-fixture.ts";
+import { configEnv, fixtureGit, initConfigRepo } from "./config-fixture.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -132,6 +133,7 @@ async function invoke(
 const topics = [
   "start",
   "setup",
+  "environment",
   "concierge",
   "workplace",
   "goals",
@@ -149,6 +151,125 @@ const topics = [
 ];
 
 describe("agent-bootstrap", () => {
+  test("environment CLI handles arguments and doctor follows the committed key", async () => {
+    using temp = mkdtempDisposableSync(join(realpathSync(tmpdir()), "ab-env-"));
+    const root = await prepareFixture(temp.path);
+    const { host, calls } = fakeHost(root);
+    const target = initConfigRepo(join(root, "target"));
+    const project = addProject(target, undefined, host.env);
+    host.env.MSB_HOME = "/tmp";
+    for (const invalid of [
+      ["build", "--target", target],
+      ["build", "--target", target, "--allow-network", "--allow-network"],
+      ["status", "--target", target, "--allow-network"],
+      ["status"],
+      ["prune", "--target", target, "--keep", "-1"],
+      ["prune", "--target", target, "--max-age-days", "9999999999"],
+      ["outdated", "--target", target],
+    ])
+      assert.equal(
+        (await invoke(["environment", ...invalid, "--json"], root, host)).code,
+        2,
+      );
+    assert.equal(calls.length, 0);
+
+    const check = async () => {
+      const result = await invoke(
+        ["doctor", "--target", target, "--json"],
+        root,
+        host,
+      );
+      return (JSON.parse(result.stdout) as Check[]).find(
+        ({ id }) => id === "environment",
+      )!;
+    };
+    const manifestPath = join(target, "package.json");
+    await writeFile(manifestPath, "{}");
+    const skipped = await check();
+    assert.equal(skipped.status, "skipped");
+    assert.equal(skipped.environment, undefined);
+    await writeFile(
+      join(target, "bun.lock"),
+      '{"lockfileVersion":1,"packages":{}}',
+    );
+    fixtureGit(target, "add", ".");
+    fixtureGit(target, "commit", "-m", "Declare Bun inputs");
+    const status = async () => {
+      const result = await invoke(
+        ["environment", "status", "--target", target, "--json"],
+        root,
+        host,
+      );
+      assert.equal(result.code, 0, result.stderr + result.stdout);
+      return JSON.parse(result.stdout) as {
+        key: string;
+        hasLock: boolean;
+        state: string;
+        size: number;
+      };
+    };
+    const initial = await status();
+    assert.equal(initial.state, "missing");
+    assert.equal(initial.hasLock, true);
+    assert.equal(initial.size, 0);
+    assert.equal((await check()).status, "missing");
+    assert.deepEqual((await check()).environment, initial);
+
+    const store = new EnvironmentStore(project.id, host.env);
+    const lock = JSON.parse(await readFile(join(root, lockFile), "utf8"));
+    const archive = Buffer.from("fixture");
+    await store.publish(
+      {
+        key: initial.key,
+        adapter: "bun",
+        profileDigest: lock.profiles.bun.image.slice(-64),
+        createdAt: new Date().toISOString(),
+        size: archive.length,
+        hasLock: true,
+        packages: [],
+      },
+      archive,
+    );
+    assert.equal((await status()).state, "current");
+    assert.equal((await check()).status, "ok");
+    const build = [
+      "environment",
+      "build",
+      "--target",
+      target,
+      "--allow-network",
+      "--json",
+    ];
+    const one = await invoke(build, root, host);
+    assert.equal(one.code, 0);
+    assert.equal(JSON.parse(one.stdout).cacheHit, true);
+    assert.match(one.stderr, /You are responsible/);
+    const two = await invoke(build, root, host);
+    assert.equal(two.code, 0);
+    assert.equal(two.stderr, "");
+    await writeFile(manifestPath, '{"name":"changed"}');
+    assert.equal((await status()).state, "current");
+    fixtureGit(target, "add", ".");
+    fixtureGit(target, "commit", "-m", "Change Bun inputs");
+    const next = await status();
+    assert.equal(next.state, "stale");
+    assert.equal(next.size, archive.length);
+    assert.notEqual(next.key, initial.key);
+    assert.deepEqual((await check()).environment, next);
+    assert.equal(
+      (
+        await invoke(
+          ["environment", "prune", "--target", target, "--keep", "0"],
+          root,
+          host,
+        )
+      ).code,
+      0,
+    );
+    assert.equal((await status()).state, "missing");
+    assert.ok(!calls.some(({ args }) => args.includes("create")));
+  });
+
   test("codex authorize refuses a non-TTY before host operations", async () => {
     const { host, calls } = fakeHost(checkout, "/nonexistent");
     const result = await invoke(
@@ -254,6 +375,7 @@ describe("agent-bootstrap", () => {
       "doctor",
       "codex",
       "setup",
+      "environment",
       "concierge",
       "workplace",
       "sandbox",
@@ -458,7 +580,10 @@ describe("agent-bootstrap", () => {
       for (const check of checks)
         assert.deepEqual(
           Object.keys(check).filter(
-            (key) => key !== "effective" && key !== "actorHarnesses",
+            (key) =>
+              key !== "effective" &&
+              key !== "actorHarnesses" &&
+              key !== "environment",
           ),
           ["id", "status", "detail", "fix", "needsNetwork", "needsHuman"],
         );

@@ -33,6 +33,7 @@ import {
   type LocalActorHarnesses,
 } from "../actors.ts";
 import { validCodexModel } from "../codex-exec.ts";
+import { EgressPolicy, type HostPort } from "../egress-policy.ts";
 import { CLAUDE_MOUNT_ENV } from "../claude-code.ts";
 import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
 import {
@@ -95,6 +96,7 @@ export interface Config {
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
+  environment?: { allow: readonly string[] };
   mounts?: Record<string, MountDeclaration>;
   volumes?: Record<string, VolumeDefinition>;
   secrets?: Record<string, SecretDefinition>;
@@ -537,6 +539,16 @@ function validateActorConfig(
   }
 }
 
+export function environmentDestination(value: unknown): HostPort {
+  const match =
+    typeof value === "string" && /^([^:]+):([1-9][0-9]{0,4})$/.exec(value);
+  if (!match || !validClaudeHostname(match[1]!) || Number(match[2]) > 65535)
+    throw new TypeError("Invalid environment destination");
+  return new EgressPolicy({
+    allow: [{ hostname: match[1]!, port: Number(match[2]) }],
+  }).allow[0]!;
+}
+
 export function parseConfig(
   value: unknown,
   layer: Layer,
@@ -545,7 +557,14 @@ export function parseConfig(
   const key = "$";
   const keys = ["version", "verification", "profiles", "egress"];
   if (layer !== "approved")
-    keys.push("claude", "mounts", "secretEnv", "actors", "codex");
+    keys.push(
+      "claude",
+      "mounts",
+      "secretEnv",
+      "actors",
+      "codex",
+      "environment",
+    );
   if (layer === "user")
     keys.push("volumes", "secrets", "microsandbox", "repositories");
   const raw = record(value, key, next);
@@ -563,6 +582,7 @@ export function parseConfig(
     "secrets",
     "secretEnv",
     "repositories",
+    "environment",
   ])
     if (Object.hasOwn(raw, field) && !keys.includes(field))
       invalid(field, "This key is disallowed in this layer.", next);
@@ -661,6 +681,19 @@ export function parseConfig(
           "Expected a list of DNS hostnames with HTTPS port 443.",
           next,
         );
+    }
+  }
+  if ("environment" in raw) {
+    const { allow } = record(raw.environment, "environment", next, ["allow"]);
+    try {
+      if (!Array.isArray(allow) || allow.length > 64) throw new TypeError();
+      allow.forEach(environmentDestination);
+    } catch {
+      invalid(
+        "environment.allow",
+        "Expected a list of DNS hostnames with ports.",
+        next,
+      );
     }
   }
   for (const slot of ["mounts", "volumes"] as const) {
@@ -923,6 +956,21 @@ export function mergeConfig(
         []) as string[];
       const origins = (sources[`egress.${actor}`] ??= []) as Layer[];
       for (const destination of values) {
+        if (entries.includes(destination)) continue;
+        entries.push(destination);
+        origins.push(layer);
+      }
+    }
+    if (layer === "approved" && current.environment)
+      invalid(
+        "environment",
+        "This key is disallowed in this layer.",
+        layerFile(layer, env, directory),
+      );
+    if (current.environment) {
+      const entries = (config.environment ??= { allow: [] }).allow as string[];
+      const origins = (sources["environment.allow"] ??= []) as Layer[];
+      for (const destination of current.environment.allow) {
         if (entries.includes(destination)) continue;
         entries.push(destination);
         origins.push(layer);

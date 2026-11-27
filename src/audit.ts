@@ -1,3 +1,7 @@
+import {
+  parseEnvironmentEvidence,
+  type EnvironmentEvidence,
+} from "./environments/events.ts";
 import { isCodexFailureCode, type CodexFailureCode } from "./codex-exec.ts";
 import { CLAUDE_MANAGED_PATH } from "./claude-code.ts";
 import {
@@ -60,6 +64,7 @@ const storedClaudeFailureCodes = [
 ] as const;
 
 type AuditDetail =
+  | EnvironmentEvidence
   | {
       readonly socketPath: string;
       readonly vsockPort: number;
@@ -106,7 +111,9 @@ export type AuditInput = {
     | "operation.allowed"
     | "operation.denied"
     | "operation.finished"
-    | "invocation.finished";
+    | "invocation.finished"
+    | "environment.started"
+    | "environment.finished";
   readonly operation?:
     | "sandbox.create"
     | "sandbox.exec"
@@ -124,7 +131,8 @@ export type AuditInput = {
     | "Reviewer"
     | "Coordinator"
     | "Verification"
-    | "Concierge";
+    | "Concierge"
+    | "Provisioner";
   /** Schema v4. Only on `sandbox.create` requests, together with `image`. */
   readonly profile?: ProfileName;
   /** Schema v4. Lowercase hex SHA-256 digest of the sandbox image. */
@@ -223,6 +231,8 @@ const kinds = [
   "operation.denied",
   "operation.finished",
   "invocation.finished",
+  "environment.started",
+  "environment.finished",
 ];
 const operations = [
   "sandbox.create",
@@ -249,6 +259,7 @@ const roles = [
   "Coordinator",
   "Verification",
   "Concierge",
+  "Provisioner",
 ];
 const profiles: readonly string[] = PROFILE_NAMES;
 const imageDigest = /^[0-9a-f]{64}$/;
@@ -625,7 +636,20 @@ const schemaV7 = [
   { name: "audit_events", sql: auditTableV7 },
   ...schemaV6.slice(1),
 ];
-const currentVersion = 7;
+const auditTableV8 = auditTableV7
+  .replace(
+    "'Verification','Concierge'))",
+    "'Verification','Concierge','Provisioner'))",
+  )
+  .replace(
+    "'invocation.finished'))",
+    "'invocation.finished','environment.started','environment.finished'))",
+  );
+const schemaV8 = [
+  { name: "audit_events", sql: auditTableV8 },
+  ...schemaV7.slice(1),
+];
+const currentVersion = 8;
 const versionSchemas = {
   1: auditSchema,
   2: schema,
@@ -634,6 +658,7 @@ const versionSchemas = {
   5: schemaV5,
   6: schemaV6,
   7: schemaV7,
+  8: schemaV8,
 };
 
 type AuditVersion = keyof typeof versionSchemas;
@@ -712,9 +737,12 @@ function parseInput(
       (kind !== "operation.requested" || result.operation !== "sandbox.create"))
   )
     throw new AuditStoreError("invalid-event");
-  const invocation = kind.startsWith("invocation.");
+  const environment = kind.startsWith("environment.");
+  const invocation = environment || kind.startsWith("invocation.");
   if (
     (invocation && result.operation !== undefined) ||
+    (environment &&
+      (result.role !== "Provisioner" || result.outcome !== undefined)) ||
     (!invocation && result.operation === undefined) ||
     ((kind === "invocation.started" ||
       kind === "operation.requested" ||
@@ -754,6 +782,17 @@ function parseAuditDetail(
   stored: boolean,
 ): AuditDetail | LegacyAuditDetail | undefined {
   const { kind, operation, role, profile, outcome } = event;
+  if (kind === "environment.started" || kind === "environment.finished") {
+    try {
+      if (!present) return invalidEvent();
+      const evidence = parseEnvironmentEvidence(value);
+      if (kind === "environment.started" && evidence.failure)
+        return invalidEvent();
+      return evidence;
+    } catch {
+      return invalidEvent();
+    }
+  }
   const claudeRole =
     role === "Concierge" ||
     role === "Worker" ||
@@ -1594,7 +1633,7 @@ export class SqliteAudit implements AuditSink {
         database.exec("PRAGMA journal_mode=WAL");
         database.exec("BEGIN IMMEDIATE");
         try {
-          for (const entry of schemaV7) database.exec(entry.sql);
+          for (const entry of schemaV8) database.exec(entry.sql);
           database.exec(
             `PRAGMA application_id=${applicationId}; PRAGMA user_version=${currentVersion}; COMMIT`,
           );
@@ -1616,6 +1655,7 @@ export class SqliteAudit implements AuditSink {
             foundVersion !== 4 &&
             foundVersion !== 5 &&
             foundVersion !== 6 &&
+            foundVersion !== 7 &&
             foundVersion !== currentVersion)
         )
           throw new AuditStoreError("invalid-database");
@@ -1634,7 +1674,7 @@ export class SqliteAudit implements AuditSink {
           "SELECT name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
         )
         .all();
-      const matchesSchema = (expectedSchema: typeof schemaV7) =>
+      const matchesSchema = (expectedSchema: typeof schemaV8) =>
         installed.length === expectedSchema.length &&
         expectedSchema.every((expected) =>
           installed.some((value) => {
@@ -1680,7 +1720,11 @@ export class SqliteAudit implements AuditSink {
       }
       if (
         !this.#readOnly &&
-        (version === 1 || version === 4 || version === 5 || version === 6)
+        (version === 1 ||
+          version === 4 ||
+          version === 5 ||
+          version === 6 ||
+          version === 7)
       ) {
         const upgradedVersion = version === 1 ? 2 : currentVersion;
         database.exec("BEGIN IMMEDIATE");
@@ -1700,8 +1744,8 @@ export class SqliteAudit implements AuditSink {
             database.exec(
               "ALTER TABLE audit_events RENAME TO audit_events_previous",
             );
-            database.exec(auditTableV7);
-            const detailColumn = version === 6 ? ", detail" : "";
+            database.exec(auditTableV8);
+            const detailColumn = version >= 6 ? ", detail" : "";
             database.exec(`
               INSERT INTO audit_events
                 (sequence, recorded_at, invocation_id, kind, operation, outcome, role, profile, image${detailColumn})
@@ -1833,6 +1877,8 @@ export class SqliteAudit implements AuditSink {
   append(event: AuditInput): void {
     this.#requireWriter();
     const input = parseInput(event);
+    if (this.#version < 8 && input.role === "Provisioner")
+      throw new AuditStoreError("invalid-event");
     if (this.#version < 7 && input.profile === "bun")
       throw new AuditStoreError("invalid-event");
     if (
