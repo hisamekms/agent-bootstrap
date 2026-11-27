@@ -1,4 +1,9 @@
 import {
+  summarizePackageDiff,
+  type PackageDiff,
+  type PackageDiffSummary,
+} from "../environments/lock.ts";
+import {
   digestPattern,
   type EnvironmentFailure,
 } from "../environments/adapter.ts";
@@ -2070,7 +2075,48 @@ export class OrchestratorStore {
     });
   }
 
-  rejectApprovedIntegration(id: string, code: string) {
+  #requeueLockConflict(task: TaskRow, at: string, proposalId: string) {
+    if (task.retries >= MAX_TASK_RETRIES) return false;
+    this.#setTaskStatus(task.id, "registered", null, at);
+    this.#event(at, "task.retried", "task", task.id, {
+      retries: task.retries + 1,
+      origin: { kind: "host" },
+      budgetReset: true,
+      lockConflictProposal: proposalId,
+    });
+    return true;
+  }
+
+  taskLockConflict(
+    taskId: string,
+    retries: number,
+  ): IntegrationContent | undefined {
+    return this.#read(() => {
+      const row = this.#db
+        .query<{ proposalId: string | null }>(
+          `
+        SELECT json_extract(data, '$.lockConflictProposal') AS proposalId FROM events
+        WHERE subject_kind = 'task' AND subject_id = ? AND kind = 'task.retried'
+          AND json_extract(data, '$.retries') = ?`,
+        )
+        .get(taskId, retries);
+      if (!row?.proposalId) return;
+      const proposal = proposalRecord(required(this.#proposal(row.proposalId)));
+      if (
+        proposal.kind !== "integration" ||
+        proposal.status !== "approved" ||
+        proposal.content.taskId !== taskId
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      return proposal.content;
+    });
+  }
+
+  rejectApprovedIntegration(
+    id: string,
+    code: string,
+    resolveLockConflict = false,
+  ) {
     this.#write((at) => {
       const proposal = proposalRecord(required(this.#proposal(id)));
       if (proposal.kind !== "integration" || proposal.status !== "approved")
@@ -2081,6 +2127,12 @@ export class OrchestratorStore {
         this.#latestIntegrationProposalId(task.id) !== id
       )
         throw new OrchestratorStoreError("invalid-transition");
+      if (
+        code === "stale-base" &&
+        resolveLockConflict &&
+        this.#requeueLockConflict(task, at, id)
+      )
+        return;
       this.#setTaskStatus(task.id, "failed", identifier(code), at);
     });
   }
@@ -2106,14 +2158,16 @@ export class OrchestratorStore {
     id: string,
     outcome: "completed" | "denied" | "uncertain",
     code: string,
+    resolveLockConflict = false,
   ) {
     this.#write((at) => {
       const proposal = proposalRecord(required(this.#proposal(id)));
       if (proposal.kind !== "integration" || proposal.status !== "approved")
         throw new OrchestratorStoreError("invalid-transition");
       const { taskId } = proposal.content;
+      const task = required(this.#task(taskId));
       if (
-        required(this.#task(taskId)).status !== "running" ||
+        task.status !== "running" ||
         this.#integrationProgress(taskId)?.proposalId !== id
       )
         throw new OrchestratorStoreError("invalid-transition");
@@ -2121,7 +2175,11 @@ export class OrchestratorStore {
         this.#integrationSucceeded(at, id, proposal.content);
       else if (outcome === "uncertain")
         this.#setTaskStatus(taskId, "running", "integration-uncertain", at, id);
-      else
+      else if (!(
+        code === "stale-base" &&
+        resolveLockConflict &&
+        this.#requeueLockConflict(task, at, id)
+      ))
         this.#setTaskStatus(
           taskId,
           "failed",
@@ -3701,6 +3759,7 @@ export class OrchestratorStore {
       invocationId: string;
       key?: string;
       cacheHit: boolean;
+      operation?: "build" | "resolve" | "update";
     } & (
       | { kind: "environment.started" }
       | {
@@ -3708,11 +3767,15 @@ export class OrchestratorStore {
           durationMs: number;
           size: number;
           failure?: EnvironmentFailure;
+          packageDiff?: PackageDiff;
         }
     ),
   ): void {
     const id = identifier(executionId);
-    const { kind, ...detail } = event;
+    const { kind, packageDiff, ...detail } = {
+      packageDiff: undefined,
+      ...event,
+    };
     this.#write((at) => {
       const row = required(this.#execution(id));
       if (
@@ -3721,7 +3784,7 @@ export class OrchestratorStore {
         (row.mode !== "task" && row.mode !== "verification") ||
         (detail.key === undefined
           ? detail.cacheHit ||
-            (kind === "environment.finished" && !event.failure)
+            (event.kind === "environment.finished" && !event.failure)
           : !digestPattern.test(detail.key))
       )
         throw new OrchestratorStoreError("invalid-transition");
@@ -3730,9 +3793,96 @@ export class OrchestratorStore {
         kind,
         "execution",
         id,
-        { ...detail, operation: "build" },
+        { operation: "build", ...detail },
         { executionId: id },
       );
+      if (packageDiff) this.#recordPackageDiff(at, id, packageDiff);
+    });
+  }
+
+  #recordPackageDiff(at: string, executionId: string, diff: PackageDiff) {
+    const packageDiff = summarizePackageDiff(diff);
+    const json = JSON.stringify(packageDiff);
+    if (Buffer.byteLength(json) <= eventDataLimit - 32) {
+      this.#event(
+        at,
+        "environment.package-diff",
+        "execution",
+        executionId,
+        { packageDiff },
+        { executionId },
+      );
+      return;
+    }
+    // Split the bounded summary to fit the existing per-event size limit.
+    const snapshot = randomUUID();
+    for (let offset = 0; offset < json.length; offset += 1500)
+      this.#event(
+        at,
+        "environment.package-diff-part",
+        "execution",
+        executionId,
+        { snapshot, text: json.slice(offset, offset + 1500) },
+        { executionId },
+      );
+    this.#event(
+      at,
+      "environment.package-diff",
+      "execution",
+      executionId,
+      { snapshot },
+      { executionId },
+    );
+  }
+
+  recordTaskPackageDiff(executionId: string, packageDiff: PackageDiff): void {
+    const id = identifier(executionId);
+    this.#write((at) => {
+      const row = required(this.#execution(id));
+      if (
+        row.status !== "running" ||
+        !row.taskId ||
+        (row.mode !== "review" && row.mode !== "verification")
+      )
+        throw new OrchestratorStoreError("invalid-transition");
+      this.#recordPackageDiff(at, id, packageDiff);
+    });
+  }
+
+  taskPackageDiff(taskId: string): PackageDiffSummary | undefined {
+    return this.#read(() => {
+      const row = this.#db
+        .query<{ executionId: string; data: string }>(
+          `
+        SELECT x.id AS executionId, e.data
+        FROM events e JOIN executions x ON x.id = e.subject_id
+        WHERE e.subject_kind = 'execution' AND x.task_id = ? AND e.kind = 'environment.package-diff'
+        ORDER BY e.rowid DESC LIMIT 1`,
+        )
+        .get(this.#taskId(identifier(taskId)));
+      if (!row) return;
+      const evidence: {
+        packageDiff?: PackageDiff | PackageDiffSummary;
+        snapshot?: string;
+      } = JSON.parse(row.data);
+      let diff = evidence.packageDiff;
+      if (evidence.snapshot) {
+        const parts = this.#db
+          .query<{ text: string }>(
+            `
+          SELECT json_extract(data, '$.text') AS text FROM events
+          WHERE subject_kind = 'execution' AND subject_id = ? AND kind = 'environment.package-diff-part'
+            AND json_extract(data, '$.snapshot') = ?
+          ORDER BY rowid`,
+          )
+          .all(row.executionId, evidence.snapshot);
+        diff = JSON.parse(parts.map(({ text }) => text).join(""));
+      }
+      if (
+        diff &&
+        (diff.added.length || diff.removed.length || diff.changed.length)
+      )
+        return summarizePackageDiff(diff);
     });
   }
 
@@ -3840,7 +3990,7 @@ export class OrchestratorStore {
           taskRef: string | null;
           taskTitle: string | null;
           startedAt: string | null;
-          preparingEnvironment: number | null;
+          preparingEnvironment: "build" | "resolve" | "update" | null;
         }>(
           `
         WITH active AS MATERIALIZED (
@@ -3853,7 +4003,8 @@ export class OrchestratorStore {
             json_extract(g.content_json, '$.title') AS goalTitle, t.id AS taskId,
             t.ref AS taskRef, json_extract(t.content_json, '$.title') AS taskTitle,
             x.started_at AS startedAt,
-            (SELECT e.kind = 'environment.started' AND json_extract(e.data, '$.cacheHit') = 0
+            (SELECT CASE WHEN e.kind = 'environment.started' AND json_extract(e.data, '$.cacheHit') = 0
+              THEN json_extract(e.data, '$.operation') END
              FROM events e WHERE e.subject_id = x.id AND e.subject_kind = 'execution'
                AND e.kind IN ('environment.started', 'environment.finished')
              ORDER BY e.rowid DESC LIMIT 1) AS preparingEnvironment,
@@ -3873,8 +4024,10 @@ export class OrchestratorStore {
         .all()
         .map(({ preparingEnvironment, ...row }) => ({
           ...row,
-          ...(preparingEnvironment === 1
-            ? { preparingEnvironment: true as const }
+          ...(preparingEnvironment && { preparingEnvironment: true as const }),
+          ...(preparingEnvironment === "resolve" ||
+          preparingEnvironment === "update"
+            ? { resolvingDependencies: true as const }
             : {}),
         })),
     );

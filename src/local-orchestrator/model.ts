@@ -1,3 +1,4 @@
+import { validPackageName } from "../environments/lock.ts";
 import { createHash } from "node:crypto";
 import { types } from "node:util";
 import { ROLE_PROFILES, type ProfileName } from "../sandbox-profiles.ts";
@@ -48,6 +49,15 @@ export interface GoalContent {
   readonly scope: GoalScope;
   readonly policies?: PolicySet;
 }
+// Keep the quoted package list within the guest command argument limit.
+export const maxNamedUpdatePackages = 256;
+
+export interface DeclaredEnvironmentUpdate {
+  readonly adapter: "bun";
+  readonly packages: "all" | readonly string[];
+  readonly allowMajor: boolean;
+}
+
 export interface TaskContent {
   readonly goalId: string;
   readonly title: string;
@@ -58,6 +68,7 @@ export interface TaskContent {
   readonly profile: ProfileName;
   readonly paths: readonly string[];
   readonly dependsOn: readonly string[];
+  readonly environment?: { readonly update: DeclaredEnvironmentUpdate };
   readonly budgets: Budgets;
   readonly policies?: PolicySet;
 }
@@ -332,6 +343,42 @@ export function validateGoalContent(value: unknown): GoalContent {
   });
 }
 
+function validateTaskEnvironment(
+  value: unknown,
+  actor: TaskContent["actor"],
+  profile: ProfileName,
+  paths: readonly string[],
+) {
+  if (
+    actor !== "Executor" ||
+    profile !== "bun" ||
+    !allowsPath(paths, "bun.lock") ||
+    !allowsPath(paths, "package.json")
+  )
+    throw new ContractError();
+  const { update } = fields(value, ["update"]);
+  const { adapter, packages, allowMajor } = fields(update, [
+    "adapter",
+    "packages",
+    "allowMajor",
+  ]);
+  if (typeof allowMajor !== "boolean" || (allowMajor && packages === "all"))
+    throw new ContractError();
+  return {
+    update: {
+      adapter: oneOf(adapter, ["bun"]),
+      packages:
+        packages === "all"
+          ? ("all" as const)
+          : unique(packages, 1, maxNamedUpdatePackages, (name) => {
+              if (!validPackageName(name)) throw new ContractError();
+              return name;
+            }),
+      allowMajor,
+    },
+  };
+}
+
 export function validateTaskContent(value: unknown): TaskContent {
   const input = fields(value, [
     ...sharedKeys,
@@ -342,8 +389,14 @@ export function validateTaskContent(value: unknown): TaskContent {
     "paths",
     "dependsOn",
     "budgets",
+    "environment",
   ]);
   const actor = oneOf(input.actor, ["Executor", "Researcher"]);
+  const profile = oneOf(input.profile, profiles);
+  const paths =
+    actor === "Executor"
+      ? unique(input.paths, 1, 64, path)
+      : unique(input.paths, 0, 0, path);
   return freeze({
     ...shared(input),
     goalId: identifier(input.goalId),
@@ -351,11 +404,18 @@ export function validateTaskContent(value: unknown): TaskContent {
     ...(Object.hasOwn(input, "category")
       ? { category: oneOf(input.category, TASK_CATEGORIES) }
       : {}),
-    profile: oneOf(input.profile, profiles),
-    paths:
-      actor === "Executor"
-        ? unique(input.paths, 1, 64, path)
-        : unique(input.paths, 0, 0, path),
+    profile,
+    ...(Object.hasOwn(input, "environment")
+      ? {
+          environment: validateTaskEnvironment(
+            input.environment,
+            actor,
+            profile,
+            paths,
+          ),
+        }
+      : {}),
+    paths,
     dependsOn: unique(input.dependsOn, 0, 1000, identifier),
     budgets: budgets(input.budgets),
   });

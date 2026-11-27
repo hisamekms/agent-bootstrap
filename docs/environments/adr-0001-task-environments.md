@@ -60,8 +60,9 @@ A new isolated role, `Provisioner`, runs adapter steps in its own VM.
   Concierge volume.
 - **Input.** A read-only copy of the Task's base tree. Workspaces and
   build scripts may need sources.
-- **Output.** Only its output directory is writable, and the host
-  collects it.
+- **Output.** In its private working copy, the Provisioner can write
+  the adapter outputs and the key files required for the operation. The
+  host collects only those files.
 - **Egress.** Each adapter declares default destinations. The user may
   add more in config (`environment.allow`), for example an internal
   registry or a Git host. Every connection is recorded through the
@@ -121,11 +122,11 @@ adapter's key files at the base commit)`
 
 ### E6. When environments are built
 
-| Trigger                          | Action                                                                  |
-| -------------------------------- | ----------------------------------------------------------------------- |
-| `setup` or `environment build`   | Build explicitly. This needs `--allow-network`, as `setup` does today.  |
-| Before a Task starts             | Compute the key from the base commit and use the stored environment.    |
-| The candidate changes a key file | Before Verification, `resolve`, write the lock back (E7), then rebuild. |
+| Trigger                          | Action                                                                                                                                                 |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `setup` or `environment build`   | Build explicitly. This needs `--allow-network`, as `setup` does today.                                                                                 |
+| Before a Task starts             | Apply a declared update (E7), then compute the key and use or build its environment.                                                                   |
+| The candidate changes a key file | Before Verification, use the candidate key. If the lock and declarations disagree, `resolve`, write the lock back (E7), and build the new environment. |
 
 Verification always runs in the environment of the candidate it
 verifies.
@@ -139,25 +140,41 @@ environment fails the Task with `env-missing`.
 `cargo update` and commits. The next Task sees the new key. Nothing in
 agent-bootstrap changes.
 
-**Path B: in a Task.**
+**Path B: a declared Task update.**
 
-- A Task whose plan declares the capability `environment.update` may
-  call that host tool. Its arguments are the adapter, all or named
-  packages, and an optional target version.
-- The host runs `update` or `resolve` in a Provisioner VM and writes the
-  new declarations and lock into the Task workspace. The audit records
-  the Provisioner as the author of those paths.
-- The Executor then runs tests and fixes code. It may repeat this.
-- If the Executor edits a key file by hand, the host runs `resolve` before
-  Verification, so the declarations and the lock never drift.
+- A Bun Executor Task declares `environment.update` with adapter `bun`,
+  all or named packages, and `allowMajor`. With `allowMajor: false`,
+  Bun updates within the declared ranges. With `allowMajor: true`, Bun
+  updates only the named packages to the latest versions.
+- Before the first Executor attempt, the host runs `update` in a
+  Provisioner VM. It writes the changed declarations and lock into the
+  starting tree and builds the environment for that tree. The audit
+  records the Provisioner as the author of the changed paths.
+- The Executor runs tests and fixes code. Revisions keep the updated
+  starting environment on the same base. A retry on a new base runs the update again.
+- If the Executor changes a key file and the lock and declarations disagree,
+  the host runs `resolve` before review, including for Tasks without a
+  Verification suite. It writes back the lock and builds the environment
+  for the corrected candidate.
+- Task updates and automatic resolution need `environment.autoBuild`
+  in private configuration. A declared update without it fails with
+  `env-update-disabled` before any VM starts.
 
 **Locks are derived files.**
 
 - Integration never merges a lock as text.
-- On `stale-base`, the host runs `resolve` again from the new base and
-  the Task's declaration changes.
-- Only a conflict in the declarations themselves, such as
-  `package.json` or `mise.toml`, needs the usual retry.
+- On `stale-base`, if every conflict is in an adapter lock file, the host
+  applies the remaining Task changes to the new base and reruns the
+  declared update. For Tasks without a declared update, it runs `resolve`.
+  The resulting candidate follows the usual Verification, review and
+  approval policy.
+- A conflict in a declaration such as `package.json` takes the usual
+  retry path. The usual path also applies when `environment.autoBuild`
+  is off.
+
+**2026-11-28.** Executors have no channel to host tools. The host
+reads the declared update and runs it before starting the Executor,
+so this path needs no new channel.
 
 ### E8. Observability
 
@@ -171,11 +188,11 @@ agent-bootstrap changes.
   attempt and row budgets than a task VM, because package managers open
   many connections at once.
 - **Failure codes.** `env-missing`, `env-fetch-failed`, `env-lock-mismatch`,
-  `env-build-failed` and `env-lock-missing` (a warning).
+  `env-build-failed`, `env-update-disabled` and `env-lock-missing` (a warning).
 - **doctor.** It shows the environment state for each target (current,
   stale or missing), its key, and whether locks exist.
-- **Task detail.** It shows the environment key and, for a Task that
-  changes dependencies, the package diff.
+- **Task detail.** It shows the declared update, the environment key and
+  the added, removed and changed package versions.
 - **Workplace "いま".** It shows 「古い依存を調べ中」 and 「依存を解決中」.
 - **Reviewer.** The Reviewer gets the code diff and the package-diff
   summary.

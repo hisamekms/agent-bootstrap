@@ -4,6 +4,7 @@ import type { HostPort } from "../egress-policy.ts";
 
 export type EnvironmentOperation = "build" | "resolve" | "update" | "outdated";
 export type EnvironmentFailure =
+  | "env-update-disabled"
   | "env-missing"
   | "env-fetch-failed"
   | "env-lock-mismatch"
@@ -57,6 +58,7 @@ export interface EnvironmentStep {
   readonly argv: readonly string[];
   readonly archive: boolean;
   readonly writesLock: boolean;
+  readonly writesDeclarations?: true;
   readonly reportsOutdated: boolean;
   readonly warning?: typeof lockMissing;
 }
@@ -71,6 +73,7 @@ export interface EnvironmentAdapter {
     operation: EnvironmentOperation,
     hasLock: boolean,
     names?: readonly string[],
+    allowMajor?: boolean,
   ): EnvironmentStep | undefined;
 }
 

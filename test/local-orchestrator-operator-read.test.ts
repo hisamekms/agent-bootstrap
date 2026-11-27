@@ -184,3 +184,46 @@ test("a budget overrun stops being a current problem after a retry", () => {
     [],
   );
 });
+
+test("Task detail and journal bound package changes and retain totals", () => {
+  using state = orchestratorFixture("lo-read-package-diff-");
+  const { store } = state;
+  const id = setup(store).task("Dependencies");
+  assert.ok(store.claimTask(id));
+  const review = store.createExecution({
+    taskId: id,
+    actor: "Reviewer",
+    mode: "review",
+    requestedBy: host,
+  }).id;
+  store.startExecution(review);
+  const packageDiff = {
+    added: Array.from(
+      { length: 320 },
+      (_, index) => `@scope/package-${index}@1.0.0`,
+    ),
+    removed: Array.from({ length: 80 }, (_, index) => `removed-${index}@2.0.0`),
+    changed: Array.from({ length: 96 }, (_, index) => ({
+      name: `changed-${index}`,
+      from: ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"],
+      to: ["2.0.0", "3.0.0"],
+    })),
+  };
+  store.recordTaskPackageDiff(review, packageDiff);
+  const expected = {
+    added: packageDiff.added.slice(0, 64),
+    removed: packageDiff.removed.slice(0, 64),
+    changed: packageDiff.changed
+      .slice(0, 64)
+      .map((row) => ({ ...row, from: row.from.slice(0, 4) })),
+    totals: { added: 320, removed: 80, changed: 96 },
+  };
+  assert.deepEqual(store.taskPackageDiff(id), expected);
+  assert.deepEqual(operatorTask(store, id)?.packageDiff, expected);
+  const evidence = JSON.stringify(
+    store.listEvents({ subjectId: review, limit: 100 }),
+  );
+  assert.ok(!evidence.includes("package-319"));
+  assert.ok(!evidence.includes("removed-79"));
+  assert.ok(!evidence.includes("changed-95"));
+});

@@ -138,7 +138,10 @@ function goal(
         description: "",
         acceptance: ["Valid docs"],
         scope: {
-          paths: profile === "bun" ? ["package.json", "packages/"] : ["docs/"],
+          paths:
+            profile === "bun"
+              ? ["package.json", "bun.lock", "packages/"]
+              : ["docs/"],
           profiles: [profile],
           actors: ["Executor"],
           maxTasks: 8,
@@ -3448,6 +3451,14 @@ for (const scenario of [
   "output collision",
   "tracked output collision",
   "mismatch",
+  "resolve",
+  "resolve without suite",
+  "resolve failure without suite",
+  "resolve disabled without suite",
+  "update",
+  "update disabled",
+  "update workspace excluded",
+  "update audit unavailable",
   "invalid manifest",
   "candidate invalid manifest",
   "tampered",
@@ -3469,7 +3480,19 @@ for (const scenario of [
       const trackedOutput = scenario === "tracked output collision";
       const outputCollision = scenario === "output collision" || trackedOutput;
       const workspace = scenario === "workspace outputs" || outputCollision;
-      const successful = scenario === "build" || workspace;
+      const noSuite = scenario.endsWith("without suite");
+      const resolveFails = scenario === "resolve failure without suite";
+      const resolveDisabled = scenario === "resolve disabled without suite";
+      const resolves =
+        scenario === "resolve" || scenario === "resolve without suite";
+      const excludedWorkspace = scenario === "update workspace excluded";
+      const updating = scenario.startsWith("update");
+      const successful = scenario === "build" || workspace || resolves;
+      const update = {
+        adapter: "bun",
+        packages: ["@fixture/a"],
+        allowMajor: true,
+      } as const;
       const revise = scenario === "mismatch" || outputCollision;
       const executorMiss = scenario === "executor cache miss";
       const verificationMiss = scenario === "verification cache miss";
@@ -3479,14 +3502,29 @@ for (const scenario of [
       const manifest =
         scenario === "invalid manifest"
           ? '{"workspaces":false}'
-          : '{"name":"fixture"}';
+          : excludedWorkspace
+            ? '{"name":"fixture","workspaces":["packages/*"]}'
+            : updating
+              ? '\uFEFF{"name":"fixture","dependencies":{"@fixture/a":"^1.0.0"}}'
+              : '{"name":"fixture"}';
       const changedManifest = workspace
         ? '{"name":"candidate","workspaces":["packages/*"]}'
-        : '{"name":"candidate"}';
+        : updating
+          ? manifest.replace("^1.0.0", "^2.0.0")
+          : '{"name":"candidate"}';
       const packageManifest = '{"name":"a"}';
       const bunLock = '{"lockfileVersion":1,"packages":{}}';
+      const changedLock =
+        '{"lockfileVersion":1,"packages":{"@fixture/a":["@fixture/a@2.0.0"]}}';
       writeFileSync(join(repoRoot, "package.json"), manifest);
       writeFileSync(join(repoRoot, "bun.lock"), bunLock);
+      if (excludedWorkspace) {
+        mkdirSync(join(repoRoot, "packages/a"), { recursive: true });
+        writeFileSync(
+          join(repoRoot, "packages/a/package.json"),
+          packageManifest,
+        );
+      }
       const trackedPath = "packages/a/node_modules/tracked";
       if (trackedOutput) {
         mkdirSync(join(repoRoot, "packages/a/node_modules"), {
@@ -3502,19 +3540,31 @@ for (const scenario of [
       const target = await resolveTarget(repoRoot, root, env);
       const { directory } = target;
       await prepareTargetDirectory(target.bootstrapRoot, directory, env);
-      const goalId = goal(store, undefined, "bun");
+      const goalId = goal(
+        store,
+        noSuite ? { integration: "agent" } : undefined,
+        "bun",
+      );
       const taskId = task(store, goalId, {
         profile: "bun",
-        paths: workspace
-          ? ["package.json", "packages/"]
-          : candidateInvalidManifest
-            ? ["package.json", "node_modules/"]
-            : ["package.json"],
+        ...(updating && { environment: { update } }),
+        paths:
+          updating || noSuite || resolves || scenario === "mismatch"
+            ? ["package.json", "bun.lock"]
+            : workspace
+              ? ["package.json", "packages/"]
+              : candidateInvalidManifest
+                ? ["package.json", "node_modules/"]
+                : ["package.json"],
         budgets: { ...budgets, maxRetries: 1 },
       });
       const cache = new EnvironmentStore(target.project.id, env);
       const digest = "a".repeat(64);
-      const keyFor = async (content: string, workspace = false) =>
+      const keyFor = async (
+        content: string,
+        workspace = false,
+        lock = bunLock,
+      ) =>
         (
           await identifyEnvironment(
             {
@@ -3526,7 +3576,7 @@ for (const scenario of [
               async read(path) {
                 return Buffer.from(
                   path === "bun.lock"
-                    ? bunLock
+                    ? lock
                     : path === "package.json"
                       ? content
                       : packageManifest,
@@ -3537,8 +3587,15 @@ for (const scenario of [
             bunAdapter,
           )
         ).key;
-      const baseKey = await keyFor('{"name":"fixture"}');
-      const candidateKey = await keyFor(changedManifest, workspace);
+      const baseKey = await keyFor(
+        scenario === "invalid manifest" ? '{"name":"fixture"}' : manifest,
+        excludedWorkspace,
+      );
+      const candidateKey = await keyFor(
+        changedManifest,
+        workspace,
+        resolves || updating ? changedLock : bunLock,
+      );
       const entry = (
         path: string,
         type: TarEntryView["type"],
@@ -3551,6 +3608,10 @@ for (const scenario of [
         data: Buffer.from(content),
       });
       const archive = writeWorkspaceTar([entry("node_modules", "directory")]);
+      const updatedArchive = writeWorkspaceTar([
+        entry("node_modules", "directory"),
+        entry("node_modules/updated", "file", "updated"),
+      ]);
       if (!executorMiss)
         await cache.publish(
           {
@@ -3580,18 +3641,26 @@ for (const scenario of [
       let reviewerRuns = 0;
       let provisionerCommands = 0;
       const provisioning: string[] = [];
+      const operations: string[] = [];
       const executor = createTaskExecutor({
         repoRoot,
         directory,
         store,
         worker: () => harness,
         reviewer: harness,
-        verification: configuredVerification({
-          profile: "bun",
-          argv: ["bun", "test"],
+        ...(!noSuite && {
+          verification: configuredVerification({
+            profile: "bun",
+            argv: ["bun", "test"],
+          }),
         }),
         environment: {
-          ...(successful || revise ? { autoBuild: true } : {}),
+          ...(successful ||
+          resolveFails ||
+          revise ||
+          (updating && scenario !== "update disabled")
+            ? { autoBuild: true }
+            : {}),
           profile: {
             image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
             recipeDigest: digest,
@@ -3600,7 +3669,10 @@ for (const scenario of [
           },
           allow: [],
           requireAudit() {
-            if (scenario === "audit unavailable")
+            if (
+              scenario === "audit unavailable" ||
+              scenario === "update audit unavailable"
+            )
               throw new Error("audit unavailable");
           },
           host: {
@@ -3608,28 +3680,60 @@ for (const scenario of [
             store: cache,
             async run(args) {
               provisionerCommands++;
-              if (args[0] === "create") {
-                assert.match(
-                  activityLabel(operatorActivity({ store, target: repoRoot })),
-                  /環境を準備中/,
-                );
+              const script = args.at(-1) ?? "";
+              if (args[0] === "exec") {
+                const operation = script.includes("'update'")
+                  ? "update"
+                  : script.includes("'install'")
+                    ? script.includes("'--frozen-lockfile'")
+                      ? "build"
+                      : "resolve"
+                    : undefined;
+                if (operation) {
+                  operations.push(operation);
+                  assert.match(
+                    activityLabel(
+                      operatorActivity({ store, target: repoRoot }),
+                    ),
+                    operation === "build" ? /環境を準備中/ : /依存を解決中/,
+                  );
+                  if (operation === "update")
+                    assert.match(script, /--latest.*@fixture\/a/);
+                  if (
+                    scenario === "mismatch" ||
+                    (resolves && operations.length === 1) ||
+                    (resolveFails &&
+                      (operation === "build" || operation === "resolve"))
+                  )
+                    return { code: 1, stdout: "", stderr: "frozen lockfile" };
+                }
               }
-              if (
-                args[0] === "exec" &&
-                args.at(-1)?.includes("install") &&
-                scenario === "mismatch"
-              )
-                return { code: 1, stdout: "", stderr: "frozen lockfile" };
-              if (args[0] === "copy")
+              if (args[0] === "copy") {
+                const resource = args[1]!;
                 writeFileSync(
                   args[2]!,
-                  workspace
+                  resource.endsWith("declarations.tar")
                     ? writeWorkspaceTar([
-                        entry("node_modules", "directory"),
-                        entry("packages/a/node_modules", "directory"),
+                        entry(
+                          "package.json",
+                          "file",
+                          scenario === "update"
+                            ? '{"dependencies":{"@fixture/a":"^2.0.0"},"name":"fixture"}\n'
+                            : changedManifest,
+                        ),
                       ])
-                    : archive,
+                    : resource.endsWith("bun.lock")
+                      ? changedLock
+                      : workspace
+                        ? writeWorkspaceTar([
+                            entry("node_modules", "directory"),
+                            entry("packages/a/node_modules", "directory"),
+                          ])
+                        : updating
+                          ? updatedArchive
+                          : archive,
                 );
+              }
               return { code: 0, stdout: "" };
             },
             async openGateway({ executionId }) {
@@ -3650,11 +3754,39 @@ for (const scenario of [
             workerRuns++;
             assert.ok(plan.sandbox.environment);
             assert.match(plan.command.argv[2]!, /AGENT_BOOTSTRAP_ENV_PATH/);
-            assert.deepEqual(cache.prune({ keep: 0 }), []);
             assert.deepEqual(
-              cache.list().map(({ key }) => key),
-              [baseKey],
+              cache.prune({ keep: 0 }),
+              updating && workerRuns === 1 ? [baseKey] : [],
             );
+            if (updating) {
+              assert.deepEqual(
+                plan.sandbox.environment.archive,
+                updatedArchive,
+              );
+              const tree = readTar(
+                readFileSync(plan.sandbox.repository!.tree),
+                undefined,
+                true,
+              );
+              assert.equal(
+                Buffer.from(
+                  tree.find(({ path }) => path === "package.json")!.data,
+                ).toString(),
+                changedManifest,
+              );
+              assert.equal(
+                Buffer.from(
+                  tree.find(({ path }) => path === "bun.lock")!.data,
+                ).toString(),
+                changedLock,
+              );
+              assert.ok(cache.get(candidateKey));
+            } else {
+              assert.deepEqual(
+                cache.list().map(({ key }) => key),
+                [baseKey],
+              );
+            }
             if (scenario === "worker failure")
               throw new Error("fixture worker failure");
             if (integrationMiss)
@@ -3670,7 +3802,7 @@ for (const scenario of [
                 },
                 archive,
               );
-            if (workerRuns === 2) {
+            if (workerRuns === 2 && !updating) {
               if (trackedOutput) {
                 const previous = readTar(
                   readFileSync(plan.sandbox.repository!.tree),
@@ -3700,6 +3832,9 @@ for (const scenario of [
               outcome: "ok",
               artifacts: {
                 files: [],
+                message: Buffer.from(
+                  "Change fixture manifest\n\nKeep the fixture in sync.",
+                ),
                 tree: writeWorkspaceTar([
                   entry(
                     "package.json",
@@ -3708,7 +3843,7 @@ for (const scenario of [
                       ? '{"workspaces":false}'
                       : changedManifest,
                   ),
-                  entry("bun.lock", "file", bunLock),
+                  entry("bun.lock", "file", updating ? changedLock : bunLock),
                   entry("node_modules", "directory"),
                   entry("node_modules/agent-write", "file", "discard this"),
                   ...(scenario === "workspace outputs"
@@ -3754,7 +3889,8 @@ for (const scenario of [
             verifyRuns++;
             assert.ok(plan.sandbox.environment);
             assert.equal(cache.get(candidateKey)?.key, candidateKey);
-            assert.deepEqual(cache.prune({ keep: 0 }), [baseKey]);
+            if (!updating)
+              assert.deepEqual(cache.prune({ keep: 0 }), [baseKey]);
             return {
               id: id!,
               outcome: "ok",
@@ -3764,6 +3900,15 @@ for (const scenario of [
           async runReviewer(plan, id) {
             reviewerRuns++;
             assert.equal(Object.hasOwn(plan.sandbox, "environment"), false);
+            if (updating || resolves) {
+              const packages = plan.sandbox.readOnlyFiles?.find(
+                ({ path }) => path === "candidate.packages.json",
+              );
+              assert.deepEqual(
+                JSON.parse(Buffer.from(packages!.bytes).toString()).added,
+                ["@fixture/a@2.0.0"],
+              );
+            }
             const diff = plan.sandbox.readOnlyFiles?.find(
               ({ path }) => path === "candidate.diff",
             );
@@ -3785,7 +3930,13 @@ for (const scenario of [
             return {
               id: id!,
               outcome: "ok",
-              response: Buffer.from('{"result":"{\\"review\\":\\"pass\\"}"}'),
+              response: Buffer.from(
+                JSON.stringify({
+                  result: JSON.stringify({
+                    review: updating && reviewerRuns === 1 ? "revise" : "pass",
+                  }),
+                }),
+              ),
             };
           },
         },
@@ -3809,6 +3960,191 @@ for (const scenario of [
         );
       }
       const detail = operatorTask(store, taskId)!;
+      if (updating) {
+        assert.deepEqual(detail.environment, { update });
+        if (scenario !== "update") {
+          assert.equal(
+            workerRuns + verifyRuns + reviewerRuns + provisionerCommands,
+            0,
+          );
+          assert.equal(
+            detail.failure?.code,
+            scenario === "update disabled"
+              ? "env-update-disabled"
+              : excludedWorkspace
+                ? "env-lock-mismatch"
+                : "host-error",
+          );
+          if (scenario === "update disabled")
+            assert.match(detail.failure?.next ?? "", /environment.autoBuild/);
+          return;
+        }
+        assert.equal(
+          detail.status,
+          "awaiting-integration",
+          detail.failure?.code,
+        );
+        assert.deepEqual(detail.packageDiff, {
+          added: ["@fixture/a@2.0.0"],
+          removed: [],
+          changed: [],
+          totals: { added: 1, removed: 0, changed: 0 },
+        });
+        assert.deepEqual(operations, ["update", "build"]);
+        assert.equal(workerRuns, 2);
+        assert.equal(reviewerRuns, 2);
+        assert.equal(verifyRuns, 2);
+        const events = await new IntegrationJournal(
+          join(directory, "integrations", taskId),
+          taskId,
+        ).read();
+        const updated = events.find(
+          ({ kind }) => kind === "environment.updated",
+        );
+        assert.ok(updated?.kind === "environment.updated");
+        assert.deepEqual(updated.changedPaths, ["bun.lock", "package.json"]);
+        assert.match(
+          String(
+            command(
+              "/usr/bin/git",
+              join(directory, "repository.git"),
+              ["show", "-s", "--format=%B", updated.candidate],
+              "utf8",
+            ),
+          ),
+          new RegExp(`Agent-Bootstrap-Provisioner-Run: ${provisioning[0]}`),
+        );
+        const first = detail.executions
+          .filter(({ mode }) => mode === "task")
+          .at(-1)!;
+        const updateEvents = store.listEvents({
+          subjectId: first.id,
+          limit: 20,
+        });
+        assert.ok(
+          updateEvents.some(({ kind }) => kind === "environment.package-diff"),
+        );
+        const audit = new SqliteAudit(join(cache.directory, "audit.sqlite"), {
+          readonly: true,
+        });
+        try {
+          assert.ok(
+            audit
+              .read(provisioning[0]!)
+              .some(
+                ({ kind, role, detail }) =>
+                  kind === "environment.finished" &&
+                  role === "Provisioner" &&
+                  JSON.stringify(detail).includes(
+                    '"changedPaths":["bun.lock","package.json"]',
+                  ),
+              ),
+          );
+        } finally {
+          audit.close();
+        }
+        const [firstProposal] = store.pendingIntegrations();
+        assert.ok(firstProposal?.kind === "integration");
+        store.decide(firstProposal.id, {
+          decision: "reject",
+          digest: firstProposal.digest,
+          answerer: { kind: "human" },
+        });
+        store.retryTask(taskId, 0);
+        await runTask(store, executor, taskId);
+        const [retry] = store.pendingIntegrations();
+        assert.ok(retry?.kind === "integration");
+        assert.equal(retry.content.base, firstProposal.content.base);
+        assert.deepEqual(operations, ["update", "build"]);
+        assert.equal(workerRuns, 3);
+        const retryJournal = await new IntegrationJournal(
+          join(directory, "integrations", taskId, "retry-1"),
+          taskId,
+        ).read();
+        assert.partialDeepStrictEqual(
+          retryJournal.find(({ kind }) => kind === "environment.updated"),
+          {
+            candidate: updated.candidate,
+            changedPaths: updated.changedPaths,
+          },
+        );
+        return;
+      }
+      if (resolveFails || resolveDisabled) {
+        assert.equal(detail.status, "failed");
+        assert.equal(
+          detail.failure?.code,
+          resolveDisabled ? "env-missing" : "env-lock-mismatch",
+        );
+        assert.deepEqual(
+          operations,
+          resolveDisabled ? [] : ["build", "resolve"],
+        );
+        assert.equal(workerRuns, 1);
+        assert.equal(verifyRuns + reviewerRuns, 0);
+        return;
+      }
+      if (resolves) {
+        assert.equal(detail.status, "awaiting-integration");
+        assert.deepEqual(operations, ["build", "resolve", "build"]);
+        assert.deepEqual(detail.packageDiff?.added, ["@fixture/a@2.0.0"]);
+        const [proposal] = store.pendingIntegrations();
+        assert.ok(proposal?.kind === "integration");
+        assert.deepEqual(proposal.content.changedPaths, [
+          "bun.lock",
+          "package.json",
+        ]);
+        const events = await new IntegrationJournal(
+          join(directory, "integrations", taskId),
+          taskId,
+        ).read();
+        const authorized = events.find(
+          (event) => event.kind === "environment.resolve-authorized",
+        );
+        assert.ok(authorized?.kind === "environment.resolve-authorized");
+        assert.deepEqual(authorized.changedPaths, ["bun.lock"]);
+        assert.match(
+          String(
+            command(
+              "/usr/bin/git",
+              join(directory, "repository.git"),
+              ["show", "-s", "--format=%B", proposal.content.candidate],
+              "utf8",
+            ),
+          ),
+          new RegExp(
+            String.raw`^Change fixture manifest\n\nKeep the fixture in sync\.\n\nAgent-Bootstrap-Worker-Run: .*\nAgent-Bootstrap-Provisioner-Paths: \["bun\.lock"\]\nAgent-Bootstrap-Provisioner-Run: ${provisioning[1]}`,
+          ),
+        );
+        if (noSuite) {
+          assert.equal(verifyRuns, 0);
+          assert.equal(reviewerRuns, 1);
+          assert.equal(proposal.content.verified, false);
+          assert.equal(proposal.invariant, "integration-verification");
+          assert.equal(
+            store.getProposalDetails(proposal.id)?.humanAnswerRequired,
+            true,
+          );
+          assert.equal(
+            detail.executions.some(({ mode }) => mode === "verification"),
+            false,
+          );
+          await assert.rejects(
+            runner(store, executor).requestApproval(proposal.id),
+            {
+              code: "approval-forbidden",
+            },
+          );
+          assert.equal(
+            events.some(({ kind }) => kind.startsWith("verification.")),
+            false,
+          );
+          approve(store, proposal);
+          await executor.integrate!(proposal.id);
+          assert.equal(store.getTask(taskId)?.status, "succeeded");
+          return;
+        }
+      }
       if (executorMiss || verificationMiss || integrationMiss) {
         const key = executorMiss ? baseKey : candidateKey;
         const mode = executorMiss ? "task" : "verification";
@@ -4056,3 +4392,377 @@ for (const scenario of [
         ]);
     },
   );
+
+for (const scenario of [
+  "lock only",
+  "declared lock only",
+  "lock only resolve no-op",
+  "retry no-op",
+  "manifest conflict",
+  "autoBuild off",
+] as const) {
+  test(
+    `stale Task replays declarations and resolves only for ${scenario}`,
+    gitTestOptions,
+    async () => {
+      using fixture = orchestratorFixture("task-lock-conflict-");
+      const { root, store } = fixture;
+      const repoRoot = join(root, "source");
+      mkdirSync(repoRoot);
+      const git = (args: string[]) =>
+        String(command("/usr/bin/git", repoRoot, args, "utf8")).trim();
+      git(["init", "--template=", "--initial-branch=main"]);
+      const rootManifest = '{"name":"fixture","workspaces":["packages/*"]}';
+      const workspace = (name: string, range: string) =>
+        JSON.stringify({ name, dependencies: { fixture: range } });
+      const lock = (version: string) =>
+        JSON.stringify({
+          lockfileVersion: 1,
+          packages: { fixture: [`fixture@${version}`] },
+        });
+      const files = (
+        a: string,
+        b: string,
+        version: string,
+      ): Record<string, string> => ({
+        "package.json": rootManifest,
+        "packages/a/package.json": workspace("a", a),
+        "packages/b/package.json": workspace("b", b),
+        "bun.lock": lock(version),
+      });
+      const base = files("^1.0.0", "^1.0.0", "1.0.0");
+      const upstream = files("^2.0.0", "^1.0.0", "2.0.0");
+      const declaredLockOnly = scenario === "declared lock only";
+      const retryNoop = scenario === "retry no-op";
+      const declared = declaredLockOnly || retryNoop;
+      const resolveNoop = scenario === "lock only resolve no-op";
+      const canRebase =
+        scenario === "lock only" || declaredLockOnly || resolveNoop;
+      const change =
+        scenario === "manifest conflict" || retryNoop
+          ? files("^3.0.0", "^1.0.0", "3.0.0")
+          : files("^1.0.0", declaredLockOnly ? "^1.0.0" : "^3.0.0", "3.0.0");
+      const resolved = files(
+        "^2.0.0",
+        declared ? "^1.0.0" : "^3.0.0",
+        resolveNoop ? "2.0.0" : "4.0.0",
+      );
+      for (const [path, value] of Object.entries(base)) {
+        if (path.includes("/"))
+          mkdirSync(join(repoRoot, path.slice(0, path.lastIndexOf("/"))), {
+            recursive: true,
+          });
+        writeFileSync(join(repoRoot, path), value);
+      }
+      git(["add", "."]);
+      git(["commit", "-m", "base"]);
+
+      const env = configEnv(root);
+      addProject(repoRoot, undefined, env);
+      const target = await resolveTarget(repoRoot, root, env);
+      const { directory } = target;
+      await prepareTargetDirectory(target.bootstrapRoot, directory, env);
+      const goalId = goal(store, undefined, "bun");
+      const first = task(store, goalId, {
+        profile: "bun",
+        paths: ["bun.lock", "packages/"],
+      });
+      const second = task(store, goalId, {
+        profile: "bun",
+        paths: ["bun.lock", "package.json", "packages/"],
+        ...(declared && {
+          environment: {
+            update: { adapter: "bun", packages: "all", allowMajor: false },
+          },
+        }),
+      });
+      const cache = new EnvironmentStore(target.project.id, env);
+      const digest = "a".repeat(64);
+      const tar = (files: Record<string, string>) =>
+        writeWorkspaceTar(
+          Object.entries(files).map(([path, value]) => ({
+            path,
+            type: "file",
+            mode: 0o644,
+            linkname: "",
+            data: Buffer.from(value),
+          })),
+        );
+      const archive = writeWorkspaceTar(
+        [
+          "node_modules",
+          "packages/a/node_modules",
+          "packages/b/node_modules",
+        ].map((path) => ({
+          path,
+          type: "directory",
+          mode: 0o755,
+          linkname: "",
+          data: Buffer.alloc(0),
+        })),
+      );
+      for (const input of [base, upstream, change]) {
+        const { key } = await identifyEnvironment(
+          {
+            paths: Object.keys(input),
+            async read(path) {
+              return input[path] ? Buffer.from(input[path]) : undefined;
+            },
+          },
+          digest,
+          bunAdapter,
+        );
+        await cache.publish(
+          {
+            key,
+            adapter: "bun",
+            profileDigest: digest,
+            hasLock: true,
+            packages: [],
+            size: archive.byteLength,
+            createdAt: new Date().toISOString(),
+          },
+          archive,
+        );
+      }
+      let workerRuns = 0;
+      let resolveRuns = 0;
+      let updateRuns = 0;
+      const mutationIds: string[] = [];
+      let operation: "update" | "resolve" | "build" | undefined;
+      let output = resolved;
+      const executor = createTaskExecutor({
+        repoRoot,
+        directory,
+        store,
+        worker: () => harness,
+        reviewer: harness,
+        verification: configuredVerification({
+          profile: "bun",
+          argv: ["bun", "test"],
+        }),
+        environment: {
+          autoBuild: scenario !== "autoBuild off",
+          profile: {
+            image: `localhost/agent-bootstrap/bun@sha256:${digest}`,
+            recipeDigest: digest,
+            memoryMiB: 2048,
+            cpus: 2,
+          },
+          allow: [],
+          requireAudit() {},
+          host: {
+            env,
+            store: cache,
+            async run(args) {
+              const script = args.at(-1) ?? "";
+              if (args[0] === "exec" && script.includes("'update'")) {
+                operation = "update";
+                updateRuns++;
+                output =
+                  updateRuns === 1
+                    ? declaredLockOnly
+                      ? change
+                      : base
+                    : resolved;
+              }
+              if (args[0] === "exec" && script.includes("'install'")) {
+                operation = script.includes("'--frozen-lockfile'")
+                  ? "build"
+                  : "resolve";
+                if (operation === "resolve") {
+                  resolveRuns++;
+                  output = resolved;
+                }
+              }
+              if (args[0] === "copy") {
+                const resource = args[1]!;
+                writeFileSync(
+                  args[2]!,
+                  resource.endsWith("declarations.tar")
+                    ? tar(
+                        Object.fromEntries(
+                          Object.entries(output).filter(([path]) =>
+                            path.endsWith("package.json"),
+                          ),
+                        ),
+                      )
+                    : resource.endsWith("bun.lock")
+                      ? output["bun.lock"]!
+                      : archive,
+                );
+              }
+              return { code: 0, stdout: "" };
+            },
+            async openGateway({ executionId }) {
+              mutationIds.push(executionId);
+              return {
+                socksPort: 19100,
+                dnsPort: 19153,
+                username: "fake",
+                password: "fixture",
+                quarantined: false,
+                async close() {},
+              };
+            },
+          },
+        },
+        host: {
+          async runWorker(_plan, id) {
+            workerRuns++;
+            assert.ok(workerRuns <= (retryNoop ? 3 : 2));
+            return {
+              id: id!,
+              outcome: "ok",
+              artifacts: {
+                files: [],
+                message: Buffer.from(
+                  "Update fixture dependency\n\nExplain the dependency change.",
+                ),
+                tree: tar(
+                  workerRuns === 1
+                    ? upstream
+                    : workerRuns === 2
+                      ? change
+                      : resolved,
+                ),
+              },
+            };
+          },
+          async runVerification(_plan, id) {
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from('{"review":"pass"}'),
+            };
+          },
+          async runReviewer(_plan, id) {
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from(
+                JSON.stringify({ result: '{"review":"pass"}' }),
+              ),
+            };
+          },
+        },
+      });
+      for (const id of [first, second]) await runTask(store, executor, id);
+      const proposals = store.pendingIntegrations();
+      const firstProposal = proposals.find(
+        (item) => item.kind === "integration" && item.content.taskId === first,
+      )!;
+      const secondProposal = proposals.find(
+        (item) => item.kind === "integration" && item.content.taskId === second,
+      )!;
+      approve(store, firstProposal);
+      await executor.integrate!(firstProposal.id);
+      assert.equal(store.getTask(first)?.status, "succeeded");
+      approve(store, secondProposal);
+      await executor.integrate!(secondProposal.id);
+      if (!canRebase) {
+        assert.equal(operatorTask(store, second)?.failure?.code, "stale-base");
+        assert.equal(store.getTask(second)?.retries, 0);
+        assert.equal(resolveRuns, 0);
+        assert.equal(workerRuns, 2);
+        if (retryNoop) {
+          assert.equal(updateRuns, 1);
+          const previous = await new IntegrationJournal(
+            join(directory, "integrations", second),
+            second,
+          ).read();
+          assert.partialDeepStrictEqual(
+            previous.find(({ kind }) => kind === "environment.updated"),
+            {
+              candidate:
+                secondProposal.kind === "integration"
+                  ? secondProposal.content.base
+                  : undefined,
+              changedPaths: [],
+            },
+          );
+          store.retryTask(second, 0);
+          await runTask(store, executor, second);
+          assert.equal(updateRuns, 2);
+          assert.equal(workerRuns, 3);
+          assert.equal(resolveRuns, 0);
+          const [proposal] = store.pendingIntegrations();
+          assert.ok(proposal?.kind === "integration");
+          assert.deepEqual(proposal.content.changedPaths, ["bun.lock"]);
+        }
+        return;
+      }
+      assert.equal(store.getTask(second)?.status, "registered");
+      await runTask(store, executor, second);
+      assert.equal(resolveRuns, declaredLockOnly ? 0 : 1);
+      assert.equal(updateRuns, declaredLockOnly ? 2 : 0);
+      assert.equal(workerRuns, 2);
+      const [proposal] = store.pendingIntegrations();
+      assert.ok(proposal?.kind === "integration");
+      assert.notEqual(proposal.id, secondProposal.id);
+      assert.equal(proposal.content.base, await executor.existingBase!(goalId));
+      assert.deepEqual(
+        proposal.content.changedPaths,
+        declaredLockOnly
+          ? ["bun.lock"]
+          : resolveNoop
+            ? ["packages/b/package.json"]
+            : ["bun.lock", "packages/b/package.json"],
+      );
+      const journal = await new IntegrationJournal(
+        join(directory, "integrations", second, "retry-1"),
+        second,
+      ).read();
+      assert.partialDeepStrictEqual(
+        journal.find(({ kind }) => kind === "environment.executor-base"),
+        {
+          candidate: proposal.content.candidate,
+          changedPaths: resolveNoop ? [] : ["bun.lock"],
+        },
+      );
+      const message = String(
+        command(
+          "/usr/bin/git",
+          join(directory, "repository.git"),
+          ["show", "-s", "--format=%B", proposal.content.candidate],
+          "utf8",
+        ),
+      );
+      assert.match(
+        message,
+        /^Update fixture dependency\n\nExplain the dependency change\.\n\nAgent-Bootstrap-Worker-Run: /,
+      );
+      if (resolveNoop)
+        assert.doesNotMatch(message, /Agent-Bootstrap-Provisioner/);
+      else {
+        assert.ok(
+          message.includes('Agent-Bootstrap-Provisioner-Paths: ["bun.lock"]'),
+        );
+        assert.ok(
+          message.includes(
+            `Agent-Bootstrap-Provisioner-Run: ${mutationIds[declaredLockOnly ? 1 : 0]}`,
+          ),
+        );
+      }
+      const tree = await LocalGitIntegration.committedTree(
+        join(directory, "repository.git"),
+        proposal.content.candidate,
+      );
+      for (const [path, content] of Object.entries(resolved))
+        assert.equal(Buffer.from((await tree.read(path))!).toString(), content);
+      assert.deepEqual(
+        operatorTask(store, second)?.packageDiff?.changed,
+        resolveNoop
+          ? undefined
+          : [{ name: "fixture", from: ["2.0.0"], to: ["4.0.0"] }],
+      );
+      approve(store, proposal);
+      await executor.integrate!(proposal.id);
+      assert.equal(store.getTask(second)?.status, "succeeded");
+      assert.equal(
+        await executor.existingBase!(goalId),
+        proposal.content.candidate,
+      );
+    },
+  );
+}

@@ -5,6 +5,8 @@ import type {
 } from "./adapter.ts";
 import { EnvironmentError, lockMissing } from "./adapter.ts";
 
+import { validPackageName } from "./lock.ts";
+
 declare const Bun: {
   Glob: new (pattern: string) => { match(path: string): boolean };
 };
@@ -125,13 +127,11 @@ export const bunAdapter: EnvironmentAdapter = {
   lockPath: "bun.lock",
   defaultEgress: [{ hostname: "registry.npmjs.org", port: 443 }],
   layout,
-  command(operation, hasLock, names = []) {
+  command(operation, hasLock, names = [], allowMajor = false) {
     if (
-      names.length &&
-      (operation !== "update" ||
-        names.some(
-          (name) => !/^(?:@[a-z\d_.-]+\/)?[a-z\d_][a-z\d_.-]*$/i.test(name),
-        ))
+      (!names.length && allowMajor) ||
+      (names.length > 0 && operation !== "update") ||
+      names.some((name) => !validPackageName(name))
     )
       throw new EnvironmentError();
     switch (operation) {
@@ -154,7 +154,14 @@ export const bunAdapter: EnvironmentAdapter = {
         };
       case "update":
         return {
-          argv: ["bun", "update", networkConcurrency, ...names],
+          argv: [
+            "bun",
+            "update",
+            networkConcurrency,
+            ...(allowMajor ? ["--latest"] : []),
+            ...(names.length ? ["--", ...names] : []),
+          ],
+          writesDeclarations: true,
           archive: true,
           writesLock: true,
           reportsOutdated: false,

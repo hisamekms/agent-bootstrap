@@ -1,3 +1,4 @@
+import { writeWorkspaceTar } from "../src/oci-image.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -29,6 +30,7 @@ import {
   validateEnvironmentArchive,
 } from "../src/environments/archive.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
+import { checkDeclaration } from "../src/environments/declarations.ts";
 import { diffBunLocks, parseBunLock } from "../src/environments/lock.ts";
 import { parseEnvironmentEvidence } from "../src/environments/events.ts";
 import {
@@ -160,8 +162,24 @@ test("workspace globs reject absolute paths and parent traversal", async () => {
     "bun",
     "update",
     "--network-concurrency=16",
+    "--",
     "@scope/a",
   ]);
+  assert.deepEqual(
+    bunAdapter.command("update", true, ["@scope/a", "b"], true)?.argv,
+    [
+      "bun",
+      "update",
+      "--network-concurrency=16",
+      "--latest",
+      "--",
+      "@scope/a",
+      "b",
+    ],
+  );
+  assert.throws(() => bunAdapter.command("update", true, [], true), {
+    code: "env-build-failed",
+  });
   assert.deepEqual(bunAdapter.command("outdated", true)?.argv, [
     "bun",
     "outdated",
@@ -1027,5 +1045,197 @@ test("environment output collisions include folded roots and implicit parent ali
       ["node_modules"],
       [{ path: "src/node_modules/a", directory: false }],
     ),
+  );
+});
+
+test("Provisioner rejects hostile declaration archives and unauthorized declaration edits", async (t) => {
+  const { env, store } = await fixture(t);
+  const base = String.raw`{"dependencies":{"pkg":"^1.0.0"},"overrides":{"other":"1.0.0"},"name":"fi\"xture"}`;
+  const file = (path: string, data: string) => ({
+    path,
+    data: Buffer.from(data),
+    type: "file" as const,
+    mode: 0o644,
+    linkname: "",
+  });
+  const manifest = (data: string) => file("package.json", data);
+  const updated = base.replace("^1.0.0", "^2.0.0");
+  const cases = [
+    { name: "extra path", files: [manifest(base), file("extra.json", "{}")] },
+    {
+      name: "symlink",
+      files: [
+        { ...manifest(""), type: "symlink" as const, linkname: "elsewhere" },
+      ],
+    },
+    { name: "missing entry", files: [] },
+    { name: "non-object JSON", files: [manifest("[]")] },
+    {
+      name: "scripts added",
+      files: [
+        manifest(
+          base.slice(0, -1) + ',"scripts":{"postinstall":"echo fixture"}}',
+        ),
+      ],
+    },
+    {
+      name: "overrides changed",
+      files: [manifest(base.replace('"other":"1.0.0"', '"other":"2.0.0"'))],
+    },
+    {
+      name: "overrides reserialized",
+      valid: true,
+      files: [manifest(base.replace('"other":"1.0.0"', '"other": "1.0.0"'))],
+    },
+    {
+      name: "version turned into git",
+      files: [
+        manifest(base.replace("^1.0.0", "git+https://fixture.invalid/pkg.git")),
+      ],
+    },
+    {
+      name: "version turned into shorthand",
+      files: [manifest(base.replace("^1.0.0", "owner/pkg"))],
+    },
+    {
+      name: "dependency added",
+      files: [
+        manifest(
+          base.replace('"pkg":"^1.0.0"', '"pkg":"^1.0.0","new":"1.0.0"'),
+        ),
+      ],
+    },
+    {
+      name: "resolve edited declarations",
+      operation: "resolve" as const,
+      files: [manifest(updated)],
+    },
+    {
+      name: "allowed version range",
+      valid: true,
+      changed: true,
+      files: [manifest(updated)],
+    },
+    {
+      name: "unchanged resolve declarations",
+      operation: "resolve" as const,
+      valid: true,
+      files: [manifest(base)],
+    },
+  ];
+  for (const { name, operation = "update", valid, changed, files } of cases) {
+    const result = provisionEnvironment(
+      {
+        ...input,
+        operation,
+        ...(operation === "update" && { names: ["pkg"], allowMajor: true }),
+        tree: {
+          ...tree({ "package.json": base, "bun.lock": lock() }),
+          pack: input.tree.pack,
+        },
+      },
+      {
+        env,
+        store,
+        ...stoppingGateway(),
+        async run(args) {
+          if (args[0] === "copy")
+            await writeFile(
+              args[2]!,
+              args[1]!.endsWith("declarations.tar")
+                ? writeWorkspaceTar(files)
+                : args[1]!.endsWith("bun.lock")
+                  ? lock()
+                  : goodArchive,
+            );
+          return { code: 0, stdout: "" };
+        },
+      },
+    );
+    if (valid) {
+      assert.deepEqual(
+        (await result).changedPaths,
+        changed ? ["package.json"] : undefined,
+        name,
+      );
+    } else {
+      await assert.rejects(
+        result,
+        {
+          code: "env-build-failed",
+          message:
+            "The Provisioner returned unexpected dependency declarations.",
+        },
+        name,
+      );
+    }
+  }
+});
+
+test("manifest updates enforce named packages and preserve major or zero-major minor ranges", () => {
+  const manifest = (pkg: string, other = "^1.0.0") =>
+    Buffer.from(
+      JSON.stringify({ dependencies: { pkg }, devDependencies: { other } }),
+    );
+  const named = { names: ["pkg"], allowMajor: false };
+  for (const [from, to] of [
+    ["^1.2.0", "~1.3.0"],
+    ["~0.2.1", "^0.2.4"],
+    ["^1.0.0", ">=1.3 <2"],
+    ["0.2.1 - 0.2.4", ">=0.2.3 <0.3.0"],
+    ["^1.0.0 || ^2.0.0", "^2.1.0 || ^1.1.0"],
+  ]) {
+    assert.deepEqual(
+      checkDeclaration(manifest(from!), manifest(to!), named),
+      manifest(to!),
+    );
+  }
+  for (const [from, to] of [
+    ["^1.0.0", "^2.0.0"],
+    ["^0.2.0", "^0.3.0"],
+    ["^0.2.0", "0.x"],
+    ["^0.2.0", ">=0.2.0 <0.4.0"],
+    ["^1.0.0", ">=1.0.0 <=2.0.0"],
+    ["^1.0.0", "^1.1.0 || >=1.0.0"],
+    ...["", "*", "x", "latest", ">=", ">=1.0.0", ">=1.0.0 <3"].map((to) => [
+      "^1.0.0",
+      to,
+    ]),
+  ]) {
+    assert.throws(
+      () => checkDeclaration(manifest(from!), manifest(to!), named),
+      { code: "env-build-failed" },
+    );
+  }
+  const base = manifest("^1.0.0");
+  const both = manifest("^1.2.0", "^1.3.0");
+  assert.throws(() => checkDeclaration(base, both, named), {
+    code: "env-build-failed",
+  });
+  assert.throws(
+    () => checkDeclaration(base, both, { ...named, allowMajor: true }),
+    { code: "env-build-failed" },
+  );
+  assert.deepEqual(checkDeclaration(base, both, {}), both);
+  const major = manifest("^2.0.0");
+  assert.throws(() => checkDeclaration(base, major, { allowMajor: true }), {
+    code: "env-build-failed",
+  });
+  assert.deepEqual(
+    checkDeclaration(base, major, { ...named, allowMajor: true }),
+    major,
+  );
+});
+
+test("manifest write-back keeps base bytes around changed dependency values", () => {
+  const base = `\uFEFF{\r\n  "scripts": { "b": "two", "a": "one" },\r\n  "dependencies": { "other": "1.0.0", "pkg": "^1.0.0" }\r\n}\r\n`;
+  const guest =
+    '{"dependencies":{"pkg":"^1.2.0","other":"1.0.0"},"scripts":{"a":"one","b":"two"}}';
+  const unchanged = Buffer.from(guest.replace("^1.2.0", "^1.0.0"));
+  assert.equal(checkDeclaration(Buffer.from(base), unchanged, {}), undefined);
+  assert.equal(checkDeclaration(Buffer.from(base), unchanged), undefined);
+  assert.deepEqual(
+    checkDeclaration(Buffer.from(base), Buffer.from(guest), { names: ["pkg"] }),
+    Buffer.from(base.replace("^1.0.0", "^1.2.0")),
   );
 });

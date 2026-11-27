@@ -30,6 +30,7 @@ const failureLabels = new Map([
   ["candidate-mismatch", "変更候補の不一致"],
   ["config-invalid", "設定エラー"],
   ["credential-leak", "機密情報の検出"],
+  ["env-update-disabled", "依存の更新が無効"],
   ["env-missing", "環境が未構築"],
   ["goal-base-mismatch", "Goal のベースの不一致"],
   ["host-error", "ホストエラー"],
@@ -64,3 +65,6 @@ export function environmentMissingReason(verification: boolean): string {
     ? "変更候補のキーの環境がありません。environment build はローカルの main にコミットされた内容だけをビルドします。変更候補が依存関係の宣言を変更して新しい環境が必要な場合は、environment.autoBuild を有効にしてください。"
     : "このキーの環境がありません。agent-bootstrap environment build --target <dir> --allow-network を実行するか、environment.autoBuild を有効にしてください。";
 }
+
+export const environmentUpdateDisabledReason =
+  "依存を更新するには、非公開の設定で environment.enabled と environment.autoBuild を有効にしてから Task を再試行してください。";

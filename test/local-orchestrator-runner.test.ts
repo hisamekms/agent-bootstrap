@@ -7,6 +7,10 @@ import {
   ActorRunner,
   type RunnerDeps,
 } from "../src/local-orchestrator/runner.ts";
+import {
+  canonicalJson,
+  validateTaskContent,
+} from "../src/local-orchestrator/model.ts";
 import { OrchestratorStore } from "../src/local-orchestrator/store.ts";
 import { MICROSANDBOX_LIMITS } from "../src/microsandbox.ts";
 import type { ReviewerPlan, ReviewerRun } from "../src/trusted-host.ts";
@@ -1133,4 +1137,123 @@ test("the scheduler records only rejection when approval would widen model deleg
   await work.drain();
   assert.equal(reviews, 3);
   assert.equal(store.getProposal(awaitingHuman.id)?.status, "approved");
+});
+
+test("Planner declares and validates Bun dependency updates", async () => {
+  using state = orchestratorFixture("local-runner-env-update-");
+  const { store } = state;
+  const goalId = registerGoal(store, {
+    ...goal,
+    scope: {
+      ...goal.scope,
+      paths: ["package.json", "bun.lock"],
+      profiles: ["bun"],
+    },
+  });
+  const sessionId = store.startSession("Concierge", "fixture").id;
+  const planned = {
+    ...task,
+    profile: "bun",
+    paths: ["package.json", "bun.lock"],
+  };
+  for (const update of [
+    { adapter: "bun", packages: "@scope/pkg", allowMajor: false },
+    { adapter: "bun", packages: [], allowMajor: false },
+    { adapter: "bun", packages: ["pkg", "pkg"], allowMajor: false },
+    { adapter: "bun", packages: ["-g"], allowMajor: false },
+    { adapter: "bun", packages: ["pkg@latest"], allowMajor: false },
+    { adapter: "bun", packages: ["../pkg"], allowMajor: false },
+    { adapter: "bun", packages: ["@scope/pkg\n"], allowMajor: false },
+    {
+      adapter: "bun",
+      packages: ["https://example.com/pkg"],
+      allowMajor: false,
+    },
+    { adapter: "bun", packages: "all", allowMajor: true },
+    { adapter: "bun", packages: ["pkg"], allowMajor: 1 },
+    { adapter: "other", packages: ["pkg"], allowMajor: false },
+    {
+      adapter: "bun",
+      packages: ["@scope/pkg", "package-two"],
+      allowMajor: true,
+    },
+    { adapter: "bun", packages: "all", allowMajor: false },
+  ]) {
+    const valid =
+      (update.packages === "all" && update.allowMajor === false) ||
+      (Array.isArray(update.packages) && update.packages[0] === "@scope/pkg");
+    const work = runner(store, {
+      runPlanner: async (plan, id) => {
+        const { contract } = JSON.parse(file(plan, "request.json"));
+        assert.match(
+          contract.answer.tasks[0]["environment?"].update.packages,
+          /Bun package names/,
+        );
+        assert.match(plan.command.argv.at(-1)!, /declare environment\.update/);
+        return response(id, {
+          tasks: [{ ...planned, environment: { update } }],
+        });
+      },
+    });
+    const id = await work.requestPlanner({
+      ...goalRequest,
+      mode: "task-decomposition",
+      sessionId,
+      goalId,
+    });
+    await work.drain();
+    assert.equal(
+      store.getExecution(id)?.status,
+      valid ? "succeeded" : "failed",
+    );
+    if (valid)
+      assert.ok(
+        store
+          .listProposals({ status: "registered" })
+          .some(
+            (proposal) =>
+              proposal.kind === "task" &&
+              proposal.content.environment !== undefined &&
+              canonicalJson(proposal.content.environment.update) ===
+                canonicalJson(update),
+          ),
+      );
+  }
+});
+
+test("Task content rejects unsafe update package names and missing key paths", () => {
+  const planned = {
+    ...task,
+    goalId: "91d2ea8f-b576-40ca-a377-a227079053bb",
+    profile: "bun",
+    paths: ["package.json", "bun.lock"],
+  };
+  const update = (packages: string[]) => ({
+    update: { adapter: "bun", packages, allowMajor: false },
+  });
+  assert.deepEqual(
+    validateTaskContent({ ...planned, environment: update(["@scope/pkg"]) })
+      .environment,
+    update(["@scope/pkg"]),
+  );
+  for (const name of [
+    "-g",
+    "pkg@latest",
+    "owner/pkg",
+    "@./pkg",
+    "@../pkg",
+    "@scope/_pkg",
+    "@scope/pkg/extra",
+    "UPPER",
+    ".pkg",
+    "_pkg",
+    "a".repeat(215),
+  ])
+    assert.throws(() =>
+      validateTaskContent({ ...planned, environment: update([name]) }),
+    );
+  for (const paths of [["package.json"], ["bun.lock"]])
+    assert.throws(() =>
+      validateTaskContent({ ...planned, paths, environment: update(["pkg"]) }),
+    );
 });

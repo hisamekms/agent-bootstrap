@@ -15,6 +15,7 @@ import {
 import { GATES, goalBranch } from "./model.ts";
 import {
   environmentMissingReason,
+  environmentUpdateDisabledReason,
   failureLabel,
   failureReason,
   groupProblems,
@@ -468,7 +469,15 @@ export function operatorTask(store: OrchestratorStore, key: string) {
   const {
     id,
     goalId,
-    content: { description, acceptance, actor, paths, budgets, category },
+    content: {
+      description,
+      acceptance,
+      actor,
+      paths,
+      budgets,
+      category,
+      environment,
+    },
   } = task;
   const context = taskContext(store, goalId, id);
   const timing = context.timings.get(id);
@@ -477,6 +486,17 @@ export function operatorTask(store: OrchestratorStore, key: string) {
       ? store.taskPathViolations(id)
       : undefined;
   const usage = store.taskUsage(id);
+  const packageDiff = store.taskPackageDiff(id);
+  const executions = store
+    .recentTaskExecutions(id)
+    .map(({ result, ...execution }) => ({
+      ...execution,
+      ...executionDisplay(result),
+    }));
+  const failureNote =
+    timing?.failureCode === "env-build-failed"
+      ? executions.find(({ code }) => code === timing.failureCode)?.next
+      : undefined;
   const origin = category
     ? store.getProposal(task.proposalId)?.source
     : undefined;
@@ -492,6 +512,8 @@ export function operatorTask(store: OrchestratorStore, key: string) {
     acceptance,
     actor,
     ...(plannerCategory && { category: plannerCategory }),
+    ...(environment && { environment }),
+    ...(packageDiff && { packageDiff }),
     paths,
     budgets,
     integrationPolicy: store.taskPolicyOverride(id),
@@ -500,12 +522,7 @@ export function operatorTask(store: OrchestratorStore, key: string) {
     }),
     tokensUsed: usage.tokens,
     tokensIncomplete: usage.usage === "unavailable",
-    executions: store
-      .recentTaskExecutions(id)
-      .map(({ result, ...execution }) => ({
-        ...execution,
-        ...executionDisplay(result),
-      })),
+    executions,
     ...(task.status === "failed" && {
       failure: {
         code: timing?.failureCode ?? "unknown",
@@ -516,9 +533,11 @@ export function operatorTask(store: OrchestratorStore, key: string) {
                 timing.missingEnvironmentRole === "Verification",
               ),
             }
-          : isCodexFailureCode(timing?.failureCode) && {
-              next: codexFailureActions[timing.failureCode],
-            }),
+          : timing?.failureCode === "env-update-disabled"
+            ? { next: environmentUpdateDisabledReason }
+            : isCodexFailureCode(timing?.failureCode)
+              ? { next: codexFailureActions[timing.failureCode] }
+              : failureNote && { next: failureNote }),
         ...(rejectedPaths && { rejectedPaths }),
       },
     }),
@@ -570,11 +589,13 @@ export function operatorProblems(
     const kind = code === "path-violation" ? "path-violation" : "task-failed";
     const label = failureLabel(code);
     const reason =
-      code === "env-missing"
-        ? environmentMissingReason(
-            row.missingEnvironmentRole === "Verification",
-          )
-        : `${label ? `Task が${label}で失敗しました` : failureReason(code)}。`;
+      code === "env-update-disabled"
+        ? environmentUpdateDisabledReason
+        : code === "env-missing"
+          ? environmentMissingReason(
+              row.missingEnvironmentRole === "Verification",
+            )
+          : `${label ? `Task が${label}で失敗しました` : failureReason(code)}。`;
     return {
       ...problem,
       kind,

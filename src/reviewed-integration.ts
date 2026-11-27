@@ -1,3 +1,4 @@
+import { summarizePackageDiff, type PackageDiff } from "./environments/lock.ts";
 import { EnvironmentError } from "./environments/adapter.ts";
 import { containsRoot, foldedPath } from "./environments/archive.ts";
 import { bunAdapter } from "./environments/bun.ts";
@@ -176,8 +177,37 @@ export const environmentLockMismatchNote =
 export const environmentOutputCollisionNote =
   "Remove generated dependency directories from the change before Verification runs again.";
 
+type EnvironmentCandidate = {
+  candidate: string;
+  changedPaths: readonly string[];
+};
+
 type Plan = {
   readonly ensureEnvironment?: EnsureTaskEnvironment;
+  readonly previousAttempt?: IntegrationJournal;
+  readonly prepareEnvironmentUpdate?: (
+    base: string,
+    id: string,
+    previous?: EnvironmentCandidate,
+  ) => Promise<EnvironmentCandidate>;
+  readonly resolveCandidate?: (
+    pin: PinnedCandidate,
+    executorBase: string,
+    id: string,
+    authorize: (paths: readonly string[]) => Promise<void>,
+  ) => Promise<{
+    candidate: string;
+    held?: Awaited<ReturnType<EnsureTaskEnvironment>>;
+  }>;
+  readonly packageDiff?: (
+    pin: PinnedCandidate,
+    id: string,
+    record: boolean,
+  ) => Promise<PackageDiff>;
+  readonly rebaseEnvironment?: (
+    base: string,
+    id: string,
+  ) => Promise<EnvironmentCandidate>;
   /** Single-file mode: one top-level file. Exclusive with `tree`. */
   readonly path?: string;
   /** Tree mode: the Worker edits a whole repository workspace. */
@@ -384,7 +414,12 @@ function preReviewVerification(
   events: IntegrationEvent[],
   pin: PinnedCandidate,
 ) {
-  const [created, authorized, finished] = events.slice(-3);
+  const [before, authorized, finished] = events.slice(-3);
+  const created =
+    before?.kind === "environment.resolve-authorized" &&
+    before.digest === pin.digest
+      ? events.at(-4)
+      : before;
   if (
     created?.kind === "candidate.created" &&
     created.candidate === pin.candidate &&
@@ -449,6 +484,15 @@ export class ReviewedIntegration {
     this.#plan = {
       ...(plan.path !== undefined ? { path: plan.path } : {}),
       ...(plan.tree !== undefined ? { tree: copyTree(plan.tree) } : {}),
+      ...(plan.prepareEnvironmentUpdate && {
+        prepareEnvironmentUpdate: plan.prepareEnvironmentUpdate,
+        previousAttempt: plan.previousAttempt,
+      }),
+      ...(plan.resolveCandidate && { resolveCandidate: plan.resolveCandidate }),
+      ...(plan.packageDiff && { packageDiff: plan.packageDiff }),
+      ...(plan.rebaseEnvironment && {
+        rebaseEnvironment: plan.rebaseEnvironment,
+      }),
       ...(plan.ensureEnvironment
         ? { ensureEnvironment: plan.ensureEnvironment }
         : {}),
@@ -523,6 +567,21 @@ export class ReviewedIntegration {
         path: "candidate.message",
         bytes: await this.candidateMessage(pin),
       });
+    if (id && this.#plan.packageDiff) {
+      const { added, removed, changed } = await this.#plan.packageDiff(
+        pin,
+        id,
+        !this.#plan.verification,
+      );
+      if (added.length || removed.length || changed.length) {
+        files.push({
+          path: "candidate.packages.json",
+          bytes: Buffer.from(
+            JSON.stringify(summarizePackageDiff({ added, removed, changed })),
+          ),
+        });
+      }
+    }
     return this.#host.runReviewer(
       {
         sandbox: {
@@ -571,7 +630,41 @@ export class ReviewedIntegration {
       throw new Error("Integration already exists");
     const append = this.#writer(0);
     const base = await this.#git.head();
-    await append({ kind: "requested", target: await this.#target(), base });
+    const target = await this.#target();
+    await append({ kind: "requested", target, base });
+    if (this.#plan.rebaseEnvironment || this.#plan.prepareEnvironmentUpdate) {
+      if (!id) throw new EnvironmentError();
+      if (this.#plan.rebaseEnvironment) {
+        const rebased = await this.#plan.rebaseEnvironment(base, id);
+        const { candidate } = rebased;
+        await append({ kind: "environment.executor-base", ...rebased });
+        return this.#recordTreeCandidate(append, base, candidate);
+      }
+      const [requested, update] =
+        (await this.#plan.previousAttempt?.read().catch(() => [])) ?? [];
+      const previous =
+        requested?.kind === "requested" &&
+        requested.target === target &&
+        requested.base === base &&
+        update?.kind === "environment.updated" &&
+        update.changedPaths !== undefined
+          ? { candidate: update.candidate, changedPaths: update.changedPaths }
+          : undefined;
+      const updated = await this.#plan.prepareEnvironmentUpdate!(
+        base,
+        id,
+        previous,
+      );
+      await append({ kind: "environment.updated", ...updated });
+      return this.#produceTree(
+        append,
+        base,
+        undefined,
+        [],
+        id,
+        updated.candidate,
+      );
+    }
     if (this.#plan.tree)
       return this.#produceTree(append, base, undefined, [], id);
     const source = await this.#git.snapshot(base, this.#plan.path!);
@@ -650,6 +743,7 @@ export class ReviewedIntegration {
     previous: string | undefined,
     readOnlyFiles: SandboxFile[],
     id?: string,
+    executorBase = base,
   ): Promise<PinnedCandidate> {
     const { scope, protectedPaths } = this.#plan.tree!;
     const profile =
@@ -657,7 +751,9 @@ export class ReviewedIntegration {
     const allReadOnly = [...readOnlyFiles, ...this.#suiteFiles()];
     const prepared = await this.#git.prepareWorkspace({
       base,
-      ...(previous !== undefined ? { previous } : {}),
+      ...((previous ?? executorBase) !== base
+        ? { previous: previous ?? executorBase }
+        : {}),
       ...(scope ? { sparsePaths: scope.map((p) => p.replace(/\/$/, "")) } : {}),
     });
     let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
@@ -727,10 +823,10 @@ export class ReviewedIntegration {
         }
       : this.#workerOptions();
     try {
-      // Revisions edit the previous candidate with the original base's environment.
+      // Revisions keep the environment selected for the first Executor attempt.
       held = await this.#plan.ensureEnvironment?.({
         role: "Executor",
-        commit: base,
+        commit: executorBase,
         profile,
         executionId: id,
       });
@@ -895,7 +991,14 @@ export class ReviewedIntegration {
             },
           ];
     if (this.#plan.tree)
-      return this.#produceTree(append, pin.base, pin.candidate, readOnly, id);
+      return this.#produceTree(
+        append,
+        pin.base,
+        pin.candidate,
+        readOnly,
+        id,
+        this.#executorBase(events, pin.base),
+      );
     const source = await this.#git.snapshot(pin.candidate, this.#plan.path!);
     return this.#produce(append, pin.base, source, readOnly, id);
   }
@@ -916,12 +1019,134 @@ export class ReviewedIntegration {
     });
   }
 
-  /** Verify the pinned candidate before review when a host suite is configured. */
-  async verifyCandidate(id?: string): Promise<boolean> {
+  #executorBase(events: IntegrationEvent[], base: string) {
+    return (
+      events.find(
+        (event) =>
+          event.kind === "environment.updated" ||
+          event.kind === "environment.executor-base",
+      )?.candidate ?? base
+    );
+  }
+
+  async currentCandidate() {
+    return candidatePin(await this.#journal.read(), await this.#target());
+  }
+
+  async #recordTreeCandidate(
+    append: (event: Event) => Promise<void>,
+    base: string,
+    candidate: string,
+  ) {
+    const diff = await this.#git.diff(base, candidate);
+    const message = await this.#git.candidateMessage(candidate);
+    await this.#plan.scanCandidate?.(diff, message);
+    const pin = { base, candidate, digest: sha256(diff) };
+    await append({
+      kind: "candidate.created",
+      candidate,
+      digest: pin.digest,
+      messageDigest: sha256(message),
+    });
+    return pin;
+  }
+
+  async #resolve(
+    pin: PinnedCandidate,
+    events: IntegrationEvent[],
+    append: (event: Event) => Promise<void>,
+    id: string,
+  ) {
+    const resolved = await this.#plan.resolveCandidate!(
+      pin,
+      this.#executorBase(events, pin.base),
+      id,
+      (changedPaths) =>
+        append({
+          kind: "environment.resolve-authorized",
+          run: id,
+          digest: pin.digest,
+          changedPaths,
+        }),
+    );
+    try {
+      return {
+        pin:
+          resolved.candidate === pin.candidate
+            ? pin
+            : await this.#recordTreeCandidate(
+                append,
+                pin.base,
+                resolved.candidate,
+              ),
+        held: resolved.held,
+      };
+    } catch (error) {
+      resolved.held?.release();
+      throw error;
+    }
+  }
+
+  async resolveCandidate(id: string): Promise<void> {
     const events = await this.#journal.read();
     const pin = candidatePin(events, await this.#target());
+    if (
+      !this.#plan.resolveCandidate ||
+      events.at(-1)?.kind !== "candidate.created"
+    )
+      throw new Error("Candidate cannot be resolved");
+    await this.#checkedDiff(pin);
+    const resolved = await this.#resolve(
+      pin,
+      events,
+      this.#writer(events.length),
+      id,
+    );
+    resolved.held?.release();
+  }
+
+  /** Verify the pinned candidate before review when a host suite is configured. */
+  async verifyCandidate(id?: string): Promise<boolean> {
+    if (!this.#plan.verification) return false;
+    const events = await this.#journal.read();
+    let pin = candidatePin(events, await this.#target());
     if (events.at(-1)?.kind !== "candidate.created")
       throw new Error("Candidate cannot be verified");
+    const append = this.#writer(events.length);
+    let diff = await this.#checkedDiff(pin);
+    let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
+    try {
+      if (id && this.#plan.resolveCandidate) {
+        try {
+          const original = pin.candidate;
+          ({ pin, held } = await this.#resolve(pin, events, append, id));
+          if (pin.candidate !== original) diff = await this.#checkedDiff(pin);
+        } catch (error) {
+          if (
+            !(error instanceof EnvironmentError) ||
+            (error.code !== "env-lock-mismatch" &&
+              error.code !== "env-output-collision")
+          )
+            throw error;
+          await append({ kind: "verification.authorized", ...pin });
+          await append({
+            kind: "verification.finished",
+            run: id,
+            digest: pin.digest,
+            review: "revise",
+            failure: error.code,
+          });
+          return false;
+        }
+      }
+      if (id) await this.#plan.packageDiff?.(pin, id, true);
+      return await this.#verify(pin, diff, append, id, held);
+    } finally {
+      held?.release();
+    }
+  }
+
+  async #checkedDiff(pin: PinnedCandidate) {
     const diff = await this.#git.diff(
       pin.base,
       pin.candidate,
@@ -929,7 +1154,7 @@ export class ReviewedIntegration {
     );
     if (sha256(diff) !== pin.digest)
       throw new Error("Candidate evidence does not match its durable pin");
-    return this.#verify(pin, diff, this.#writer(events.length), id);
+    return diff;
   }
 
   /** The current candidate when its latest review passed, else null. */
@@ -1175,6 +1400,7 @@ export class ReviewedIntegration {
     diff: Uint8Array,
     append: (event: Event) => Promise<void>,
     id?: string,
+    provisioned?: Awaited<ReturnType<EnsureTaskEnvironment>>,
   ): Promise<boolean> {
     const plan = this.#plan.verification;
     if (!plan) throw new Error("Verification is not configured");
@@ -1191,12 +1417,14 @@ export class ReviewedIntegration {
     let verification: ReviewerRun;
     let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
     try {
-      held = await this.#plan.ensureEnvironment?.({
-        role: "Verification",
-        commit: pin.candidate,
-        profile,
-        executionId: id,
-      });
+      held =
+        provisioned ??
+        (await this.#plan.ensureEnvironment?.({
+          role: "Verification",
+          commit: pin.candidate,
+          profile,
+          executionId: id,
+        }));
       verification = await this.#host.runVerification(
         {
           sandbox: {
@@ -1232,7 +1460,7 @@ export class ReviewedIntegration {
       return false;
     } finally {
       try {
-        held?.release();
+        if (!provisioned) held?.release();
       } finally {
         if (prepared) await this.#cleanup(prepared);
       }

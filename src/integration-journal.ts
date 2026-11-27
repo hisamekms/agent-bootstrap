@@ -1,3 +1,4 @@
+import { environmentPath } from "./environments/bun.ts";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -33,6 +34,9 @@ const fields = {
 const eventFields = {
   requested: ["target", "base"],
   "environment.outputs-excluded": ["run"],
+  "environment.updated": ["candidate"],
+  "environment.executor-base": ["candidate"],
+  "environment.resolve-authorized": ["run", "digest"],
   "candidate.authorized": ["run", "digest"],
   "candidate.created": ["candidate", "digest"],
   "candidate.failed": ["cleanup"],
@@ -56,7 +60,11 @@ type Base = {
     readonly [F in (typeof eventFields)[K][number]]: string;
   };
 }[Kind];
+type EnvironmentPaths = { readonly changedPaths?: readonly string[] };
 type EventDetails = {
+  "environment.updated": EnvironmentPaths;
+  "environment.executor-base": EnvironmentPaths;
+  "environment.resolve-authorized": EnvironmentPaths;
   "verification.finished": {
     readonly failure?:
       "env-lock-mismatch" | "env-output-collision" | "env-missing";
@@ -143,7 +151,26 @@ function decode(value: unknown): IntegrationEvent {
     (hasDelegated && typeof data.delegated !== "boolean")
   )
     throw new Error("Invalid integration event fields");
+  const hasChangedPaths =
+    (kind === "environment.updated" ||
+      kind === "environment.executor-base" ||
+      kind === "environment.resolve-authorized") &&
+    Object.hasOwn(data, "changedPaths");
+  if (
+    hasChangedPaths &&
+    (!Array.isArray(data.changedPaths) ||
+      data.changedPaths.some(
+        (path) =>
+          typeof path !== "string" ||
+          !environmentPath(path) ||
+          (path !== "bun.lock" &&
+            path !== "package.json" &&
+            !path.endsWith("/package.json")),
+      ))
+  )
+    throw new Error("Invalid integration event fields");
   const optional = [
+    hasChangedPaths,
     hasFailure,
     hasTests,
     hasProtectedCount,
@@ -196,9 +223,9 @@ function decode(value: unknown): IntegrationEvent {
   return value as IntegrationEvent;
 }
 
-// The first candidate and integration take up to 16 events; each revision
-// adds up to 9.
-const eventLimit = 16 + 9 * MAX_REVISIONS;
+// Reserve space for the initial candidate, a host update or rebase, and
+// integration, plus a possible lock write-back in each revision.
+const eventLimit = 20 + 11 * MAX_REVISIONS;
 
 export class IntegrationJournal {
   readonly #journal: PrivateJournal<IntegrationEvent>;
