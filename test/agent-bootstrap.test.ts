@@ -410,6 +410,7 @@ describe("agent-bootstrap", () => {
       "verification",
       "export-goal-branch",
       "publish-goal",
+      "complete-goal",
       "set-auto-merge",
       "analyze",
       "denials",
@@ -530,6 +531,12 @@ describe("agent-bootstrap", () => {
     assert.deepEqual(JSON.parse(result.stdout), {
       counts: { goals: 0, tasks: 0, proposals: 0, pending: 0 },
       pending: [],
+      publish: {
+        enabled: false,
+        remote: "origin",
+        base: "main",
+        autoMerge: "off",
+      },
       recentExecutions: [],
       recentTasks: [],
     });

@@ -1,4 +1,7 @@
-import { goalPublishConfirmation } from "../publish/protocol.ts";
+import {
+  goalPublishConfirmation,
+  type GoalPublishConfirmationPr,
+} from "../publish/protocol.ts";
 import type { GoalPublisher } from "../publish/goals.ts";
 import {
   autoMergeMethods,
@@ -152,6 +155,7 @@ const shutdownBlockedMethods = new Set([
   "goal.discard",
   "goal.export",
   "goal.publish",
+  "goal.completeAfterMerge",
   "goal.setAutoMerge",
   "goal.updateBase",
   "proposal.answer",
@@ -297,11 +301,15 @@ export async function operatorAction(
       await apply();
       return { result: { id: goal.id, ref: goal.ref, from, to } };
     }
-    const { id, confirm, expectedHead } = fields(params, [
-      "id",
-      "confirm",
-      "expectedHead",
-    ]);
+    const { id, confirm, expectedHead, expectedClosedPrNumber } = fields(
+      params,
+      [
+        "id",
+        "confirm",
+        "expectedHead",
+        ...(method === "goal.discard" ? ["expectedClosedPrNumber"] : []),
+      ],
+    );
     if (typeof confirm !== "string") throw new ContractError();
     const expected =
       method === "goal.discard" && expectedHead === null
@@ -332,6 +340,9 @@ export async function operatorAction(
       stateDirectory,
       goal.id,
       "operator-ui",
+      expectedClosedPrNumber === undefined
+        ? undefined
+        : integer(expectedClosedPrNumber, 1, Number.MAX_SAFE_INTEGER),
     );
     if (head !== expected) return failure("stale-base");
     await apply();
@@ -375,12 +386,28 @@ export async function operatorAction(
 export async function goalPublishAction(
   store: OrchestratorStore,
   publisher: OperatorApiOptions["publisher"],
-  method: "goal.publish" | "goal.setAutoMerge",
+  method: "goal.publish" | "goal.setAutoMerge" | "goal.completeAfterMerge",
   params: unknown,
 ): Promise<Reply> {
   try {
+    if (method === "goal.completeAfterMerge") {
+      const { id, confirm } = fields(params, ["id", "confirm"]);
+      if (typeof confirm !== "string") throw new ContractError();
+      return {
+        result: store.completeGoalAfterMerge(
+          identifier(id),
+          confirm,
+          "operator-ui",
+        ),
+      };
+    }
     if (method === "goal.publish") {
-      const input = fields(params, ["id", "expectedHead", "confirm"]);
+      const input = fields(params, [
+        "id",
+        "expectedHead",
+        "confirm",
+        "expectedPr",
+      ]);
       const id = identifier(input.id);
       const head = gitCommit(input.expectedHead);
       if (typeof input.confirm !== "string") throw new ContractError();
@@ -389,7 +416,16 @@ export async function goalPublishAction(
       if (!goal) return failure("not-found");
       if (input.confirm !== goalPublishConfirmation(goal.ref, head))
         return failure("confirmation-mismatch");
-      return { result: await publisher.publish(goal.id, head) };
+      let expectedPr: GoalPublishConfirmationPr | undefined;
+      if (input.expectedPr === null) expectedPr = null;
+      else if (input.expectedPr !== undefined) {
+        const { number, state } = fields(input.expectedPr, ["number", "state"]);
+        expectedPr = {
+          number: integer(number, 1, Number.MAX_SAFE_INTEGER),
+          state: oneOf(state, ["open", "closed", "merged"]),
+        };
+      }
+      return { result: await publisher.publish(goal.id, head, expectedPr) };
     }
     const input = fields(params, ["id", "method", "confirm"]);
     const id = identifier(input.id);
@@ -760,6 +796,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         case "goal.updateBase":
           return operatorAction(store, stateDirectory, method, params, options);
         case "goal.publish":
+        case "goal.completeAfterMerge":
         case "goal.setAutoMerge":
           return goalPublishAction(store, options.publisher, method, params);
         case "workplace.stopPreview":
@@ -983,6 +1020,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                   message.method !== "proposal.answerMany" &&
                   message.method !== "task.retry" &&
                   message.method !== "goal.discard" &&
+                  message.method !== "goal.completeAfterMerge" &&
                   message.method !== "goal.export" &&
                   message.method !== "goal.updateBase" &&
                   message.method !== "workplace.stop" &&

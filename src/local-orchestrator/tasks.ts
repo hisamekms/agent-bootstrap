@@ -299,11 +299,12 @@ export async function previewGoalDiscard(
   directory: string,
   id: string,
   channel: "cli" | "operator-ui" = "cli",
+  expectedClosedPrNumber?: number,
 ) {
   const goal = store.getGoal(id);
   if (!goal) throw new OrchestratorStoreError("not-found");
   const goalId = goal.id;
-  store.assertGoalDiscardable(goalId);
+  store.assertGoalDiscardable(goalId, expectedClosedPrNumber);
   const branch = goalBranch(goalId);
   const git = localGit(directory, branch);
   const head = await readGoalBranchHead(directory, goalId).catch(() => {
@@ -326,6 +327,7 @@ export async function previewGoalDiscard(
           }
         },
         channel,
+        expectedClosedPrNumber,
       ),
   };
 }
@@ -1206,6 +1208,7 @@ export async function integrateApprovedProposal(
         "closed",
         "invalid-transition",
         "goal-inactive",
+        "goal-pr-open",
         "integration-uncertain",
       ].includes(error.code)
     )

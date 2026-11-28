@@ -1,4 +1,5 @@
 import { ROLE_PROFILES } from "../../sandbox-profiles.ts";
+import type { GoalPublishMethods } from "../../publish/protocol.ts";
 export {
   groupProblems,
   pendingDecisions,
@@ -204,7 +205,7 @@ export function ruleChangeCanWiden(
   });
 }
 
-export interface Methods {
+export interface Methods extends GoalPublishMethods {
   status: { params: Record<string, never>; result: Status };
   "policy.get": { params: Record<string, never>; result: PolicySettings };
   "policy.setDefault": {
@@ -264,7 +265,12 @@ export interface Methods {
     result: ReturnType<OrchestratorStore["retryTask"]>;
   };
   "goal.discard": {
-    params: { id: string; confirm: string; expectedHead: string | null };
+    params: {
+      id: string;
+      confirm: string;
+      expectedHead: string | null;
+      expectedClosedPrNumber?: number;
+    };
     result: { id: string; ref: string; status: "cancelled" };
   };
   "goal.export": {

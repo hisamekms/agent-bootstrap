@@ -1,4 +1,7 @@
-import { goalPublishConfirmation } from "../publish/protocol.ts";
+import {
+  goalPrOpenGuidance,
+  goalPublishConfirmation,
+} from "../publish/protocol.ts";
 import { GoalPublisher } from "../publish/goals.ts";
 import { githubGh } from "../publish/github-gh.ts";
 import {
@@ -114,6 +117,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   discard-goal <goalId>
   export-goal-branch <goalId> [--target <checkout>]
   publish-goal <goalId>
+  complete-goal <goalId>
   set-auto-merge <goalId> <off|squash|merge|rebase>
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
@@ -142,6 +146,7 @@ type Command =
         | "retry-task"
         | "update-goal-base"
         | "discard-goal"
+        | "complete-goal"
         | "publish-goal";
       id: string;
     }
@@ -241,6 +246,7 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     case "retry-task":
     case "update-goal-base":
     case "discard-goal":
+    case "complete-goal":
     case "publish-goal":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
       break;
@@ -500,6 +506,20 @@ async function execute(
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await apply();
       await writeCheckedJson(store.getGoal(command.id));
+      return 0;
+    }
+    case "complete-goal": {
+      const goal = store.getGoal(command.id);
+      if (!goal) return refuse(io, "not-found");
+      const preview = store.goalMergeCompletion(goal.id);
+      if (!preview) return refuse(io, "invalid-transition");
+      const { confirm, prNumber, mergedHead, goalHead } = preview;
+      await writeCheckedJson({ ref: goal.ref, prNumber, mergedHead, goalHead });
+      if ((await io.prompt(`Type "${confirm}" to confirm: `)) !== confirm)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      await writeCheckedJson(
+        store.completeGoalAfterMerge(goal.id, confirm, "cli"),
+      );
       return 0;
     }
     case "publish-goal": {
@@ -902,6 +922,7 @@ export async function runCli(
       "discard-goal",
       "export-goal-branch",
       "publish-goal",
+      "complete-goal",
       "set-auto-merge",
       "verification-set",
       "verification-clear",
@@ -999,7 +1020,12 @@ export async function runCli(
     if (error instanceof ClaudeRunError || error instanceof PublishError)
       return refuse(io, error.code);
     if (
-      command.kind === "set-auto-merge" &&
+      error instanceof OrchestratorStoreError &&
+      error.code === "goal-pr-open"
+    )
+      return refuse(io, `goal-pr-open: ${goalPrOpenGuidance}`);
+    if (
+      (command.kind === "set-auto-merge" || command.kind === "complete-goal") &&
       error instanceof OrchestratorStoreError
     )
       return refuse(io, error.code);

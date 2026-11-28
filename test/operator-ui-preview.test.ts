@@ -18,8 +18,6 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     () => {},
   );
   const previewBridgeMethods = new Set(operatorBridgeMethods);
-  previewBridgeMethods.delete("goal.publish");
-  previewBridgeMethods.delete("goal.setAutoMerge");
   assert.deepEqual(new Set(Object.keys(methods)), previewBridgeMethods);
 
   const pending = pendingDecisions(methods["inbox.list"]({}));
@@ -84,7 +82,11 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
         "answer" in row &&
         (row.answer.approve || row.answer.reject),
     ).length;
-    assert.equal(turn.owner === "human", count > 0, id);
+    assert.equal(
+      turn.owner === "human",
+      count > 0 || turn.reason.kind === "pr-open",
+      id,
+    );
     if (count) assert.deepEqual(turn.reason, { kind: "approvals", count });
     const detail = methods["goal.get"]({ id });
     assert.deepEqual(detail.turn, turn);

@@ -9,6 +9,7 @@ import {
   goalBaseUpdate,
   goalExport,
   goalProgress,
+  goalPublishPanel,
   problemActions,
   workplaceStopControls,
 } from "../src/operator-ui/web/panel.ts";
@@ -1286,6 +1287,7 @@ function hostDocument(t: TestContext) {
     "delegation",
     "display-settings",
     "connection-settings",
+    "publish-settings",
     "tab-problems",
     "tab-goals",
     "badge-decisions",
@@ -1951,6 +1953,18 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
   elements.get("tab-goals")!.dispatchEvent(new Event("click"));
   await settle();
   const goals = elements.get("goal-content")!;
+  assert.ok(byName(goals, "あなたの番。 PR #12"));
+  const prLink = goals.find(
+    (node) => node.tag === "a" && node.textContent === "PR #12",
+  )!;
+  assert.equal(
+    prLink.attributes.get("href"),
+    "https://github.com/example/example/pull/12",
+  );
+  assert.equal(prLink.attributes.get("target"), "_blank");
+  assert.equal(prLink.attributes.get("rel"), "noopener noreferrer");
+  assert.ok(byName(goals, "チェック中"));
+  assert.ok(byName(goals, "チェック失敗"));
   assert.ok(
     findAction("inline:goal-G2", goals)?.parent?.querySelector(".human"),
   );
@@ -1971,7 +1985,7 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
     ["goal-G4", /G4-1 検証の失敗/],
     ["goal-G9", /作業中/],
     ["goal-G6", /手元に書き出し済み/],
-    ["goal-G7", /PR #1（オープン）/],
+    ["goal-G7", /PR #1 · マージ済み/],
   ] as const) {
     click("back-list", goals);
     await settle();
@@ -1979,6 +1993,242 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
     await settle();
     assert.match(goals.querySelector(".goal-now")!.visibleText, reason);
   }
+  elements.get("settings-toggle")!.dispatchEvent(new Event("click"));
+  elements.get("settings-connection")!.dispatchEvent(new Event("click"));
+  await settle();
+  assert.match(
+    elements.get("publish-settings")!.visibleText,
+    /PR 公開.*有効.*origin.*main.*オフ.*local.json/,
+  );
+});
+
+test("Goal publishing binds the fresh head and refreshes conflicts before accepting another phrase", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const methods = createPreviewMethods(
+    () => {},
+    () => {},
+  );
+  let goal = methods["goal.get"]({ id: "G13" });
+  const key = `publish:${goal.id}`;
+  const id = goal.id;
+  const first = "7".repeat(40);
+  const second = "8".repeat(40);
+  const requests: Methods["goal.publish"]["params"][] = [];
+  const channel = {
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      if (method === "goal.get") return goal as Methods[M]["result"];
+      assert.equal(method, "goal.publish");
+      const attempt = params as Methods["goal.publish"]["params"];
+      requests.push(attempt);
+      if (attempt.expectedHead !== goal.publishPreview?.expectedHead)
+        throw new Error("publish-stale-head");
+      return goal.publish as Methods[M]["result"];
+    },
+  };
+  const root = new TestElement();
+  function render(message = "") {
+    root.replaceChildren(
+      ...(goalPublishPanel(
+        channel,
+        goal,
+        message,
+        render,
+      ) as unknown as TestElement[]),
+    );
+  }
+  function enter(phrase: string) {
+    const input = byName(root, "確認の文言")!;
+    input.value = phrase;
+    input.dispatchEvent(new Event("input"));
+  }
+  render();
+  assert.equal(findAction(key, root)?.textContent, "もう一度送る");
+  assert.ok(findAction(`publish-discard:${id}`, root));
+  assert.equal(byName(root, "自動マージの方式")?.disabled, true);
+  assert.match(root.textContent, /クローズ済み/);
+  click(key, root);
+  await settle();
+  assert.equal(findAction(`${key}:confirm`, root)?.disabled, true);
+  enter("publish-goal G13 777777777777");
+  goal = { ...goal, publishPreview: { expectedHead: second } };
+  click(`${key}:confirm`, root);
+  await settle();
+  assert.match(root.visibleText, /Goal の先端が変更された/);
+  assert.equal(findAction(`${key}:confirm`, root), undefined);
+  click(key, root);
+  await settle();
+  enter("publish-goal G13 777777777777");
+  assert.equal(findAction(`${key}:confirm`, root)?.disabled, true);
+  enter("publish-goal G13 888888888888");
+  click(`${key}:confirm`, root);
+  await settle();
+  assert.deepEqual(requests, [
+    {
+      id,
+      expectedHead: first,
+      confirm: "publish-goal G13 777777777777",
+      expectedPr: { number: 14, state: "closed" },
+    },
+    {
+      id,
+      expectedHead: second,
+      confirm: "publish-goal G13 888888888888",
+      expectedPr: { number: 14, state: "closed" },
+    },
+  ]);
+});
+
+test("Goal overview limits PR links and confirms the selected auto-merge method", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const methods = createPreviewMethods(
+    () => {},
+    () => {},
+  );
+  const channel = {
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      return methods[method](params);
+    },
+  };
+  const root = new TestElement();
+  const goal = methods["goal.get"]({ id: "G12" });
+  const key = `auto-merge:${goal.id}`;
+  const render = (detail: GoalDetail) =>
+    root.replaceChildren(
+      ...(goalPublishPanel(
+        channel,
+        detail,
+        "",
+        () => {},
+      ) as unknown as TestElement[]),
+    );
+  render(goal);
+  const link = root.find(({ tag }) => tag === "a")!;
+  assert.equal(link.attributes.get("href"), goal.publish.prUrl);
+  assert.equal(link.attributes.get("target"), "_blank");
+  assert.equal(link.attributes.get("rel"), "noopener noreferrer");
+  assert.match(root.visibleText, /チェック失敗.*この Goal の設定/);
+  const control = byName(root, "自動マージの方式")!;
+  assert.equal(control.value, "squash");
+  assert.equal(findAction(key, root)?.hidden, true);
+  control.value = "rebase";
+  control.dispatchEvent(new Event("change"));
+  assert.equal(findAction(key, root)?.hidden, false);
+  click(key, root);
+  await settle();
+  assert.equal(control.disabled, true);
+  assert.match(root.visibleText, /自動マージを「リベース」に変更します/);
+  click(`${key}:cancel`, root);
+  assert.equal(control.disabled, false);
+  control.value = "squash";
+  control.dispatchEvent(new Event("change"));
+  assert.equal(findAction(key, root)?.hidden, true);
+  control.value = "rebase";
+  control.dispatchEvent(new Event("change"));
+  click(key, root);
+  await settle();
+  assert.equal(goal.publish.autoMerge, "squash");
+  click(`${key}:confirm`, root);
+  await settle();
+  assert.equal(control.disabled, false);
+  assert.equal(goal.publish.autoMerge, "rebase");
+  const publish = { ...goal.publish };
+  for (const prUrl of [
+    "https://github.com/example/example/issues/13",
+    "https://github.com/example/example/pull/14",
+    "https://github.com/example/example/pull/13/files",
+    "https://github.com/example/example/pull/13?x=1",
+    "https://github.com/../example/pull/13",
+  ]) {
+    render({ ...goal, publish: { ...publish, prUrl } });
+    assert.equal(
+      root.find(({ tag }) => tag === "a"),
+      undefined,
+      prUrl,
+    );
+  }
+  render({
+    ...goal,
+    publish: {
+      ...goal.publish,
+      enabled: false,
+      prUrl: "https://github.com.example.org/pull/13",
+    },
+  });
+  assert.equal(
+    root.find(({ tag }) => tag === "a"),
+    undefined,
+  );
+  assert.ok(byName(root, "自動マージの方式")?.disabled);
+  assert.equal(findAction(key, root), undefined);
+  assert.match(root.visibleText, /プロジェクトで PR 公開が無効/);
+  render(methods["goal.get"]({ id: "G14" }));
+  assert.match(
+    root.visibleText,
+    /自動マージを解除できない.*GitHub で PR の自動マージを解除/,
+  );
+  const unavailable = methods["goal.get"]({ id: "G16" });
+  render(unavailable);
+  assert.match(
+    root.visibleText,
+    /自動マージは使えません（GitHub の設定を確認してください）/,
+  );
+  assert.equal(findAction(`publish:${unavailable.id}`, root), undefined);
+  const closed = methods["goal.get"]({ id: "G13" });
+  render({
+    ...closed,
+    publish: {
+      ...closed.publish,
+      state: "failed",
+      failure: "publish-non-fast-forward",
+    },
+  });
+  assert.ok(byName(root, "自動マージの方式")?.disabled);
+  assert.ok(findAction(`publish-discard:${closed.id}`, root));
+});
+
+test("Goal overview confirms the PR and commits a manual completion", async (t) => {
+  const { click, findAction } = decisionDocument(t);
+  const methods = createPreviewMethods(
+    () => {},
+    () => {},
+  );
+  const goal = methods["goal.get"]({ id: "G15" });
+  const root = new TestElement();
+  const key = `complete-after-merge:${goal.id}`;
+  const channel = {
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      return methods[method](params);
+    },
+  };
+  const render = () =>
+    root.replaceChildren(
+      ...(goalPublishPanel(
+        channel,
+        goal,
+        "",
+        render,
+      ) as unknown as TestElement[]),
+    );
+  render();
+  assert.equal(findAction(key, root)?.textContent, "手で完了にする");
+  click(key, root);
+  await settle();
+  assert.match(root.visibleText, /PR #16 のマージ済みコミット 333333333333/);
+  assert.equal(goal.status, "active");
+  assert.equal(findAction(`${key}:confirm`, root)?.textContent, "完了を確定");
+  click(`${key}:confirm`, root);
+  await settle();
+  assert.equal(goal.status, "done");
+  assert.equal(findAction(key, root), undefined);
 });
 
 function fixtureGoal(id: string, ref: string): GoalDetail {

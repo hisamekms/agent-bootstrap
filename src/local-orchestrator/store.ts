@@ -9,8 +9,11 @@ import type {
   PublishAuthorization,
   PublishEventKind,
 } from "../publish/journal.ts";
-import { remoteGoalBranch } from "../publish/journal.ts";
-import type { GoalAutoMergeConfirmations } from "../publish/protocol.ts";
+import { mergedHeadDiffers, remoteGoalBranch } from "../publish/journal.ts";
+import {
+  goalMergeCompletionConfirmation,
+  type GoalAutoMergeConfirmations,
+} from "../publish/protocol.ts";
 import {
   summarizePackageDiff,
   type PackageDiff,
@@ -147,7 +150,9 @@ export type StoreErrorCode =
   | "session-busy"
   | "reconcile-changed"
   | "stale-confirmation"
-  | "integration-uncertain";
+  | "integration-uncertain"
+  | "goal-pr-open"
+  | "publish-disabled";
 
 function readTaskEnvironment(
   json: string,
@@ -1416,6 +1421,7 @@ export class OrchestratorStore {
   }
 
   #taskApprovalError(task: TaskContent, goal: ReturnType<typeof goalRecord>) {
+    if (this.#goalPrBlocksChanges(goal.id)) return "goal-pr-open";
     if (goal.status !== "active") return "goal-inactive";
     if (
       taskLimitReasons(goal.content, task, this.#taskCount(task.goalId))
@@ -1454,6 +1460,7 @@ export class OrchestratorStore {
     const source = parseOrigin(origin);
     return this.#write((at) => {
       const goalId = required(this.#goal(input.goalId)).id;
+      this.#assertGoalPrAllowsChanges(goalId);
       const dependsOn = input.dependsOn.map((id) => this.#task(id)?.id ?? id);
       if (new Set(dependsOn).size !== dependsOn.length)
         throw new OrchestratorStoreError("task-constraints");
@@ -1585,7 +1592,11 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("invalid-transition");
       const integration =
         proposal.kind === "integration" ? proposal.content : null;
-      if (integration) this.#checkIntegrationTask(integration, id);
+      if (integration) {
+        if (decision === "approve")
+          this.#assertGoalPrAllowsChanges(integration.goalId);
+        this.#checkIntegrationTask(integration, id);
+      }
       const task = proposal.kind === "task" ? proposal.content : undefined;
       const origin = proposal.source;
       const requirements = {
@@ -2021,6 +2032,7 @@ export class OrchestratorStore {
       return rows.find(
         ({ goalId, taskId, id }) =>
           !excluded?.has(id) &&
+          !this.#goalPrBlocksChanges(goalId) &&
           this.#latestIntegrationProposalId(taskId) === id &&
           !this.#goalIntegrationInProgress(goalId),
       )?.id;
@@ -2031,6 +2043,7 @@ export class OrchestratorStore {
     const proposal = proposalRecord(required(this.#proposal(id)));
     if (proposal.kind !== "integration" || proposal.status !== "approved")
       throw new OrchestratorStoreError("invalid-transition");
+    this.#assertGoalPrAllowsChanges(proposal.content.goalId);
     this.#checkIntegrationTask(proposal.content, proposal.id);
     this.assertGoalScheduling(proposal.content.goalId);
     const approval = this.#db
@@ -2267,17 +2280,20 @@ export class OrchestratorStore {
     this.#publishConfig = { ...publishDefaults, ...config };
   }
 
-  goalPublishOptIn(enabled = true) {
-    const kind = enabled ? "publish.enabled" : "publish.disabled";
-    const read = () =>
-      this.#db
-        .query<{ revision: number; kind: string }>(
-          `SELECT rowid AS revision, kind FROM events
+  #latestPublishOptIn() {
+    return this.#db
+      .query<{ revision: number; kind: string }>(
+        `SELECT rowid AS revision, kind FROM events
            WHERE subject_kind = 'project' AND subject_id = 'project'
              AND kind IN ('publish.enabled', 'publish.disabled')
            ORDER BY rowid DESC LIMIT 1`,
-        )
-        .get();
+      )
+      .get();
+  }
+
+  goalPublishOptIn(enabled = true) {
+    const kind = enabled ? "publish.enabled" : "publish.disabled";
+    const read = () => this.#latestPublishOptIn();
     const previous = this.#read(read);
     if (previous?.kind === kind || (!previous && !enabled))
       return enabled ? previous!.revision : null;
@@ -2342,6 +2358,19 @@ export class OrchestratorStore {
     return this.#publishConfig.enabled;
   }
 
+  get goalPublishConfig() {
+    return { ...this.#publishConfig };
+  }
+
+  goalUsesAutomaticPublish(id: string) {
+    if (!this.goalPublishEnabled) return false;
+    const optIn = this.#read(() => this.#latestPublishOptIn());
+    return (
+      optIn?.kind === "publish.enabled" &&
+      this.goalFinishedAfter(id, optIn.revision)
+    );
+  }
+
   goalAutoMerge(id: string) {
     return this.#read(() => {
       const row = this.#db
@@ -2393,6 +2422,11 @@ export class OrchestratorStore {
       throw new ContractError();
     return this.#write((at) => {
       const goal = required(this.#goal(identifier(id)));
+      const pr = this.goalPublishRecord(goal.id)?.pr;
+      if (origin === "operator-ui" && !this.goalPublishEnabled)
+        throw new OrchestratorStoreError("publish-disabled");
+      if (goal.status === "cancelled" || (pr && pr.state !== "open"))
+        throw new OrchestratorStoreError("invalid-transition");
       if (this.goalAutoMergeConfirmations(goal.id)[autoMerge] !== confirm)
         throw new OrchestratorStoreError("stale-confirmation");
       this.#event(at, "goal.auto-merge-set", "goal", goal.id, {
@@ -2443,6 +2477,20 @@ export class OrchestratorStore {
     });
   }
 
+  #goalPrBlocksChanges(id: string) {
+    const record = this.goalPublishRecord(id);
+    return (
+      record?.pr?.state === "open" ||
+      record?.pr?.state === "merged" ||
+      record?.pendingMutation?.step === "open-pr"
+    );
+  }
+
+  #assertGoalPrAllowsChanges(id: string) {
+    if (this.#goalPrBlocksChanges(id))
+      throw new OrchestratorStoreError("goal-pr-open");
+  }
+
   goalPreviousPushedHead(id: string) {
     return this.#read(
       () =>
@@ -2491,15 +2539,118 @@ export class OrchestratorStore {
             Object.entries(record).filter(([, value]) => value !== undefined),
           ),
       };
-      const event = this.#event(at, kind, "goal", goal.id, data);
-      this.#run(
-        "INSERT INTO goal_publish_audit VALUES (?, ?, ?, ?, ?)",
-        event,
-        goal.id,
-        kind,
-        at,
-        canonicalJson(data, eventDataLimit),
-      );
+      this.#publishAudit(at, kind, goal.id, data);
+      if (record?.pr?.state === "merged")
+        this.#completeMergedGoal(goal, record, at);
+    });
+  }
+
+  #publishAudit(at: string, kind: PublishEventKind, id: string, data: object) {
+    const event = this.#event(at, kind, "goal", id, data);
+    this.#run(
+      "INSERT INTO goal_publish_audit VALUES (?, ?, ?, ?, ?)",
+      event,
+      id,
+      kind,
+      at,
+      canonicalJson(data, eventDataLimit),
+    );
+  }
+
+  goalMergeCompletion(key: string) {
+    return this.#read(() => {
+      const goal = this.#goal(identifier(key));
+      if (goal?.status !== "active") return null;
+      const { id, ref, baseCommit } = goal;
+      const record = this.goalPublishRecord(id);
+      // Queued or running work for the Goal must finish first.
+      if (
+        !record ||
+        record.pr?.state !== "merged" ||
+        this.#canCompleteMergedGoal(goal, record) ||
+        this.#goalHasActiveWork(id)
+      )
+        return null;
+      const { number, head } = record.pr;
+      return {
+        prNumber: number,
+        mergedHead: head,
+        goalHead: this.goalIntegrationHead(id) ?? baseCommit,
+        confirm: goalMergeCompletionConfirmation(ref, number, head),
+      };
+    });
+  }
+
+  completeGoalAfterMerge(
+    key: string,
+    confirm: string,
+    origin: "cli" | "operator-ui",
+  ) {
+    return this.#write((at) => {
+      const { id, ref } = required(this.#goal(identifier(key)));
+      const preview = this.goalMergeCompletion(id);
+      if (!preview || preview.confirm !== confirm)
+        throw new OrchestratorStoreError("stale-confirmation");
+      this.assertGoalScheduling(id);
+      const { prNumber, mergedHead: head, goalHead } = preview;
+      const data = { prNumber, head, goalHead, origin, manual: true };
+      this.#publishAudit(at, "publish.completed-manually", id, data);
+      this.#markGoalMerged(id, at, data);
+      return { id, ref, status: "done" as const };
+    });
+  }
+
+  #goalHasActiveWork(goalId: string) {
+    return (
+      this.#db
+        .query<{ found: number }>(
+          `SELECT 1 AS found FROM executions
+           WHERE status IN ('queued', 'running') AND (goal_id = ?1 OR task_id IN
+             (SELECT id FROM tasks WHERE goal_id = ?2))
+           LIMIT 1`,
+        )
+        .get(goalId, goalId) !== null
+    );
+  }
+
+  #canCompleteMergedGoal(goal: GoalRow, record: GoalPublishRecord) {
+    const pr = record.pr;
+    return (
+      goal.status === "active" &&
+      pr?.state === "merged" &&
+      !mergedHeadDiffers(
+        record,
+        this.goalIntegrationHead(goal.id) ?? goal.baseCommit,
+      ) &&
+      this.goalIsPublishReady(goal.id)
+    );
+  }
+
+  #completeMergedGoal(goal: GoalRow, record: GoalPublishRecord, at: string) {
+    if (!this.#canCompleteMergedGoal(goal, record)) return;
+    this.#markGoalMerged(goal.id, at, {
+      prNumber: record.pr!.number,
+      head: record.pr!.head,
+    });
+  }
+
+  #markGoalMerged(id: string, at: string, detail: object) {
+    this.#run("UPDATE goals SET status = 'done' WHERE id = ?", id);
+    this.#event(at, "goal.status", "goal", id, { ...detail, status: "done" });
+  }
+
+  // Reconcile merged records written before the Goal status transition existed.
+  reconcileMergedGoal(id: string) {
+    const ready = this.#read(() => {
+      const goal = this.#goal(id);
+      const record = this.goalPublishRecord(id);
+      return goal && record && this.#canCompleteMergedGoal(goal, record);
+    });
+    if (!ready) return;
+    this.#write((at) => {
+      const goal = this.#goal(id);
+      const record = this.goalPublishRecord(id);
+      if (goal && record) this.#completeMergedGoal(goal, record, at);
     });
   }
 
@@ -2516,22 +2667,46 @@ export class OrchestratorStore {
   }
 
   goalPublishEvidence(id: string) {
-    return this.#read(() =>
-      this.#db
+    return this.#read(() => {
+      // Each candidate begins with an Executor run. Prefer the integration
+      // verification when it follows the candidate's initial verification.
+      const rows = this.#db
         .query<{
-          verificationPassed: number;
-          verificationFailed: number;
-          reviewPassed: number;
-          reviewRevised: number;
+          id: string;
+          verification: 0 | 1 | null;
+          review: 0 | 1 | null;
+          revisions: number;
         }>(
-          `SELECT count(*) FILTER (WHERE x.mode = 'verification' AND x.status = 'succeeded') AS verificationPassed,
-        count(*) FILTER (WHERE x.mode = 'verification' AND x.status = 'failed') AS verificationFailed,
-        count(*) FILTER (WHERE x.mode = 'review' AND json_extract(x.result_json, '$.review') = 'pass') AS reviewPassed,
-        count(*) FILTER (WHERE x.mode = 'review' AND json_extract(x.result_json, '$.review') = 'revise') AS reviewRevised
-       FROM executions x JOIN tasks t ON x.task_id = t.id WHERE t.goal_id = ?`,
+          `WITH task_attempts AS (
+             SELECT t.id,
+               coalesce(max(x.rowid), 0) AS finalAttempt,
+               count(*) FILTER (WHERE json_extract(x.result_json, '$.revision') = 1) AS revisions
+             FROM tasks t LEFT JOIN executions x ON x.task_id = t.id
+               AND x.actor = 'Executor' AND x.mode = 'task'
+             WHERE t.goal_id = ? GROUP BY t.id
+           )
+           SELECT a.id, a.revisions,
+             (SELECT x.status = 'succeeded' FROM executions x
+              WHERE x.task_id = a.id AND x.mode = 'verification' AND x.rowid > a.finalAttempt
+                AND x.finished_at IS NOT NULL ORDER BY x.rowid DESC LIMIT 1) AS verification,
+             (SELECT x.status = 'succeeded' AND json_extract(x.result_json, '$.review') IS 'pass'
+              FROM executions x WHERE x.task_id = a.id AND x.mode = 'review'
+                AND x.rowid > a.finalAttempt AND x.finished_at IS NOT NULL
+              ORDER BY x.rowid DESC LIMIT 1) AS review
+           FROM task_attempts a`,
         )
-        .get(id)!,
-    );
+        .all(id);
+      return new Map(
+        rows.map(({ id, verification, review, revisions }) => [
+          id,
+          {
+            verification: verification === null ? null : verification === 1,
+            review: review === null ? null : review === 1,
+            revisions,
+          },
+        ]),
+      );
+    });
   }
 
   auditGoalExport(
@@ -3057,6 +3232,7 @@ export class OrchestratorStore {
 
   #eligibleGoalBase(id: string): string | null {
     const goal = this.#goal(id);
+    this.#assertGoalPrAllowsChanges(id);
     if (goal?.status === "cancelled")
       throw new OrchestratorStoreError("goal-inactive");
     if (
@@ -3149,7 +3325,12 @@ export class OrchestratorStore {
     );
   }
 
-  #eligibleGoalDiscard(id: string): void {
+  #eligibleGoalDiscard(id: string, expectedClosedPrNumber?: number): void {
+    if (expectedClosedPrNumber !== undefined) {
+      const pr = this.goalPublishRecord(id)?.pr;
+      if (pr?.state !== "closed" || pr.number !== expectedClosedPrNumber)
+        throw new OrchestratorStoreError("stale-confirmation");
+    }
     this.#activeGoal(id);
     if (!this.#ownsGoalBranch(id))
       throw new OrchestratorStoreError("context-mismatch");
@@ -3171,9 +3352,12 @@ export class OrchestratorStore {
       throw new OrchestratorStoreError("goal-busy");
   }
 
-  assertGoalDiscardable(goalId: string): void {
+  assertGoalDiscardable(goalId: string, expectedClosedPrNumber?: number): void {
     this.#read(() =>
-      this.#eligibleGoalDiscard(this.#goalId(identifier(goalId))),
+      this.#eligibleGoalDiscard(
+        this.#goalId(identifier(goalId)),
+        expectedClosedPrNumber,
+      ),
     );
   }
 
@@ -3182,18 +3366,23 @@ export class OrchestratorStore {
     expectedHead: string | null,
     deleteRef: (head: string | null) => Promise<void>,
     channel: SettingsOrigin = "cli",
+    expectedClosedPrNumber?: number,
   ): Promise<void> {
     const key = identifier(goalId);
     const head = expectedHead === null ? null : gitCommit(expectedHead);
     const origin = { kind: "operator", channel };
     const id = this.#write((at) => {
       const id = this.#goalId(key);
-      this.#eligibleGoalDiscard(id);
-      this.#event(at, "goal.discard-authorized", "goal", id, { head, origin });
+      this.#eligibleGoalDiscard(id, expectedClosedPrNumber);
+      this.#event(at, "goal.discard-authorized", "goal", id, {
+        head,
+        origin,
+        ...(expectedClosedPrNumber !== undefined && { expectedClosedPrNumber }),
+      });
       return id;
     });
     await this.#changeGoalBranch(
-      () => this.#eligibleGoalDiscard(id),
+      () => this.#eligibleGoalDiscard(id, expectedClosedPrNumber),
       () => deleteRef(head),
       (at) => {
         this.#run("UPDATE goals SET status = 'cancelled' WHERE id = ?", id);
@@ -4389,7 +4578,7 @@ export class OrchestratorStore {
           'environment.started', 'environment.finished',
           'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
           'goal.exported', 'goal.auto-merge-set', 'publish.pushed', 'publish.pr-opened',
-          'publish.auto-merge-set', 'publish.failed', 'publish.polled',
+          'publish.auto-merge-set', 'publish.auto-merge-unavailable', 'publish.failed', 'publish.polled',
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
           'task.retried', 'task.budget-exceeded',
           'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',

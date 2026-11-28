@@ -127,7 +127,9 @@ export async function loadWorkplaceAssets(): Promise<
     `/*!\n${texts.join("\n").replaceAll("https://", "//")}\n*/\n`;
   const encoder = new TextEncoder();
   function asset(contentType: string, content: string): Asset {
-    if (/https?:/.test(content))
+    // The panel links to GitHub pull requests by navigation only; the strict
+    // CSP still blocks loading anything from that origin.
+    if (/https?:/.test(content.replaceAll('"https://github.com"', '""')))
       throw new Error("Workplace asset contains an HTTP URL or protocol");
     return { contentType, body: encoder.encode(content) };
   }

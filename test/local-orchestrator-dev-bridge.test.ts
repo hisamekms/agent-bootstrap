@@ -143,11 +143,18 @@ test("delegation and Goal export methods are explicitly allowlisted on the bridg
   assert.equal(operatorBridgeMethods.has("reconcile"), false);
 });
 
-test("workplace assets contain no remote URLs", async () => {
+test("workplace assets contain no remote URLs except the GitHub link origin", async () => {
   const assets = await loadWorkplaceAssets();
   assert.ok(assets.has("/index.html"));
-  for (const [path, asset] of assets)
-    assert.doesNotMatch(new TextDecoder().decode(asset.body), /https?:/i, path);
+  for (const [path, asset] of assets) {
+    const text = new TextDecoder().decode(asset.body);
+    // Pull request links navigate to GitHub; nothing is loaded from there.
+    assert.doesNotMatch(
+      text.replaceAll('"https://github.com"', '""'),
+      /https?:/i,
+      path,
+    );
+  }
 });
 
 test(

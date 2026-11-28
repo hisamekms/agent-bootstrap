@@ -98,6 +98,7 @@ export interface PublishProvider {
   findPullRequest(
     destination: PublishDestination,
     recoveringHead?: string,
+    afterPrNumber?: number,
   ): Promise<PublishPullRequest | null>;
   readPullRequest(
     destination: PublishDestination,

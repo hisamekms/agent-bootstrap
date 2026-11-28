@@ -1,5 +1,8 @@
-import { publishView, remoteGoalBranch } from "../publish/journal.ts";
-import type { GoalPublishedReason } from "../publish/protocol.ts";
+import {
+  publishFailure,
+  publishView,
+  remoteGoalBranch,
+} from "../publish/journal.ts";
 import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
 import { executionDisplay } from "./execution-display.ts";
 import { escapeTerminalControls } from "./analysis.ts";
@@ -120,6 +123,7 @@ export function operatorStatus(store: OrchestratorStore) {
     pending,
     recentExecutions,
     recentTasks,
+    publish: store.goalPublishConfig,
   };
 }
 
@@ -528,13 +532,41 @@ export function operatorGoalTurn(
     planned,
     exportable,
   } = facts;
+  const record = store.goalPublishRecord(goal.id);
+  const pr = record?.pr;
+  if (goal.status === "cancelled" && !record?.disarmFailure)
+    return { owner: "stopped", reason: { kind: "cancelled" } } as const;
+  if (pr?.state === "merged")
+    return {
+      owner: goal.status === "done" ? "done" : "stopped",
+      reason: { kind: "merged", prNumber: pr.number },
+    } as const;
+  const failure = publishFailure(record);
+  if (failure)
+    return {
+      owner: "stopped",
+      reason: { kind: "publish-failed", code: failure },
+    } as const;
+  if (pr?.state === "closed")
+    return {
+      owner: "stopped",
+      reason: { kind: "pr-closed", prNumber: pr.number },
+    } as const;
+  if (pr)
+    return {
+      owner: "human",
+      reason: {
+        kind: "pr-open",
+        prNumber: pr.number,
+        checks: pr.checks ?? null,
+        autoMerge: store.goalAutoMerge(goal.id).method,
+      },
+    } as const;
   if (approvals > 0)
     return {
       owner: "human",
       reason: { kind: "approvals", count: approvals },
     } as const;
-  if (goal.status === "cancelled")
-    return { owner: "stopped", reason: { kind: "cancelled" } } as const;
   if (failedRef)
     return {
       owner: "stopped",
@@ -562,23 +594,19 @@ export function operatorGoalTurn(
     (progress.total > 0 && progress.done === progress.total)
   ) {
     const head = store.goalIntegrationHead(goal.id) ?? goal.baseCommit;
-    const published = store.goalPublishRecord(goal.id);
+    if (
+      head &&
+      ((record && store.goalPublishEnabled) ||
+        store.goalUsesAutomaticPublish(goal.id))
+    )
+      return { owner: "ai", reason: { kind: "publishing" } } as const;
     const exported = store.goalExported(goal.id);
-    let finished: GoalPublishedReason | undefined;
-    if (head && published?.pushedHead === head && published.pr?.head === head)
-      finished = {
-        kind: "published",
-        branch: published.destination.branch,
-        prNumber: published.pr.number,
-        prUrl: published.pr.url,
-      };
-    else if (head && exported?.head === head)
-      finished = { kind: "exported", branch: exported.branch };
     return {
       owner: "done",
       reason:
-        finished ??
-        ({ kind: exportable ? "exportable" : "completed" } as const),
+        head && exported?.head === head
+          ? ({ kind: "exported", branch: exported.branch } as const)
+          : ({ kind: exportable ? "exportable" : "completed" } as const),
     } as const;
   }
   return { owner: "idle", reason: { kind: "idle" } } as const;
@@ -704,13 +732,29 @@ export function operatorGoal(store: OrchestratorStore, key: string) {
   if (!goal) return null;
   const { id } = goal;
   const { description, acceptance, scope } = goal.content;
+  const summary = goalSummary(
+    store,
+    goal,
+    meanTaskWallTime(store.succeededTaskWallTimes()),
+    store.goalTurnFacts([id]).get(id)!,
+  );
+  const expectedHead = store.goalIntegrationHead(id) ?? goal.baseCommit;
+  const mergeCompletion = store.goalMergeCompletion(id);
+  const pr = store.goalPublishRecord(id)?.pr;
+  const canPublish =
+    summary.publish.enabled &&
+    goal.status !== "cancelled" &&
+    summary.publish.state !== "merged" &&
+    summary.publish.state !== "merged-stale" &&
+    (!summary.publish.prNumber ||
+      summary.publish.state === "closed" ||
+      summary.publish.state === "failed") &&
+    store.goalIsPublishReady(id);
   return {
-    ...goalSummary(
-      store,
-      goal,
-      meanTaskWallTime(store.succeededTaskWallTimes()),
-      store.goalTurnFacts([id]).get(id)!,
-    ),
+    ...summary,
+    ...(canPublish && expectedHead && { publishPreview: { expectedHead } }),
+    ...(pr && { prState: pr.state }),
+    ...(mergeCompletion && { mergeCompletion }),
     description,
     acceptance,
     scope,

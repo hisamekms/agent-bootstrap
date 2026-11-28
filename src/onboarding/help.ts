@@ -152,6 +152,7 @@ export const helpTopics = {
       `${target} approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"`,
       `${target} export-goal-branch "$goal_id"`,
       `${target} publish-goal "$goal_id"`,
+      `${target} complete-goal "$goal_id"`,
       `${target} set-auto-merge "$goal_id" off`,
     ],
     output:
@@ -387,6 +388,11 @@ export const operatorOutputs = {
     usage: "publish-goal <goalId>",
     json: "Goal publish state and PR details.",
     next: "Use events --subject <goalId> to inspect the publish audit.",
+  },
+  "complete-goal": {
+    usage: "complete-goal <goalId>",
+    json: "PR number, merged head and Goal head, followed by the completion receipt on confirmation.",
+    next: "Use events --subject <goalId> to inspect the manual completion.",
   },
   "set-auto-merge": {
     usage: "set-auto-merge <goalId> <off|squash|merge|rebase>",
