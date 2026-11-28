@@ -1,4 +1,14 @@
 import {
+  tryStartVmJob,
+  tryLockVmJob,
+  withVmJob,
+} from "../src/local-orchestrator/vm-job.ts";
+import {
+  LocalHostCheckRunner,
+  hostCheckHash,
+  type HostCheckRunner,
+} from "../src/local-orchestrator/host-check-run.ts";
+import {
   hostCheckDigest,
   recomputeHostCheckApprovalDigest,
   type HostCheckDeclaration,
@@ -59,6 +69,7 @@ import {
   projectStateDirectory,
   projectConfigDirectory,
   writePrivateConfig,
+  userStateDirectory,
 } from "../src/config/layers.ts";
 import { addProject } from "../src/config/projects.ts";
 import { configEnv } from "./config-fixture.ts";
@@ -80,7 +91,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { claudeRoleHarness } from "../src/actors.ts";
@@ -2446,6 +2457,7 @@ function stage3Fixture(
   hostChecks?: Parameters<typeof createTaskExecutor>[0]["hostChecks"],
   link = false,
   protectedPaths?: () => readonly string[],
+  hostCheckRun?: Parameters<typeof createTaskExecutor>[0]["hostCheckRun"],
 ) {
   const { root, store } = state;
   const f = goalBaseFixture(state, true, policies, title);
@@ -2462,6 +2474,7 @@ function stage3Fixture(
     worker: () => harness,
     reviewer: harness,
     ...(hostChecks && { hostChecks }),
+    ...(hostCheckRun && { hostCheckRun }),
     ...(protectedPaths && { protectedPaths }),
     ...(verification
       ? { verification: { command: { argv: ["verify"], timeoutMs: 1000 } } }
@@ -2564,6 +2577,7 @@ function hostCheckFixture(
     link?: boolean;
     verification?: "revise-review" | "disabled";
     protectedPaths?: () => readonly string[];
+    hostCheckRun?: Parameters<typeof createTaskExecutor>[0]["hostCheckRun"];
   } = {},
 ) {
   const command = join(state.root, "fake-host-check");
@@ -2590,6 +2604,7 @@ function hostCheckFixture(
     () => declarations,
     options.link,
     options.protectedPaths,
+    options.hostCheckRun,
   );
   return {
     ...flow,
@@ -2607,6 +2622,534 @@ function hostCheckFixture(
 
 const panelAnswerer = { kind: "human", channel: "operator-ui" } as const;
 
+function authorizeHostRun(
+  store: OrchestratorStore,
+  gate: ReturnType<OrchestratorStore["activeHostCheckGates"]>[number],
+  combined = false,
+) {
+  return store.decide(gate.id, {
+    digest: gate.digest,
+    approvalDigest: gate.content.hostCheck.digest,
+    decision: "approve",
+    answerer: panelAnswerer,
+    ...(combined && {
+      integrateOnPass: {
+        acknowledgeProtected: gate.content.hostCheck.protectedPaths,
+      },
+    }),
+  });
+}
+
+const checkPassed = {
+  exitStatus: 0,
+  durationMs: 1,
+  timedOut: false,
+  stdoutDigest: hostCheckHash(""),
+  stderrDigest: hostCheckHash(""),
+  tail: "",
+};
+
+test(
+  "approved host checks run in order in the actor slot and combine with integration",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-run-");
+    const { store } = state;
+    const ran: string[] = [];
+    let locked = false;
+    const f = hostCheckFixture(state, undefined, {
+      protectedPaths: () => ["docs/"],
+      hostCheckRun: {
+        configFiles: [],
+        tryJobSlot() {
+          assert.ok(!locked);
+          locked = true;
+          return () => {
+            locked = false;
+          };
+        },
+        runner: {
+          async run({ check }) {
+            assert.ok(locked);
+            assert.equal(store.hostCheckJob()?.name, check.name);
+            ran.push(check.name);
+            return checkPassed;
+          },
+        },
+      },
+    });
+    f.declarations.push({ ...f.declarations[0]!, name: "second" });
+    const gate = await f.gate();
+    assert.deepEqual(ran, []);
+    assert.equal(locked, false);
+    authorizeHostRun(store, gate, true);
+    await f.work.drain();
+    assert.deepEqual(ran, ["local-check", "second"]);
+    assert.equal(locked, false);
+    assert.equal(f.head(), gate.content.candidate);
+    assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+    assert.equal(
+      store.hasPassedHostChecks(
+        f.taskId,
+        gate.content,
+        gate.content.hostCheck.digest,
+      ),
+      true,
+    );
+    assert.equal(
+      store.hasPassedHostChecks(f.taskId, gate.content, "0".repeat(64)),
+      false,
+    );
+  },
+);
+
+test(
+  "separate integration approval needs a pass for the current host-check digest",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-separate-");
+    const { store } = state;
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: {
+        configFiles: [],
+        runner: {
+          async run() {
+            return checkPassed;
+          },
+        },
+      },
+    });
+    const gate = await f.gate();
+    authorizeHostRun(store, gate);
+    await f.work.drain();
+    assert.equal(f.head(), f.base);
+    const pending = store.pendingIntegrations()[0];
+    assert.ok(pending?.kind === "integration");
+    assert.partialDeepStrictEqual(
+      await operatorProposal(store, f.directory, pending.id),
+      {
+        kind: "integration",
+        hostChecksPassed: true,
+        verified: true,
+      },
+    );
+    assert.equal(
+      store.hasPassedHostChecks(
+        f.taskId,
+        pending.content,
+        gate.content.hostCheck.digest,
+      ),
+      true,
+    );
+    writeFileSync(f.command, "changed after passing");
+    approve(store, pending);
+    await f.work.drain();
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getProposal(pending.id)?.status, "lapsed");
+    assert.equal(store.activeHostCheckGates()[0]?.status, "pending");
+  },
+);
+
+test(
+  "a host-check-bound proposal cannot integrate after its passed record is invalidated",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-proof-");
+    const { store } = state;
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: {
+        configFiles: [],
+        runner: {
+          async run() {
+            return checkPassed;
+          },
+        },
+      },
+    });
+    const gate = await f.gate();
+    authorizeHostRun(store, gate);
+    await f.work.drain();
+    const proposal = store.pendingIntegrations()[0];
+    assert.ok(proposal?.kind === "integration");
+    assert.equal(
+      store.integrationHostCheckDigest(proposal.id),
+      gate.content.hostCheck.digest,
+    );
+    using db = new Database(state.filename);
+    db.exec(
+      "UPDATE host_check_runs SET status = 'failed' WHERE status = 'passed'",
+    );
+    f.declarations.length = 0;
+    approve(store, proposal);
+    await f.work.drain();
+    assert.equal(store.getProposal(proposal.id)?.status, "lapsed");
+    assert.equal(f.head(), f.base);
+  },
+);
+
+test(
+  "a host check failure revises the same Task using only a masked tail",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-revision-");
+    const { store } = state;
+    const secret = "fixture-secret:/123";
+    const original = new LocalHostCheckRunner({
+      tempRoot: state.root,
+      excludedRoots: [],
+      readKeychain: async () => Buffer.from(secret),
+    });
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: { runner: original, configFiles: [] },
+    });
+    const hex = Buffer.from(secret).toString("hex");
+    const base64 = Buffer.from(secret).toString("base64");
+    writeFileSync(
+      f.command,
+      `#!/bin/sh
+grep -q "Candidate 1" docs/a.md || exit 0
+printf '%s\\n' "$SERVICE_KEY" ${base64} ${hex}
+echo "fixture failed" >&2
+exit 1
+`,
+      { mode: 0o700 },
+    );
+    const gate = await f.gate();
+    authorizeHostRun(store, gate);
+    await f.work.drain();
+    const [next] = store.activeHostCheckGates();
+    assert.ok(next && next.id !== gate.id);
+    assert.equal(next.status, "pending");
+    assert.equal(store.getTask(f.taskId)?.retries, 0);
+    const detail = await readOperatorTask(store, f.directory, f.taskId);
+    const tail = detail?.hostChecks?.[0]?.tail;
+    assert.match(tail ?? "", /fixture failed/);
+    assert.match(tail ?? "", /\[REDACTED\]/);
+    const events = await f.journal.read();
+    const revision = events.find(({ kind }) => kind === "revision.requested");
+    assert.ok(revision?.kind === "revision.requested");
+    const notes = Buffer.from(
+      await f.journal.readNote(revision.notes),
+    ).toString();
+    assert.ok(notes.includes("local-check") && notes.includes(tail!));
+    for (const value of [secret, base64, hex]) {
+      assert.ok(!notes.includes(value));
+      assert.ok(!JSON.stringify(detail).includes(value));
+      assert.ok(
+        !JSON.stringify(
+          store.listEvents({ subjectId: f.taskId, limit: 100 }),
+        ).includes(value),
+      );
+    }
+  },
+);
+
+for (const when of ["started", "finished"] as const) {
+  test(
+    `host check fails closed when the ${when} audit write fails`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-host-audit-");
+      let runs = 0;
+      const f = hostCheckFixture(state, undefined, {
+        hostCheckRun: {
+          configFiles: [],
+          runner: {
+            async run() {
+              runs++;
+              return {
+                ...checkPassed,
+                exitStatus: when === "finished" ? 1 : 0,
+              };
+            },
+          },
+        },
+      });
+      const gate = await f.gate();
+      authorizeHostRun(state.store, gate, true);
+      using db = new Database(state.filename);
+      db.exec(`CREATE TRIGGER fail_audit BEFORE INSERT ON events
+      WHEN NEW.kind = 'host-check.${when}' BEGIN SELECT RAISE(ABORT, 'fixture'); END;`);
+      await assert.rejects(f.work.drain(), { code: "write-failed" });
+      assert.equal(runs, when === "started" ? 0 : 1);
+      assert.equal(f.head(), f.base);
+      assert.equal(state.store.nextApprovedIntegration(), undefined);
+      assert.equal(state.store.readyTasks(10, []).length, 0);
+      assert.equal(
+        state.store.hostCheckJob()?.status,
+        when === "finished" ? "running" : undefined,
+      );
+    },
+  );
+}
+
+test(
+  "a busy slot defers rechecking an approved executable until the slot is available",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-digest-");
+    let busy = false;
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: {
+        configFiles: [],
+        tryJobSlot: () => (busy ? undefined : () => {}),
+        runner: {
+          async run() {
+            return assert.fail("run must not start");
+          },
+        },
+      },
+    });
+    const gate = await f.gate();
+    authorizeHostRun(state.store, gate, true);
+    writeFileSync(f.command, "replacement");
+    busy = true;
+    await f.work.drain();
+    assert.equal(state.store.getProposal(gate.id)?.status, "approved");
+    busy = false;
+    await f.work.drain();
+    assert.equal(state.store.getProposal(gate.id)?.status, "lapsed");
+    assert.equal(state.store.activeHostCheckGates()[0]?.status, "pending");
+    assert.equal(f.head(), f.base);
+  },
+);
+
+test(
+  "changed host check inputs block integration and revision after the run",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-tamper-");
+    const file = join(state.root, "local.json");
+    writeFileSync(file, "{}");
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: {
+        configFiles: [file],
+        runner: {
+          async run() {
+            writeFileSync(file, '{"changed":true}');
+            return checkPassed;
+          },
+        },
+      },
+    });
+    const gate = await f.gate();
+    authorizeHostRun(state.store, gate, true);
+    await f.work.drain();
+    assert.equal(state.store.getTask(f.taskId)?.status, "failed");
+    assert.equal(
+      (failure(state.store, f.taskId) as { code: string }).code,
+      "host-check-tampered",
+    );
+    assert.equal(f.head(), f.base);
+    assert.equal(state.store.hostCheckResults(f.taskId)[0]?.tampered, true);
+    assert.deepEqual(state.store.readyTasks(10, []), []);
+  },
+);
+
+test(
+  "tampered delegation rules block the target and VM slot until the operator clears the run",
+  gitTestOptions,
+  async () => {
+    using root = mkdtempDisposableSync(
+      join(realpathSync(tmpdir()), "lo-tamper-slot-"),
+    );
+    const env = configEnv(root.path);
+    const projects = join(userStateDirectory(env), "projects");
+    mkdirSync(projects, { recursive: true, mode: 0o700 });
+    using state = orchestratorFixture("lo-tampered-", projects);
+    const { store } = state;
+    using db = new Database(state.filename);
+    let runs = 0;
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: {
+        configFiles: [],
+        tryJobSlot: () => tryStartVmJob(env),
+        runner: {
+          async run() {
+            if (++runs === 1) {
+              db.query("UPDATE delegation_rules SET rules_json = ?").run(
+                JSON.stringify([
+                  {
+                    id: "injected-rule",
+                    name: "Injected rule",
+                    gate: "integration",
+                    order: 0,
+                    action: "agent",
+                    enabled: true,
+                    conditions: { pathsWithin: ["docs/*.md"] },
+                  },
+                ]),
+              );
+            }
+            return checkPassed;
+          },
+        },
+      },
+    });
+    const second = task(store, f.goalId, { title: "Second check" });
+    await f.gate();
+    const gates = store.activeHostCheckGates();
+    const a = gates.find(({ content }) => content.taskId === f.taskId)!;
+    const b = gates.find(({ content }) => content.taskId === second)!;
+    authorizeHostRun(store, a, true);
+    authorizeHostRun(store, b, true);
+
+    await f.work.drain();
+    await f.work.drain();
+    assert.equal(runs, 1);
+    assert.equal(f.head(), f.base);
+    assert.equal(store.getTask(second)?.status, "awaiting-host-check");
+    assert.equal(store.getProposal(b.id)?.status, "approved");
+    assert.equal(store.policySettings().rules[0]?.id, "injected-rule");
+    assert.equal(store.nextApprovedIntegration(), undefined);
+    assert.equal(tryStartVmJob(env), undefined);
+    using reopened = openTestStore(state.filename);
+    assert.partialDeepStrictEqual(reopened.store.hostCheckJob(), {
+      status: "tampered",
+      proposalId: a.id,
+    });
+    assert.partialDeepStrictEqual(
+      (await readOperatorTask(store, f.directory, second))?.hostCheckJob,
+      { status: "tampered", proposalId: a.id, taskId: f.taskId },
+    );
+    assert.deepEqual(
+      await operatorAction(store, f.directory, "task.retry", {
+        id: f.taskId,
+        expectedRetries: 0,
+      }),
+      { error: { code: "host-check-blocked" } },
+    );
+    await assert.rejects(
+      withVmJob(env, async () => assert.fail("VM job must stay blocked")),
+      {
+        message: `Target "${basename(state.root)}" has a tampered host check. Open that target in Workplace and clear the host check from Task detail.`,
+      },
+    );
+    assert.throws(() => store.clearInterruptedHostCheck(a.id, "agent"), {
+      code: "approval-forbidden",
+    });
+    db.exec("UPDATE delegation_rules SET rules_json = '[]'");
+    await f.work.drain();
+    assert.equal(runs, 1);
+    reopened.store.clearInterruptedHostCheck(a.id, "operator-ui");
+    await f.work.drain();
+    assert.equal(runs, 2);
+    assert.equal(store.getTask(second)?.status, "succeeded");
+    assert.equal(f.head(), b.content.candidate);
+  },
+);
+
+for (const kind of ["passed row", "passed event", "failure event"] as const) {
+  test(
+    `tamper detection covers a forged host check ${kind} for a different Task`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-forged-check-");
+      const { store } = state;
+      using db = new Database(state.filename);
+      const f = hostCheckFixture(state, undefined, {
+        hostCheckRun: {
+          configFiles: [],
+          runner: {
+            async run() {
+              if (kind === "passed row") {
+                db.query(
+                  "INSERT INTO host_check_runs VALUES (?, ?, 0, 'passed', 'fake', NULL, 0, NULL)",
+                ).run(other.id, other.content.taskId);
+              } else {
+                db.query(
+                  `INSERT INTO events (id, at, kind, subject_kind, subject_id, data)
+                VALUES ('fake', ?, ?, 'task', ?, ?)`,
+                ).run(
+                  new Date().toISOString(),
+                  kind === "passed event"
+                    ? "host-check.passed"
+                    : "host-check.finished",
+                  other.content.taskId,
+                  JSON.stringify({
+                    proposalId: other.id,
+                    exitStatus: kind === "passed event" ? 0 : 1,
+                  }),
+                );
+              }
+              return checkPassed;
+            },
+          },
+        },
+      });
+      const second = task(store, f.goalId, { title: "Unapproved check" });
+      await f.gate();
+      const gates = store.activeHostCheckGates();
+      const current = gates.find(({ content }) => content.taskId === f.taskId)!;
+      const other = gates.find(({ content }) => content.taskId === second)!;
+      authorizeHostRun(store, current, true);
+      await f.work.drain();
+      assert.equal(store.hostCheckJob()?.status, "tampered");
+      assert.equal(store.hostCheckResults(f.taskId)[0]?.tampered, true);
+      assert.equal(f.head(), f.base);
+    },
+  );
+}
+
+test(
+  "startup marks a dead host check interrupted and keeps the slot blocked until operator clear",
+  gitTestOptions,
+  async () => {
+    using root = mkdtempDisposableSync(
+      join(realpathSync(tmpdir()), "lo-vm-slot-"),
+    );
+    const env = configEnv(root.path);
+    const projects = join(userStateDirectory(env), "projects");
+    mkdirSync(projects, { recursive: true, mode: 0o700 });
+    using state = orchestratorFixture("lo-host-interrupted-", projects);
+    const fake: HostCheckRunner = {
+      async run() {
+        return assert.fail("approval may not be used again");
+      },
+    };
+    const f = hostCheckFixture(state, undefined, {
+      hostCheckRun: { configFiles: [], runner: fake },
+    });
+    const gate = await f.gate();
+    authorizeHostRun(state.store, gate);
+    const msbHome = join(state.root, "leftover-vms");
+    const release = tryStartVmJob(env);
+    assert.ok(release);
+    state.store.beginHostCheck(gate.id, 0, msbHome);
+    state.store.recordHostCheck(gate.id, checkPassed, false);
+    assert.equal(tryStartVmJob(env), undefined);
+    using legacyDb = new Database(state.filename);
+    legacyDb.exec("PRAGMA user_version=10");
+    using reopened = openTestStore(state.filename);
+    assert.equal(reopened.store.hostCheckResults(f.taskId)[0]?.exitStatus, 0);
+    reopened.store.recoverHostCheck(() => tryLockVmJob(env));
+    assert.equal(reopened.store.hostCheckJob()?.status, "running");
+    release();
+    reopened.store.recoverHostCheck(() => tryLockVmJob(env));
+    assert.equal(tryStartVmJob(env), undefined);
+    assert.partialDeepStrictEqual(reopened.store.hostCheckJob(), {
+      status: "interrupted",
+      msbHome,
+    });
+    assert.equal(reopened.store.getProposal(gate.id)?.status, "lapsed");
+    assert.equal(reopened.store.getTask(f.taskId)?.status, "failed");
+    assert.throws(() => reopened.store.retryTask(f.taskId, 0), {
+      code: "session-busy",
+    });
+    await f.work.drain();
+    assert.throws(
+      () => reopened.store.clearInterruptedHostCheck(gate.id, "agent"),
+      { code: "approval-forbidden" },
+    );
+    reopened.store.clearInterruptedHostCheck(gate.id, "operator-ui");
+    assert.equal(reopened.store.hostCheckJob(), null);
+    const unlocked = tryStartVmJob(env);
+    assert.ok(unlocked);
+    unlocked();
+    assert.equal(reopened.store.getProposal(gate.id)?.status, "lapsed");
+  },
+);
+
 test(
   "host-check gate follows Verification and Review and exposes only names",
   gitTestOptions,
@@ -2619,7 +3162,8 @@ test(
     assert.equal(f.verifications(), 1);
     assert.deepEqual(store.pendingIntegrations(), []);
     const display = await operatorProposal(store, f.directory, gate.id);
-    assert.equal(display?.kind, "host-check");
+    assert.ok(display?.kind === "host-check");
+    assert.match(display.exposure, /leaves the process group.*setsid/);
     assert.partialDeepStrictEqual(display, {
       effectivePolicy: "human",
       policySource: "invariant",
@@ -6352,6 +6896,146 @@ function publishAudit(db: InstanceType<typeof Database>) {
       "SELECT kind, data FROM goal_publish_audit ORDER BY rowid",
     )
     .all();
+}
+
+for (const kind of [
+  "task.integrated",
+  "goal.auto-merge-set",
+  "publish.polled",
+]) {
+  test(
+    `a host check tampered via ${kind} pauses publishing until operator clear`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-host-publish-");
+      const { store } = state;
+      using db = new Database(state.filename);
+      const remote = fakePublishRemote("passed");
+      store.configureGoalPublishing({ autoMerge: "squash" });
+      let runs = 0;
+      const f = hostCheckFixture(state, undefined, {
+        hostCheckRun: {
+          configFiles: [],
+          runner: {
+            async run() {
+              if (++runs === 2) {
+                await publisher.tick();
+                assert.deepEqual(remote.calls, []);
+                // Bypass trusted-host methods to simulate writes by the check.
+                db.query(
+                  `INSERT INTO events (id, at, kind, subject_kind, subject_id, data)
+                   VALUES (?, ?, ?, ?, ?, ?)`,
+                ).run(
+                  "injected-event",
+                  new Date().toISOString(),
+                  kind,
+                  kind === "task.integrated" ? "task" : "goal",
+                  kind === "task.integrated" ? f.taskId : f.goalId,
+                  JSON.stringify({ head, autoMerge: "squash" }),
+                );
+              }
+              return checkPassed;
+            },
+          },
+        },
+      });
+      const publisher = new GoalPublisher(
+        store,
+        f.directory,
+        f.repoRoot,
+        remote.provider,
+        { enabled: true, autoMerge: "squash" },
+      );
+      await publisher.tick();
+      authorizeHostRun(store, await f.gate(), true);
+      await f.work.drain();
+      assert.equal(store.getTask(f.taskId)?.status, "succeeded");
+      const head = f.head();
+      const secondGoal = goal(store, undefined, "base", "Run another check");
+      const secondTask = task(store, secondGoal);
+      store.recordGoalCommit(secondGoal, f.base, "base");
+      f.bareGit(["update-ref", `refs/heads/${goalBranch(secondGoal)}`, f.base]);
+      await f.work.drain();
+      const [gate] = store.activeHostCheckGates();
+      assert.equal(gate?.content.taskId, secondTask);
+      authorizeHostRun(store, gate!);
+      await f.work.drain();
+      assert.equal(runs, 2);
+      assert.equal(store.blockedHostCheck()?.status, "tampered");
+
+      const goalRecord = store.getGoal(f.goalId)!;
+      const publishParams = {
+        id: f.goalId,
+        expectedHead: head,
+        confirm: goalPublishConfirmation(goalRecord.ref, head),
+      };
+      assert.deepEqual(
+        await goalPublishAction(
+          store,
+          publisher,
+          "goal.publish",
+          publishParams,
+        ),
+        { error: { code: "host-check-blocked" } },
+      );
+      assert.deepEqual(
+        await goalPublishAction(store, publisher, "goal.setAutoMerge", {
+          id: f.goalId,
+          method: "off",
+          confirm: store.goalAutoMergeConfirmations(f.goalId).off,
+        }),
+        { error: { code: "host-check-blocked" } },
+      );
+      await assert.rejects(
+        publisher.actOnPullRequest(f.goalId, "squash", "", "operator-ui"),
+        { code: "host-check-blocked" },
+      );
+      await publisher.tick();
+      assert.deepEqual(remote.calls, []);
+      assert.deepEqual(remote.mutations, []);
+
+      store.clearInterruptedHostCheck(gate!.id, "operator-ui");
+      for (const unauthorized of ["agent", { kind: "human", delegate: true }]) {
+        await assert.rejects(
+          publisher.publish(f.goalId, head, undefined, unauthorized as never),
+          { code: "approval-forbidden" },
+        );
+        await assert.rejects(
+          publisher.actOnPullRequest(
+            f.goalId,
+            "squash",
+            "",
+            unauthorized as never,
+          ),
+          { code: "approval-forbidden" },
+        );
+        assert.throws(
+          () =>
+            store.setGoalAutoMerge(
+              f.goalId,
+              "squash",
+              "",
+              unauthorized as never,
+            ),
+          { code: "approval-forbidden" },
+        );
+      }
+      assert.deepEqual(remote.mutations, []);
+      await publisher.tick();
+      assert.deepEqual(remote.mutations, [
+        `push ${head}:ab/${goalRecord.ref.toLowerCase()}-${f.goalId.slice(0, 8)}`,
+        "open-pr",
+        "auto-merge squash",
+      ]);
+      await publisher.actOnPullRequest(
+        f.goalId,
+        "squash",
+        store.goalPrActions(f.goalId).merge!.squash,
+        "operator-ui",
+      );
+      assert.equal(remote.mutations.at(-1), "merge-pr squash");
+    },
+  );
 }
 
 test(

@@ -51,23 +51,48 @@ export type TaskEnvironmentOptions = {
   readonly requireAudit: (executionId: string) => void;
 };
 
-/** Read the candidate cache entry selected by Verification without provisioning it. */
-export async function hostCheckArchiveDigest(
+/** Select the candidate cache entry used by Verification without provisioning. */
+async function hostCheckEnvironment(
   options: TaskEnvironmentOptions | undefined,
   repository: string,
   candidate: string,
   verificationProfile: ProfileName | undefined,
-): Promise<string | null> {
+) {
   if (!options || verificationProfile !== "bun") return null;
   const tree = await LocalGitIntegration.committedTree(repository, candidate);
   if (!hasBunLayout(tree)) return null;
   if (!options.profile) throw new EnvironmentError("env-missing");
-  const { key } = await identifyEnvironment(
+  const { key, layout } = await identifyEnvironment(
     tree,
     options.profile.image.slice(-64),
     bunAdapter,
   );
-  return options.host.store.archiveDigest(key);
+  return { key, layout, store: options.host.store };
+}
+
+export async function hostCheckArchiveDigest(
+  ...args: Parameters<typeof hostCheckEnvironment>
+): Promise<string | null> {
+  const cached = await hostCheckEnvironment(...args);
+  return cached ? cached.store.archiveDigest(cached.key) : null;
+}
+
+export async function readHostCheckArchive(
+  ...args: Parameters<typeof hostCheckEnvironment>
+) {
+  const cached = await hostCheckEnvironment(...args);
+  if (!cached) return null;
+  const { key, layout, store } = cached;
+  const release = store.hold(key);
+  try {
+    return {
+      bytes: store.readArchive(key),
+      outputs: layout.outputs,
+      linkTargets: layout.linkTargets,
+    };
+  } finally {
+    release();
+  }
 }
 
 async function withBuildSlot<T>(host: ProvisionerHost, run: () => Promise<T>) {

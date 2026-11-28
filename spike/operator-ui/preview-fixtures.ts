@@ -1602,6 +1602,9 @@ export function createPreviewMethods(
       });
       return entry;
     },
+    "hostCheck.clearInterrupted": () => {
+      throw new Error("invalid-transition");
+    },
     "problem.list": ({ includeResolved }) => problems(includeResolved),
     "concierge.attach": () => ({
       replay: Buffer.from(

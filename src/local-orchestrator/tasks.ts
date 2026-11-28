@@ -1,6 +1,13 @@
 import {
+  emptyHostCheckOutcome,
+  hashHostCheckFile,
+  type HostCheckRunner,
+} from "./host-check-run.ts";
+import {
   hostCheckApproval,
   hostCheckRequirement,
+  readHostCheckPin,
+  validateHostCheckHome,
   type HostCheckContent,
   type HostCheckDeclaration,
 } from "./host-checks.ts";
@@ -14,6 +21,7 @@ import {
 import {
   hasDerivedLockConflict,
   hostCheckArchiveDigest,
+  readHostCheckArchive,
   taskEnvironmentPlan,
   type TaskEnvironmentOptions,
 } from "./task-environment.ts";
@@ -87,6 +95,9 @@ type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
   usage?: TokenUsage;
   isError?: boolean;
   revision?: boolean;
+  hostCheckRevision?: NonNullable<
+    ReturnType<OrchestratorStore["hostCheckRevision"]>
+  >;
 };
 type CandidateChange = {
   path: string;
@@ -465,6 +476,12 @@ export function createTaskExecutor(options: {
   protectedPaths?: () => readonly string[];
   hostChecks?:
     readonly HostCheckDeclaration[] | (() => readonly HostCheckDeclaration[]);
+  hostCheckRun?: {
+    runner: HostCheckRunner;
+    agentHome?: string;
+    configFiles: readonly string[];
+    tryJobSlot?: () => (() => void) | undefined;
+  };
   environment?: TaskEnvironmentOptions;
   scan?: CredentialScanner;
 }): TaskExecutor {
@@ -634,7 +651,7 @@ export function createTaskExecutor(options: {
       async worker(id, revise, observed) {
         workerResult = observed;
         return revise
-          ? integration.revise(id)
+          ? integration.revise(id, observed.hostCheckRevision)
           : integration.prepareCandidate(id);
       },
       async review(id, observed) {
@@ -760,9 +777,8 @@ export function createTaskExecutor(options: {
         readHostChecks(),
       ).flow;
     },
-    // Step 3b resumes approved checks here, after refreshing the pin and
-    // committing the per-check authorization before handing off to a runner.
     async resumeHostChecks() {
+      if (store.hostCheckJob()) return;
       const gates = [
         ...store.activeHostCheckGates(),
         ...store.waitingHostCheckInputs(),
@@ -774,65 +790,189 @@ export function createTaskExecutor(options: {
         const git = localGit(directory, content.branch);
         const previous =
           "id" in gate ? gate.content.hostCheck.digest : undefined;
-        let reason:
-          | "stale-base"
-          | "candidate-changed"
-          | "approval-inputs-changed"
-          | undefined;
-        let approval: HostCheckContent["hostCheck"] | undefined;
-        try {
+        const ready = "id" in gate && gate.status === "approved";
+        const run = ready ? options.hostCheckRun : undefined;
+        const refresh = async () => {
           const base = await git.branchHead();
-          if (base !== content.base) {
-            reason = "stale-base";
-          } else {
-            const journal = taskJournal(directory, task.id, task.retries);
-            const { integration } = taskFlow(task, git, journal);
-            if (!(await integration.reviewedPin(content))) {
-              reason = "candidate-changed";
-            } else {
-              const changes = await git.candidateChanges(
-                base,
-                content.candidate,
-              );
-              const { required } = hostCheckRequirement(
-                readHostChecks(),
-                changes,
-              );
-              if (required.length) {
-                const archive = await archiveDigest(content);
+          if (base !== content.base) return { reason: "stale-base" } as const;
+          const journal = taskJournal(directory, task.id, task.retries);
+          const { integration } = taskFlow(task, git, journal);
+          if (!(await integration.reviewedPin(content)))
+            return { reason: "candidate-changed" } as const;
+          const changes = await git.candidateChanges(base, content.candidate);
+          const { required } = hostCheckRequirement(readHostChecks(), changes);
+          if (required.length) {
+            const verifiedArchive = store.hostCheckVerificationArchive(
+              task.id,
+              content,
+            );
+            let archiveMissing = false;
+            const archive = await archiveDigest(content).catch(
+              (error: unknown) => {
                 if (
-                  archive ===
-                  store.hostCheckVerificationArchive(task.id, content)
+                  run &&
+                  verifiedArchive &&
+                  error instanceof EnvironmentError &&
+                  error.code === "env-missing"
                 ) {
-                  approval = await hostCheckApproval(
-                    content,
-                    required,
-                    await integration.protectedPaths(content),
-                    archive,
-                  );
+                  // The accepted digest can still identify the failed setup.
+                  // No runner or credential read may occur without its bytes.
+                  archiveMissing = true;
+                  return verifiedArchive;
                 }
-              }
-              if (approval?.digest !== previous || !approval) {
-                reason = "approval-inputs-changed";
-                if (approval)
-                  await scan?.(
-                    JSON.stringify({ ...content, hostCheck: approval }),
-                  );
-              }
+                throw error;
+              },
+            );
+            if (archive === verifiedArchive) {
+              const protectedPaths = await integration.protectedPaths(content);
+              const declarations = required.map(
+                ({ declaration }) => declaration,
+              );
+              const pin = await readHostCheckPin(
+                content,
+                declarations,
+                archive,
+                protectedPaths,
+              );
+              if (pin.digest === previous)
+                return { pin, declarations, archive, archiveMissing };
+              const approval = await hostCheckApproval(
+                content,
+                required,
+                protectedPaths,
+                archive,
+              );
+              await scan?.(JSON.stringify({ ...content, hostCheck: approval }));
+              return { reason: "approval-inputs-changed", approval } as const;
             }
           }
-        } catch {
-          store.noteUnavailableHostCheckInputs(task.id, gate);
-          continue;
+          return { reason: "approval-inputs-changed" } as const;
+        };
+
+        const snapshot = async () =>
+          JSON.stringify([
+            ...(await Promise.all(
+              (run?.configFiles ?? []).map(hashHostCheckFile),
+            )),
+            "id" in gate && store.hostCheckTamperDigest(gate.id, task.id),
+          ]);
+        let release: (() => void) | undefined;
+        try {
+          if (run?.tryJobSlot) {
+            release = run.tryJobSlot();
+            if (!release) return;
+          }
+          for (let index = 0; ; index++) {
+            const configBefore = run
+              ? await snapshot().catch(() => null)
+              : null;
+            const inputs = await refresh().catch(() => null);
+            if (!inputs) {
+              if (run && ready)
+                store.lapseHostCheck(gate.id, "approval-inputs-changed");
+              else store.noteUnavailableHostCheckInputs(task.id, gate);
+              break;
+            }
+            if (inputs.reason) {
+              if ("id" in gate)
+                store.lapseHostCheck(gate.id, inputs.reason, inputs.approval);
+              else
+                store.resolveHostCheckInputs(
+                  task.id,
+                  gate.executionId,
+                  inputs.approval ?? inputs.reason,
+                );
+              break;
+            }
+            if (!ready || !run) break;
+            const check = inputs.declarations[index]!;
+            const executable = inputs.pin.executables[index]!;
+            let before: string;
+            try {
+              validateHostCheckHome(
+                check,
+                run.agentHome,
+                "Edit the target's host-check declaration.",
+              );
+              before = await snapshot();
+            } catch {
+              store.lapseHostCheck(gate.id, "approval-inputs-changed");
+              break;
+            }
+            if (configBefore !== before) {
+              store.lapseHostCheck(gate.id, "approval-inputs-changed");
+              break;
+            }
+            store.beginHostCheck(gate.id, index, check.env?.MSB_HOME ?? null);
+            const outcome = inputs.archiveMissing
+              ? emptyHostCheckOutcome("archive-missing")
+              : await run.runner
+                  .run({
+                    check,
+                    executable,
+                    pack: async (path) =>
+                      (
+                        await LocalGitIntegration.committedTree(
+                          repository,
+                          content.candidate,
+                        )
+                      ).pack(path),
+                    archiveDigest: inputs.archive,
+                    archive: () =>
+                      readHostCheckArchive(
+                        options.environment,
+                        repository,
+                        content.candidate,
+                        verification?.profile,
+                      ),
+                  })
+                  .catch(() => emptyHostCheckOutcome("setup"));
+            const after = await snapshot().catch(() => null);
+            const tampered = before !== after;
+            store.recordHostCheck(gate.id, outcome, tampered);
+            if (tampered) break;
+            if (outcome.cleanupFailed) {
+              store.finishHostChecks(gate.id, "host-check-cleanup-failed");
+              break;
+            }
+            if (
+              outcome.failure === "executable-changed" ||
+              outcome.failure === "archive-changed"
+            ) {
+              const updated = await refresh().catch(() => null);
+              store.lapseHostCheck(
+                gate.id,
+                "approval-inputs-changed",
+                updated?.approval,
+              );
+              break;
+            }
+            if (
+              outcome.exitStatus !== 0 ||
+              outcome.failure ||
+              outcome.timedOut
+            ) {
+              store.finishHostChecks(gate.id, "host-check-failed");
+              break;
+            }
+            if (index === inputs.declarations.length - 1) {
+              const diffSize = await git
+                .diffSize(content.base, content.candidate)
+                .catch(() => undefined);
+              store.finishHostChecks(
+                gate.id,
+                undefined,
+                diffSize?.changedFiles === content.changedPaths.length
+                  ? diffSize
+                  : undefined,
+              );
+              break;
+            }
+          }
+        } finally {
+          release?.();
         }
-        if (!reason) continue;
-        if ("id" in gate) store.lapseHostCheck(gate.id, reason, approval);
-        else
-          store.resolveHostCheckInputs(
-            task.id,
-            gate.executionId,
-            approval ?? reason,
-          );
+        if (run) return; // Re-enter the scheduler between batches.
       }
     },
     integrate(proposalId) {
@@ -854,6 +994,7 @@ export function createTaskExecutor(options: {
             }
           : undefined,
         readHostChecks,
+        archiveDigest,
       );
     },
     async diff(content) {
@@ -884,6 +1025,7 @@ export async function runTask(
   canContinue: () => boolean = () => true,
   scan?: CredentialScanner,
 ): Promise<void> {
+  const revision = store.hostCheckRevision(id);
   const task = store.claimTask(id);
   if (!task) return;
   const { budgets, paths } = task.content;
@@ -1002,7 +1144,11 @@ export async function runTask(
 
   try {
     const flow = await executor.open(task);
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    for (
+      let attempt = revision?.attempts ?? 0;
+      attempt <= maxRetries;
+      attempt++
+    ) {
       if (!canContinue()) {
         code = "session-ended";
         break;
@@ -1013,6 +1159,8 @@ export async function runTask(
         flow.workerAgent,
         async (runId, observed) => {
           observed.revision = attempt > 0;
+          if (revision?.attempts === attempt)
+            observed.hostCheckRevision = revision;
           const pin = await flow.worker(runId, attempt > 0, observed);
           const changes = await flow.changes(pin);
           const changedPaths = changes.map(({ path }) => path);
@@ -1265,6 +1413,7 @@ export async function integrateApprovedProposal(
     content: IntegrationContent,
   ) => Promise<boolean>,
   readHostChecks?: () => readonly HostCheckDeclaration[],
+  archiveDigest?: (pin: PinnedCandidate) => Promise<string | null>,
 ): Promise<void> {
   let resolveStale: (() => Promise<boolean>) | undefined;
   let isPreGitFailure: (() => Promise<boolean>) | undefined;
@@ -1305,6 +1454,53 @@ export async function integrateApprovedProposal(
       );
 
     const protectedPaths = await integration.protectedPaths(pin);
+    if (shouldResolveStale)
+      resolveStale = () =>
+        shouldResolveStale(task, git, content).catch(() => false);
+    if ((await git.branchHead()) !== base)
+      throw new GitIntegrationError("stale-base");
+    const required = readHostChecks
+      ? hostCheckRequirement(readHostChecks(), changes).required
+      : [];
+    const expectedHostCheck = store.integrationHostCheckDigest(proposalId);
+    if (required.length || expectedHostCheck) {
+      const archive =
+        required.length && archiveDigest
+          ? await archiveDigest(pin).catch(() => undefined)
+          : undefined;
+      const current =
+        archive === undefined
+          ? null
+          : await readHostCheckPin(
+              pin,
+              required.map(({ declaration }) => declaration),
+              archive,
+              protectedPaths,
+              false,
+            ).catch(() => null);
+      if (
+        !current ||
+        current.digest !== expectedHostCheck ||
+        !store.hasPassedHostChecks(task.id, content, current.digest)
+      ) {
+        const replacement =
+          expectedHostCheck &&
+          current &&
+          archive !== undefined &&
+          archive === store.hostCheckVerificationArchive(task.id, pin)
+            ? await hostCheckApproval(
+                pin,
+                required,
+                protectedPaths,
+                archive,
+              ).catch(() => undefined)
+            : undefined;
+        if (replacement)
+          await scan?.(JSON.stringify({ ...content, hostCheck: replacement }));
+        store.requireHostCheckForIntegration(proposalId, replacement);
+        return;
+      }
+    }
     const linkPaths = new Set(
       changes
         .filter(
@@ -1315,7 +1511,12 @@ export async function integrateApprovedProposal(
     );
     // Ordinary integration approvals only record symlinks. A configured
     // protected file needs an approval that explicitly covers that path.
-    if (protectedPaths.some((path) => !linkPaths.has(path)))
+    const combinedProtected = store.combinedHostCheckProtectedPaths(proposalId);
+    if (
+      protectedPaths.some((path) => !linkPaths.has(path)) &&
+      (combinedProtected?.length !== protectedPaths.length ||
+        protectedPaths.some((path) => !combinedProtected.includes(path)))
+    )
       throw new TaskError("candidate-mismatch");
     if (protectedPaths.length && answerer.kind !== "human")
       throw new OrchestratorStoreError("approval-forbidden");
@@ -1334,21 +1535,6 @@ export async function integrateApprovedProposal(
         throw new TaskError("candidate-mismatch");
     }
 
-    if (shouldResolveStale)
-      resolveStale = () =>
-        shouldResolveStale(task, git, content).catch(() => false);
-    if ((await git.branchHead()) !== base)
-      throw new GitIntegrationError("stale-base");
-    // A pending integration may predate the declarations or this gate.
-    // Step 3b must replace this re-evaluation with a check that
-    // a passed host-check record exists for this exact pin and digest.
-    if (
-      readHostChecks &&
-      hostCheckRequirement(readHostChecks(), changes).required.length
-    ) {
-      store.requireHostCheckForIntegration(proposalId);
-      return;
-    }
     store.beginIntegration(proposalId, proposal.digest, approvalId);
     isPreGitFailure = () =>
       Promise.all([git.branchHead(), journal.read()]).then(
@@ -1415,6 +1601,7 @@ export async function integrateApprovedProposal(
         "write-failed",
         "read-failed",
         "closed",
+        "session-busy",
         "invalid-transition",
         "goal-inactive",
         "goal-pr-open",

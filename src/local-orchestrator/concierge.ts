@@ -1,3 +1,7 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { configRoot, userConfigPath } from "../config/layers.ts";
+import { LocalHostCheckRunner } from "./host-check-run.ts";
+import { vmJobWaitReason } from "./vm-job.ts";
 import type { TaskEnvironmentOptions } from "./task-environment.ts";
 import { createHash } from "node:crypto";
 import { codexExecutorOptions, readCodexExecutor } from "./codex-executor.ts";
@@ -134,6 +138,12 @@ export interface ConciergeDeps {
   readonly auth: ClaudeCodeAuth;
   readonly config: Config;
   readonly readHostChecks?: () => NonNullable<Config["hostChecks"]>;
+  readonly hostCheckPaths?: {
+    agentHome: string;
+    auditRoot: string;
+    tryJobSlot: () => (() => void) | undefined;
+    tryRecoverySlot: () => (() => void) | undefined;
+  };
   readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
@@ -560,6 +570,19 @@ export async function startConcierge(
     );
   }
 
+  store.recoverHostCheck(deps.hostCheckPaths?.tryRecoverySlot);
+  const hostCheckJob = store.hostCheckJob();
+  if (hostCheckJob?.status === "running")
+    throw new Error("Host check job is active");
+  if (hostCheckJob) {
+    deps.note?.(
+      hostCheckJob.status === "tampered"
+        ? "Host check tampering detected. Inspect the target state, then open Workplace and clear the tampered host check from Task detail."
+        : "Host check interrupted. Inspect the recorded MSB_HOME, then open Workplace and clear the interrupted host check from Task detail.",
+    );
+    while (store.hostCheckJob())
+      await delay(250, undefined, { signal: options.signal });
+  }
   const invocationId = randomUUID();
   const { id: sessionId } = store.startSession("Concierge", invocationId, true);
   let snapshotDir: string | undefined;
@@ -568,6 +591,7 @@ export async function startConcierge(
   let drain: Promise<void> | undefined;
   let drainFailed = false;
   let scheduler: ReturnType<typeof setInterval> | undefined;
+  let releaseConciergeBoot: (() => void) | undefined;
   let stopping = false;
   const isStopping = () => stopping || options.signal?.aborted === true;
   let failed = false;
@@ -674,6 +698,28 @@ export async function startConcierge(
             },
             reviewer,
             hostChecks: deps.readHostChecks ?? config.hostChecks ?? [],
+            ...(deps.hostCheckPaths && {
+              hostCheckRun: {
+                agentHome: deps.hostCheckPaths.agentHome,
+                tryJobSlot: deps.hostCheckPaths.tryJobSlot,
+                configFiles: [
+                  join(target.configDirectory, "local.json"),
+                  userConfigPath(env),
+                ],
+                runner: new LocalHostCheckRunner({
+                  agentHome: deps.hostCheckPaths.agentHome,
+                  excludedRoots: [
+                    repoRoot,
+                    bootstrapRoot,
+                    target.directory,
+                    userStateDirectory(env),
+                    configRoot(env),
+                    deps.hostCheckPaths.auditRoot,
+                  ],
+                  ...(scan && { scan }),
+                }),
+              },
+            }),
             ...(deps.verification ? { verification: deps.verification } : {}),
             ...(environment ? { environment } : {}),
           })
@@ -685,6 +731,9 @@ export async function startConcierge(
       ...(tasks ? { tasks } : {}),
       autoApproveRegistrations: true,
       canScheduleTasks: () => !isStopping(),
+      ...(deps.hostCheckPaths && {
+        tryVmJobSlot: deps.hostCheckPaths.tryJobSlot,
+      }),
       runPlanner: (...args) => {
         if (isStopping()) throw new Error("Concierge session ended");
         return runPlanner(...args);
@@ -713,8 +762,9 @@ export async function startConcierge(
       },
     });
     let drainRequested = false;
+    let conciergeStarted = false;
     const scheduleDrain = () => {
-      if (isStopping() || drainFailed) return;
+      if (isStopping() || drainFailed || !conciergeStarted) return;
       drainRequested = true;
       if (drain) return;
       drainRequested = false;
@@ -758,10 +808,15 @@ export async function startConcierge(
     options.signal?.throwIfAborted();
     await host.prepareConciergeVolume(stateVolume);
     options.signal?.throwIfAborted();
-    scheduleDrain();
-    // Operator decisions and policy changes can arrive through state.db.
-    scheduler = setInterval(scheduleDrain, 1000);
-    scheduler.unref();
+    if (deps.hostCheckPaths) {
+      releaseConciergeBoot = deps.hostCheckPaths.tryJobSlot();
+      if (!releaseConciergeBoot)
+        deps.note?.(`Waiting to start Concierge. ${vmJobWaitReason(env)}`);
+      while (!releaseConciergeBoot) {
+        await delay(250, undefined, { signal: options.signal });
+        releaseConciergeBoot = deps.hostCheckPaths.tryJobSlot();
+      }
+    }
     ({ outcome, code } = await host.runConcierge(
       {
         sandbox: {
@@ -779,7 +834,14 @@ export async function startConcierge(
       },
       invocationId,
       async (terminal) => {
+        releaseConciergeBoot?.();
+        releaseConciergeBoot = undefined;
         options.signal?.throwIfAborted();
+        conciergeStarted = true;
+        scheduleDrain();
+        // Operator decisions and policy changes can arrive through state.db.
+        scheduler = setInterval(scheduleDrain, 1000);
+        scheduler.unref();
         if (options.terminal) {
           const attachment = await terminal.attach(
             {
@@ -817,6 +879,7 @@ export async function startConcierge(
     throw error;
   } finally {
     stopping = true;
+    releaseConciergeBoot?.();
     clearInterval(scheduler);
     const cleanup = async (code: string, effect: () => unknown) => {
       try {

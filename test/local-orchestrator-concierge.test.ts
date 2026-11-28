@@ -638,6 +638,64 @@ test("Concierge refuses further Planner work after a failed execution audit writ
   });
 });
 
+for (const status of ["interrupted", "tampered"] as const) {
+  test(`Concierge directs the operator to Workplace when a host check is ${status}`, async () => {
+    await fixture(async (repoRoot, store, target) => {
+      store.hostCheckJob = () => ({
+        status,
+        proposalId: "blocked-check",
+        taskId: "task",
+        retries: 0,
+        name: "fixture",
+        msbHome: null,
+        pid: 1,
+      });
+      const stop = new AbortController();
+      const notes: string[] = [];
+      const deps: ConciergeDeps = {
+        store,
+        config: { version: 1 },
+        baseImage: ALPINE_3_23.reference,
+        auth,
+        install,
+        async snapshot() {
+          return assert.fail("blocked Concierge tried to snapshot");
+        },
+        async listen() {
+          return assert.fail("blocked Concierge tried to listen");
+        },
+        host: {
+          async prepareConciergeVolume() {
+            return assert.fail("blocked Concierge tried to prepare the VM");
+          },
+          async runConcierge() {
+            return assert.fail("blocked Concierge tried to start the VM");
+          },
+          async runPlanner() {
+            return assert.fail("blocked Concierge tried to run Planner");
+          },
+          async runReviewer() {
+            return assert.fail("blocked Concierge tried to run Reviewer");
+          },
+        },
+        note(message) {
+          notes.push(message);
+          stop.abort();
+        },
+      };
+      await assert.rejects(
+        startConcierge(deps, { repoRoot, target, model, signal: stop.signal }),
+        { name: "AbortError" },
+      );
+      assert.equal(notes.length, 1);
+      assert.match(
+        notes[0]!,
+        new RegExp(`open Workplace and clear the ${status} host check`),
+      );
+    });
+  });
+}
+
 test("Concierge guest command admits only validated options and uses a fixed relay and guest state", () => {
   const alpine = conciergeCommand({ model }, auth);
   const [shell, flags, script] = alpine.argv;

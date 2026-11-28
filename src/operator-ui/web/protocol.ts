@@ -322,6 +322,10 @@ export interface Methods extends GoalPublishMethods {
   "goal.get": { params: { id: string }; result: GoalDetail };
   "task.list": { params: { goalId: string }; result: TaskSummary[] };
   "task.get": { params: { id: string }; result: TaskDetail };
+  "hostCheck.clearInterrupted": {
+    params: { id: string; confirm: string };
+    result: { id: string };
+  };
   "problem.list": { params: { includeResolved?: boolean }; result: Problem[] };
   "concierge.attach": {
     params: Record<string, never>;

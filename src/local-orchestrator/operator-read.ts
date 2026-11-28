@@ -493,6 +493,10 @@ export async function screenOperatorProposal(
       budgets: proposal.budgets,
       pathViolations: [],
       reviewExecutionId: review.executionId,
+      ...(proposal.hostChecksPassed && {
+        hostChecksPassed: true as const,
+        verified: proposal.content.verified,
+      }),
       modelText: {
         verdict: review.verdict,
         findings,
@@ -962,7 +966,14 @@ export async function readOperatorTask(
     task,
     scan,
   );
-  return { ...task, ...(verificationNote ? { verificationNote } : {}) };
+  const hostChecks = store.hostCheckResults(task.id);
+  const hostCheckJob = store.blockedHostCheck();
+  return {
+    ...task,
+    ...(verificationNote ? { verificationNote } : {}),
+    ...(hostChecks.length && { hostChecks }),
+    ...(hostCheckJob && { hostCheckJob }),
+  };
 }
 
 export function operatorProblems(

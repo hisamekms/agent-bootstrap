@@ -1,3 +1,4 @@
+import { withVmJob } from "../local-orchestrator/vm-job.ts";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { readLayer } from "../config/layers.ts";
@@ -154,12 +155,14 @@ export async function runSandboxShell(
     profiles,
   });
   try {
-    return await observed.host.runSandboxShell(
-      plan.profile,
-      plan.allow,
-      mounts,
-      undefined,
-      command,
+    return await withVmJob(host.env, () =>
+      observed.host.runSandboxShell(
+        plan.profile,
+        plan.allow,
+        mounts,
+        undefined,
+        command,
+      ),
     );
   } finally {
     await observed.close();

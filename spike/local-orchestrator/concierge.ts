@@ -1,3 +1,8 @@
+import {
+  tryLockVmJob,
+  tryStartVmJob,
+  withVmJob,
+} from "../../src/local-orchestrator/vm-job.ts";
 import { GoalPublisher } from "../../src/publish/goals.ts";
 import { githubGh } from "../../src/publish/github-gh.ts";
 import { EnvironmentStore } from "../../src/environments/store.ts";
@@ -483,7 +488,10 @@ async function launchConcierge(
     });
     setStage("launch or clean up session");
     if (volumeShell) {
-      const result = await observed.host.runVolumeShell(volumeShell);
+      const { host } = observed;
+      const result = await withVmJob(target.env, () =>
+        host.runVolumeShell(volumeShell),
+      );
       if (result.code) console.error(result.code);
       if (result.outcome !== "ok" || result.terminal?.exitCode !== 0)
         process.exitCode = 1;
@@ -505,6 +513,7 @@ async function launchConcierge(
       publisher,
       stateDirectory: directory,
       target: repoRoot,
+      tryHostCheckRecoverySlot: () => tryLockVmJob(target.env),
       repository: {
         project: target.project.name,
         repositoryPath: target.repositoryPath,
@@ -517,6 +526,10 @@ async function launchConcierge(
         ),
       ...(scan ? { scan } : {}),
     };
+    const environmentStore = new EnvironmentStore(
+      target.project.id,
+      target.env,
+    );
     const launchSession = (
       sessionOptions: Pick<
         ConciergeOptions,
@@ -534,6 +547,12 @@ async function launchConcierge(
           install,
           auth,
           config: effective.config,
+          hostCheckPaths: {
+            agentHome: home,
+            auditRoot: config.directory,
+            tryJobSlot: () => tryStartVmJob(target.env),
+            tryRecoverySlot: () => tryLockVmJob(target.env),
+          },
           readHostChecks: () =>
             loadConfig({ ...process.env, MSB_HOME: home }, configDirectory)
               .config.hostChecks ?? [],
@@ -546,7 +565,7 @@ async function launchConcierge(
                   requireAudit: host.requireTaskEnvironmentAudit.bind(host),
                   host: {
                     env: target.env,
-                    store: new EnvironmentStore(target.project.id, target.env),
+                    store: environmentStore,
                     run(args, timeout, extra, signal) {
                       return systemHost.command(
                         "mise",

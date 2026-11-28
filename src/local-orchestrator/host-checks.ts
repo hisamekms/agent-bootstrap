@@ -209,6 +209,12 @@ export function parseHostChecks(
                   next,
                 );
               const name = environmentName(variable, `${entryKey}.env`, next);
+              if (name === "MSB_HOME")
+                invalid(
+                  entryKey + ".env",
+                  "Declare MSB_HOME as a literal value.",
+                  next,
+                );
               if (keychainNames.has(name) || (env && Object.hasOwn(env, name)))
                 invalid(
                   `${entryKey}.env`,
@@ -422,7 +428,7 @@ export function matchHostCheck(
 
 export const HOST_CHECK_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 export const hostCheckExposure =
-  "This runs the candidate as you, with access to your files, network and Keychain. It can change files you can write and read other Keychain items available without a prompt.";
+  "This runs the candidate as you, with access to your files, network and Keychain. It can change files you can write and read other Keychain items available without a prompt.\nA process that leaves the process group (for example, with setsid) cannot be contained.";
 
 type RequiredCheck = {
   declaration: HostCheckDeclaration;
@@ -530,7 +536,7 @@ const executableDigests = new Map<
   { identity: string; sha256: string }
 >();
 
-async function executableIdentity(command: string) {
+export async function executableIdentity(command: string, useCache = true) {
   const path = await realpath(command);
   await access(path, constants.X_OK);
   const file = await open(
@@ -548,7 +554,8 @@ async function executableIdentity(command: string) {
     };
     const identity = await identityOf();
     const cached = executableDigests.get(path);
-    if (cached?.identity === identity) return { path, sha256: cached.sha256 };
+    if (useCache && cached?.identity === identity)
+      return { path, sha256: cached.sha256 };
     const hash = createHash("sha256");
     for await (const bytes of file.createReadStream({ autoClose: false }))
       hash.update(bytes);
@@ -563,22 +570,23 @@ async function executableIdentity(command: string) {
 }
 
 /** Recompute against current declarations, executables and cached archive before use. */
-export async function recomputeHostCheckApprovalDigest(
+export async function readHostCheckPin(
   { base, candidate }: Pick<IntegrationContent, "base" | "candidate">,
   declarations: readonly HostCheckDeclaration[],
   environmentArchiveDigest: string | null,
   protectedPaths: readonly string[] = [],
-): Promise<string> {
+  useCache = true,
+) {
   const checks = [];
   for (const declaration of declarations) {
     checks.push({
       declaration: hostCheckDigest(declaration),
-      executable: await executableIdentity(declaration.argv[0]),
+      executable: await executableIdentity(declaration.argv[0], useCache),
       keychainServices:
         declaration.keychain?.map(({ service }) => service) ?? [],
     });
   }
-  return contentDigest({
+  const digest = contentDigest({
     base,
     candidate,
     checks,
@@ -586,6 +594,13 @@ export async function recomputeHostCheckApprovalDigest(
     environmentArchiveDigest,
     protectedPaths: [...new Set(protectedPaths)].sort(),
   });
+  return { digest, executables: checks.map(({ executable }) => executable) };
+}
+
+export async function recomputeHostCheckApprovalDigest(
+  ...args: Parameters<typeof readHostCheckPin>
+): Promise<string> {
+  return (await readHostCheckPin(...args)).digest;
 }
 
 export function hostCheckRequirement(
