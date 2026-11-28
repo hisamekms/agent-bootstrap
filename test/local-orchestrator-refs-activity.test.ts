@@ -18,6 +18,7 @@ import {
   operatorActivityRevision,
   operatorGoal,
   operatorGoalList,
+  operatorInbox,
   operatorProblems,
   operatorTask,
   operatorTaskList,
@@ -300,12 +301,28 @@ test("activity lists parallel executions and waiting tasks, and derives goal tur
     owner: "stopped",
     reason: { kind: "cancelled" },
   });
+  assert.equal(operatorGoal(store, other)?.progress.cancelled, 1);
 
   store.decide(proposal.id, {
     digest: proposal.digest,
     decision: "reject",
     answerer: { kind: "human" },
   });
+  assert.deepEqual(
+    operatorGoal(store, "g1")!.timeline.map(({ kind, ref, proposalKind }) => [
+      kind,
+      ref,
+      proposalKind,
+    ]),
+    [
+      ["rejected", null, "task"],
+      ["approved", "G1", "goal"],
+    ],
+  );
+  assert.deepEqual(
+    operatorGoal(store, "g2")!.timeline.map(({ kind, ref }) => [kind, ref]),
+    [["approved", "G2"]],
+  );
   store.recordGoalCommit("g1", "a".repeat(40), "base");
   assert.equal(store.getGoal(id)?.baseCommit, "a".repeat(40));
   const db = new Database(state.filename);
@@ -515,6 +532,40 @@ test("activity counts the same unresolved actions as the bounded inbox", () => {
   );
   assert.equal(visibleActions.length, 200);
   assert.equal(operatorActivity(source).yourTurn, visibleActions.length);
+});
+
+test("Goal turn counts only human decisions when the Goal also has AI-pending proposals", () => {
+  using state = orchestratorFixture("refs-human-turn-");
+  const { store, root } = state;
+  const goalId = goal(store);
+  store.setProjectDefaults({ "task-registration": "agent" }, operator);
+  const delegated = store.proposeTask({ ...taskContent, goalId }, operator);
+  const human = store.proposeTask(
+    { ...taskContent, goalId, paths: ["outside"] },
+    operator,
+  );
+  const rows = operatorInbox(store, projectInbox({ store, target: root }));
+  const answer = (id: string) => {
+    const row = rows.find(({ subject }) => subject.proposalId === id);
+    assert.ok(row && "answer" in row);
+    return row.answer;
+  };
+  assert.partialDeepStrictEqual(answer(delegated.id), {
+    approve: false,
+    reject: false,
+    takeover: true,
+  });
+  assert.partialDeepStrictEqual(answer(human.id), {
+    approve: true,
+    reject: true,
+  });
+  assert.deepEqual(
+    operatorGoalList(store).find(({ id }) => id === goalId)?.turn,
+    {
+      owner: "human",
+      reason: { kind: "approvals", count: 1 },
+    },
+  );
 });
 
 test("activity counts decisions and groups a Task failure with its over-budget execution", () => {

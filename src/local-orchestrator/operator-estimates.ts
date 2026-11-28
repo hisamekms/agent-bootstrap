@@ -119,6 +119,7 @@ interface TaskTiming {
   lastStage: TrackStage;
   endedAt?: number;
   activeExecution?: TimelineEvent;
+  lastReviewMode?: "review" | "verification";
   failureCode?: string;
   missingEnvironmentRole?: TimelineEvent["missingEnvironmentRole"];
 }
@@ -153,6 +154,8 @@ export function taskTimings(events: readonly TimelineEvent[]) {
           ? "running"
           : undefined;
     if (!stage || stage === "failed" || stage === "cancelled") continue;
+    if (event.mode === "review" || event.mode === "verification")
+      task.lastReviewMode = event.mode;
     task.lastStage = stage;
     task.times[stage] ??= at;
     if (stage === "done") task.endedAt = at;

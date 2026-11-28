@@ -59,7 +59,16 @@ export function restoreFocus(
     ).find(
       (node) => node.dataset.focusKey === key && !node.closest("[hidden]"),
     );
-    (replacement ?? fallback)?.focus({ preventScroll: true });
+    let target = replacement;
+    for (
+      let details = target?.closest("details:not([open])");
+      details;
+      details = details.parentElement?.closest("details:not([open])")
+    ) {
+      const summary = details.querySelector<HTMLElement>(":scope > summary");
+      if (!summary?.contains(target ?? null)) target = summary ?? undefined;
+    }
+    (target ?? fallback)?.focus({ preventScroll: true });
   }
 }
 

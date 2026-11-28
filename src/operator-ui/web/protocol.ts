@@ -32,9 +32,15 @@ import type {
   PanelAnswerResult,
 } from "../../local-orchestrator/proposal-answer.ts";
 
-export type Proposal = NonNullable<
-  Awaited<ReturnType<typeof operatorProposal>>
->;
+type HostProposal = NonNullable<Awaited<ReturnType<typeof operatorProposal>>>;
+type IntegrationProposal = Extract<HostProposal, { kind: "integration" }>;
+export type Proposal =
+  | Exclude<HostProposal, IntegrationProposal>
+  | (Omit<IntegrationProposal, "modelText"> & {
+      modelText: Omit<IntegrationProposal["modelText"], "verdict"> & {
+        verdict: "pass" | "concern";
+      };
+    });
 type Repository = { project: string; repositoryPath: string };
 export type Status = ReturnType<typeof operatorStatus> &
   (Repository | { project?: never; repositoryPath?: never });
@@ -470,7 +476,7 @@ export function isProposal(value: unknown): value is Proposal {
       plainText(value.reviewExecutionId) &&
       value.reviewExecutionId.length > 0 &&
       keys(modelText, ["verdict", "findings"]) &&
-      modelText.verdict === "pass" &&
+      choice(modelText.verdict, ["pass", "concern"]) &&
       (modelText.findings === null ||
         multilineText(modelText.findings) ||
         withheld(modelText.findings))
