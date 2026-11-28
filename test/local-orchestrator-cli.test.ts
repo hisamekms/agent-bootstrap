@@ -107,6 +107,7 @@ test("status reports counts and pending gates, and show and proposals include co
       remote: "origin",
       base: "main",
       autoMerge: "off",
+      mergeMethod: "squash",
     },
     recentTasks: [],
     recentExecutions: [],

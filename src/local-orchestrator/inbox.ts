@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { publishFailure } from "../publish/journal.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import { secretTestCommand, shellWord } from "./secret-test-record.ts";
 import type { OrchestratorStore } from "./store.ts";
@@ -12,6 +13,8 @@ type Kind =
   | "integration"
   | "task-failed"
   | "execution-over-budget"
+  | "pr-merge"
+  | "pr-auto-merge"
   | "secret-test-required"
   | "task-succeeded"
   | "goal-completed"
@@ -19,7 +22,7 @@ type Kind =
 
 export interface InboxRow {
   id: string;
-  kind: Exclude<Kind, "secret-test-required">;
+  kind: Exclude<Kind, "secret-test-required" | "pr-merge" | "pr-auto-merge">;
   at: string;
   goalId: string | null;
   taskId: string | null;
@@ -178,10 +181,50 @@ export function projectInbox(
       state: passed ? "resolved" : "open",
     });
   }
-  // Keep unresolved checks without timestamps visible ahead of dated history.
+  const pullRequests = store
+    .openGoalPullRequests()
+    .flatMap(({ id, ref, title, number, autoMerge, at }): InboxItem[] => {
+      const record = store.goalPublishRecord(id);
+      const failure = publishFailure(record);
+      const actions = store.goalPrActions(id);
+      if (!failure && Object.keys(actions).length === 0) return [];
+      const waiting = !failure && autoMerge !== "off";
+      const checks = record?.pr?.checks ?? "unknown";
+      const next = failure
+        ? `events --subject ${ref}`
+        : waiting
+          ? `set-auto-merge ${ref} off`
+          : actions.merge && (checks === "none" || checks === "passed")
+            ? `merge-goal ${ref}${checks === "none" ? " --no-checks" : ""}`
+            : actions.autoMerge &&
+                store.goalPublishEnabled &&
+                (checks === "pending" || checks === "unknown")
+              ? `set-auto-merge ${ref} ${store.goalPublishConfig.mergeMethod}`
+              : actions.close
+                ? `close-goal-pr ${ref}`
+                : `show ${ref}`;
+      return [
+        {
+          id: `pr-merge:${id}:${number}`,
+          kind: waiting ? "pr-auto-merge" : "pr-merge",
+          weight: "action",
+          state: "open",
+          subject: { goalId: id, ref, goalRef: ref },
+          title: escapeTerminalControls(title),
+          next: `${command} ${next}`,
+          at,
+        },
+      ];
+    });
+  const unresolvedAction = ({ weight, state }: InboxItem) =>
+    weight === "action" && state !== "resolved";
+  // Keep automatic waits and history behind decisions that still need action.
   const combined = [
-    ...checks.filter(({ state }) => state !== "resolved"),
-    ...items,
+    ...checks.filter(unresolvedAction),
+    ...pullRequests.filter(({ kind }) => kind === "pr-merge"),
+    ...items.filter(unresolvedAction),
+    ...pullRequests.filter(({ kind }) => kind === "pr-auto-merge"),
+    ...items.filter((item) => !unresolvedAction(item)),
     ...checks.filter(({ state }) => state === "resolved"),
   ];
   const bounded = limit < 0 ? combined : combined.slice(0, limit);

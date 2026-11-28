@@ -129,6 +129,18 @@ export function operatorStatus(store: OrchestratorStore) {
 
 export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
   return items.map((item) => {
+    if (item.kind === "pr-merge" || item.kind === "pr-auto-merge") {
+      const goal = item.subject.goalId && store.getGoal(item.subject.goalId);
+      const record = goal ? store.goalPublishRecord(goal.id) : null;
+      if (goal && record?.pr?.state === "open")
+        return {
+          ...item,
+          pullRequest: {
+            publish: goalPublishView(store, goal),
+            actions: store.goalPrActions(goal.id),
+          },
+        };
+    }
     const id = item.subject.proposalId;
     if (!id || item.weight !== "action" || item.state === "resolved")
       return item;
@@ -534,33 +546,38 @@ export function operatorGoalTurn(
   } = facts;
   const record = store.goalPublishRecord(goal.id);
   const pr = record?.pr;
-  if (goal.status === "cancelled" && !record?.disarmFailure)
-    return { owner: "stopped", reason: { kind: "cancelled" } } as const;
-  if (pr?.state === "merged")
-    return {
-      owner: goal.status === "done" ? "done" : "stopped",
-      reason: { kind: "merged", prNumber: pr.number },
-    } as const;
   const failure = publishFailure(record);
   if (failure)
     return {
       owner: "stopped",
       reason: { kind: "publish-failed", code: failure },
     } as const;
-  if (pr?.state === "closed")
+  if (goal.status === "cancelled")
+    return { owner: "stopped", reason: { kind: "cancelled" } } as const;
+  if (pr?.state === "merged")
     return {
-      owner: "stopped",
-      reason: { kind: "pr-closed", prNumber: pr.number },
+      owner: goal.status === "done" ? "done" : "stopped",
+      reason: { kind: "merged", prNumber: pr.number },
     } as const;
-  if (pr)
+  if (pr?.state === "open") {
+    const waiting =
+      record?.prActionOutcome === "unknown" || pr.autoMerge !== "off";
+    const canAct =
+      !waiting && Object.keys(store.goalPrActions(goal.id)).length > 0;
     return {
-      owner: "human",
+      owner: waiting ? "ai" : canAct ? "human" : "stopped",
       reason: {
         kind: "pr-open",
         prNumber: pr.number,
         checks: pr.checks ?? null,
-        autoMerge: store.goalAutoMerge(goal.id).method,
+        autoMerge: pr.autoMerge,
       },
+    } as const;
+  }
+  if (pr?.state === "closed")
+    return {
+      owner: "stopped",
+      reason: { kind: "pr-closed", prNumber: pr.number },
     } as const;
   if (approvals > 0)
     return {
@@ -612,6 +629,16 @@ export function operatorGoalTurn(
   return { owner: "idle", reason: { kind: "idle" } } as const;
 }
 
+function goalPublishView(store: OrchestratorStore, goal: Goal) {
+  return publishView(
+    store.goalPublishConfig,
+    remoteGoalBranch(goal),
+    store.goalPublishRecord(goal.id),
+    store.goalAutoMerge(goal.id),
+    store.goalIntegrationHead(goal.id) ?? goal.baseCommit,
+  );
+}
+
 function goalSummary(
   store: OrchestratorStore,
   goal: Goal,
@@ -627,13 +654,7 @@ function goalSummary(
     status,
     createdAt,
     turn: operatorGoalTurn(store, goal, facts),
-    publish: publishView(
-      store.goalPublishEnabled,
-      remoteGoalBranch(goal),
-      store.goalPublishRecord(id),
-      store.goalAutoMerge(id),
-      store.goalIntegrationHead(id) ?? goal.baseCommit,
-    ),
+    publish: goalPublishView(store, goal),
     progress,
     estimate:
       status === "active"
@@ -754,6 +775,7 @@ export function operatorGoal(store: OrchestratorStore, key: string) {
     ...summary,
     ...(canPublish && expectedHead && { publishPreview: { expectedHead } }),
     ...(pr && { prState: pr.state }),
+    ...(pr?.state === "open" && { prActions: store.goalPrActions(id) }),
     ...(mergeCompletion && { mergeCompletion }),
     description,
     acceptance,
@@ -814,10 +836,13 @@ export function operatorTask(store: OrchestratorStore, key: string) {
     origin?.kind === "actor" && origin.actor === "Planner"
       ? category
       : undefined;
+  const goal = store.getGoal(goalId)!;
+  const pr = store.goalPublishRecord(goalId)?.pr;
   return {
     ...taskSummary(task, context),
     goalId,
-    goalRef: store.getGoal(goalId)!.ref,
+    goalRef: goal.ref,
+    ...(pr && { pullRequest: { prNumber: pr.number, prUrl: pr.url } }),
     description,
     acceptance,
     actor,

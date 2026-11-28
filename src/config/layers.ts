@@ -1,5 +1,6 @@
 import {
   autoMergeMethods,
+  mergeMethods,
   validPublishRef,
   validPublishRemote,
   type PublishConfig,
@@ -702,6 +703,7 @@ export function parseConfig(
       "remote",
       "base",
       "autoMerge",
+      "mergeMethod",
     ]);
     if (Object.hasOwn(publish, "enabled")) {
       if (layer !== "local")
@@ -722,6 +724,11 @@ export function parseConfig(
         "Expected off, squash, merge or rebase.",
         next,
       );
+    if (
+      Object.hasOwn(publish, "mergeMethod") &&
+      !mergeMethods.some((method) => method === publish.mergeMethod)
+    )
+      invalid("publish.mergeMethod", "Expected squash, merge or rebase.", next);
   }
   if ("environment" in raw) {
     const environment = record(raw.environment, "environment", next, [

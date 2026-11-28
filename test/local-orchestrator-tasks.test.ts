@@ -107,6 +107,7 @@ const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
       run(...args: string[]): void;
     };
     close(): void;
+    [Symbol.dispose](): void;
   };
 };
 
@@ -4794,7 +4795,9 @@ for (const scenario of [
   );
 }
 
-function fakePublishRemote() {
+function fakePublishRemote(
+  initialChecks: NonNullable<PublishPullRequest["checks"]> = "pending",
+) {
   const calls: string[] = [];
   const mutations: string[] = [];
   const files: Array<{ title: string; body: string }> = [];
@@ -4872,9 +4875,20 @@ function fakePublishRemote() {
         head: remoteHead,
         state: "open",
         autoMerge: "off",
-        checks: "pending",
+        checks: initialChecks,
       };
       if (controls.loseCreateReply) throw new PublishError("publish-pr-failed");
+    },
+    async mergePullRequest(_destination, number, method, head) {
+      assert.equal(controls.pr?.number, number);
+      assert.equal(controls.pr?.head, head);
+      mutations.push(`merge-pr ${method}`);
+      controls.pr = { ...controls.pr!, state: "merged", autoMerge: "off" };
+    },
+    async closePullRequest(_destination, number) {
+      assert.equal(controls.pr?.number, number);
+      mutations.push("close-pr");
+      controls.pr = { ...controls.pr!, state: "closed", autoMerge: "off" };
     },
     async setAutoMerge(_destination, _number, method, head) {
       calls.push("auto-merge");
@@ -4961,6 +4975,576 @@ function publishAudit(db: InstanceType<typeof Database>) {
     )
     .all();
 }
+
+test(
+  "Workplace PR operations audit first, pin a fresh PR head and preserve the Goal lifecycle",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-actions-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true, mergeMethod: "rebase" },
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    const source = { store, target: f.repoRoot };
+    const detail = async () =>
+      (await readOperatorGoal(store, f.directory, f.goalId))!;
+    const assertTurn = async (kind: string, count: number, owner: string) => {
+      assert.deepEqual(
+        projectInbox(source)
+          .map((row) => row.kind)
+          .filter((kind) => kind.startsWith("pr-")),
+        [kind],
+      );
+      assert.equal(operatorActivity(source).yourTurn, count);
+      assert.equal((await detail()).turn.owner, owner);
+    };
+    const initialCount = operatorActivity(source).yourTurn;
+    assert.ok(initialCount > 0);
+    await assertTurn("pr-merge", initialCount, "human");
+    assert.match(
+      projectInbox(source).find(({ kind }) => kind === "pr-merge")!.next,
+      / set-auto-merge G1 rebase$/,
+    );
+    remote.controls.pr = {
+      ...remote.controls.pr!,
+      checks: "passed",
+      checkRuns: [{ name: "test", state: "pass" }],
+      mergeable: "clean",
+      review: "approved",
+      additions: 6,
+      deletions: 1,
+      changedFiles: 2,
+    };
+    await publisher.tick(Date.now() + 100_000);
+    const open = await detail();
+    assert.partialDeepStrictEqual(open.publish, {
+      checks: "passed",
+      checkRuns: [{ name: "test", state: "pass" }],
+      mergeable: "clean",
+      review: "approved",
+      additions: 6,
+      deletions: 1,
+      changedFiles: 2,
+      mergeMethod: "rebase",
+    });
+    assert.deepEqual(operatorTask(store, open.tasks[0]!.id)?.pullRequest, {
+      prNumber: 12,
+      prUrl: open.publish.prUrl,
+    });
+    const { id } = open;
+    assert.partialDeepStrictEqual(
+      await goalPublishAction(store, publisher, "goal.setAutoMerge", {
+        id,
+        method: "merge",
+        confirm: open.autoMergeConfirmations.merge,
+      }),
+      { result: { autoMerge: "merge" } },
+    );
+    await publisher.tick(Date.now() + 200_000);
+    await assertTurn("pr-auto-merge", initialCount - 1, "ai");
+    const armed = await detail();
+    assert.partialDeepStrictEqual(
+      await goalPublishAction(store, publisher, "goal.setAutoMerge", {
+        id,
+        method: "off",
+        confirm: armed.autoMergeConfirmations.off,
+      }),
+      { result: { autoMerge: "off" } },
+    );
+    await publisher.tick(Date.now() + 300_000);
+    await assertTurn("pr-merge", initialCount, "human");
+
+    const params = {
+      id,
+      method: "rebase",
+      confirm: open.prActions!.merge!.rebase,
+    } as const;
+    const merge = () =>
+      goalPublishAction(store, publisher, "goal.merge", params);
+    const close = () =>
+      goalPublishAction(store, publisher, "goal.closePr", {
+        id,
+        confirm: open.prActions!.close,
+      });
+    const mutations = [...remote.mutations];
+    await assert.rejects(
+      publisher.actOnPullRequest(
+        id,
+        "rebase",
+        params.confirm,
+        "agent" as never,
+      ),
+      {
+        code: "approval-forbidden",
+      },
+    );
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.merge", {
+        ...params,
+        actor: "Reviewer",
+      }),
+      { error: { code: "invalid-params" } },
+    );
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.merge", {
+        ...params,
+        method: "squash",
+      }),
+      { error: { code: "stale-confirmation" } },
+    );
+    const saved = remote.controls.pr!;
+    remote.controls.overrideReadHead = "a".repeat(40);
+    assert.deepEqual(await merge(), {
+      error: { code: "publish-remote-head-changed" },
+    });
+    assert.deepEqual(await close(), {
+      error: { code: "publish-remote-head-changed" },
+    });
+    delete remote.controls.overrideReadHead;
+    remote.controls.pr = { ...saved, state: "closed" };
+    assert.deepEqual(await merge(), { error: { code: "invalid-transition" } });
+    for (const [changed, code] of [
+      [{ checks: "failed" }, "publish-checks-failed"],
+      [{ checks: "pending" }, "publish-checks-pending"],
+      [{ checks: "unknown" }, "publish-checks-unknown"],
+      [{ mergeable: "conflict" }, "publish-not-mergeable"],
+      [{ mergeable: "blocked" }, "publish-not-mergeable"],
+      [{ checks: "none" }, "stale-confirmation"],
+    ] as const) {
+      remote.controls.pr = { ...saved, ...changed };
+      assert.deepEqual(await merge(), { error: { code } });
+    }
+    const { checks: _checks, ...missingChecks } = saved;
+    remote.controls.pr = missingChecks;
+    assert.deepEqual(await merge(), {
+      error: { code: "publish-checks-unknown" },
+    });
+    remote.controls.pr = saved;
+    assert.deepEqual(remote.mutations, mutations);
+
+    const db = new Database(state.filename);
+    try {
+      db.exec(`CREATE TRIGGER fail_pr_authorization BEFORE INSERT ON goal_publish_audit
+        WHEN NEW.kind = 'publish.authorized' BEGIN SELECT RAISE(ABORT, 'fixture'); END`);
+      for (const [operation, confirm] of [
+        ["rebase", params.confirm],
+        ["close", open.prActions!.close!],
+      ] as const) {
+        using blocked = openTestStore(state.filename);
+        const blockedPublisher = new GoalPublisher(
+          blocked.store,
+          f.directory,
+          f.repoRoot,
+          remote.provider,
+        );
+        await assert.rejects(
+          blockedPublisher.actOnPullRequest(
+            id,
+            operation,
+            confirm,
+            "operator-ui",
+          ),
+          {
+            code: "publish-audit-failed",
+          },
+        );
+      }
+      assert.deepEqual(remote.mutations, mutations);
+      db.exec("DROP TRIGGER fail_pr_authorization");
+      assert.partialDeepStrictEqual(await close(), {
+        result: { state: "closed" },
+      });
+      assert.deepEqual((await detail()).turn, {
+        owner: "stopped",
+        reason: { kind: "pr-closed", prNumber: 12 },
+      });
+      assert.equal(remote.mutations.at(-1), "close-pr");
+      assert.deepEqual(await merge(), {
+        error: { code: "invalid-transition" },
+      });
+
+      await publisher.publish(id, f.integratedHead, {
+        number: 12,
+        state: "closed",
+      });
+      assert.deepEqual(await merge(), {
+        error: { code: "stale-confirmation" },
+      });
+      remote.controls.pr = { ...remote.controls.pr!, checks: "passed" };
+      await publisher.tick(Date.now() + 400_000);
+      const reopened = await detail();
+      assert.partialDeepStrictEqual(
+        await goalPublishAction(store, publisher, "goal.merge", {
+          ...params,
+          confirm: reopened.prActions!.merge!.rebase,
+        }),
+        { result: { state: "merged" } },
+      );
+      assert.equal(store.getGoal(id)?.status, "done");
+      assert.equal(remote.mutations.at(-1), "merge-pr rebase");
+      assert.deepEqual(
+        publishAudit(db)
+          .slice(-2)
+          .map(({ kind }) => kind),
+        ["publish.authorized", "publish.pr-merged"],
+      );
+      assert.partialDeepStrictEqual(JSON.parse(publishAudit(db).at(-2)!.data), {
+        origin: "operator-ui",
+        step: "merge-pr",
+        method: "rebase",
+        prNumber: 13,
+        head: f.integratedHead,
+      });
+      assert.ok(
+        !projectInbox(source).some(({ kind }) => kind.startsWith("pr-")),
+      );
+    } finally {
+      db.close();
+    }
+  },
+);
+
+test(
+  "manual PR mutations audit provider failures and let polling settle unreadable results",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-outcomes-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote("passed");
+    let rejectMutation = true;
+    let rejectNextRead = false;
+    const provider: PublishProvider = {
+      ...remote.provider,
+      async readPullRequest(...args) {
+        if (rejectNextRead) {
+          rejectNextRead = false;
+          throw new PublishError("publish-pr-failed");
+        }
+        return remote.provider.readPullRequest(...args);
+      },
+      async closePullRequest(destination, number) {
+        if (rejectMutation) throw new Error("fixture close failure");
+        await remote.provider.closePullRequest(destination, number);
+        remote.controls.rejectPoll = true;
+      },
+      async mergePullRequest(destination, number, method, head) {
+        if (rejectMutation) throw new Error("fixture merge failure");
+        await remote.provider.mergePullRequest(
+          destination,
+          number,
+          method,
+          head,
+        );
+        remote.controls.rejectPoll = true;
+      },
+    };
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      provider,
+      {
+        enabled: true,
+      },
+    );
+    using db = new Database(state.filename);
+    await publisher.publish(f.goalId, f.integratedHead);
+    const source = { store, target: f.repoRoot };
+    for (const operation of ["close", "squash"] as const) {
+      const { close, merge } = store.goalPrActions(f.goalId);
+      const act = () =>
+        publisher.actOnPullRequest(
+          f.goalId,
+          operation,
+          (operation === "close" ? close : merge?.squash)!,
+          "cli",
+        );
+      const code =
+        operation === "close" ? "publish-close-failed" : "publish-merge-failed";
+      await assert.rejects(act(), { code });
+      const [authorization, failure] = publishAudit(db).slice(-2);
+      assert.equal(authorization?.kind, "publish.authorized");
+      assert.equal(failure?.kind, "publish.failed");
+      const warning = store.goalPublishRecord(f.goalId)?.prActionFailure;
+      assert.equal(warning?.code, code);
+      assert.ok(Number.isFinite(Date.parse(warning.at)));
+      assert.partialDeepStrictEqual(JSON.parse(failure!.data), {
+        code,
+        record: { prActionFailure: warning, pr: { state: "open" } },
+      });
+      assert.equal(store.goalPublishRecord(f.goalId)?.failure, undefined);
+      assert.partialDeepStrictEqual(
+        await readOperatorGoal(store, f.directory, f.goalId),
+        {
+          publish: { state: "pr-open", prActionFailure: warning },
+          turn: { owner: "human", reason: { kind: "pr-open" } },
+          prActions: { merge, close },
+        },
+      );
+      assert.ok(projectInbox(source).some(({ kind }) => kind === "pr-merge"));
+      if (operation === "close") {
+        const setMethod = (method: "off" | "rebase") =>
+          store.setGoalAutoMerge(
+            f.goalId,
+            method,
+            store.goalAutoMergeConfirmations(f.goalId)[method],
+            "cli",
+          );
+        setMethod("rebase");
+        remote.controls.pr = { ...remote.controls.pr!, checks: "unknown" };
+        rejectNextRead = true;
+        const auditStart = publishAudit(db).length;
+        const now = Date.now();
+        await publisher.tick(now);
+        assert.equal(remote.mutations.at(-1), "auto-merge rebase");
+        assert.deepEqual(
+          publishAudit(db)
+            .slice(auditStart)
+            .map(({ kind }) => kind),
+          [
+            "publish.failed",
+            "publish.polled",
+            "publish.authorized",
+            "publish.auto-merge-set",
+          ],
+        );
+        assert.equal(
+          store.goalPublishRecord(f.goalId)?.prActionFailure,
+          undefined,
+        );
+        setMethod("off");
+        await publisher.tick(now + 120_000);
+        assert.equal(remote.mutations.at(-1), "auto-merge off");
+      } else {
+        await publisher.tick(Date.now() + 60_000);
+        assert.equal(
+          store.goalPublishRecord(f.goalId)?.prActionFailure,
+          undefined,
+        );
+        await assert.rejects(act(), { code });
+      }
+      rejectMutation = false;
+      const result = await act();
+      assert.equal(result.state, "pr-open");
+      assert.equal(result.prActionOutcome, "unknown");
+      assert.equal(result.goalCompleted, undefined);
+      assert.equal(result.failure, undefined);
+      assert.equal(result.prActionFailure, undefined);
+      assert.equal(publishAudit(db).at(-1)?.kind, "publish.polled");
+      assert.equal(
+        JSON.parse(publishAudit(db).at(-1)!.data).outcome,
+        "unknown",
+      );
+      assert.deepEqual(store.goalPrActions(f.goalId), {});
+      assert.ok(
+        !projectInbox({ store, target: f.repoRoot }).some(({ kind }) =>
+          kind.startsWith("pr-"),
+        ),
+      );
+      await publisher.tick(Date.now());
+      assert.equal(
+        store.goalPublishRecord(f.goalId)?.prActionOutcome,
+        "unknown",
+      );
+      assert.equal(publishAudit(db).at(-1)?.kind, "publish.polled");
+      remote.controls.rejectPoll = false;
+      await publisher.tick(Date.now() + 10_000);
+      assert.equal(
+        store.goalPublishRecord(f.goalId)?.prActionOutcome,
+        undefined,
+      );
+      assert.equal(
+        store.goalPublishRecord(f.goalId)?.pr?.state,
+        operation === "close" ? "closed" : "merged",
+      );
+      if (operation === "close") {
+        assert.equal(store.getGoal(f.goalId)?.status, "active");
+        await publisher.publish(f.goalId, f.integratedHead);
+        rejectMutation = true;
+      }
+    }
+    assert.equal(store.getGoal(f.goalId)?.status, "done");
+  },
+);
+
+test(
+  "queueing a manual PR merge keeps the Goal active until polling observes the merge",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-queue-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote("passed");
+    let queued = false;
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      {
+        ...remote.provider,
+        async mergePullRequest() {
+          queued = true;
+        },
+      },
+      { enabled: true },
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    const result = await publisher.actOnPullRequest(
+      f.goalId,
+      "squash",
+      store.goalPrActions(f.goalId).merge!.squash,
+      "cli",
+    );
+    assert.equal(queued, true);
+    assert.equal(result.state, "pr-open");
+    assert.equal(result.goalCompleted, undefined);
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
+    remote.controls.pr = { ...remote.controls.pr!, state: "merged" };
+    await publisher.tick(Date.now() + 10_000);
+    assert.equal(store.getGoal(f.goalId)?.status, "done");
+  },
+);
+
+test(
+  "manual PR merge racing the poller completes the Goal once",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-race-");
+    using reopened = openTestStore(state.filename);
+    using db = new Database(state.filename);
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote("passed");
+    const inMerge = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const manual = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      {
+        ...remote.provider,
+        async mergePullRequest(...args) {
+          await remote.provider.mergePullRequest(...args);
+          inMerge.resolve();
+          await release.promise;
+        },
+      },
+      { enabled: true },
+    );
+    await manual.publish(f.goalId, f.integratedHead);
+    const poller = new GoalPublisher(
+      reopened.store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: false },
+    );
+    const merge = manual.actOnPullRequest(
+      f.goalId,
+      "squash",
+      store.goalPrActions(f.goalId).merge!.squash,
+      "cli",
+    );
+    try {
+      await Promise.race([
+        inMerge.promise,
+        merge.then(() => assert.fail("merge did not pause")),
+      ]);
+      await poller.tick(Date.now());
+      assert.equal(remote.controls.pr?.state, "merged");
+      assert.equal(store.getGoal(f.goalId)?.status, "active");
+      release.resolve();
+      assert.equal((await merge).goalCompleted, true);
+      await poller.tick(Date.now() + 10_000);
+      assert.equal(
+        publishAudit(db).filter(({ kind }) => kind === "publish.pr-merged")
+          .length,
+        1,
+      );
+      assert.equal(
+        store
+          .listEvents({ subjectId: f.goalId, limit: 50 })
+          .filter(
+            ({ kind, data }) =>
+              kind === "goal.status" &&
+              (data as { status?: string }).status === "done",
+          ).length,
+        1,
+      );
+    } finally {
+      release.resolve();
+      await merge;
+    }
+  },
+);
+
+test(
+  "Workplace PR operations refuse a cancelled Goal with an open PR",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-cancel-");
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote("passed");
+    let cancelDuringRead = false;
+    const publisher = new GoalPublisher(
+      state.store,
+      f.directory,
+      f.repoRoot,
+      {
+        ...remote.provider,
+        async readPullRequest(...args) {
+          const pr = await remote.provider.readPullRequest(...args);
+          if (cancelDuringRead)
+            await state.store.discardGoal(
+              f.goalId,
+              f.integratedHead,
+              async () => {},
+            );
+          return pr;
+        },
+      },
+      { enabled: true },
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    const actions = state.store.goalPrActions(f.goalId);
+    cancelDuringRead = true;
+    using db = new Database(state.filename);
+    const before = publishAudit(db);
+    await assert.rejects(
+      publisher.actOnPullRequest(
+        f.goalId,
+        "squash",
+        actions.merge!.squash,
+        "cli",
+      ),
+      { code: "publish-not-ready" },
+    );
+    assert.equal(state.store.getGoal(f.goalId)?.status, "cancelled");
+    assert.deepEqual(publishAudit(db), before);
+    await assert.rejects(
+      publisher.actOnPullRequest(
+        f.goalId,
+        "squash",
+        actions.merge!.squash,
+        "cli",
+      ),
+      { code: "invalid-transition" },
+    );
+    await assert.rejects(
+      publisher.actOnPullRequest(f.goalId, "close", actions.close!, "cli"),
+      { code: "invalid-transition" },
+    );
+    assert.equal(remote.controls.pr?.state, "open");
+  },
+);
 
 test(
   "Goal stays active through pending, push and PR closure, and can be published again or discarded",
@@ -5496,7 +6080,7 @@ test(
           autoMergeSource: "project",
         },
         turn: {
-          owner: "human",
+          owner: "ai",
           reason: {
             kind: "pr-open",
             checks: "pending",
@@ -5515,6 +6099,7 @@ test(
     );
     const beforeIntegration = store.goalAutoMergeConfirmations(f.goalId).off;
     const second = await integrateNext(state, f);
+    assert.equal(store.goalPrActions(f.goalId).merge, undefined);
     assert.throws(
       () => store.setGoalAutoMerge(f.goalId, "off", beforeIntegration, "cli"),
       {
@@ -5534,6 +6119,21 @@ test(
       `push ${second}:${branch}`,
     ]);
     assert.equal(store.goalExported(f.goalId)?.head, second);
+    assert.equal(store.goalPrActions(f.goalId).merge, undefined);
+    remote.controls.pr = { ...remote.controls.pr!, checks: "passed" };
+    store.recordGoalPublish(f.goalId, "publish.polled", {
+      ...store.goalPublishRecord(f.goalId)!,
+      pr: remote.controls.pr,
+    });
+    await assert.rejects(
+      publisher.actOnPullRequest(
+        f.goalId,
+        "squash",
+        `merge-goal G1 #12 ${second} squash checks=passed`,
+        "cli",
+      ),
+      { code: "publish-not-ready" },
+    );
 
     assert.equal(remote.controls.pr?.autoMerge, "off");
     await publisher.tick(3);
@@ -5577,7 +6177,7 @@ test(
       {
         publish: { checks: "failed" },
         turn: {
-          owner: "human",
+          owner: "ai",
           reason: {
             kind: "pr-open",
             checks: "failed",
@@ -5871,16 +6471,19 @@ test(
   async () => {
     using state = orchestratorFixture("lo-publish-");
     const f = await integratedGoal(state);
-    const remote = fakePublishRemote();
+    const remote = fakePublishRemote("passed");
     const env = configEnv(state.root);
     writePrivateConfig(
       join(projectConfigDirectory("source", env), "local.json"),
       configRoot(env),
       {
         version: 1,
-        publish: { enabled: true },
+        publish: { enabled: true, mergeMethod: "rebase" },
       },
     );
+    const output: string[] = [];
+    const errors: string[] = [];
+    const queued: string[] = [];
     const run = (
       args: string[],
       isTTY: boolean,
@@ -5890,19 +6493,39 @@ test(
         ["--db", state.filename, "--target", f.repoRoot, ...args],
         {
           stdin: new PassThrough(),
-          stdout: { write() {} },
-          stderr: { write() {} },
+          stdout: { write: (text) => output.push(text) },
+          stderr: { write: (text) => errors.push(text) },
           isTTY,
           prompt,
         },
         state.root,
         env,
-        () => remote.provider,
+        () => ({
+          ...remote.provider,
+          async mergePullRequest(_destination, _number, method) {
+            queued.push(method);
+          },
+        }),
       );
+    for (const flags of [
+      ["--method"],
+      ["--method", "ff-only"],
+      ["--method", "merge", "--method", "squash"],
+      ["--no-checks", "--no-checks"],
+    ]) {
+      assert.equal(
+        await run(["merge-goal", "G1", ...flags], true, () => {
+          throw new Error("unexpected prompt");
+        }),
+        2,
+      );
+    }
     for (const args of [
       ["publish-goal", "G1"],
       ["set-auto-merge", "G1", "rebase"],
       ["complete-goal", "G1"],
+      ["merge-goal", "G1", "--method", "merge"],
+      ["close-goal-pr", "G1"],
     ]) {
       assert.equal(
         await run(args, false, () => {
@@ -5922,7 +6545,69 @@ test(
     );
     assert.equal(await run(["publish-goal", "G1"], true, answer), 0);
     assert.equal(remote.mutations.at(-1), "auto-merge rebase");
+    assert.equal(
+      await run(["close-goal-pr", "G1"], true, (message) => {
+        assert.equal(
+          answer(message),
+          `close-goal-pr G1 #12 ${f.integratedHead}`,
+        );
+        return answer(message);
+      }),
+      0,
+    );
+    assert.equal(remote.mutations.at(-1), "close-pr");
+    assert.equal(await run(["publish-goal", "G1"], true, answer), 0);
+    assert.equal(
+      await run(["merge-goal", "G1"], true, (message) => {
+        assert.equal(
+          answer(message),
+          `merge-goal G1 #13 ${f.integratedHead} rebase checks=passed`,
+        );
+        return "yes";
+      }),
+      1,
+    );
+    remote.controls.pr = { ...remote.controls.pr!, checks: "none" };
     const record = state.store.goalPublishRecord(f.goalId)!;
+    state.store.recordGoalPublish(f.goalId, "publish.polled", {
+      ...record,
+      pr: remote.controls.pr,
+    });
+    const answerWithCheckPreview = (message: string) => {
+      assert.equal(JSON.parse(output.at(-1)!).checks, "none");
+      assert.match(answer(message), / checks=none$/);
+      return answer(message);
+    };
+    assert.equal(
+      await run(["merge-goal", "G1"], true, answerWithCheckPreview),
+      1,
+    );
+    assert.match(errors.at(-1)!, /publish-no-checks/);
+    const noChecks = remote.controls.pr;
+    for (const [checks, code] of [
+      ["pending", "publish-checks-pending"],
+      ["passed", "stale-confirmation"],
+    ] as const) {
+      assert.equal(
+        await run(["merge-goal", "G1", "--no-checks"], true, (message) => {
+          remote.controls.pr = { ...noChecks, checks };
+          return answerWithCheckPreview(message);
+        }),
+        1,
+      );
+      assert.ok(errors.at(-1)!.includes(code));
+    }
+    remote.controls.pr = noChecks;
+    assert.deepEqual(queued, []);
+    assert.equal(
+      await run(
+        ["merge-goal", "G1", "--no-checks", "--method", "merge"],
+        true,
+        answerWithCheckPreview,
+      ),
+      0,
+    );
+    assert.deepEqual(queued, ["merge"]);
     const mergedHead = "a".repeat(40);
     state.store.recordGoalPublish(f.goalId, "publish.polled", {
       ...record,
@@ -5932,7 +6617,7 @@ test(
     assert.equal(state.store.getGoal(f.goalId)?.status, "active");
     assert.equal(
       await run(["complete-goal", "G1"], true, (message) => {
-        assert.equal(answer(message), `complete-goal G1 #12 ${mergedHead}`);
+        assert.equal(answer(message), `complete-goal G1 #13 ${mergedHead}`);
         return answer(message);
       }),
       0,
@@ -5959,10 +6644,19 @@ test(
     await assert.rejects(publisher.publish(f.goalId, f.integratedHead), {
       code: "publish-remote-head-changed",
     });
-    assert.equal(
-      (await readOperatorGoal(state.store, f.directory, f.goalId))?.turn.reason
-        .kind,
-      "publish-failed",
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(state.store, f.directory, f.goalId),
+      {
+        publish: { failure: "publish-remote-head-changed" },
+        turn: {
+          owner: "stopped",
+          reason: {
+            kind: "publish-failed",
+            code: "publish-remote-head-changed",
+          },
+        },
+        prActions: {},
+      },
     );
     delete remote.controls.overrideReadHead;
     assert.equal(
@@ -5981,6 +6675,7 @@ test(
       {
         publish: { failure: "publish-remote-head-changed" },
         turn: {
+          owner: "stopped",
           reason: {
             kind: "publish-failed",
             code: "publish-remote-head-changed",
@@ -5990,6 +6685,7 @@ test(
     );
     assert.equal(remote.mutations.length, 2);
     delete remote.controls.overrideReadHead;
+    await publisher.tick(Date.now() + 100_000);
     const confirm = state.store.goalAutoMergeConfirmations(f.goalId).rebase;
     state.store.setGoalAutoMerge(f.goalId, "rebase", confirm, "cli");
     remote.controls.loseAutoMergeReply = true;
@@ -6266,6 +6962,116 @@ for (const reason of ["goal-cancelled", "remote-head-changed"] as const) {
 }
 
 test(
+  "foreign armed PR with a failed disarm counts as an operator decision",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-foreign-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      {
+        enabled: true,
+        autoMerge: "squash",
+      },
+    );
+    store.setGoalAutoMerge(
+      f.goalId,
+      "squash",
+      store.goalAutoMergeConfirmations(f.goalId).squash,
+      "cli",
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    const source = { store, target: f.repoRoot };
+    const initialCount = operatorActivity(source).yourTurn;
+    assert.equal(
+      projectInbox(source).find(({ kind }) => kind.startsWith("pr-"))?.kind,
+      "pr-auto-merge",
+    );
+    remote.foreignPush("a".repeat(40));
+    remote.controls.rejectDisarm = true;
+    await publisher.tick(Date.now() + 10000);
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, f.goalId),
+      {
+        publish: {
+          state: "failed",
+          failure: "auto-merge-disarm-failed",
+          autoMergeEnabled: "squash",
+        },
+        turn: {
+          owner: "stopped",
+          reason: { kind: "publish-failed", code: "auto-merge-disarm-failed" },
+        },
+      },
+    );
+    const row = projectInbox(source).find(({ kind }) => kind.startsWith("pr-"));
+    assert.equal(row?.kind, "pr-merge");
+    assert.match(row.next, / events --subject G1$/);
+    assert.equal(operatorActivity(source).yourTurn, initialCount + 1);
+    assert.equal(store.goalPrActions(f.goalId).merge, undefined);
+  },
+);
+
+test(
+  "explicit Goal setting still disarms an open PR with publishing opted out",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-pr-setting-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const enabled = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true },
+    );
+    store.setGoalAutoMerge(
+      f.goalId,
+      "squash",
+      store.goalAutoMergeConfirmations(f.goalId).squash,
+      "cli",
+    );
+    await enabled.publish(f.goalId, f.integratedHead);
+    await enabled.stop();
+    assert.equal(remote.controls.pr?.autoMerge, "squash");
+    const disabled = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: false },
+    );
+    const now = Date.now();
+    await disabled.tick(now);
+    assert.equal(store.goalPublishOptIn(false), null);
+    assert.equal(remote.controls.pr?.autoMerge, "squash");
+    const start = remote.mutations.length;
+    store.setGoalAutoMerge(
+      f.goalId,
+      "off",
+      store.goalAutoMergeConfirmations(f.goalId).off,
+      "operator-ui",
+    );
+    await disabled.tick(now + 1);
+    assert.deepEqual(remote.mutations.slice(start), ["auto-merge off"]);
+    assert.equal(store.goalPublishRecord(f.goalId)?.pr?.autoMerge, "off");
+    using db = new Database(state.filename);
+    const [authorization, outcome] = publishAudit(db).slice(-2);
+    assert.equal(authorization?.kind, "publish.authorized");
+    assert.equal(JSON.parse(authorization!.data).reason, "setting-change");
+    assert.equal(outcome?.kind, "publish.auto-merge-set");
+    assert.equal(JSON.parse(outcome!.data).reason, "setting-change");
+  },
+);
+
+test(
   "discard disarms after opt-out and exposes retry failures with backoff",
   gitTestOptions,
   async () => {
@@ -6483,20 +7289,32 @@ test(
       { enabled: true },
     );
     await publisher.publish(f.goalId, f.integratedHead);
+    remote.controls.pr = {
+      ...remote.controls.pr!,
+      checkRuns: [{ name: "build", state: "pending" }],
+      checkCounts: { pass: 0, pending: 1, fail: 0 },
+      mergeable: "clean",
+    };
     const db = new Database(state.filename);
     try {
       const now = Date.now() + 3_700_000;
+      await publisher.tick(now - 600_000);
       const revision = state.store.activityRevision();
       const audit = publishAudit(db);
       await publisher.tick(now);
-      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 1);
+      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 2);
       assert.deepEqual(publishAudit(db), audit);
       assert.equal(state.store.activityRevision(), revision);
-      remote.controls.pr = { ...remote.controls.pr!, checks: "passed" };
+      remote.controls.pr = {
+        ...remote.controls.pr!,
+        checks: "passed",
+        checkRuns: [{ name: "build", state: "pass" }],
+        checkCounts: { pass: 1, pending: 0, fail: 0 },
+      };
       await publisher.tick(now + 599_999);
-      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 1);
-      await publisher.tick(now + 600_000);
       assert.equal(remote.calls.filter((call) => call === "read-pr").length, 2);
+      await publisher.tick(now + 600_000);
+      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 3);
       assert.deepEqual(
         publishAudit(db)
           .slice(audit.length)
@@ -6507,7 +7325,7 @@ test(
       remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
       await publisher.tick(now + 1_200_000);
       await publisher.tick(now + 1_800_000);
-      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 3);
+      assert.equal(remote.calls.filter((call) => call === "read-pr").length, 4);
     } finally {
       db.close();
     }

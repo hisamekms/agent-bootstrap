@@ -496,7 +496,7 @@ async function launchConcierge(
       store,
       directory,
       repoRoot,
-      githubGh(repoRoot, target.env),
+      githubGh(repoRoot, target.env, undefined, scan),
       effective.config.publish,
       scan,
     );

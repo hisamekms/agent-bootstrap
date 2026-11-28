@@ -23,13 +23,18 @@ import {
 } from "./journal.ts";
 import {
   publishDefaults,
+  mergeMethods,
+  type MergeMethod,
   PublishError,
   type AutoMerge,
   type PublishConfig,
   type PublishProvider,
   type PublishPullRequest,
 } from "./port.ts";
-import type { GoalPublishConfirmationPr } from "./protocol.ts";
+import {
+  goalPrConfirmation,
+  type GoalPublishConfirmationPr,
+} from "./protocol.ts";
 
 interface LockDatabase {
   exec(sql: string): void;
@@ -416,9 +421,33 @@ export class GoalPublisher {
     } else {
       this.#polling.delete(id);
     }
-    if (this.#stopped || optIn === null) return;
+    if (this.#stopped) return;
 
     const latest = this.#store.goalPublishRecord(id);
+    if (latest?.prActionOutcome === "unknown") return;
+    if (optIn === null) {
+      const setting = this.#store.goalAutoMerge(id);
+      if (
+        latest?.pr?.state === "open" &&
+        latest.pr.autoMerge !== "off" &&
+        setting.source === "goal" &&
+        setting.method === "off" &&
+        latest.autoMergeRevision !== setting.revision
+      ) {
+        const release = lockPublisher(this.#directory);
+        try {
+          await this.#disableAutoMerge(
+            id,
+            latest,
+            "setting-change",
+            setting.revision,
+          );
+        } finally {
+          release();
+        }
+      }
+      return;
+    }
     if (latest?.pr && latest.pr.state !== "open") return;
     if (latest?.pollFailure === "publish-remote-head-changed") return;
     if (
@@ -495,7 +524,7 @@ export class GoalPublisher {
     if (!goal) throw new OrchestratorStoreError("not-found");
     await this.#publish(goal, expectedHead, true, expectedPr);
     return publishView(
-      true,
+      this.#config,
       remoteGoalBranch(goal),
       this.#store.goalPublishRecord(goal.id),
       this.#store.goalAutoMerge(goal.id),
@@ -503,6 +532,163 @@ export class GoalPublisher {
         this.#store.getGoal(goal.id)?.baseCommit ??
         null,
     );
+  }
+
+  async actOnPullRequest(
+    id: string,
+    operation: MergeMethod | "close",
+    confirm: string,
+    origin: "cli" | "operator-ui",
+    noChecks = false,
+  ) {
+    if (origin !== "cli" && origin !== "operator-ui")
+      throw new OrchestratorStoreError("approval-forbidden");
+    if (operation !== "close" && !mergeMethods.includes(operation))
+      throw new OrchestratorStoreError("invalid-transition");
+    if (this.#stopped) throw new PublishError("publish-disabled");
+    const release = lockPublisher(this.#directory);
+    let authorizedGoalId: string | undefined;
+    try {
+      const goal = this.#store.getGoal(id);
+      if (!goal) throw new OrchestratorStoreError("not-found");
+      const record = this.#store.goalPublishRecord(goal.id);
+      const pr = record?.pr;
+      if (!record || pr?.state !== "open" || goal.status === "cancelled")
+        throw new OrchestratorStoreError("invalid-transition");
+      if (record.prActionOutcome === "unknown")
+        throw new PublishError("publish-busy");
+      if (goalPrConfirmation(goal.ref, pr, operation) !== confirm)
+        throw new OrchestratorStoreError("stale-confirmation");
+      if (pr.head !== record.pushedHead)
+        throw new PublishError("publish-remote-head-changed");
+      const { destination } = record;
+      const current = await this.#provider.readPullRequest(
+        destination,
+        pr.number,
+      );
+      if (current.number !== pr.number || current.state !== "open")
+        throw new OrchestratorStoreError("invalid-transition");
+      if (current.head !== record.pushedHead)
+        throw new PublishError("publish-remote-head-changed");
+      if (operation !== "close") {
+        const checks = current.checks ?? "unknown";
+        if (checks !== "none" && checks !== "passed")
+          throw new PublishError(`publish-checks-${checks}`);
+        if (goalPrConfirmation(goal.ref, current, operation) !== confirm)
+          throw new OrchestratorStoreError("stale-confirmation");
+        if (current.mergeable === "conflict" || current.mergeable === "blocked")
+          throw new PublishError("publish-not-mergeable");
+        if (checks === "none" && !noChecks)
+          throw new PublishError("publish-no-checks");
+      }
+      if (this.#stopped) throw new PublishError("publish-disabled");
+      this.#record(
+        goal.id,
+        "publish.authorized",
+        null,
+        {
+          step: operation === "close" ? "close-pr" : "merge-pr",
+          destination,
+          prNumber: pr.number,
+          head: pr.head,
+          origin,
+          ...(operation !== "close" && {
+            method: operation,
+            ...(current.checks && { checks: current.checks }),
+          }),
+        },
+        {
+          head: pr.head,
+          requireFinished: operation !== "close",
+          prNumber: pr.number,
+        },
+      );
+      authorizedGoalId = goal.id;
+
+      try {
+        if (operation === "close")
+          await this.#provider.closePullRequest(destination, pr.number);
+        else
+          await this.#provider.mergePullRequest(
+            destination,
+            pr.number,
+            operation,
+            pr.head,
+          );
+      } catch {
+        const code =
+          operation === "close"
+            ? "publish-close-failed"
+            : "publish-merge-failed";
+        this.#record(
+          goal.id,
+          "publish.failed",
+          {
+            ...record,
+            pr: current,
+            prActionFailure: { code, at: new Date().toISOString() },
+          },
+          { code, prNumber: pr.number },
+        );
+        throw new PublishError(code);
+      }
+
+      // A successful merge command can enqueue the PR on a merge-queue base.
+      // Only an observed merge may complete the Goal.
+      let updated: PublishPullRequest | undefined;
+      try {
+        updated = await this.#provider.readPullRequest(destination, pr.number);
+      } catch {
+        // The mutation succeeded. Leave its disposition to the poller.
+      }
+      let next: GoalPublishRecord;
+      if (updated) {
+        const outcome =
+          updated.state === "merged"
+            ? "publish.pr-merged"
+            : updated.state === "closed"
+              ? "publish.pr-closed"
+              : "publish.polled";
+        next = await this.#observePr(
+          goal.id,
+          record,
+          updated,
+          Date.now(),
+          true,
+          outcome,
+        );
+      } else {
+        next = {
+          ...record,
+          pr: current,
+          failure: undefined,
+          pollFailure: undefined,
+          prActionFailure: undefined,
+          prActionOutcome: "unknown",
+        };
+        this.#record(goal.id, "publish.polled", next, {
+          outcome: "unknown",
+          operation,
+          prNumber: pr.number,
+        });
+      }
+      const updatedGoal = this.#store.getGoal(goal.id);
+      return {
+        ...publishView(
+          this.#config,
+          remoteGoalBranch(goal),
+          next,
+          this.#store.goalAutoMerge(goal.id),
+          this.#store.goalIntegrationHead(goal.id) ?? goal.baseCommit,
+        ),
+        ...(next.pr?.state === "merged" &&
+          updatedGoal?.status === "done" && { goalCompleted: true as const }),
+      };
+    } finally {
+      if (authorizedGoalId) this.#polling.delete(authorizedGoalId);
+      release();
+      this.wake();
+    }
   }
 
   #record(
@@ -1120,6 +1306,7 @@ export class GoalPublisher {
     id: string,
     record: GoalPublishRecord,
     reason: string,
+    revision?: number,
   ) {
     const { pr, destination } = record;
     if (!pr || pr.state !== "open" || pr.autoMerge === "off") return record;
@@ -1150,7 +1337,7 @@ export class GoalPublisher {
     const next = {
       ...record,
       pr: { ...pr, autoMerge: "off" as const },
-      autoMergeRevision: undefined,
+      autoMergeRevision: revision,
       disarmFailure: undefined,
     };
     this.#record(id, "publish.auto-merge-set", next, { method: "off", reason });
@@ -1163,6 +1350,7 @@ export class GoalPublisher {
     pr: PublishPullRequest,
     now: number,
     canDisarmForeign = true,
+    manualOutcome?: PublishEventKind,
   ) {
     // During a push the PR view may still report the immediately preceding head.
     const foreign =
@@ -1184,7 +1372,8 @@ export class GoalPublisher {
       (foreign || record.pollFailure === "publish-remote-head-changed")
         ? ("publish-remote-head-changed" as const)
         : undefined;
-    const failure = pr.state === "open" ? record.failure : undefined;
+    const failure =
+      pr.state === "open" && !manualOutcome ? record.failure : undefined;
     const autoMergeUnavailable =
       pr.state === "open" && pr.autoMerge === "off"
         ? record.autoMergeUnavailable
@@ -1196,9 +1385,21 @@ export class GoalPublisher {
     const previous = record.pr;
     let next = record;
     if (
+      manualOutcome ||
+      record.prActionFailure ||
+      record.prActionOutcome ||
       pr.state !== previous?.state ||
       pr.head !== previous?.head ||
       pr.checks !== previous?.checks ||
+      pr.mergeable !== previous?.mergeable ||
+      pr.review !== previous?.review ||
+      pr.additions !== previous?.additions ||
+      pr.deletions !== previous?.deletions ||
+      pr.changedFiles !== previous?.changedFiles ||
+      JSON.stringify(pr.checkRuns) !== JSON.stringify(previous?.checkRuns) ||
+      pr.checkCounts?.pass !== previous?.checkCounts?.pass ||
+      pr.checkCounts?.pending !== previous?.checkCounts?.pending ||
+      pr.checkCounts?.fail !== previous?.checkCounts?.fail ||
       pr.autoMerge !== previous?.autoMerge ||
       failure !== record.failure ||
       autoMergeUnavailable !== record.autoMergeUnavailable ||
@@ -1208,6 +1409,8 @@ export class GoalPublisher {
       next = {
         ...record,
         pr,
+        prActionFailure: undefined,
+        prActionOutcome: undefined,
         failure,
         autoMergeUnavailable,
         pollFailure,
@@ -1217,7 +1420,7 @@ export class GoalPublisher {
       };
       this.#record(
         id,
-        foreign ? "publish.failed" : "publish.polled",
+        foreign ? "publish.failed" : (manualOutcome ?? "publish.polled"),
         next,
         foreign ? { code: pollFailure } : {},
       );
@@ -1253,7 +1456,7 @@ export class GoalPublisher {
           latest.pr.number,
         );
       } catch {
-        if (latest.pollFailure === undefined)
+        if (latest.pollFailure === undefined && !latest.prActionOutcome)
           this.#record(
             goal.id,
             "publish.failed",

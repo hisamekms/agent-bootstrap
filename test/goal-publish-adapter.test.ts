@@ -16,6 +16,7 @@ test("publishing config validates Git names and merges private layers only", () 
         remote: "origin",
         base: "release/stable",
         autoMerge: "merge",
+        mergeMethod: "rebase",
       },
     },
     "user",
@@ -32,12 +33,22 @@ test("publishing config validates Git names and merges private layers only", () 
     remote: "upstream",
     base: "release/stable",
     autoMerge: "off",
+    mergeMethod: "rebase",
   });
   assert.equal(
     mergeConfig(user, undefined, local).sources["publish.base"],
     "user",
   );
   assert.equal(publishDefaults.enabled, false);
+  assert.equal(publishDefaults.mergeMethod, "squash");
+  assert.throws(
+    () =>
+      parseConfig(
+        { version: 1, publish: { mergeMethod: "merge" } },
+        "approved",
+      ),
+    /disallowed/,
+  );
   assert.throws(
     () => parseConfig(local, "approved"),
     /publish\. This key is disallowed in this layer\./,
@@ -90,6 +101,7 @@ test("publishing config validates Git names and merges private layers only", () 
   for (const [key, value] of Object.entries({
     enabled: "true",
     autoMerge: "fast-forward",
+    mergeMethod: "off",
   }))
     assert.throws(
       () => parseConfig({ version: 1, publish: { [key]: value } }, "local"),
@@ -175,8 +187,32 @@ test("GitHub adapter uses explicit repo and refs, strips token variables and fee
     state: "open",
     head,
     checks: "failed",
+    checkRuns: [{ name: "チェック", state: "fail" }],
+    checkCounts: { pass: 0, pending: 0, fail: 1 },
+    mergeable: "unknown",
+    review: "none",
     autoMerge: "squash",
   });
+
+  await provider.mergePullRequest(destination, 5, "squash", head);
+  await provider.closePullRequest(destination, 5);
+  assert.deepEqual(commands.at(-2)?.[1], [
+    "pr",
+    "merge",
+    "5",
+    "--repo",
+    "github.com/fixture/project",
+    "--squash",
+    "--match-head-commit",
+    head,
+  ]);
+  assert.deepEqual(commands.at(-1)?.[1], [
+    "pr",
+    "close",
+    "5",
+    "--repo",
+    "github.com/fixture/project",
+  ]);
 
   for (const [binary, , cwd, env] of commands) {
     assert.equal(cwd, "/checkout");
@@ -214,9 +250,120 @@ test("GitHub adapter uses explicit repo and refs, strips token variables and fee
   ]);
 });
 
+test("GitHub PR facts bound and screen names and aggregate checks beyond the display limit", async () => {
+  const raw = {
+    ...prJson,
+    mergeable: "MERGEABLE",
+    mergeStateStatus: "CLEAN",
+    reviewDecision: "APPROVED",
+    additions: 57,
+    deletions: 4,
+    changedFiles: 3,
+    statusCheckRollup: [
+      { name: "build", conclusion: "SUCCESS" },
+      { context: "integration\nchecks", state: "PENDING" },
+      { name: "sk-ant-" + "a".repeat(32), conclusion: "SUCCESS" },
+      { name: "long " + "画".repeat(140), conclusion: "SKIPPED" },
+      ...Array.from({ length: 46 }, () => ({
+        name: "test",
+        conclusion: "SUCCESS",
+      })),
+      { name: "hidden failure", conclusion: "TIMED_OUT" },
+    ],
+  };
+  const provider = githubGh("/checkout", {}, async (_binary, args) => {
+    const fields = args.at(-1)?.split(",");
+    for (const field of [
+      "statusCheckRollup",
+      "mergeable",
+      "mergeStateStatus",
+      "reviewDecision",
+      "additions",
+      "deletions",
+      "changedFiles",
+    ])
+      assert.ok(fields?.includes(field));
+    return ok(JSON.stringify(raw));
+  });
+  const result = await provider.readPullRequest(destination, 5);
+  assert.partialDeepStrictEqual(result, {
+    checks: "failed",
+    checkCounts: { pass: 49, pending: 1, fail: 1 },
+    mergeable: "clean",
+    review: "approved",
+    additions: 57,
+    deletions: 4,
+    changedFiles: 3,
+  });
+  assert.equal(result.checkRuns?.length, 50);
+  assert.deepEqual(result.checkRuns?.slice(0, 3), [
+    { name: "build", state: "pass" },
+    { name: "integration checks", state: "pending" },
+    { name: "名前非表示", state: "pass" },
+  ]);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(result.checkRuns?.[3]?.name)) <= 32,
+  );
+  assert.doesNotMatch(JSON.stringify(result), /sk-ant-|hidden failure/);
+  raw.mergeable = "CONFLICTING";
+  raw.reviewDecision = "CHANGES_REQUESTED";
+  assert.partialDeepStrictEqual(
+    await provider.readPullRequest(destination, 5),
+    {
+      mergeable: "conflict",
+      review: "changes-requested",
+    },
+  );
+  raw.mergeable = "MERGEABLE";
+  raw.mergeStateStatus = "BLOCKED";
+  raw.reviewDecision = "REVIEW_REQUIRED";
+  raw.statusCheckRollup = [{ name: "test", conclusion: "PENDING" }];
+  assert.partialDeepStrictEqual(
+    await provider.readPullRequest(destination, 5),
+    {
+      checks: "pending",
+      mergeable: "blocked",
+      review: "review-required",
+    },
+  );
+  raw.reviewDecision = "APPROVED";
+  assert.partialDeepStrictEqual(
+    await provider.readPullRequest(destination, 5),
+    {
+      checks: "pending",
+      mergeable: "unknown",
+      review: "approved",
+    },
+  );
+  raw.reviewDecision = "REVIEW_REQUIRED";
+  raw.statusCheckRollup = [];
+  assert.partialDeepStrictEqual(
+    await provider.readPullRequest(destination, 5),
+    {
+      checks: "none",
+      checkRuns: [],
+      checkCounts: { pass: 0, pending: 0, fail: 0 },
+      mergeable: "blocked",
+      review: "review-required",
+    },
+  );
+});
+
 function pushRemoteListing(url: string) {
   return `agent-bootstrap-publish-url-check\t${url} (push)\n`;
 }
+
+test("GitHub adapter reports missing and non-array PR checks as unknown", async () => {
+  for (const statusCheckRollup of [undefined, null, {}]) {
+    const provider = githubGh("/checkout", {}, async () =>
+      ok(JSON.stringify({ ...prJson, statusCheckRollup })),
+    );
+    const pr = await provider.readPullRequest(destination, 5);
+    assert.equal(pr.checks, "unknown");
+    assert.equal(pr.checkCounts, undefined);
+    assert.equal(pr.checkRuns, undefined);
+  }
+});
 
 test("GitHub adapter refuses ambiguous remotes and untrusted PR responses and maps command errors", async () => {
   let remote =

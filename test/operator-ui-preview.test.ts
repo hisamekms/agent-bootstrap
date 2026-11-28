@@ -23,7 +23,7 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
   const pending = pendingDecisions(methods["inbox.list"]({}));
   const approvals: PanelAnswer[] = [];
   const withheldId = "proposal-withheld";
-  for (const row of pending) {
+  for (const row of pending.filter(({ kind }) => kind !== "pr-merge")) {
     assert.ok("answer" in row);
     const { id, digest, takeover } = row.answer;
     const evidence = methods["proposal.get"]({ id });
@@ -52,7 +52,13 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     pending.filter((row) => "answer" in row && row.answer.takeover).length,
     2,
   );
-  assert.equal(pending.length, 10);
+  assert.equal(pending.length, 14);
+  assert.equal(pending.filter(({ kind }) => kind === "pr-merge").length, 4);
+  assert.equal(
+    methods["inbox.list"]({}).filter(({ kind }) => kind === "pr-auto-merge")
+      .length,
+    1,
+  );
   assert.equal(approvals.length, 6);
   assert.ok(
     methods["proposal.get"]({ id: "proposal-out-of-scope" })
@@ -84,7 +90,8 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     ).length;
     assert.equal(
       turn.owner === "human",
-      count > 0 || turn.reason.kind === "pr-open",
+      count > 0 ||
+        (turn.reason.kind === "pr-open" && !publish.autoMergeEnabled),
       id,
     );
     if (count) assert.deepEqual(turn.reason, { kind: "approvals", count });
@@ -111,7 +118,7 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
   assert.equal(detailed.policyOverrides["task-registration"], "human");
   const activity = methods["activity.get"]({});
   assert.ok(activity.running.length);
-  assert.equal(activity.yourTurn, 12);
+  assert.equal(activity.yourTurn, 16);
   const exportable = methods["goal.get"]({ id: "G5" });
   assert.equal(exportable.turn.reason.kind, "exportable");
   assert.ok(exportable.exportPreview);

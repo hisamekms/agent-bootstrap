@@ -5,6 +5,7 @@ export function pendingDecisions<T extends InboxItem>(items: readonly T[]) {
     ({ weight, state, kind }) =>
       weight === "action" &&
       state !== "resolved" &&
+      kind !== "pr-auto-merge" &&
       kind !== "task-failed" &&
       kind !== "execution-over-budget",
   );

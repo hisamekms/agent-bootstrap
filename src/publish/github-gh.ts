@@ -1,14 +1,22 @@
 import { execFile } from "node:child_process";
 import { accessSync, constants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import {
+  builtInCredentialScanner,
+  credentialScanClean,
+  proposalCredentialCheck,
+  type CredentialScanner,
+} from "../local-orchestrator/credential-scan.ts";
 import { delimiter, isAbsolute, join, relative, sep } from "node:path";
 import {
   autoMergeMethods,
   validPublishRemote,
   PublishError,
   type PublishDestination,
+  type PublishCheckState,
   type PublishFailure,
   type PublishProvider,
+  type PublishPrFacts,
   type PublishPullRequest,
 } from "./port.ts";
 
@@ -18,7 +26,7 @@ const remoteUrl = new RegExp(
   `^(?:https://github\\.com/|git@github\\.com:|ssh://git@github\\.com/)(${repositoryPattern})$`,
 );
 const prFields =
-  "number,url,state,headRefOid,headRefName,baseRefName,isCrossRepository,statusCheckRollup,autoMergeRequest";
+  "number,url,state,headRefOid,headRefName,baseRefName,isCrossRepository,statusCheckRollup,autoMergeRequest,mergeable,mergeStateStatus,reviewDecision,additions,deletions,changedFiles";
 
 type Command = (
   binary: "git" | "gh",
@@ -84,36 +92,122 @@ const execute: Command = (binary, args, cwd, env, stdin) =>
     child.stdin?.end(stdin);
   });
 
-function checks(value: unknown): PublishPullRequest["checks"] {
-  if (!Array.isArray(value) || !value.length) return;
-  let pending = false;
-  for (const item of value) {
-    if (!item || typeof item !== "object") {
-      pending = true;
-      continue;
-    }
-    const result = item.conclusion || item.state;
-    if (
-      [
-        "FAILURE",
-        "ERROR",
-        "CANCELLED",
-        "TIMED_OUT",
-        "ACTION_REQUIRED",
-        "STARTUP_FAILURE",
-        "STALE",
-      ].includes(result)
-    )
-      return "failed";
-    if (!["SUCCESS", "NEUTRAL", "SKIPPED"].includes(result)) pending = true;
-  }
-  return pending ? "pending" : "passed";
+function checkState(row: Record<string, unknown>): PublishCheckState {
+  const result = row.conclusion || row.state;
+  if (
+    [
+      "FAILURE",
+      "ERROR",
+      "CANCELLED",
+      "TIMED_OUT",
+      "ACTION_REQUIRED",
+      "STARTUP_FAILURE",
+      "STALE",
+    ].some((state) => state === result)
+  )
+    return "fail";
+  return ["SUCCESS", "NEUTRAL", "SKIPPED"].some((state) => state === result)
+    ? "pass"
+    : "pending";
 }
 
-function pullRequest(
+function boundedCheckName(raw: string) {
+  let name = "";
+  // Reserve room for all 50 checks within a publish journal event.
+  for (const char of raw.replace(/\p{C}/gu, " ").trim()) {
+    if (Buffer.byteLength(JSON.stringify(name + char)) > 32) break;
+    name += char;
+  }
+  return name.trimEnd();
+}
+
+async function checkFacts(
   value: unknown,
   destination: PublishDestination,
-): PublishPullRequest {
+  scan?: CredentialScanner,
+) {
+  if (!Array.isArray(value)) return { checks: "unknown" } as const;
+  const checkCounts = { pass: 0, pending: 0, fail: 0 };
+  const checkRuns: NonNullable<PublishPrFacts["checkRuns"]> = [];
+  if (value.length === 0)
+    return { checks: "none", checkRuns, checkCounts } as const;
+  const visible: { raw: string; name: string; state: PublishCheckState }[] = [];
+  for (const item of value as unknown[]) {
+    const row =
+      item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+    const state = checkState(row);
+    checkCounts[state]++;
+    if (visible.length === 50) continue;
+    const label = row.name ?? row.context;
+    const raw = typeof label === "string" ? label : "";
+    visible.push({ raw, name: boundedCheckName(raw), state });
+  }
+  // Screen both what GitHub returned and what will appear in the journal.
+  const sources = visible.map(({ raw, name }) => [raw, name]);
+  const screen = proposalCredentialCheck(scan ?? builtInCredentialScanner);
+  const screened = await screen(sources);
+  // Reserve space for the pinned destination and other fields in the journal.
+  let remaining = 2600 - Buffer.byteLength(JSON.stringify(destination));
+  for (const [i, { name, state }] of visible.entries()) {
+    const entry = {
+      name: credentialScanClean(screened[i] ?? null)
+        ? name || "チェック"
+        : "名前非表示",
+      state,
+    };
+    remaining -= Buffer.byteLength(JSON.stringify(entry)) + 1;
+    if (remaining < 0) break;
+    checkRuns.push(entry);
+  }
+  const checks = checkCounts.fail
+    ? "failed"
+    : checkCounts.pending
+      ? "pending"
+      : "passed";
+  return { checks, checkRuns, checkCounts } as const;
+}
+
+function mergeability(
+  row: Record<string, unknown>,
+  checks: PublishPullRequest["checks"],
+  review: PublishPrFacts["review"],
+): NonNullable<PublishPrFacts["mergeable"]> {
+  const status = row.mergeStateStatus;
+  if (row.mergeable === "CONFLICTING" || status === "DIRTY") return "conflict";
+  if (status === "BEHIND" || status === "DRAFT") return "blocked";
+  if (status === "BLOCKED") {
+    // GitHub also reports BLOCKED while required checks are running. If no
+    // other blocker is known, let GitHub decide whether auto-merge can arm.
+    return checks === "pending" &&
+      row.mergeable === "MERGEABLE" &&
+      review !== "review-required" &&
+      review !== "changes-requested"
+      ? "unknown"
+      : "blocked";
+  }
+  return row.mergeable === "MERGEABLE" && status !== "UNKNOWN"
+    ? "clean"
+    : "unknown";
+}
+
+function reviewDecision(value: unknown): NonNullable<PublishPrFacts["review"]> {
+  switch (value) {
+    case "APPROVED":
+      return "approved";
+    case "CHANGES_REQUESTED":
+      return "changes-requested";
+    case "REVIEW_REQUIRED":
+      return "review-required";
+    default:
+      return "none";
+  }
+}
+
+async function pullRequest(
+  value: unknown,
+  destination: PublishDestination,
+  scan?: CredentialScanner,
+): Promise<PublishPullRequest> {
   if (!value || typeof value !== "object")
     throw new PublishError("publish-pr-failed");
   const row = value as Record<string, unknown>;
@@ -150,13 +244,27 @@ function pullRequest(
       : "off";
   const autoMerge = autoMergeMethods.find((entry) => entry === method);
   if (!autoMerge) throw new PublishError("publish-pr-failed");
-  const status = checks(row.statusCheckRollup);
+  const stats: PublishPrFacts = {};
+  for (const key of ["additions", "deletions", "changedFiles"] as const) {
+    const value = row[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+      stats[key] = value;
+  }
+  const checkResults = await checkFacts(
+    row.statusCheckRollup,
+    destination,
+    scan,
+  );
+  const review = reviewDecision(row.reviewDecision);
   return {
     number,
     url,
     head: headRefOid,
     state,
-    ...(status && { checks: status }),
+    ...checkResults,
+    mergeable: mergeability(row, checkResults.checks, review),
+    review,
+    ...stats,
     autoMerge,
   };
 }
@@ -165,6 +273,7 @@ export function githubGh(
   checkout: string,
   hostEnv = process.env,
   run: Command = execute,
+  scan?: CredentialScanner,
 ): PublishProvider {
   const checkoutPath = realPath(checkout);
   const path = hostEnv.PATH?.split(delimiter)
@@ -382,23 +491,24 @@ export function githubGh(
         ),
       );
       if (!Array.isArray(value)) throw new PublishError("publish-pr-failed");
-      const requests = value
+      const candidates = value
         .filter(
           (item) =>
             item &&
             typeof item === "object" &&
             item.isCrossRepository === false,
         )
-        .map((item) => pullRequest(item, destination))
-        .filter((pr) => pr.number > afterPrNumber);
-      return (
-        requests.find((pr) => pr.state === "open") ??
-        requests.find((pr) => pr.head === recoveringHead) ??
-        null
-      );
+        .filter(
+          (item) =>
+            typeof item.number === "number" && item.number > afterPrNumber,
+        );
+      const candidate =
+        candidates.find((item) => item.state === "OPEN") ??
+        candidates.find((item) => item.headRefOid === recoveringHead);
+      return candidate ? pullRequest(candidate, destination, scan) : null;
     },
     async readPullRequest(destination, number) {
-      const pr = pullRequest(
+      const pr = await pullRequest(
         json(
           output(
             await gh([
@@ -413,6 +523,7 @@ export function githubGh(
           ),
         ),
         destination,
+        scan,
       );
       if (pr.number !== number) throw new PublishError("publish-pr-failed");
       return pr;
@@ -435,6 +546,26 @@ export function githubGh(
           body,
         ),
         "publish-pr-failed",
+      );
+    },
+    async mergePullRequest(destination, number, method, expectedHead) {
+      output(
+        await gh([
+          "pr",
+          "merge",
+          String(number),
+          ...repo(destination),
+          `--${method}`,
+          "--match-head-commit",
+          expectedHead,
+        ]),
+        "publish-merge-failed",
+      );
+    },
+    async closePullRequest(destination, number) {
+      output(
+        await gh(["pr", "close", String(number), ...repo(destination)]),
+        "publish-close-failed",
       );
     },
     async setAutoMerge(destination, number, method, expectedHead) {

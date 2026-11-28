@@ -7,10 +7,15 @@ import { contentDigest } from "../../src/local-orchestrator/model.ts";
 import { parsePanelAnswer } from "../../src/local-orchestrator/proposal-answer.ts";
 import { credentialMaskMarker } from "../../src/local-orchestrator/proposal-screening.ts";
 import { remoteGoalBranch } from "../../src/publish/journal.ts";
-import { autoMergeMethods, publishDefaults } from "../../src/publish/port.ts";
+import {
+  autoMergeMethods,
+  publishDefaults,
+  type MergeMethod,
+} from "../../src/publish/port.ts";
 import {
   goalMergeCompletionConfirmation,
   goalPublishConfirmation,
+  goalPrConfirmation,
 } from "../../src/publish/protocol.ts";
 import {
   groupProblems,
@@ -399,13 +404,37 @@ export function createPreviewMethods(
   stop: () => void,
 ): PreviewMethods {
   const publishConfig = { ...publishDefaults, enabled: true };
-  let nextPr = 18;
+  let nextPr = 20;
   function pr(number: number) {
     return {
       prNumber: number,
       prUrl: `https://github.com/example/example/pull/${number}`,
     };
   }
+  function updatePrActions(entry: GoalDetail) {
+    const { prNumber } = entry.publish;
+    if (entry.prState !== "open" || entry.status !== "active" || !prNumber) {
+      delete entry.prActions;
+      return;
+    }
+    const current = {
+      number: prNumber,
+      head: entry.head ?? candidate,
+      ...(entry.publish.checks !== undefined && {
+        checks: entry.publish.checks,
+      }),
+    };
+    entry.prActions = {
+      merge: {
+        squash: goalPrConfirmation(entry.ref, current, "squash"),
+        merge: goalPrConfirmation(entry.ref, current, "merge"),
+        rebase: goalPrConfirmation(entry.ref, current, "rebase"),
+      },
+      close: goalPrConfirmation(entry.ref, current, "close"),
+      autoMerge: entry.autoMergeConfirmations,
+    };
+  }
+
   function publishGoal(
     ref: string,
     title: string,
@@ -416,6 +445,8 @@ export function createPreviewMethods(
     Object.assign(entry.publish, {
       enabled: publishConfig.enabled,
       lastCheckedAt: minutesAgo(2),
+      base: publishConfig.base,
+      mergeMethod: publishConfig.mergeMethod,
       ...details,
     });
     entry.head = candidate;
@@ -440,6 +471,7 @@ export function createPreviewMethods(
     }
     if (["pushing", "closed", "failed"].includes(entry.publish.state))
       entry.publishPreview = { expectedHead: candidate };
+    updatePrActions(entry);
     return entry;
   }
   const main = goal("G1", "領収書の CSV インポートを改善する", {
@@ -515,11 +547,23 @@ export function createPreviewMethods(
         reason: {
           kind: "pr-open",
           prNumber: 12,
-          checks: "pending",
+          checks: "passed",
           autoMerge: "off",
         },
       },
-      { state: "pr-open", checks: "pending", ...pr(12) },
+      {
+        state: "pr-open",
+        checks: "passed",
+        mergeable: "clean",
+        review: "approved",
+        checkRuns: ["build", "test", "lint", "typecheck", "format"].map(
+          (name) => ({ name, state: "pass" }),
+        ),
+        additions: 57,
+        deletions: 4,
+        changedFiles: 3,
+        ...pr(12),
+      },
     ),
     publishGoal(
       "G12",
@@ -530,15 +574,21 @@ export function createPreviewMethods(
           kind: "pr-open",
           prNumber: 13,
           checks: "failed",
-          autoMerge: "squash",
+          autoMerge: "off",
         },
       },
       {
         state: "pr-open",
         checks: "failed",
-        autoMerge: "squash",
-        autoMergeEnabled: "squash",
-        autoMergeSource: "goal",
+        mergeable: "clean",
+        review: "changes-requested",
+        checkRuns: [
+          { name: "build", state: "pass" },
+          { name: "test", state: "fail" },
+        ],
+        additions: 22,
+        deletions: 2,
+        changedFiles: 2,
         ...pr(13),
       },
     ),
@@ -581,19 +631,65 @@ export function createPreviewMethods(
         reason: {
           kind: "pr-open",
           prNumber: 17,
+          checks: "pending",
+          autoMerge: "off",
+        },
+      },
+      {
+        state: "pr-open",
+        checks: "pending",
+        mergeable: "clean",
+        review: "none",
+        checkRuns: ["build", "lint", "format", "test", "typecheck"].map(
+          (name, i) => ({ name, state: i < 3 ? "pass" : "pending" }),
+        ),
+        additions: 18,
+        deletions: 9,
+        changedFiles: 2,
+        autoMergeUnavailable: true,
+        ...pr(17),
+      },
+    ),
+    publishGoal(
+      "G17",
+      "取引の並び順を調整する",
+      {
+        owner: "human",
+        reason: {
+          kind: "pr-open",
+          prNumber: 18,
           checks: "passed",
+          autoMerge: "off",
+        },
+      },
+      { state: "pr-open", checks: "passed", mergeable: "conflict", ...pr(18) },
+    ),
+    publishGoal(
+      "G18",
+      "精算の締め日を設定できるようにする",
+      {
+        owner: "ai",
+        reason: {
+          kind: "pr-open",
+          prNumber: 19,
+          checks: "pending",
           autoMerge: "squash",
         },
       },
       {
         state: "pr-open",
-        checks: "passed",
+        checks: "pending",
+        mergeable: "clean",
         autoMerge: "squash",
-        autoMergeUnavailable: true,
-        ...pr(17),
+        autoMergeEnabled: "squash",
+        checkRuns: [{ name: "test", state: "pending" }],
+        ...pr(19),
       },
     ),
   ];
+  const disarmFailed = goals.find(({ ref }) => ref === "G14")!;
+  disarmFailed.status = "cancelled";
+  updatePrActions(disarmFailed);
   main.baseUpdatePreview = { from: baseCommit, to: nextBase };
   main.policyOverrides["task-registration"] = "human";
   exportable.policyOverrides.integration = "human";
@@ -889,6 +985,67 @@ export function createPreviewMethods(
     return entry;
   }
 
+  const seenPullRequests = new Set<string>();
+
+  function pullRequestRowId(entry: GoalDetail) {
+    return `pr-merge:${entry.id}:${entry.publish.prNumber}`;
+  }
+
+  function pullRequestRows(): PanelInboxItem[] {
+    return goals.flatMap((entry): PanelInboxItem[] => {
+      if (entry.status !== "active" || entry.prState !== "open") return [];
+      const id = pullRequestRowId(entry);
+      return [
+        {
+          id,
+          kind: entry.publish.autoMergeEnabled ? "pr-auto-merge" : "pr-merge",
+          weight: "action",
+          state: seenPullRequests.has(id) ? "seen" : "open",
+          subject: { goalId: entry.id, ref: entry.ref, goalRef: entry.ref },
+          title: entry.title,
+          next: `merge-goal ${entry.ref}`,
+          at: entry.publish.lastCheckedAt ?? null,
+          pullRequest: {
+            publish: entry.publish,
+            actions: entry.prActions ?? {},
+          },
+        },
+      ];
+    });
+  }
+
+  function finishPullRequest(
+    id: string,
+    method: MergeMethod | "close",
+    confirm: string,
+  ) {
+    const entry = find(goals, id);
+    const { prNumber } = entry.publish;
+    if (entry.prState !== "open" || !prNumber || entry.status !== "active")
+      throw new PreviewError("invalid-transition");
+    const expected =
+      method === "close"
+        ? entry.prActions?.close
+        : entry.prActions?.merge?.[method];
+    if (confirm !== expected) throw new PreviewError("stale-confirmation");
+    const closed = method === "close";
+    entry.prState = closed ? "closed" : "merged";
+    entry.publish.state = entry.prState;
+    delete entry.publish.autoMergeEnabled;
+    delete entry.publish.autoMergeUnavailable;
+    if (!closed) entry.status = "done";
+    else if (entry.head) entry.publishPreview = { expectedHead: entry.head };
+    entry.turn = closed
+      ? { owner: "stopped", reason: { kind: "pr-closed", prNumber } }
+      : { owner: "done", reason: { kind: "merged", prNumber } };
+    updatePrActions(entry);
+    changed([pullRequestRowId(entry)]);
+    return {
+      ...entry.publish,
+      ...(!closed && { goalCompleted: true as const }),
+    };
+  }
+
   function activity() {
     const rowsForTasks: ActivityRow[] = tasks.flatMap((entry) => {
       const parent = find(goals, entry.goalId);
@@ -921,7 +1078,8 @@ export function createPreviewMethods(
       queued,
       queuedCount: queued.length,
       yourTurn:
-        pendingDecisions(rows).length + groupProblems(problems()).length,
+        pendingDecisions([...rows, ...pullRequestRows()]).length +
+        groupProblems(problems()).length,
     };
   }
 
@@ -1117,10 +1275,14 @@ export function createPreviewMethods(
       return settingsReceipt;
     },
     "decision.history": ({ limit = 20 }) => history.slice(0, limit),
-    "inbox.list": ({ includeResolved }) =>
-      rows.filter(({ state }) => includeResolved || state !== "resolved"),
+    "inbox.list": ({ includeResolved }) => [
+      ...pullRequestRows(),
+      ...rows.filter(({ state }) => includeResolved || state !== "resolved"),
+    ],
     "inbox.subscribe": () => ({ subscribed: true }),
     "inbox.markSeen": ({ ids }) => {
+      for (const row of pullRequestRows())
+        if (ids.includes(row.id)) seenPullRequests.add(row.id);
       const seen = rows.filter(
         ({ id, state }) => state === "open" && ids.includes(id),
       );
@@ -1264,6 +1426,10 @@ export function createPreviewMethods(
       changed([]);
       return { id: entry.id, ref: entry.ref, status: "done" };
     },
+    "goal.merge": ({ id, method, confirm }) =>
+      finishPullRequest(id, method, confirm),
+    "goal.closePr": ({ id, confirm }) =>
+      finishPullRequest(id, "close", confirm),
     "goal.publish": ({ id, expectedHead, confirm, expectedPr }) => {
       const entry = find(goals, id);
       if (!entry.publish.enabled) throw new PreviewError("publish-disabled");
@@ -1294,6 +1460,8 @@ export function createPreviewMethods(
         ...pr(number),
         state: "pr-open",
         checks: "pending",
+        mergeable: "clean",
+        checkRuns: [{ name: "test", state: "pending" }],
         lastCheckedAt: new Date().toISOString(),
         ...(previous.autoMerge !== "off" && {
           autoMergeEnabled: previous.autoMerge,
@@ -1301,7 +1469,7 @@ export function createPreviewMethods(
       };
       entry.prState = "open";
       entry.turn = {
-        owner: "human",
+        owner: entry.publish.autoMergeEnabled ? "ai" : "human",
         reason: {
           kind: "pr-open",
           prNumber: number,
@@ -1311,7 +1479,8 @@ export function createPreviewMethods(
       };
       delete entry.publishPreview;
       renewAutoMergeConfirmations(entry);
-      changed();
+      updatePrActions(entry);
+      changed([pullRequestRowId(entry)]);
       return entry.publish;
     },
     "goal.setAutoMerge": ({ id, method, confirm }) => {
@@ -1332,14 +1501,15 @@ export function createPreviewMethods(
       delete entry.publish.autoMergeUnavailable;
       if (entry.turn.reason.kind === "pr-open") {
         entry.turn = {
-          owner: "human",
+          owner: method === "off" ? "human" : "ai",
           reason: { ...entry.turn.reason, autoMerge: method },
         };
         if (method === "off") delete entry.publish.autoMergeEnabled;
         else entry.publish.autoMergeEnabled = method;
       }
       renewAutoMergeConfirmations(entry);
-      changed();
+      updatePrActions(entry);
+      changed(entry.prState === "open" ? [pullRequestRowId(entry)] : []);
       return { autoMerge: method, autoMergeSource: "goal" };
     },
     "goal.export": ({ id, confirm, expectedHead }) => {
@@ -1418,6 +1588,8 @@ export function createPreviewMethods(
     "task.get": ({ id }) => {
       const entry = find(tasks, id);
       const parent = find(goals, entry.goalId);
+      const { prNumber, prUrl } = parent.publish;
+      if (prNumber && prUrl) entry.pullRequest = { prNumber, prUrl };
       entry.effectiveIntegrationPolicy = resolveDelegation("integration", {
         task: entry.integrationPolicy,
         goal: parent.policyOverrides.integration,
