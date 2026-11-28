@@ -110,7 +110,8 @@ This ADR amends three sections of the configuration-layers ADR:
 
 - **C3.** The project declaration gains a top-level key, `evidence`.
   v1 declarations may hold `verification`, `profiles`, `egress` and
-  `evidence`. `verification` keeps only `profile` and `argv`.
+  `evidence`. `verification` accepts `profile`, `argv`, and optional
+  `timeoutMs` as defined in the configuration-layers ADR.
 - **C5.** A project's `local.json` may also hold `evidence`. The user
   config may not.
 - **C6.** `evidence` joins the single values. A project's `local.json`

@@ -40,6 +40,10 @@ import {
   parseVerificationConfig,
 } from "../src/local-orchestrator/verification.ts";
 import { verificationResult } from "../src/reviewed-integration.ts";
+import {
+  VERIFICATION_TAIL_LIMIT,
+  VERIFICATION_TAIL_PATH,
+} from "../src/sandbox-runtime.ts";
 
 async function fixture(run: (root: string) => Promise<void>) {
   const root = await mkdtemp(join(await realpath(tmpdir()), "lo-target-"));
@@ -341,6 +345,8 @@ test("verification CLI scopes audited config to each target and requires a typed
       "set",
       "--profile",
       "base",
+      "--timeout-ms",
+      "600000",
       "--",
       "test",
       "-f",
@@ -357,6 +363,7 @@ test("verification CLI scopes audited config to each target and requires a typed
     const expected = {
       profile: "base",
       argv: ["test", "-f", "a; echo literal"],
+      timeoutMs: 600_000,
     };
     const show = ["verification", "show"];
     assert.deepEqual(
@@ -410,7 +417,7 @@ test("verification CLI scopes audited config to each target and requires a typed
     assert.match(stale.stderr, /Verification changed/);
     assert.deepEqual(
       JSON.parse((await cli(bootstrap, ["--target", one, ...show])).stdout),
-      { profile: "base", argv: ["test", "-f", "replacement"] },
+      { ...expected, argv: ["test", "-f", "replacement"] },
     );
     assert.equal((await cli(bootstrap, clear, accept)).code, 0);
 
@@ -434,7 +441,7 @@ test("verification CLI scopes audited config to each target and requires a typed
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { version: 1 });
   }));
 
-test("verification validates argv bounds and produces only the fixed verdict", () => {
+test("verification validates argv and timeout bounds", () => {
   for (const argv of [
     [],
     [""],
@@ -446,28 +453,68 @@ test("verification validates argv bounds and produces only the fixed verdict", (
   assert.throws(() =>
     parseVerificationConfig({ profile: "missing", argv: ["true"] }),
   );
-  for (const [status, expected] of [
-    ["0", { review: "pass" }],
-    ["1", { review: "revise", tests: { passed: 0, failed: 1 } }],
-  ] as const) {
-    const trial = configuredVerification({
-      profile: "base",
-      argv: [
-        "/bin/sh",
-        "-c",
-        'printf \'{"review":"pass"}\'; printf noise >&2; test "$1" = \'$(exit 99)\' || exit 99; exit "$2"',
-        "fixture",
-        "$(exit 99)",
-        status,
-      ],
-    });
-    const [shell, ...args] = trial.command.argv;
-    const response = execFileSync(shell!, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    assert.deepEqual(
-      verificationResult({ id: "verification", outcome: "ok", response }),
-      expected,
+  const config = { profile: "base", argv: ["true"] };
+  assert.equal(
+    configuredVerification(parseVerificationConfig(config)).command.timeoutMs,
+    240_000,
+  );
+  for (const timeoutMs of [1, 240_001, 3_600_000])
+    assert.equal(
+      configuredVerification(parseVerificationConfig({ ...config, timeoutMs }))
+        .command.timeoutMs,
+      timeoutMs,
     );
-  }
+  for (const timeoutMs of [
+    0,
+    -1,
+    3_600_001,
+    1.5,
+    "600000",
+    Infinity,
+    null,
+    undefined,
+  ])
+    assert.throws(() => parseVerificationConfig({ ...config, timeoutMs }));
 });
+
+test("verification keeps a bounded combined tail off the fixed verdict channel", () =>
+  fixture(async (root) => {
+    for (const [status, expected] of [
+      ["0", { review: "pass" }],
+      ["1", { review: "revise", tests: { passed: 0, failed: 1 } }],
+    ] as const) {
+      const trial = configuredVerification({
+        profile: "base",
+        argv: [
+          "/bin/sh",
+          "-c",
+          'printf \'{"review":"pass"}%020000d out\' 0; printf noise >&2; test "$1" = \'$(exit 99)\' || exit 99; exit "$2"',
+          "fixture",
+          "$(exit 99)",
+          status,
+        ],
+      });
+      const cwd = join(root, status);
+      await mkdir(cwd);
+      const [shell, flag, script, ...args] = trial.command.argv;
+      const response = execFileSync(
+        shell!,
+        [
+          flag!,
+          script!.replace(VERIFICATION_TAIL_PATH, "./diagnostic/tail"),
+          ...args,
+        ],
+        {
+          cwd,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      assert.deepEqual(
+        verificationResult({ id: "verification", outcome: "ok", response }),
+        expected,
+      );
+      const tail = await readFile(join(cwd, "diagnostic/tail"), "utf8");
+      assert.equal(tail.length, VERIFICATION_TAIL_LIMIT);
+      assert.ok(tail.endsWith(" outnoise"));
+    }
+  }));

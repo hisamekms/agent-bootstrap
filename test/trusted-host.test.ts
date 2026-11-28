@@ -32,6 +32,7 @@ import type { RuntimeEvent } from "../src/runtime-events.ts";
 import {
   INTERACTIVE_MAX_LIFETIME_MS,
   SandboxRuntimeError,
+  VERIFICATION_FAILURE_VERDICT,
 } from "../src/sandbox-runtime.ts";
 import {
   HostAuditError,
@@ -852,6 +853,95 @@ test("runVerification refuses provider, tools and hostTcpPort without auditing",
     assert.deepEqual(audit.read(id), []);
   }
   assert.equal(specs.length, 0);
+});
+
+test("Verification does not collect when its collection authorization audit fails", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { calls, runtime } = adapter(VERIFICATION_FAILURE_VERDICT);
+  const failing: AuditSink = {
+    append(event) {
+      if (
+        event.operation === "sandbox.collect" &&
+        event.kind === "operation.allowed"
+      )
+        throw new Error("fixture collection authorization write failure");
+      audit.append(event);
+    },
+  };
+  const id = randomUUID();
+  await assert.rejects(
+    new TrustedHost(failing, runtime, profiles).runVerification(
+      { sandbox: {}, ...quick, captureFailureTail: true },
+      id,
+    ),
+    (error) => error instanceof HostAuditError && error.invocationId === id,
+  );
+  assert.deepEqual(calls, ["create", "exec", "destroy"]);
+  assert.deepEqual(
+    audit
+      .read(id)
+      .filter((event) => event.operation === "sandbox.collect")
+      .map((event) => event.kind),
+    ["operation.requested"],
+  );
+});
+
+test("Worker and Reviewer ignore a request to capture a Verification tail", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { calls, runtime } = adapter(VERIFICATION_FAILURE_VERDICT);
+  const specs: SandboxSpec[] = [];
+  const host = new TrustedHost(
+    audit,
+    {
+      ...runtime,
+      async create(spec) {
+        specs.push(spec);
+        return runtime.create(spec);
+      },
+    },
+    profiles,
+  );
+  const input = { ...plan, captureFailureTail: true };
+  for (const run of [
+    await host.runWorker(input),
+    await host.runReviewer(input),
+  ]) {
+    assert.equal("failureTail" in run, false);
+    assert.equal(
+      audit.read(run.id).some((event) => event.operation === "sandbox.collect"),
+      false,
+    );
+  }
+  assert.equal(specs.length, 2);
+  assert.ok(specs.every((spec) => !("verification" in spec)));
+  assert.deepEqual(calls, [
+    "create",
+    "exec",
+    "destroy",
+    "create",
+    "exec",
+    "destroy",
+  ]);
+});
+
+test("TrustedHost refuses a caller-supplied Verification sandbox flag before audit", async (t) => {
+  const audit = new SqliteAudit(fixture(t));
+  t.after(() => audit.close());
+  const { calls, runtime } = adapter("");
+  const host = new TrustedHost(audit, runtime, profiles);
+  const input = {
+    ...plan,
+    sandbox: { ...plan.sandbox, verification: true as const },
+  };
+  const id = randomUUID();
+  await assert.rejects(
+    host.runWorker(input, id),
+    /Verification sandboxes are assigned by the trusted host/,
+  );
+  assert.deepEqual(audit.read(id), []);
+  assert.deepEqual(calls, []);
 });
 
 test("TrustedHost requires a ProfileCatalog", () => {

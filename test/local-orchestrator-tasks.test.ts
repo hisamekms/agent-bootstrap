@@ -6,6 +6,13 @@ import {
   type PublishPullRequest,
 } from "../src/publish/port.ts";
 import { SqliteAudit } from "../src/audit.ts";
+import { TrustedHost } from "../src/trusted-host.ts";
+import { ProfileCatalog } from "../src/sandbox-profiles.ts";
+import {
+  VERIFICATION_FAILURE_VERDICT,
+  VERIFICATION_TAIL_LIMIT,
+  VERIFICATION_TAIL_PATH,
+} from "../src/sandbox-runtime.ts";
 import { EnvironmentStore } from "../src/environments/store.ts";
 import { identifyEnvironment } from "../src/environments/adapter.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
@@ -14,6 +21,7 @@ import {
   operatorGoalList,
   operatorProblems,
   operatorTask,
+  readOperatorTask,
 } from "../src/local-orchestrator/operator-read.ts";
 import { failureLabel } from "../src/local-orchestrator/operator-attention.ts";
 import { projectInbox } from "../src/local-orchestrator/inbox.ts";
@@ -39,7 +47,7 @@ import { configEnv } from "./config-fixture.ts";
 import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -1229,6 +1237,245 @@ test(
   },
 );
 
+test("Verification wrapper returns while a background child holds stdout", () => {
+  using temp = mkdtempDisposableSync(
+    join(realpathSync(tmpdir()), "lo-verify-"),
+  );
+  const tail = join(temp.path, "output", "tail");
+  const [, flag, script, ...argv] = configuredVerification({
+    profile: "base",
+    argv: ["/bin/sh", "-c", "printf 'suite output'; sleep 3 & exit 0"],
+  }).command.argv;
+  const started = performance.now();
+  const result = spawnSync(
+    "/bin/sh",
+    [
+      flag!,
+      script!.replace(VERIFICATION_TAIL_PATH, '"$VERIFICATION_TEST_TAIL"'),
+      ...argv,
+    ],
+    {
+      env: { ...process.env, VERIFICATION_TEST_TAIL: tail },
+      encoding: "utf8",
+      timeout: 5000,
+    },
+  );
+  const elapsed = performance.now() - started;
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '{"review":"pass"}\n');
+  assert.ok(elapsed < 2000, `Verification took ${elapsed} ms`);
+  assert.equal(readFileSync(tail, "utf8"), "suite output");
+  assert.equal(existsSync(`${tail}.full`), false);
+});
+
+for (const scenario of [
+  "screened",
+  "truncated",
+  "truncated without a newline",
+  "collection error",
+  "masking error",
+] as const) {
+  test(
+    `Verification revision notes with ${scenario}`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-tasks-verification-");
+      const { root, store } = state;
+      const { goalId, directory, repoRoot } = goalBaseFixture(state);
+      const taskId = task(store, goalId);
+      const token = `sk-ant-${"f".repeat(32)}`;
+      const diagnostic = Buffer.concat([
+        Buffer.from(`failure\x00\x1b\x7f\u202e\t${token}\n`),
+        Uint8Array.of(0xff),
+      ]);
+      const tokenSuffix = token.slice("sk-ant-".length);
+      let rawTail = diagnostic;
+      if (scenario === "truncated") {
+        rawTail = Buffer.concat([
+          Buffer.from(tokenSuffix),
+          Buffer.alloc(
+            VERIFICATION_TAIL_LIMIT -
+              diagnostic.length -
+              tokenSuffix.length -
+              1,
+            " ",
+          ),
+          Buffer.from("\n"),
+          diagnostic,
+        ]);
+      } else if (scenario === "truncated without a newline") {
+        rawTail = Buffer.alloc(VERIFICATION_TAIL_LIMIT, "x");
+        rawTail.write(tokenSuffix);
+      }
+      const audit = new SqliteAudit(join(root, "verify.sqlite"));
+      try {
+        let collected = false;
+        let workerRuns = 0;
+        const verifier = new TrustedHost(
+          audit,
+          {
+            async create(spec) {
+              assert.equal(spec.verification, true);
+              assert.equal(spec.maxLifetimeMs, 450_000);
+              return { id: "verification-fixture" };
+            },
+            async exec(_handle, command) {
+              assert.equal(command.timeoutMs, 300_000);
+              return {
+                status: "exited",
+                exitCode: 0,
+                stdout: Buffer.from(
+                  workerRuns === 1
+                    ? VERIFICATION_FAILURE_VERDICT
+                    : '{"review":"pass"}',
+                ),
+                stderr: Buffer.alloc(0),
+              };
+            },
+            async collect(_handle, spec) {
+              collected = true;
+              assert.deepEqual(spec, { verificationTail: true });
+              if (scenario === "collection error")
+                throw new Error("fixture collection error");
+              return {
+                files: [{ path: VERIFICATION_TAIL_PATH, bytes: rawTail }],
+              };
+            },
+            async destroy() {},
+          },
+          new ProfileCatalog({
+            base: { image: `fixture.invalid/alpine@sha256:${"a".repeat(64)}` },
+          }),
+        );
+        let revisionNote: Uint8Array | undefined;
+        const executor = createTaskExecutor({
+          repoRoot,
+          directory,
+          store,
+          worker: () => harness,
+          reviewer: harness,
+          verification: configuredVerification({
+            profile: "base",
+            argv: ["fixture-verify"],
+            timeoutMs: 600_000,
+          }),
+          ...(scenario === "masking error" && {
+            async scan(...sources) {
+              if (
+                sources.some(
+                  (source) =>
+                    typeof source === "string" &&
+                    source.startsWith("failure\t"),
+                )
+              )
+                throw new Error("fixture scanner error");
+            },
+          }),
+          host: {
+            runVerification: verifier.runVerification.bind(verifier),
+            async runReviewer() {
+              throw new Error(
+                "Review is unreachable for a failing Verification",
+              );
+            },
+            async runWorker(plan, id) {
+              assert.equal(plan.command.timeoutMs, 240_000);
+              revisionNote = plan.sandbox.readOnlyFiles?.find(
+                ({ path }) => path === "review-notes.txt",
+              )?.bytes;
+              return {
+                id: id!,
+                outcome: "ok",
+                artifacts: {
+                  files: [],
+                  tree: writeWorkspaceTar([
+                    {
+                      path: "docs",
+                      type: "directory",
+                      mode: 0o755,
+                      data: Buffer.alloc(0),
+                      linkname: "",
+                    },
+                    {
+                      path: "docs/a.md",
+                      type: "file",
+                      mode: 0o644,
+                      data: Buffer.from(`Revision ${++workerRuns}\n`),
+                      linkname: "",
+                    },
+                  ]),
+                },
+              };
+            },
+          },
+        });
+        const flow = await executor.open(store.getTask(taskId)!);
+        await flow.worker(randomUUID(), false, {});
+        const verificationId = randomUUID();
+        assert.equal(await flow.verify!(verificationId, {}), false);
+        assert.equal(collected, true);
+        await flow.worker(randomUUID(), true, {});
+        const journal = new IntegrationJournal(
+          join(directory, "integrations", taskId),
+          taskId,
+        );
+        const events = await journal.read();
+        const finish = events.find(
+          (event) => event.kind === "verification.finished",
+        )!;
+        assert.equal(finish.review, "revise");
+        assert.equal(
+          finish.tailDigest,
+          scenario === "collection error"
+            ? undefined
+            : createHash("sha256").update(rawTail).digest("hex"),
+        );
+        assert.equal(
+          audit
+            .read(verificationId)
+            .find(
+              (event) =>
+                event.operation === "sandbox.collect" &&
+                event.kind === "operation.finished",
+            )?.outcome,
+          scenario === "collection error" ? "failed" : "ok",
+        );
+        const note = Buffer.from(revisionNote!).toString();
+        if (scenario === "screened" || scenario === "truncated") {
+          assert.match(note, /failure\t［伏せ字］\n�/);
+          assert.equal(
+            (await readOperatorTask(store, directory, taskId))
+              ?.verificationNote,
+            note,
+          );
+          assert.equal(
+            events.find((event) => event.kind === "revision.requested")?.notes,
+            finish.notes,
+          );
+          assert.equal(await flow.verify!(randomUUID(), {}), true);
+          assert.equal(
+            (await readOperatorTask(store, directory, taskId))
+              ?.verificationNote,
+            undefined,
+          );
+        } else {
+          assert.match(note, /verification suite failed/);
+          assert.equal(finish.notes, undefined);
+          assert.equal(
+            (await readOperatorTask(store, directory, taskId))
+              ?.verificationNote,
+            undefined,
+          );
+        }
+        assert.ok(!note.includes(tokenSuffix));
+      } finally {
+        audit.close();
+      }
+    },
+  );
+}
+
 test(
   "real Git composes tree mode, path rejection, verification, review and operator CLI",
   gitTestOptions,
@@ -1370,14 +1617,18 @@ test(
           assert.ok(plan.sandbox.repository);
           assert.equal(plan.sandbox.profile, "base");
           assert.equal(plan.command.timeoutMs, 125_000);
-          const [binary, ...args] = plan.command.argv;
+          const [binary, flag, script, ...args] = plan.command.argv;
           const { tree } = plan.sandbox.repository;
           const workspace = mkdtempSync(join(root, "verify-"));
           const unpacked = spawnSync("/usr/bin/tar", ["-xf", tree], {
             cwd: workspace,
           });
           assert.equal(unpacked.status, 0, String(unpacked.stderr));
-          const response = command(binary!, workspace, args);
+          const response = command(binary!, workspace, [
+            flag!,
+            script!.replace(VERIFICATION_TAIL_PATH, "./diagnostic/tail"),
+            ...args,
+          ]);
           return {
             id: id!,
             outcome: "ok",

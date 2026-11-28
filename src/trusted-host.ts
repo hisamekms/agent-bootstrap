@@ -61,6 +61,9 @@ import {
   sameProvider,
   SandboxRuntimeError,
   terminalEnvEntries,
+  VERIFICATION_FAILURE_VERDICT,
+  VERIFICATION_TAIL_LIMIT,
+  VERIFICATION_TAIL_PATH,
   WORKER_MESSAGE_LIMIT,
 } from "./sandbox-runtime.ts";
 import {
@@ -117,6 +120,7 @@ type AuditedProfile = NonNullable<AuditInput["profile"]>;
 
 const AUDIT_HEALTH_POLL_MS = 25;
 const DEFAULT_CONCIERGE_LIFETIME_MS = 120_000;
+const verificationFailureVerdict = Buffer.from(VERIFICATION_FAILURE_VERDICT);
 const CONCIERGE_EXTRA_EGRESS = [
   { hostname: "platform.claude.com", port: 443 },
 ] as const;
@@ -192,7 +196,16 @@ export interface VerificationPlan {
     "readOnlyFiles" | "maxLifetimeMs" | "profile" | "repository" | "environment"
   >;
   readonly command: SandboxCommand;
+  /** Opt in to the configured command wrapper's fixed failure diagnostic. */
+  readonly captureFailureTail?: true;
 }
+
+export interface VerificationRun extends ReviewerRun {
+  readonly failureTail?: Uint8Array;
+}
+
+type InvocationCollection = Pick<WorkerPlan, "collectPaths" | "collectTree"> &
+  Pick<VerificationPlan, "captureFailureTail">;
 
 export interface HostObservabilityAudit extends AuditSink {
   readonly isV5Writable: boolean;
@@ -297,7 +310,7 @@ type Invoke = {
 } & (
   | {
       readonly command: SandboxCommand;
-      readonly plan: Pick<WorkerPlan, "collectPaths" | "collectTree">;
+      readonly plan: InvocationCollection;
     }
   | {
       readonly command: SandboxCommand;
@@ -496,15 +509,13 @@ export class TrustedHost {
     return this.#run("Worker", plan, id, context, options);
   }
 
-  /** Read-only verification under its own role. It accepts only files,
-   * lifetime, profile and a host-prepared repository (never collected):
-   * never a provider, tools or a host port. */
+  /** Offline verification under its own role, with opt-in diagnostics. */
   async runVerification(
     plan: VerificationPlan,
     id?: string,
     context?: ExecutionContext,
     options?: TrustedHostRunOptions,
-  ): Promise<ReviewerRun> {
+  ): Promise<VerificationRun> {
     if (
       Object.keys(plan.sandbox).some(
         (key) =>
@@ -864,7 +875,7 @@ export class TrustedHost {
     id?: string,
     context?: ExecutionContext,
     options?: TrustedHostRunOptions,
-  ): Promise<ReviewerRun> {
+  ): Promise<VerificationRun> {
     // Verification never copies egress or tools, even from a non-enumerable
     // property that the key check in runVerification cannot see.
     if (
@@ -917,6 +928,10 @@ export class TrustedHost {
         sandbox,
         command: { ...plan.command, argv: [...plan.command.argv] },
         collectPaths: [],
+        ...(role === "Verification" &&
+        (plan as VerificationPlan).captureFailureTail === true
+          ? { captureFailureTail: true }
+          : {}),
       },
       id,
       context,
@@ -926,11 +941,11 @@ export class TrustedHost {
 
   async #run(
     role: "Worker" | "Reviewer" | "Planner" | "Coordinator" | "Verification",
-    plan: WorkerPlan,
+    plan: WorkerPlan & Pick<VerificationPlan, "captureFailureTail">,
     id: string | undefined,
     context: ExecutionContext | undefined,
     options: TrustedHostRunOptions | undefined,
-  ): Promise<WorkerRun & ReviewerRun> {
+  ): Promise<WorkerRun & VerificationRun> {
     // Only Worker may carry a repository or collect the tree. Refused before
     // any audit write.
     if (
@@ -957,29 +972,34 @@ export class TrustedHost {
     const validated =
       context === undefined ? undefined : parseExecutionContext(context);
     const invocationId = id ?? validated?.executionId ?? randomUUID();
-    const { outcome, artifacts, response, code } = await this.#invoke({
-      id: invocationId,
-      role,
-      sandbox: plan.sandbox,
-      command: plan.command,
-      plan: {
-        collectPaths: [...plan.collectPaths],
-        ...(plan.collectTree ? { collectTree: plan.collectTree } : {}),
-      },
-      context: validated,
-      options,
-    }).finally(async () => {
-      if (options?.secretFile) {
-        options.secretFile.clearScreen();
-        await options.secretFile.close();
-      }
-    });
+    const { outcome, artifacts, response, code, failureTail } =
+      await this.#invoke({
+        id: invocationId,
+        role,
+        sandbox: plan.sandbox,
+        command: plan.command,
+        plan: {
+          collectPaths: [...plan.collectPaths],
+          ...(plan.collectTree ? { collectTree: plan.collectTree } : {}),
+          ...(role === "Verification" && plan.captureFailureTail
+            ? { captureFailureTail: true }
+            : {}),
+        },
+        context: validated,
+        options,
+      }).finally(async () => {
+        if (options?.secretFile) {
+          options.secretFile.clearScreen();
+          await options.secretFile.close();
+        }
+      });
     return {
       id: invocationId,
       outcome,
       ...(code ? { code } : {}),
       ...(outcome === "ok" && artifacts ? { artifacts } : {}),
       ...(outcome === "ok" && response ? { response } : {}),
+      ...(outcome === "ok" && failureTail ? { failureTail } : {}),
     };
   }
 
@@ -988,6 +1008,7 @@ export class TrustedHost {
     code?: RunFailureCode;
     artifacts?: CollectedArtifacts;
     response?: Uint8Array;
+    failureTail?: Uint8Array;
     value?: unknown;
   }> {
     const { id, role, options } = input;
@@ -1000,6 +1021,11 @@ export class TrustedHost {
     };
     if ("debugMounts" in sandbox && input.debugEgress === undefined)
       throw new Error("Debug mounts require the operator sandbox shell");
+    if ("verification" in sandbox)
+      throw new Error(
+        "Verification sandboxes are assigned by the trusted host",
+      );
+    if (role === "Verification" && "plan" in input) sandbox.verification = true;
     if (
       "mounts" in sandbox ||
       "claudeManagedSettings" in sandbox ||
@@ -1332,6 +1358,7 @@ export class TrustedHost {
     let outcome: Outcome = "failed";
     let artifacts: CollectedArtifacts | undefined;
     let response: Uint8Array | undefined;
+    let failureTail: Uint8Array | undefined;
     let value: unknown;
     let failure: { error: unknown } | undefined;
     let providerGranted = false;
@@ -2102,6 +2129,31 @@ export class TrustedHost {
             role === "Worker" ? guestRequest(result.stdout) : "none";
           if (role !== "Worker") response = result.stdout;
           if (
+            role === "Verification" &&
+            input.plan.captureFailureTail &&
+            result.stdout.byteLength ===
+              verificationFailureVerdict.byteLength &&
+            verificationFailureVerdict.equals(result.stdout)
+          ) {
+            await authorize("sandbox.collect");
+            ensureAudit();
+            try {
+              const { files } = await this.#sandbox.collect(current, {
+                verificationTail: true,
+              });
+              const file = files.length === 1 ? files[0] : undefined;
+              if (
+                file?.path === VERIFICATION_TAIL_PATH &&
+                file.bytes.byteLength <= VERIFICATION_TAIL_LIMIT
+              )
+                failureTail = new Uint8Array(file.bytes);
+            } catch (error) {
+              if (error instanceof HostAuditError) throw error;
+              // Missing diagnostics do not change the verdict.
+            }
+            await finish("sandbox.collect", failureTail ? "ok" : "failed");
+          }
+          if (
             request === "collect" &&
             (input.plan.collectPaths.length > 0 || input.plan.collectTree)
           ) {
@@ -2267,6 +2319,7 @@ export class TrustedHost {
         ...(code ? { code } : {}),
         ...(artifacts ? { artifacts } : {}),
         ...(response ? { response } : {}),
+        ...(failureTail ? { failureTail } : {}),
         ...(value !== undefined ? { value } : {}),
       };
     } catch (error) {

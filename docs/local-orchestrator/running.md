@@ -319,6 +319,7 @@ profile lock. Configure the command before starting the launcher.
 
 ```sh
 agent-bootstrap --target "$target" verification set --profile bun -- bun test
+agent-bootstrap --target "$target" verification set --profile bun --timeout-ms 1800000 -- bun run verify:full
 agent-bootstrap --target "$target" verification show
 agent-bootstrap --target "$target" verification clear
 ```
@@ -333,9 +334,18 @@ startup. Keep it in place until existing integration proposals are
 resolved, so integration can recheck each candidate with the same command.
 
 The credential-free Verification sandbox runs the fixed argv in the pinned
-candidate workspace. Its timeout is bounded by the Task's execution time
-budget and the runtime limit. A nonzero exit uses the Task's revision
-budget. A passing command allows review to proceed and the resulting
+candidate workspace. Set `verification.timeoutMs` in `local.json` or use
+`--timeout-ms` to set an integer from 1 to 3,600,000 milliseconds. The default
+is 240,000 milliseconds. Verification uses the smaller of this timeout and
+the Task's `maxExecutionMs`. Set both budgets high enough for the suite.
+A nonzero exit uses the Task's revision budget. When available, the last
+16 KiB of combined output is screened for credentials and saved in the
+Executor's private revision notes. Task detail shows the latest screened
+failure output. The journal records the raw tail's
+SHA-256 digest alongside the verification result.
+The VM keeps the command's full output in a file under `/tmp` until the
+command exits, so a very noisy suite uses VM disk or memory for it.
+A passing command allows review to proceed and the resulting
 proposal records `verified: true`. Verification runs again at integration.
 Without a suite, a human must answer the integration gate.
 

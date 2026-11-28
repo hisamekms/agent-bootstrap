@@ -42,7 +42,10 @@ import {
 import { validCodexModel } from "../codex-exec.ts";
 import { EgressPolicy, type HostPort } from "../egress-policy.ts";
 import { CLAUDE_MOUNT_ENV } from "../claude-code.ts";
-import { isSafeCredentialVariable } from "../sandbox-runtime.ts";
+import {
+  isSafeCredentialVariable,
+  VERIFICATION_TIMEOUT_LIMIT_MS,
+} from "../sandbox-runtime.ts";
 import {
   CLAUDE_ACTORS,
   validClaudeHostname,
@@ -621,6 +624,7 @@ export function parseConfig(
     const verification = record(raw.verification, "verification", next, [
       "profile",
       "argv",
+      "timeoutMs",
     ]);
     if (
       !ROLE_PROFILES.Verification.some(
@@ -630,6 +634,19 @@ export function parseConfig(
       invalid(
         "verification.profile",
         "The profile is outside the Verification allowlist.",
+        next,
+      );
+    const { timeoutMs } = verification;
+    if (
+      Object.hasOwn(verification, "timeoutMs") &&
+      (typeof timeoutMs !== "number" ||
+        !Number.isSafeInteger(timeoutMs) ||
+        timeoutMs < 1 ||
+        timeoutMs > VERIFICATION_TIMEOUT_LIMIT_MS)
+    )
+      invalid(
+        "verification.timeoutMs",
+        `Provide an integer between 1 and ${VERIFICATION_TIMEOUT_LIMIT_MS} milliseconds.`,
         next,
       );
     try {

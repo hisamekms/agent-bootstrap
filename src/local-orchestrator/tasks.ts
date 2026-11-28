@@ -581,7 +581,7 @@ export function createTaskExecutor(options: {
                   ...verification.command,
                   timeoutMs: Math.min(
                     verification.command.timeoutMs,
-                    timeoutMs,
+                    task.content.budgets.maxExecutionMs,
                   ),
                 },
               },
@@ -1054,7 +1054,11 @@ export async function runTask(
   );
 }
 
-function taskJournal(directory: string, taskId: string, retries: number) {
+export function taskJournal(
+  directory: string,
+  taskId: string,
+  retries: number,
+) {
   const root = join(directory, "integrations", taskId);
   return new IntegrationJournal(
     retries === 0 ? root : join(root, `retry-${retries}`),

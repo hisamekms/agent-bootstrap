@@ -17,7 +17,10 @@ import {
   type CredentialSpan,
   type CredentialScanner,
 } from "./credential-scan.ts";
-import { MAX_REVISIONS } from "../integration-journal.ts";
+import {
+  MAX_REVISIONS,
+  VERIFICATION_NOTE_LIMIT_BYTES,
+} from "../integration-journal.ts";
 import {
   inboxLimit,
   projectInbox,
@@ -52,7 +55,7 @@ import {
 } from "./proposal-screening.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
 import { readPathViolations } from "./path-violations.ts";
-import { candidateDiffStat } from "./tasks.ts";
+import { candidateDiffStat, taskJournal } from "./tasks.ts";
 import { permitsPanelAnswer, type OrchestratorStore } from "./store.ts";
 
 type ProposalDetails = NonNullable<
@@ -880,6 +883,48 @@ export function operatorTask(store: OrchestratorStore, key: string) {
       .listEvents({ subjectId: id, limit: 10 })
       .map(({ kind, at }) => ({ kind, at })),
   };
+}
+
+export async function readTaskVerificationNote(
+  directory: string,
+  { id, retries }: Pick<Task, "id" | "retries">,
+  scan = builtInCredentialScanner,
+): Promise<string | undefined> {
+  const journal = taskJournal(directory, id, retries);
+  try {
+    const latest = (await journal.read()).findLast(
+      (event) => event.kind === "verification.finished",
+    );
+    if (
+      latest?.kind !== "verification.finished" ||
+      latest.review === "pass" ||
+      !latest.notes
+    )
+      return;
+    const note = new TextDecoder("utf-8", { fatal: true }).decode(
+      await journal.readNote(latest.notes, VERIFICATION_NOTE_LIMIT_BYTES),
+    );
+    await scan(note, JSON.stringify(note));
+    return note;
+  } catch {
+    // A missing or withheld diagnostic leaves the Task detail available.
+  }
+}
+
+export async function readOperatorTask(
+  store: OrchestratorStore,
+  directory: string,
+  key: string,
+  scan?: CredentialScanner,
+) {
+  const task = operatorTask(store, key);
+  if (!task) return null;
+  const verificationNote = await readTaskVerificationNote(
+    directory,
+    task,
+    scan,
+  );
+  return { ...task, ...(verificationNote ? { verificationNote } : {}) };
 }
 
 export function operatorProblems(
