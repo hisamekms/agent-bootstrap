@@ -17,7 +17,10 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     (push) => pushes.push(push),
     () => {},
   );
-  assert.deepEqual(new Set(Object.keys(methods)), operatorBridgeMethods);
+  const previewBridgeMethods = new Set(operatorBridgeMethods);
+  previewBridgeMethods.delete("goal.publish");
+  previewBridgeMethods.delete("goal.setAutoMerge");
+  assert.deepEqual(new Set(Object.keys(methods)), previewBridgeMethods);
 
   const pending = pendingDecisions(methods["inbox.list"]({}));
   const approvals: PanelAnswer[] = [];
@@ -65,7 +68,7 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     new Set(["human", "ai", "idle", "stopped", "done"]),
   );
   assert.ok(goals.filter(({ turn }) => turn.owner === "done").length > 2);
-  for (const { id, turn } of goals) {
+  for (const { id, turn, publish } of goals) {
     const count = pending.filter(
       (row) =>
         row.subject.goalId === id &&
@@ -74,7 +77,9 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     ).length;
     assert.equal(turn.owner === "human", count > 0, id);
     if (count) assert.deepEqual(turn.reason, { kind: "approvals", count });
-    assert.deepEqual(methods["goal.get"]({ id }).turn, turn);
+    const detail = methods["goal.get"]({ id });
+    assert.deepEqual(detail.turn, turn);
+    assert.deepEqual(detail.publish, publish);
   }
   const detailed = methods["goal.get"]({ id: "G1" });
   assert.deepEqual(detailed.turn, {

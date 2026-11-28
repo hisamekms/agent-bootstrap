@@ -428,7 +428,7 @@ test("version 7 event migration preserves ordering and accepts a full environmen
   store.close();
   const db = new Database(filename);
   try {
-    db.exec("PRAGMA user_version=7");
+    db.exec("DROP TABLE goal_publish_audit; PRAGMA user_version=7");
   } finally {
     db.close();
   }
@@ -1125,6 +1125,7 @@ test("schema 6 migration preserves legacy Goal policies over project defaults", 
       ALTER TABLE proposal_approval_runs RENAME TO integration_approval_runs;
       ALTER TABLE approvals DROP COLUMN policy_details_json;
       ALTER TABLE approvals DROP COLUMN reasons_json;
+      DROP TABLE goal_publish_audit;
       PRAGMA user_version=5;
     `);
   } finally {

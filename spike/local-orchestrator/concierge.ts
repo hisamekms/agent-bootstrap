@@ -1,3 +1,5 @@
+import { GoalPublisher } from "../../src/publish/goals.ts";
+import { githubGh } from "../../src/publish/github-gh.ts";
 import { EnvironmentStore } from "../../src/environments/store.ts";
 import { systemHost } from "../../src/onboarding/prerequisites.ts";
 import { codexProvider, siwcCodexEndpoint } from "../../src/codex-exec.ts";
@@ -410,6 +412,7 @@ async function launchConcierge(
   const scan = volumeShell ? undefined : claude.scan;
   const telemetry = createTelemetry(config.telemetry, config.directory);
   let store: OrchestratorStore | undefined;
+  let publisher: GoalPublisher | undefined;
   let observed: Awaited<ReturnType<typeof createObservedHost>> | undefined;
   let sessionId: string | undefined;
   let operator: Awaited<ReturnType<typeof listenOperatorApi>> | undefined;
@@ -489,8 +492,17 @@ async function launchConcierge(
     if (!store) throw new Error("Concierge state unavailable");
     const host = observed.host;
     setStage("open operator API");
+    publisher = new GoalPublisher(
+      store,
+      directory,
+      repoRoot,
+      githubGh(repoRoot, target.env),
+      effective.config.publish,
+      scan,
+    );
     const apiOptions = {
       store,
+      publisher,
       stateDirectory: directory,
       target: repoRoot,
       repository: {
@@ -512,6 +524,7 @@ async function launchConcierge(
       > = {},
     ) => {
       setStage("launch or clean up session");
+      publisher?.start(sessionOptions.signal);
       return startConcierge(
         {
           host,
@@ -613,6 +626,7 @@ async function launchConcierge(
     credential = "";
     const closed = await Promise.allSettled([
       Promise.resolve().then(() => operator?.close()),
+      Promise.resolve().then(() => publisher?.stop()),
       Promise.resolve().then(() => observed?.close()),
       telemetry.shutdown(),
     ]);

@@ -5,6 +5,7 @@ import {
 } from "../../src/local-orchestrator/delegation.ts";
 import { contentDigest } from "../../src/local-orchestrator/model.ts";
 import { parsePanelAnswer } from "../../src/local-orchestrator/proposal-answer.ts";
+import { remoteGoalBranch } from "../../src/publish/journal.ts";
 import {
   groupProblems,
   pendingDecisions,
@@ -75,8 +76,10 @@ function goal(
         : "active";
   const exportable = turn.reason.kind === "exportable";
   const branch = `lo/goal-${ref.slice(1).padStart(8, "0")}`;
+  const id = `goal-${ref}`;
+  const { reason } = turn;
   return {
-    id: `goal-${ref}`,
+    id,
     ref,
     title,
     status,
@@ -91,9 +94,29 @@ function goal(
     baseCommit,
     branch,
     policyOverrides: { "task-registration": "inherit", integration: "inherit" },
+    publish: {
+      branch: remoteGoalBranch({ id, ref }),
+      enabled: reason.kind === "published",
+      state: reason.kind === "published" ? "pr-open" : "disabled",
+      autoMerge: "off",
+      autoMergeSource: "project",
+      ...(reason.kind === "published" && {
+        prNumber: reason.prNumber,
+        prUrl: reason.prUrl,
+      }),
+    },
+    autoMergeConfirmations: {
+      off: "0".repeat(64),
+      squash: "1".repeat(64),
+      merge: "2".repeat(64),
+      rebase: "3".repeat(64),
+    },
     tasks: [],
     timeline: [],
-    head: exportable ? candidate : baseCommit,
+    head:
+      exportable || reason.kind === "exported" || reason.kind === "published"
+        ? candidate
+        : baseCommit,
     headAvailable: true,
     exportPreview: exportable
       ? { branch, from: null, to: candidate, target: project }
@@ -391,11 +414,16 @@ export function createPreviewMethods(
     exportable,
     goal("G6", "レシート一覧の読み込みを速くする", {
       owner: "done",
-      reason: { kind: "completed" },
+      reason: { kind: "exported", branch: "lo/goal-00000006" },
     }),
     goal("G7", "重複した取引の警告を追加する", {
       owner: "done",
-      reason: { kind: "completed" },
+      reason: {
+        kind: "published",
+        branch: remoteGoalBranch({ id: "goal-G7", ref: "G7" }),
+        prNumber: 1,
+        prUrl: "https://github.com/example/example/pull/1",
+      },
     }),
     goal("G8", "税率の表示を揃える", {
       owner: "done",
@@ -966,6 +994,7 @@ export function createPreviewMethods(
             status,
             createdAt,
             turn,
+            publish,
             progress,
             estimate,
           }) => ({
@@ -975,6 +1004,7 @@ export function createPreviewMethods(
             status,
             createdAt,
             turn,
+            publish,
             progress,
             estimate,
           }),

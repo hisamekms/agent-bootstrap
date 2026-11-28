@@ -1457,7 +1457,19 @@ const turnGroups = [
   { label: "終わった", owners: ["done"] },
 ];
 
-function turnReason(reason: GoalSummary["turn"]["reason"]) {
+const publishStateLabels = {
+  disabled: "無効",
+  pending: "公開待ち",
+  pushed: "プッシュ済み",
+  "pr-open": "オープン",
+  merged: "マージ済み",
+  "merged-stale": "マージ後に変更あり",
+  closed: "クローズ済み",
+  failed: "公開処理に失敗",
+} satisfies Record<GoalSummary["publish"]["state"], string>;
+
+function turnReason(goal: GoalSummary): string {
+  const { reason } = goal.turn;
   switch (reason.kind) {
     case "approvals":
       return `判断 ${reason.count} 件`;
@@ -1475,6 +1487,10 @@ function turnReason(reason: GoalSummary["turn"]["reason"]) {
       return "計画前";
     case "exportable":
       return "書き出し可能";
+    case "exported":
+      return "手元に書き出し済み";
+    case "published":
+      return `PR #${reason.prNumber}（${publishStateLabels[goal.publish.state]}）`;
     case "completed":
       return "作業完了";
     case "idle":
@@ -1493,10 +1509,17 @@ function goalTurn(goal: GoalSummary, showReason = false) {
       done: ["check", "完了"],
     } as const
   )[owner];
-  const explanation = turnReason(reason);
-  const visible = showReason || reason.kind === "failed";
+  const explanation = turnReason(goal);
+  const resultGlyph =
+    reason.kind === "exported"
+      ? "export"
+      : reason.kind === "published"
+        ? "merge"
+        : null;
+  const visible =
+    showReason || reason.kind === "failed" || resultGlyph !== null;
   const mark = visual(
-    glyph,
+    resultGlyph ?? glyph,
     visible ? label : `${label}。 ${explanation}`,
     `owner ${owner}`,
   );

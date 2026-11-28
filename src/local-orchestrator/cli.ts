@@ -1,3 +1,12 @@
+import { goalPublishConfirmation } from "../publish/protocol.ts";
+import { GoalPublisher } from "../publish/goals.ts";
+import { githubGh } from "../publish/github-gh.ts";
+import {
+  autoMergeMethods,
+  PublishError,
+  type AutoMerge,
+  type PublishProvider,
+} from "../publish/port.ts";
 import { boundField, executionDisplay } from "./execution-display.ts";
 import {
   GOAL_POLICIES,
@@ -62,6 +71,7 @@ import {
   previewGoalDiscard,
   previewGoalBranchExport,
   reconciliationIntegrationHeads,
+  readGoalBranchHead,
 } from "./tasks.ts";
 import { displayProposal, proposalDecisionPreview } from "./proposal-answer.ts";
 
@@ -103,6 +113,8 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   update-goal-base <goalId>
   discard-goal <goalId>
   export-goal-branch <goalId> [--target <checkout>]
+  publish-goal <goalId>
+  set-auto-merge <goalId> <off|squash|merge|rebase>
   show-execution <executionId>
   proposals [--status <pending|approved|rejected|registered>]
   show <proposalId|goalId|taskId>
@@ -126,10 +138,15 @@ type Command =
   | { kind: "show"; id: string }
   | {
       kind:
-        "show-execution" | "retry-task" | "update-goal-base" | "discard-goal";
+        | "show-execution"
+        | "retry-task"
+        | "update-goal-base"
+        | "discard-goal"
+        | "publish-goal";
       id: string;
     }
   | { kind: "export-goal-branch"; id: string; checkout?: string }
+  | { kind: "set-auto-merge"; id: string; method: AutoMerge }
   | {
       kind: "approve" | "reject";
       id: string;
@@ -224,7 +241,16 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
     case "retry-task":
     case "update-goal-base":
     case "discard-goal":
+    case "publish-goal":
       if (args.length === 1) return { kind, id: identifier(args[0]) };
+      break;
+    case "set-auto-merge":
+      if (args.length === 2)
+        return {
+          kind,
+          id: identifier(args[0]),
+          method: oneOf(args[1], autoMergeMethods),
+        };
       break;
     case "export-goal-branch": {
       const id = identifier(args[0]);
@@ -372,6 +398,7 @@ async function execute(
   configDirectory?: string,
   env = process.env,
   bootstrapRoot = bootstrapCheckout,
+  publisher?: GoalPublisher,
 ): Promise<0 | 1> {
   const writeCheckedJson = async (value: unknown) => {
     await scan?.(JSON.stringify(value));
@@ -460,17 +487,44 @@ async function execute(
     case "discard-goal": {
       if (directory === undefined)
         return refuse(io, "discard-goal with --db requires --target <path>.");
-      const { branch, head, apply } = await previewGoalDiscard(
-        store,
-        directory,
-        command.id,
-      );
-      await writeCheckedJson({ goalId: command.id, branch, head });
+      const { branch, head, autoMergeDisarmPending, apply } =
+        await previewGoalDiscard(store, directory, command.id);
+      await writeCheckedJson({
+        goalId: command.id,
+        branch,
+        head,
+        ...(autoMergeDisarmPending && { autoMergeDisarmPending }),
+      });
       const phrase = `discard-goal ${command.id} ${head?.slice(0, 12) ?? "none"}`;
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await apply();
       await writeCheckedJson(store.getGoal(command.id));
+      return 0;
+    }
+    case "publish-goal": {
+      if (!directory || !publisher || !store.goalPublishEnabled)
+        return refuse(io, "publish-disabled");
+      const goal = store.getGoal(command.id);
+      if (!goal) return refuse(io, "not-found");
+      const head = await readGoalBranchHead(directory, goal.id);
+      if (!head) return refuse(io, "goal-head-unavailable");
+      const phrase = goalPublishConfirmation(goal.ref, head);
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      await writeCheckedJson(await publisher.publish(goal.id, head));
+      return 0;
+    }
+    case "set-auto-merge": {
+      const goal = store.getGoal(command.id);
+      if (!goal) return refuse(io, "not-found");
+      const confirm = store.goalAutoMergeConfirmations(goal.id)[command.method];
+      const phrase = `set-auto-merge ${goal.ref} ${command.method}`;
+      if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
+        return refuse(io, "Confirmation did not match. Operation cancelled.");
+      const { method: autoMerge, source: autoMergeSource } =
+        store.setGoalAutoMerge(goal.id, command.method, confirm, "cli");
+      await writeCheckedJson({ autoMerge, autoMergeSource });
       return 0;
     }
     case "export-goal-branch": {
@@ -494,9 +548,7 @@ async function execute(
       if ((await io.prompt(`Type "${phrase}" to confirm: `)) !== phrase)
         return refuse(io, "Confirmation did not match. Operation cancelled.");
       await apply();
-      io.stdout.write(
-        `Review ${branch} in the operator checkout. When ready, push ${branch} and open a pull request to main.\n`,
-      );
+      io.stdout.write(`Exported ${branch} into the operator checkout.\n`);
       return 0;
     }
     case "retry-task": {
@@ -794,6 +846,10 @@ export async function runCli(
   io: CliIo,
   bootstrapRoot = bootstrapCheckout,
   env = process.env,
+  publisherProvider: (
+    checkout: string,
+    env: NodeJS.ProcessEnv,
+  ) => PublishProvider = githubGh,
 ): Promise<0 | 1 | 2> {
   let db: string | undefined;
   let targetPath: string | undefined;
@@ -845,6 +901,8 @@ export async function runCli(
       "update-goal-base",
       "discard-goal",
       "export-goal-branch",
+      "publish-goal",
+      "set-auto-merge",
       "verification-set",
       "verification-clear",
     ].includes(command.kind) &&
@@ -853,7 +911,8 @@ export async function runCli(
     return refuse(io, "This command requires a terminal on stdin and stdout.");
 
   if (
-    command.kind === "export-goal-branch" &&
+    (command.kind === "export-goal-branch" ||
+      command.kind === "publish-goal") &&
     db !== undefined &&
     targetPath === undefined
   )
@@ -907,6 +966,20 @@ export async function runCli(
               await dbScan(...text);
             }
           : (targetScan ?? dbScan);
+      const publishConfig = loadConfig(env, target?.configDirectory).config
+        .publish;
+      store.configureGoalPublishing(publishConfig);
+      const publisher =
+        command.kind === "publish-goal" && directory
+          ? new GoalPublisher(
+              store,
+              directory,
+              repoRoot,
+              publisherProvider(repoRoot, env),
+              publishConfig,
+              scan,
+            )
+          : undefined;
       return await execute(
         io,
         store,
@@ -917,12 +990,19 @@ export async function runCli(
         target?.configDirectory,
         env,
         bootstrapRoot,
+        publisher,
       );
     } finally {
       store.close();
     }
   } catch (error) {
-    if (error instanceof ClaudeRunError) return refuse(io, error.code);
+    if (error instanceof ClaudeRunError || error instanceof PublishError)
+      return refuse(io, error.code);
+    if (
+      command.kind === "set-auto-merge" &&
+      error instanceof OrchestratorStoreError
+    )
+      return refuse(io, error.code);
     if (error instanceof ConfigError)
       return refuse(io, `${error.message}\nnext: ${error.next}`);
     if (command.kind === "analyze" || command.kind === "denials")

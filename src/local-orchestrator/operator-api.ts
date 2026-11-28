@@ -1,3 +1,10 @@
+import { goalPublishConfirmation } from "../publish/protocol.ts";
+import type { GoalPublisher } from "../publish/goals.ts";
+import {
+  autoMergeMethods,
+  PublishError,
+  type PublishFailure,
+} from "../publish/port.ts";
 import {
   GOAL_POLICIES,
   RULE_GATES,
@@ -75,11 +82,13 @@ interface OperatorApiOptions extends InboxSource {
   terminal?: ConciergeTerminalHub;
   workplace?: { signal: AbortSignal; stop(): void };
   environment?: WorkplaceEnvironment;
+  publisher?: Pick<GoalPublisher, "publish"> &
+    Partial<Pick<GoalPublisher, "wake">>;
 }
 
 type GoalExportTarget = Pick<
   OperatorApiOptions,
-  "target" | "repository" | "scan"
+  "target" | "repository" | "scan" | "publisher"
 >;
 
 type RequestId = string | number;
@@ -98,6 +107,7 @@ type OperatorGoalDetail = NonNullable<ReturnType<typeof operatorGoal>> & {
 };
 type ErrorCode =
   | StoreErrorCode
+  | PublishFailure
   | "invalid-request"
   | "invalid-params"
   | "unknown-method"
@@ -138,6 +148,8 @@ const shutdownBlockedMethods = new Set([
   "task.retry",
   "goal.discard",
   "goal.export",
+  "goal.publish",
+  "goal.setAutoMerge",
   "goal.updateBase",
   "proposal.answer",
   "proposal.answerMany",
@@ -312,7 +324,7 @@ export async function operatorAction(
       return { result: { id: goal.id, ref: goal.ref, branch, from, to } };
     }
     if (confirm !== goal.ref) return failure("confirmation-mismatch");
-    const { head, apply } = await previewGoalDiscard(
+    const { head, autoMergeDisarmPending, apply } = await previewGoalDiscard(
       store,
       stateDirectory,
       goal.id,
@@ -320,7 +332,15 @@ export async function operatorAction(
     );
     if (head !== expected) return failure("stale-base");
     await apply();
-    return { result: { id: goal.id, ref: goal.ref, status: "cancelled" } };
+    destination?.publisher?.wake?.();
+    return {
+      result: {
+        id: goal.id,
+        ref: goal.ref,
+        status: "cancelled",
+        ...(autoMergeDisarmPending && { autoMergeDisarmPending }),
+      },
+    };
   } catch (error) {
     if (error instanceof ContractError) return failure("invalid-params");
     if (error instanceof ConfirmationMismatchError)
@@ -345,6 +365,48 @@ export async function operatorAction(
     }
     if (error instanceof ClaudeRunError && error.code === "credential-leak")
       return failure("credential-leak");
+    return failure("write-failed");
+  }
+}
+
+export async function goalPublishAction(
+  store: OrchestratorStore,
+  publisher: OperatorApiOptions["publisher"],
+  method: "goal.publish" | "goal.setAutoMerge",
+  params: unknown,
+): Promise<Reply> {
+  try {
+    if (method === "goal.publish") {
+      const input = fields(params, ["id", "expectedHead", "confirm"]);
+      const id = identifier(input.id);
+      const head = gitCommit(input.expectedHead);
+      if (typeof input.confirm !== "string") throw new ContractError();
+      if (!publisher) return failure("publish-disabled");
+      const goal = store.getGoal(id);
+      if (!goal) return failure("not-found");
+      if (input.confirm !== goalPublishConfirmation(goal.ref, head))
+        return failure("confirmation-mismatch");
+      return { result: await publisher.publish(goal.id, head) };
+    }
+    const input = fields(params, ["id", "method", "confirm"]);
+    const id = identifier(input.id);
+    const requested = oneOf(input.method, autoMergeMethods);
+    if (
+      typeof input.confirm !== "string" ||
+      !/^[a-f0-9]{64}$/.test(input.confirm)
+    )
+      throw new ContractError();
+    const { method: autoMerge, source: autoMergeSource } =
+      store.setGoalAutoMerge(id, requested, input.confirm, "operator-ui");
+    publisher?.wake?.();
+    return { result: { autoMerge, autoMergeSource } };
+  } catch (error) {
+    if (error instanceof ContractError) return failure("invalid-params");
+    if (
+      error instanceof OrchestratorStoreError ||
+      error instanceof PublishError
+    )
+      return failure(error.code);
     return failure("write-failed");
   }
 }
@@ -641,6 +703,9 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         case "goal.export":
         case "goal.updateBase":
           return operatorAction(store, stateDirectory, method, params, options);
+        case "goal.publish":
+        case "goal.setAutoMerge":
+          return goalPublishAction(store, options.publisher, method, params);
         case "workplace.stopPreview":
         case "workplace.stop":
           return workplaceStopAction(store, options.workplace, method, params);

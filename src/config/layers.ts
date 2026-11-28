@@ -1,3 +1,9 @@
+import {
+  autoMergeMethods,
+  validPublishRef,
+  validPublishRemote,
+  type PublishConfig,
+} from "../publish/port.ts";
 import { codexExecutorOptions } from "../local-orchestrator/codex-executor.ts";
 import { randomUUID } from "node:crypto";
 import {
@@ -96,6 +102,7 @@ export interface Config {
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
+  publish?: Partial<PublishConfig>;
   environment?: {
     enabled?: boolean;
     autoBuild?: boolean;
@@ -568,6 +575,7 @@ export function parseConfig(
       "actors",
       "codex",
       "environment",
+      "publish",
     );
   if (layer === "user")
     keys.push("volumes", "secrets", "microsandbox", "repositories");
@@ -587,6 +595,7 @@ export function parseConfig(
     "secretEnv",
     "repositories",
     "environment",
+    "publish",
   ])
     if (Object.hasOwn(raw, field) && !keys.includes(field))
       invalid(field, "This key is disallowed in this layer.", next);
@@ -686,6 +695,33 @@ export function parseConfig(
           next,
         );
     }
+  }
+  if ("publish" in raw) {
+    const publish = record(raw.publish, "publish", next, [
+      "enabled",
+      "remote",
+      "base",
+      "autoMerge",
+    ]);
+    if (Object.hasOwn(publish, "enabled")) {
+      if (layer !== "local")
+        invalid("publish.enabled", "Allowed only in private local.json.", next);
+      if (typeof publish.enabled !== "boolean")
+        invalid("publish.enabled", "Expected a boolean.", next);
+    }
+    if (Object.hasOwn(publish, "remote") && !validPublishRemote(publish.remote))
+      invalid("publish.remote", "Expected a Git remote name.", next);
+    if (Object.hasOwn(publish, "base") && !validPublishRef(publish.base))
+      invalid("publish.base", "Expected a Git ref name.", next);
+    if (
+      Object.hasOwn(publish, "autoMerge") &&
+      !autoMergeMethods.some((method) => method === publish.autoMerge)
+    )
+      invalid(
+        "publish.autoMerge",
+        "Expected off, squash, merge or rebase.",
+        next,
+      );
   }
   if ("environment" in raw) {
     const environment = record(raw.environment, "environment", next, [
@@ -977,6 +1013,27 @@ export function mergeConfig(
         entries.push(destination);
         origins.push(layer);
       }
+    }
+    if (layer === "approved" && Object.hasOwn(current, "publish"))
+      invalid(
+        "publish",
+        "This key is disallowed in this layer.",
+        layerFile(layer, env, directory),
+      );
+    if (
+      layer === "user" &&
+      current.publish &&
+      Object.hasOwn(current.publish, "enabled")
+    )
+      invalid(
+        "publish.enabled",
+        "Allowed only in private local.json.",
+        layerFile(layer, env),
+      );
+    if (current.publish) {
+      config.publish = { ...config.publish, ...current.publish };
+      for (const key of Object.keys(current.publish))
+        sources[`publish.${key}`] = layer;
     }
     if (layer === "approved" && current.environment)
       invalid(

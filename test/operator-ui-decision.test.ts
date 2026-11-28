@@ -1896,6 +1896,8 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
   for (const [id, reason] of [
     ["goal-G4", /G4-1 検証の失敗/],
     ["goal-G9", /作業中/],
+    ["goal-G6", /手元に書き出し済み/],
+    ["goal-G7", /PR #1（オープン）/],
   ] as const) {
     click("back-list", goals);
     await settle();
@@ -1935,6 +1937,14 @@ function fixtureGoal(id: string, ref: string): GoalDetail {
     baseCommit: null,
     branch: "lo/goal-preview",
     policyOverrides: { "task-registration": "inherit", integration: "human" },
+    publish: {
+      enabled: false,
+      state: "disabled",
+      branch: "ab/goal-preview",
+      autoMerge: "off",
+      autoMergeSource: "project",
+    },
+    autoMergeConfirmations: { off: "", squash: "", merge: "", rebase: "" },
     tasks: [],
     timeline: [],
     head: null,

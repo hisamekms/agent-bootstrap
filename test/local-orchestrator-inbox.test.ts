@@ -448,6 +448,7 @@ test("version four stores acquire seen marks without losing pending proposals", 
       ALTER TABLE proposal_approval_runs RENAME TO integration_approval_runs;
       ALTER TABLE approvals DROP COLUMN policy_details_json;
       ALTER TABLE approvals DROP COLUMN reasons_json;
+      DROP TABLE goal_publish_audit;
       PRAGMA user_version=4;
     `);
   } finally {

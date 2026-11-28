@@ -229,7 +229,7 @@ Changes to symbolic links and Concierge proposals require an operator
 answer. Pending integration proposals from older databases also need an
 operator answer when they lack the host's symlink check record. A model's request to widen delegation requires operator approval.
 The Reviewer may still reject it when the gate allows delegated rejection.
-Goal discard and branch export remain operator commands.
+Goal discard, explicit branch export and changes to Goal auto-merge are operator commands.
 
 The **ルール** list is evaluated from top to bottom. Rules for Task
 registration can check planned paths and the proposed maximum token
@@ -556,8 +556,70 @@ Both commands create or fast-forward the branch locally. Switch away
 from the destination branch in any worktree where it is checked out.
 A branch with commits outside the Goal cannot be fast-forwarded.
 If the branch already points to the Goal head, there is nothing to export.
-Review the exported branch, then push it and open a PR to `main`
-from your usual Git workflow.
+With publishing disabled, use your usual Git workflow to publish an
+exported branch.
+
+## Publish a Goal to GitHub
+
+Set this in the project's private `local.json` with
+`agent-bootstrap config edit --project <name>`. The user configuration layer can set the remote, base and auto-merge defaults.
+
+```json
+{
+  "version": 1,
+  "publish": {
+    "enabled": true,
+    "remote": "origin",
+    "base": "main",
+    "autoMerge": "off"
+  }
+}
+```
+
+Publishing is off by default. The remote and base default to `origin`
+and `main`. Use an existing GitHub remote with Git push authentication
+configured in the launch checkout and an existing host `gh` login.
+For HTTPS, configure a Git credential helper before the first run.
+Configure the repository and its branch protection in GitHub.
+
+For Goals that finish after the Workplace first observes the project opt-in,
+the host exports the local `lo/goal-<id8>` branch, pushes the exact commit
+to `ab/<goal-ref>-<id8>`,
+and opens or finds the PR. The host screens the export and PR text and
+records each outward step in the Goal journal and the append-only
+`goal_publish_audit` table in the private target state database. Later
+integrations fast-forward that branch while the PR remains open. The host
+disables auto-merge before advancing an open PR and restores the Goal setting
+when the Goal finishes. A discarded Goal triggers an audited auto-merge disable
+on its open PR even when publishing is disabled. A PR head the host never
+pushed also triggers a disable. Once the expected head is restored, use
+`publish-goal` to resume. Git rejects non-fast-forward pushes. After a merge,
+later integrations are shown as `merged-stale`.
+
+Workplace polls for changes in checks, auto-merge and PR state. Routine
+polling slows to ten-minute intervals after the first hour and stops at merge
+or closure. Goals that finish while publishing is disabled require
+`publish-goal`, including after publishing is re-enabled. Use the same command
+for Goals that finished before the first opt-in or to retry a failed publish.
+If discarding a Goal schedules an auto-merge disable, the CLI preview and API
+response include `autoMergeDisarmPending`. The running Workplace performs the
+disable and retries failures reported as `auto-merge-disarm-failed`.
+
+```sh
+agent-bootstrap --target <checkout> publish-goal <goal>
+agent-bootstrap --target <checkout> set-auto-merge <goal> <off|squash|merge|rebase>
+```
+
+Both CLI commands use typed TTY confirmations. `publish-goal` pins the
+displayed head for a retry. New Goals inherit the configured auto-merge
+default at registration. An operator can override it for an individual
+Goal. The running host applies setting changes to open PRs. When
+GitHub refuses auto-merge, the PR stays open and the host records
+`auto-merge-unavailable`. Merge the PR yourself when auto-merge is off.
+
+Use `agent-bootstrap events --subject <goal>` to inspect publish
+events. An interrupted publish is reconciled against the remote branch
+and PR when the Workplace restarts.
 
 ## Analyze runs
 

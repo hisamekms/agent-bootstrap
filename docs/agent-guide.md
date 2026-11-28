@@ -33,7 +33,7 @@ Doctor reports ok, missing, wrong, or skipped for each check and prints one next
 Run agent-bootstrap help setup, then repeat doctor after setup.
 
 **Human involvement**  
-The operator updates local main, pushes branches, and opens pull requests.
+The operator updates local main. In opted-in projects the trusted host publishes finished Goals.
 
 ## setup
 
@@ -103,7 +103,7 @@ The launcher prints its session ID and audit database path and opens Claude Code
 Describe the desired Goal in the Concierge and inspect proposals from a second host terminal.
 
 **Human involvement**  
-The operator starts the session and reviews provider access and costs. The operator updates local main, pushes branches, and opens pull requests.
+The operator starts the session and reviews provider access and costs. The operator updates local main. In opted-in projects the trusted host publishes finished Goals.
 
 ## workplace
 
@@ -206,16 +206,18 @@ agent-bootstrap --target /path/to/project approve "$proposal_id"
 agent-bootstrap --target /path/to/project reject "$proposal_id"
 agent-bootstrap --target /path/to/project approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"
 agent-bootstrap --target /path/to/project export-goal-branch "$goal_id"
+agent-bootstrap --target /path/to/project publish-goal "$goal_id"
+agent-bootstrap --target /path/to/project set-auto-merge "$goal_id" off
 ```
 
 **Expected output**  
 Review the digest, effective policy and integration diff stat, choose approve or reject, and type the exact confirmation phrase. Export previews the destination and heads before confirmation.
 
 **Next action**  
-Wait for integration in status. Review the exported lo/goal-* branch before the operator pushes it and opens a PR.
+Wait for integration in status. Publishing is automatic in opted-in projects.
 
 **Human involvement**  
-The operator answers human-policy gates unless they explicitly delegate a terminal answer. The operator updates local main, pushes branches, and opens pull requests.
+The operator answers human-policy gates unless they explicitly delegate a terminal answer. The operator updates local main. In opted-in projects the trusted host publishes finished Goals.
 
 ## audit
 
@@ -285,7 +287,7 @@ Verification show returns the effective command or null. Set and clear edit the 
 Launch with the same target. Keep verification configured until its integration proposals are resolved.
 
 **Human involvement**  
-The operator confirms verification changes and eligible base updates from a host TTY. The operator updates local main, pushes branches, and opens pull requests.
+The operator confirms verification changes and eligible base updates from a host TTY. The operator updates local main. In opted-in projects the trusted host publishes finished Goals.
 
 ## configuration
 
@@ -362,7 +364,7 @@ Policy reports gate defaults, ordered rules, and Goal and Task overrides. Propos
 Review the proposed paths, verification result, digest, and policy before answering each gate.
 
 **Human involvement**  
-The operator updates local main, pushes branches, and opens pull requests. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep API keys in Keychain. Review mount and egress grants separately.
+The operator updates local main. In opted-in projects the trusted host publishes finished Goals. The operator answers human-policy gates unless they explicitly delegate a terminal answer. Keep API keys in Keychain. Review mount and egress grants separately.
 
 ## volume
 
@@ -438,5 +440,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap discard-goal <goalId>` → { goalId, branch, head } preview, followed by the cancelled Goal record on confirmation.
 - `agent-bootstrap verification show | verification clear | verification set --profile <name> -- <argv...>` → { profile, argv } or null for show. { target, current, verification } for set or clear.
 - `agent-bootstrap export-goal-branch <goalId> [--target <checkout>]` → { goalId, checkout, branch, from, to } for the completed export.
+- `agent-bootstrap publish-goal <goalId>` → Goal publish state and PR details.
+- `agent-bootstrap set-auto-merge <goalId> <off|squash|merge|rebase>` → { autoMerge, autoMergeSource }
 - `agent-bootstrap analyze [--audit <file>] [--out <dir>] [--sql <file>]` → { report } with human-readable tables, export path, and manual DuckDB command.
 - `agent-bootstrap denials [--since <iso>] [--limit <1-1000>]` → { report } with human-readable summary and export details.
