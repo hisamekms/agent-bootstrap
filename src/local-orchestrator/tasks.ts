@@ -309,9 +309,11 @@ export async function previewGoalDiscard(
   const head = await readGoalBranchHead(directory, goalId).catch(() => {
     throw new OrchestratorStoreError("goal-head-unavailable");
   });
+  const pr = store.goalPublishRecord(goalId)?.pr;
   return {
     branch,
     head,
+    autoMergeDisarmPending: pr?.state === "open" && pr.autoMerge !== "off",
     apply: () =>
       store.discardGoal(
         goalId,
@@ -335,6 +337,12 @@ export async function previewGoalBranchExport(
   id: string,
   scan?: CredentialScanner,
   checkHead?: (to: string) => void,
+  forPublish = false,
+  screenHistory?: (
+    base: string,
+    head: string,
+    screen: () => Promise<void>,
+  ) => Promise<void>,
 ) {
   const goal = store.getGoal(id);
   if (!goal) throw new OrchestratorStoreError("not-found");
@@ -354,20 +362,24 @@ export async function previewGoalBranchExport(
   )
     throw new GitIntegrationError("export-head-mismatch");
   checkHead?.(to);
-  if (scan && from !== to) {
+  if (scan && (from !== to || forPublish)) {
     // Older Goals can have integration events without a pinned base.
-    let base = goal.baseCommit ?? store.goalIntegrationBase(goalId);
+    const base = goal.baseCommit ?? store.goalIntegrationBase(goalId);
     if (base === null) throw new GitIntegrationError("invalid-object");
-    if (base !== to) {
+    const screen = async () => {
+      if (base === to) return;
       const { stdout } = await gitCommandHistory(directory, base, to);
+      let previous = base;
       for (const commit of stdout.trim().split("\n").map(gitCommit)) {
         await scan(
-          await git.diff(base, commit),
+          await git.diff(previous, commit),
           await git.candidateMessage(commit),
         );
-        base = commit;
+        previous = commit;
       }
-    }
+    };
+    if (screenHistory) await screenHistory(base, to, screen);
+    else await screen();
   }
   return {
     from,
@@ -376,7 +388,14 @@ export async function previewGoalBranchExport(
     async apply() {
       if (store.getGoal(goalId)?.status === "cancelled")
         throw new OrchestratorStoreError("goal-inactive");
-      await apply(() => store.auditGoalExport(goalId, branch, from, to, false));
+      if (forPublish && from === to) {
+        if (store.goalExported(goalId)?.head === to) return;
+        store.auditGoalExport(goalId, branch, from, to, false);
+      } else {
+        await apply(() =>
+          store.auditGoalExport(goalId, branch, from, to, false),
+        );
+      }
       try {
         store.auditGoalExport(goalId, branch, from, to, true);
       } catch {

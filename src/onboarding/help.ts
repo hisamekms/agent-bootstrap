@@ -8,7 +8,7 @@ export const exitCodes = {
 } as const;
 
 const humanRepo =
-  "The operator updates local main, pushes branches, and opens pull requests.";
+  "The operator updates local main. In opted-in projects the trusted host publishes finished Goals.";
 const humanGate =
   "The operator answers human-policy gates unless they explicitly delegate a terminal answer.";
 const exampleTarget = "/path/to/project";
@@ -151,10 +151,12 @@ export const helpTopics = {
       `${target} reject "$proposal_id"`,
       `${target} approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"`,
       `${target} export-goal-branch "$goal_id"`,
+      `${target} publish-goal "$goal_id"`,
+      `${target} set-auto-merge "$goal_id" off`,
     ],
     output:
       "Review the digest, effective policy and integration diff stat, choose approve or reject, and type the exact confirmation phrase. Export previews the destination and heads before confirmation.",
-    next: "Wait for integration in status. Review the exported lo/goal-* branch before the operator pushes it and opens a PR.",
+    next: "Wait for integration in status. Publishing is automatic in opted-in projects.",
     human: `${humanGate} ${humanRepo}`,
   },
   audit: {
@@ -379,7 +381,17 @@ export const operatorOutputs = {
   "export-goal-branch": {
     usage: "export-goal-branch <goalId> [--target <checkout>]",
     json: "{ goalId, checkout, branch, from, to } for the completed export.",
-    next: "Review the exported local branch before the operator pushes and opens a PR.",
+    next: "Review the exported local branch in the launch checkout.",
+  },
+  "publish-goal": {
+    usage: "publish-goal <goalId>",
+    json: "Goal publish state and PR details.",
+    next: "Use events --subject <goalId> to inspect the publish audit.",
+  },
+  "set-auto-merge": {
+    usage: "set-auto-merge <goalId> <off|squash|merge|rebase>",
+    json: "{ autoMerge, autoMergeSource }",
+    next: "The running host applies the setting to an open PR.",
   },
   analyze: {
     usage: "analyze [--audit <file>] [--out <dir>] [--sql <file>]",

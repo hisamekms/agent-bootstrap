@@ -279,8 +279,17 @@ Stage 2 runs Executor, optional host-configured verification, and Reviewer.
 The host submits a digest-bound integration proposal after a passing
 review. Stage 3 consumes approved proposals, checks the pin and current base, and
 integrates into the Goal's work branch. Dependencies wait for successful
-integration. The operator can export a local branch and handles branch
-pushes and PRs to `main`. See [Stage 3](stage3.md).
+integration. The operator can export a local branch. See [Stage 3](stage3.md).
+
+Amended 2026-11-28: The trusted host may publish a finished Goal so the
+operator can complete the handoff from Workplace without a terminal.
+Private project configuration opts in. The host screens the local export
+and PR text, pushes the exact Goal commit with fast-forward-only semantics,
+and uses the host's existing GitHub CLI login to open a PR. It records
+durable authorization before each outward step. GitHub access stays on the
+host. Repository creation, branch protection and merging when auto-merge
+is off remain human responsibilities. The operator controls each Goal's
+auto-merge setting.
 
 ## Consequences
 

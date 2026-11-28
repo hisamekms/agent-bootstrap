@@ -100,6 +100,7 @@ test("v6 migration backfills by timestamp then rowid and allocates after migrati
     ALTER TABLE tasks DROP COLUMN ref;
     UPDATE goals SET created_at = '2026-01-02T00:00:00.000Z';
     UPDATE tasks SET created_at = '2026-01-02T00:00:00.000Z';
+    DROP TABLE goal_publish_audit;
     PRAGMA user_version=6;
   `);
   db.query(

@@ -1,3 +1,5 @@
+import { publishView, remoteGoalBranch } from "../publish/journal.ts";
+import type { GoalPublishedReason } from "../publish/protocol.ts";
 import { codexFailureActions, isCodexFailureCode } from "../codex-exec.ts";
 import { executionDisplay } from "./execution-display.ts";
 import { escapeTerminalControls } from "./analysis.ts";
@@ -329,11 +331,27 @@ export function operatorGoalTurn(
   if (
     goal.status === "done" ||
     (progress.total > 0 && progress.done === progress.total)
-  )
+  ) {
+    const head = store.goalIntegrationHead(goal.id) ?? goal.baseCommit;
+    const published = store.goalPublishRecord(goal.id);
+    const exported = store.goalExported(goal.id);
+    let finished: GoalPublishedReason | undefined;
+    if (head && published?.pushedHead === head && published.pr?.head === head)
+      finished = {
+        kind: "published",
+        branch: published.destination.branch,
+        prNumber: published.pr.number,
+        prUrl: published.pr.url,
+      };
+    else if (head && exported?.head === head)
+      finished = { kind: "exported", branch: exported.branch };
     return {
       owner: "done",
-      reason: { kind: exportable ? "exportable" : "completed" },
+      reason:
+        finished ??
+        ({ kind: exportable ? "exportable" : "completed" } as const),
     } as const;
+  }
   return { owner: "idle", reason: { kind: "idle" } } as const;
 }
 
@@ -352,6 +370,13 @@ function goalSummary(
     status,
     createdAt,
     turn: operatorGoalTurn(store, goal, facts),
+    publish: publishView(
+      store.goalPublishEnabled,
+      remoteGoalBranch(goal),
+      store.goalPublishRecord(id),
+      store.goalAutoMerge(id),
+      store.goalIntegrationHead(id) ?? goal.baseCommit,
+    ),
     progress,
     estimate:
       status === "active"
@@ -454,6 +479,7 @@ export function operatorGoal(store: OrchestratorStore, key: string) {
     baseCommit: goal.baseCommit,
     branch: goalBranch(id),
     policyOverrides: store.goalPolicyOverrides(id),
+    autoMergeConfirmations: store.goalAutoMergeConfirmations(id),
     tasks: taskSummaries(store, id),
   };
 }

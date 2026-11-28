@@ -409,6 +409,8 @@ describe("agent-bootstrap", () => {
       "discard-goal",
       "verification",
       "export-goal-branch",
+      "publish-goal",
+      "set-auto-merge",
       "analyze",
       "denials",
     ]);

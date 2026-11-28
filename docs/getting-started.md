@@ -122,8 +122,9 @@ export the branch from a host terminal.
 agent-bootstrap --target "$target" export-goal-branch "$goal_id"
 ```
 
-Inspect the exported branch. The operator pushes, opens the PR, and
-integrates into `main`. Use `concierge --continue` with the same target and
+Inspect the exported branch. In opted-in projects the host pushes and
+opens the PR automatically. See [Goal publishing](local-orchestrator/running.md#publish-a-goal-to-github).
+Use `concierge --continue` with the same target and
 Microsandbox home to continue a conversation.
 
 ## 3. Inspect audit evidence

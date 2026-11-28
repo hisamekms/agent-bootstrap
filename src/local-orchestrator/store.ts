@@ -1,4 +1,17 @@
 import {
+  publishDefaults,
+  autoMergeMethods,
+  type AutoMerge,
+  type PublishConfig,
+} from "../publish/port.ts";
+import type {
+  GoalPublishRecord,
+  PublishAuthorization,
+  PublishEventKind,
+} from "../publish/journal.ts";
+import { remoteGoalBranch } from "../publish/journal.ts";
+import type { GoalAutoMergeConfirmations } from "../publish/protocol.ts";
+import {
   summarizePackageDiff,
   type PackageDiff,
   type PackageDiffSummary,
@@ -185,7 +198,7 @@ type ApprovalPolicy = EffectivePolicy;
 type SettingsOrigin = "cli" | "operator-ui";
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 8;
+const schemaVersion = 9;
 const environmentBuildAuthorization = "environment.build-authorized";
 const eventDataLimit = 4096;
 const environmentAuthorizationLimit = 64 * 1024;
@@ -273,6 +286,22 @@ const eventGuards = `
   CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
   CREATE TRIGGER events_no_replace BEFORE INSERT ON events
     WHEN EXISTS (SELECT 1 FROM events WHERE id = NEW.id OR rowid = NEW.rowid)
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+`;
+const publishAuditSchema = `
+  CREATE TABLE goal_publish_audit (
+    event_id TEXT PRIMARY KEY REFERENCES events(id),
+    goal_id TEXT NOT NULL REFERENCES goals(id),
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL,
+    data TEXT NOT NULL CHECK (json_valid(data))
+  ) STRICT;
+  CREATE TRIGGER goal_publish_audit_no_update BEFORE UPDATE ON goal_publish_audit
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER goal_publish_audit_no_delete BEFORE DELETE ON goal_publish_audit
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER goal_publish_audit_no_replace BEFORE INSERT ON goal_publish_audit
+    WHEN EXISTS (SELECT 1 FROM goal_publish_audit WHERE event_id = NEW.event_id)
     BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 `;
 const schema = `
@@ -639,6 +668,7 @@ export class OrchestratorStore {
   #closed = false;
   #writeFailed = false;
   #changingGoalBranch = false;
+  #publishConfig: PublishConfig = publishDefaults;
 
   private constructor(db: Connection) {
     this.#db = db;
@@ -680,7 +710,7 @@ export class OrchestratorStore {
             !connection.query("SELECT name FROM sqlite_schema LIMIT 1").get()
           ) {
             connection.exec(
-              `${schema} ${refsMigration} PRAGMA application_id=${applicationId}; PRAGMA user_version=${schemaVersion}`,
+              `${schema} ${refsMigration} ${publishAuditSchema} PRAGMA application_id=${applicationId}; PRAGMA user_version=${schemaVersion}`,
             );
           } else if (id !== applicationId) {
             throw new Error();
@@ -722,6 +752,7 @@ export class OrchestratorStore {
               version !== 5 &&
               version !== 6 &&
               version !== 7 &&
+              version !== 8 &&
               version !== schemaVersion
             ) {
               throw new Error();
@@ -749,7 +780,7 @@ export class OrchestratorStore {
                 throw new Error();
             }
             if (version < 7) connection.exec(refsMigration);
-            if (version < schemaVersion) {
+            if (version < 8) {
               // Activity revisions and event ordering use the original rowids.
               connection.exec(`
                 CREATE TABLE next_events (${eventDefinition}) STRICT;
@@ -758,9 +789,12 @@ export class OrchestratorStore {
                 DROP TABLE events;
                 ALTER TABLE next_events RENAME TO events;
                 ${eventGuards}
-                PRAGMA user_version=${schemaVersion};
               `);
             }
+            if (version < 9)
+              connection.exec(
+                `${publishAuditSchema} PRAGMA user_version=${schemaVersion}`,
+              );
           }
         })
         .immediate();
@@ -829,10 +863,11 @@ export class OrchestratorStore {
     subjectId: string,
     data: object,
     correlation: { sessionId?: string; executionId?: string } = {},
-  ): void {
+  ): string {
+    const id = randomUUID();
     this.#run(
       "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      randomUUID(),
+      id,
       at,
       kind,
       subjectKind,
@@ -846,6 +881,7 @@ export class OrchestratorStore {
           : eventDataLimit,
       ),
     );
+    return id;
   }
 
   recordApiCall(
@@ -1727,7 +1763,7 @@ export class OrchestratorStore {
         "goal.registered",
         "goal",
         goalId,
-        { proposalId: id },
+        { proposalId: id, autoMerge: this.#publishConfig.autoMerge },
         correlation,
       );
       return freeze({ status, goalId, ref: required(this.#goal(goalId)).ref });
@@ -2217,6 +2253,277 @@ export class OrchestratorStore {
        ORDER BY events.rowid ASC LIMIT 1`,
           )
           .get(this.#goalId(identifier(goalId)))?.base ?? null,
+    );
+  }
+
+  configureGoalPublishing(config: Partial<PublishConfig> | undefined) {
+    this.#publishConfig = { ...publishDefaults, ...config };
+  }
+
+  goalPublishOptIn(enabled = true) {
+    const kind = enabled ? "publish.enabled" : "publish.disabled";
+    const read = () =>
+      this.#db
+        .query<{ revision: number; kind: string }>(
+          `SELECT rowid AS revision, kind FROM events
+           WHERE subject_kind = 'project' AND subject_id = 'project'
+             AND kind IN ('publish.enabled', 'publish.disabled')
+           ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get();
+    const previous = this.#read(read);
+    if (previous?.kind === kind || (!previous && !enabled))
+      return enabled ? previous!.revision : null;
+    return this.#write((at) => {
+      const current = read();
+      if (current?.kind === kind) return enabled ? current.revision : null;
+      this.#event(at, kind, "project", "project", {});
+      if (!enabled) return null;
+      const revision = read()!.revision;
+      // A Goal can have its final integration already journaled while an
+      // execution or approval still blocks completion at the opt-in boundary.
+      const awaiting = this.#db
+        .query<{ id: string; status: GoalRow["status"] }>(
+          `SELECT g.id, g.status FROM goals g WHERE g.status != 'cancelled'
+           AND (g.status = 'done' OR EXISTS (
+             SELECT 1 FROM tasks t JOIN events e ON e.subject_id = t.id
+             WHERE t.goal_id = g.id AND e.subject_kind = 'task'
+               AND e.kind = 'task.integrated'
+           ))`,
+        )
+        .all();
+      const facts = this.goalTurnFacts(awaiting.map(({ id }) => id));
+      for (const goal of awaiting)
+        if (!this.#goalPublishReady(goal.status, facts.get(goal.id)!))
+          this.#event(at, "publish.awaiting-finish", "goal", goal.id, {});
+      return revision;
+    });
+  }
+
+  goalPublishOpenedAt(id: string) {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ at: string }>(
+            `SELECT at FROM events WHERE subject_id = ? AND subject_kind = 'goal'
+           AND kind = 'publish.pr-opened' ORDER BY rowid LIMIT 1`,
+          )
+          .get(id)?.at,
+    );
+  }
+
+  goalFinishedAfter(id: string, revision: number) {
+    return this.#read(
+      () =>
+        this.#db
+          .query(
+            `SELECT 1 FROM events
+           WHERE rowid > ?1 AND (
+             (kind = 'task.integrated' AND subject_kind = 'task'
+               AND subject_id IN (SELECT id FROM tasks WHERE goal_id = ?2))
+             OR (subject_kind = 'goal' AND subject_id = ?2 AND (
+               (kind = 'goal.status' AND json_extract(data, '$.status') = 'done')
+               OR kind IN ('goal.registered', 'publish.awaiting-finish')
+             ))
+           ) LIMIT 1`,
+          )
+          .get(revision, id) !== null,
+    );
+  }
+
+  get goalPublishEnabled() {
+    return this.#publishConfig.enabled;
+  }
+
+  goalAutoMerge(id: string) {
+    return this.#read(() => {
+      const row = this.#db
+        .query<{ kind: string; method: AutoMerge | null; revision: number }>(
+          `SELECT kind, json_extract(data, '$.autoMerge') AS method, rowid AS revision
+         FROM events WHERE subject_id = ? AND subject_kind = 'goal'
+         AND kind IN ('goal.auto-merge-set', 'goal.registered') ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(id);
+      return {
+        method: row?.method ?? "off",
+        source:
+          row?.kind === "goal.auto-merge-set"
+            ? ("goal" as const)
+            : ("project" as const),
+        revision: row?.revision ?? 0,
+      };
+    });
+  }
+
+  goalAutoMergeConfirmations(id: string): GoalAutoMergeConfirmations {
+    const current = this.goalAutoMerge(id);
+    const head = this.goalIntegrationHead(id) ?? this.getGoal(id)?.baseCommit;
+    const prNumber = this.goalPublishRecord(id)?.pr?.number;
+    return Object.fromEntries(
+      autoMergeMethods.map((method) => [
+        method,
+        createHash("sha256")
+          .update(
+            JSON.stringify([id, current.revision, method, head, prNumber]),
+          )
+          .digest("hex"),
+      ]),
+    ) as GoalAutoMergeConfirmations;
+  }
+
+  setGoalAutoMerge(
+    id: string,
+    autoMerge: AutoMerge,
+    confirm: string,
+    origin: SettingsOrigin,
+  ) {
+    if (origin !== "operator-ui" && origin !== "cli")
+      throw new OrchestratorStoreError("approval-forbidden");
+    if (
+      !autoMergeMethods.includes(autoMerge) ||
+      !/^[a-f0-9]{64}$/.test(confirm)
+    )
+      throw new ContractError();
+    return this.#write((at) => {
+      const goal = required(this.#goal(identifier(id)));
+      if (this.goalAutoMergeConfirmations(goal.id)[autoMerge] !== confirm)
+        throw new OrchestratorStoreError("stale-confirmation");
+      this.#event(at, "goal.auto-merge-set", "goal", goal.id, {
+        autoMerge,
+        origin,
+      });
+      return this.goalAutoMerge(goal.id);
+    });
+  }
+
+  goalIsPublishReady(id: string) {
+    const goal = this.getGoal(id);
+    if (!goal || goal.status === "cancelled") return false;
+    return this.#goalPublishReady(
+      goal.status,
+      this.goalTurnFacts([goal.id]).get(goal.id)!,
+    );
+  }
+
+  #goalPublishReady(
+    status: GoalRow["status"],
+    facts: NonNullable<
+      ReturnType<ReturnType<OrchestratorStore["goalTurnFacts"]>["get"]>
+    >,
+  ) {
+    return (
+      !facts.approvals &&
+      !facts.queued &&
+      !facts.runningActor &&
+      !facts.executionActor &&
+      facts.progress.done === facts.progress.total &&
+      (status === "done" ||
+        (facts.progress.total > 0 && facts.exportable === 1))
+    );
+  }
+
+  goalPublishRecord(id: string): GoalPublishRecord | null {
+    return this.#read(() => {
+      const row = this.#db
+        .query<{ data: string }>(
+          `SELECT data FROM events WHERE subject_id = ? AND subject_kind = 'goal'
+          AND kind LIKE 'publish.%' AND json_type(data, '$.record') = 'object' ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(id);
+      return row
+        ? (JSON.parse(row.data) as { record: GoalPublishRecord }).record
+        : null;
+    });
+  }
+
+  goalPreviousPushedHead(id: string) {
+    return this.#read(
+      () =>
+        this.#db
+          .query<{ head: string }>(
+            `SELECT json_extract(data, '$.record.pushedHead') AS head
+             FROM events WHERE subject_id = ? AND subject_kind = 'goal'
+             AND kind = 'publish.pushed' ORDER BY rowid DESC LIMIT 1 OFFSET 1`,
+          )
+          .get(id)?.head,
+    );
+  }
+
+  recordGoalPublish(
+    id: string,
+    kind: PublishEventKind,
+    record: GoalPublishRecord | null,
+    detail: object = {},
+    authorization?: PublishAuthorization,
+  ) {
+    this.#write((at) => {
+      const goal = required(this.#goal(identifier(id)));
+      if (record && record.destination.branch !== remoteGoalBranch(goal))
+        throw new OrchestratorStoreError("context-mismatch");
+      if (authorization) {
+        if (
+          goal.status === "cancelled" ||
+          this.#goalIntegrationInProgress(id) ||
+          (this.goalIntegrationHead(id) ?? goal.baseCommit) !==
+            gitCommit(authorization.head)
+        )
+          throw new OrchestratorStoreError("export-head-mismatch");
+        if (authorization.requireFinished && !this.goalIsPublishReady(id))
+          throw new OrchestratorStoreError("invalid-transition");
+        if (
+          authorization.autoMergeRevision !== undefined &&
+          this.goalAutoMerge(id).revision !== authorization.autoMergeRevision
+        )
+          throw new OrchestratorStoreError("stale-confirmation");
+      }
+      const data = {
+        ...detail,
+        record:
+          record &&
+          Object.fromEntries(
+            Object.entries(record).filter(([, value]) => value !== undefined),
+          ),
+      };
+      const event = this.#event(at, kind, "goal", goal.id, data);
+      this.#run(
+        "INSERT INTO goal_publish_audit VALUES (?, ?, ?, ?, ?)",
+        event,
+        goal.id,
+        kind,
+        at,
+        canonicalJson(data, eventDataLimit),
+      );
+    });
+  }
+
+  goalExported(id: string) {
+    return this.#read(() =>
+      this.#db
+        .query<{ branch: string; head: string }>(
+          `SELECT json_extract(data, '$.branch') AS branch, json_extract(data, '$.to') AS head
+       FROM events WHERE subject_id = ? AND subject_kind = 'goal' AND kind = 'goal.exported'
+       ORDER BY rowid DESC LIMIT 1`,
+        )
+        .get(id),
+    );
+  }
+
+  goalPublishEvidence(id: string) {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          verificationPassed: number;
+          verificationFailed: number;
+          reviewPassed: number;
+          reviewRevised: number;
+        }>(
+          `SELECT count(*) FILTER (WHERE x.mode = 'verification' AND x.status = 'succeeded') AS verificationPassed,
+        count(*) FILTER (WHERE x.mode = 'verification' AND x.status = 'failed') AS verificationFailed,
+        count(*) FILTER (WHERE x.mode = 'review' AND json_extract(x.result_json, '$.review') = 'pass') AS reviewPassed,
+        count(*) FILTER (WHERE x.mode = 'review' AND json_extract(x.result_json, '$.review') = 'revise') AS reviewRevised
+       FROM executions x JOIN tasks t ON x.task_id = t.id WHERE t.goal_id = ?`,
+        )
+        .get(id)!,
     );
   }
 
@@ -4043,6 +4350,8 @@ export class OrchestratorStore {
         WHERE kind IN ('execution.queued', 'execution.started', 'execution.finished',
           'environment.started', 'environment.finished',
           'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
+          'goal.exported', 'goal.auto-merge-set', 'publish.pushed', 'publish.pr-opened',
+          'publish.auto-merge-set', 'publish.failed', 'publish.polled',
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
           'task.retried', 'task.budget-exceeded',
           'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',
