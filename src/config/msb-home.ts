@@ -1,6 +1,6 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { missing, type Config } from "./layers.ts";
+import type { Config } from "./layers.ts";
 
 type Source = "env" | "user" | "default";
 type Failure = {
@@ -16,10 +16,10 @@ const editHome =
   "Run agent-bootstrap config edit and set microsandbox.home to a short absolute directory.";
 const envFix = ['mkdir -p "$HOME/.msb"', 'export MSB_HOME="$HOME/.msb"'];
 
-export async function resolveMsbHome(
+export function msbHomeCandidate(
   env: NodeJS.ProcessEnv,
   user: Pick<Config, "microsandbox">,
-): Promise<MsbHomeResolution> {
+) {
   const override = env.MSB_HOME;
   const configured = user.microsandbox?.home;
   const source = override
@@ -29,6 +29,14 @@ export async function resolveMsbHome(
       : "default";
   const candidate =
     override || (configured ?? (env.HOME && `${env.HOME}/.msb`));
+  return { candidate, source } as const;
+}
+
+export async function resolveMsbHome(
+  env: NodeJS.ProcessEnv,
+  user: Pick<Config, "microsandbox">,
+): Promise<MsbHomeResolution> {
+  const { candidate, source } = msbHomeCandidate(env, user);
   const fix = source === "env" ? envFix : [editHome];
 
   if (!candidate && source === "default")
@@ -65,7 +73,7 @@ export async function resolveMsbHome(
       };
     return { path, source };
   } catch (error) {
-    if (missing(error)) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
       const shellPath = /^[\w./-]+$/.test(candidate)
         ? candidate
         : "'" + candidate.replaceAll("'", "'\"'\"'") + "'";

@@ -33,6 +33,12 @@ import {
   parseVerificationConfig,
   type VerificationConfig,
 } from "../local-orchestrator/verification.ts";
+import {
+  parseHostChecks,
+  validateHostCheckHomes,
+  type HostCheckDeclaration,
+} from "../local-orchestrator/host-checks.ts";
+import { msbHomeCandidate } from "./msb-home.ts";
 import { listProjects } from "./projects.ts";
 import {
   localActorHarnesses,
@@ -103,6 +109,7 @@ export interface Config {
   microsandbox?: { home: string };
   repositories?: { root: string };
   verification?: VerificationConfig;
+  hostChecks?: readonly HostCheckDeclaration[];
   claude?: Record<string, unknown>;
   profiles?: Profiles;
   egress?: Partial<Record<EgressActor, readonly string[]>>;
@@ -583,7 +590,10 @@ export function parseConfig(
     );
   if (layer === "user")
     keys.push("volumes", "secrets", "microsandbox", "repositories");
+  if (layer === "local") keys.push("hostChecks");
   const raw = record(value, key, next);
+  if (Object.hasOwn(raw, "hostChecks") && layer !== "local")
+    invalid("hostChecks", "Allowed only in private local.json.", next);
   validateActorConfig(raw, layer !== "approved", next);
   if (Object.hasOwn(raw, "microsandbox") && layer !== "user")
     invalid(
@@ -931,7 +941,10 @@ export function parseConfig(
         );
     }
   }
-  return raw as unknown as Config;
+  const config = raw as unknown as Config;
+  return Object.hasOwn(raw, "hostChecks")
+    ? { ...config, hostChecks: parseHostChecks(raw.hostChecks, next) }
+    : config;
 }
 
 export function readLayer(
@@ -982,6 +995,19 @@ export function readApproved(
   };
 }
 
+export function validateLocalHostChecks(
+  checks: readonly HostCheckDeclaration[],
+  user: Config,
+  env: NodeJS.ProcessEnv,
+  directory?: string,
+) {
+  validateHostCheckHomes(
+    checks,
+    msbHomeCandidate(env, user).candidate,
+    layerFile("local", env, directory),
+  );
+}
+
 export function mergeConfig(
   user: Config,
   approved: Config | undefined,
@@ -999,6 +1025,11 @@ export function mergeConfig(
   if (user.repositories) {
     config.repositories = user.repositories;
     sources["repositories.root"] = "user";
+  }
+  if (local.hostChecks) {
+    validateLocalHostChecks(local.hostChecks, user, env, directory);
+    config.hostChecks = local.hostChecks;
+    sources.hostChecks = "local";
   }
   const layers = { user, approved, local };
   if (approved)

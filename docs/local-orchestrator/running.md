@@ -349,6 +349,49 @@ A passing command allows review to proceed and the resulting
 proposal records `verified: true`. Verification runs again at integration.
 Without a suite, a human must answer the integration gate.
 
+### Declare host checks for the target
+
+Set `hostChecks` only in the target's private `local.json`. Open it with
+`agent-bootstrap config edit --project <name>`.
+
+```json
+{
+  "version": 1,
+  "hostChecks": [
+    {
+      "name": "runtime",
+      "argv": ["/opt/homebrew/bin/bun", "run", "test:runtime"],
+      "timeoutMs": 1800000,
+      "env": { "MSB_HOME": "/private/tmp/target-msb" },
+      "keychain": [{ "service": "target-runner-key", "env": "RUNNER_KEY" }],
+      "triggers": ["packages/runtime/", "test/runtime.ts"],
+      "vmCount": 1
+    }
+  ]
+}
+```
+
+Declare up to eight checks with unique names of 1 to 32 lowercase letters,
+digits, or hyphens. Each needs an absolute executable path as the first of
+up to 32 nonempty arguments and a timeout from 1,000 to 7,200,000 milliseconds.
+Use `env` for up to 32 literal, non-secret values and `keychain` for up to
+eight item names and their destination variables. Variable names use
+`[A-Z_][A-Z0-9_]*` and must be distinct across both fields. The host reserves
+`PATH`, `HOME`, and `TMPDIR`.
+
+List 1 to 64 repository-relative triggers. A trailing slash matches a directory
+prefix. Without a trailing slash, a trigger matches only that exact path.
+Omit `triggers` to require the check for every candidate. An empty list is
+invalid. `vmCount` defaults to zero and accepts integers up to four. A positive
+count requires absolute paths for both the check's `env.MSB_HOME` and
+agent-bootstrap's effective Microsandbox home. The two homes must be distinct,
+and neither may contain the other.
+
+`agent-bootstrap doctor --target <path>` reports whether the executable and
+declared Microsandbox home are available, along with trigger and VM counts
+and Keychain item names. These checks are informational. The approval gate
+and execution are pending. [Host checks ADR](../host-checks/adr-0001-host-checks.md)
+
 ### Run with secret files
 
 Before collecting output for a [secret-file run](../agent-guide.md#secrets),

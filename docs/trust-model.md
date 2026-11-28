@@ -19,6 +19,12 @@ the host. Claude guest access depends on the configured authentication mode. Wor
 human approval to the request and pinned candidate and base. Before integrating,
 it rechecks the expected base, review evidence, and verification results.
 
+**Host check.** A host check executes untrusted candidate code outside every
+VM, with the host user's access to files, network, and Keychain. The design
+requires a human to approve each run against a pinned candidate. The current
+implementation validates private declarations and reports them in doctor.
+The approval gate and execution are pending. [Host checks ADR](host-checks/adr-0001-host-checks.md)
+
 | Threat                                         | Intended control and evidence                                                                                                                                                                                 |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Hostile repository instructions                | Treat file content as data. Capability checks and sandbox permissions apply regardless of agent instructions.                                                                                                 |

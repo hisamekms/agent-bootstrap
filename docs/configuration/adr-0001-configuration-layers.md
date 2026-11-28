@@ -101,7 +101,7 @@ Version 1 allows only these keys:
 
 The declaration cannot contain volume definitions, mounts, secret sources
 (`secrets`), actor secret grants (`secretEnv`), `microsandbox`, `actors`,
-or `codex`.
+`codex`, or `hostChecks`.
 
 ### C4. Approval and drift
 
@@ -150,6 +150,11 @@ Re-approval replaces only `approved.json`. It never touches `local.json`.
 volume definitions, and secret source definitions. `local.json` can refer to
 volumes and secret sources defined in the user config. `agent-bootstrap
 config edit [--project <name>]` opens the right file in `$EDITOR`.
+
+`hostChecks` is an ordered list allowed only in private `local.json`.
+The user layer and project declaration both reject it. Doctor reports
+declaration prerequisites. The approval gate and execution are pending.
+[Host checks ADR](../host-checks/adr-0001-host-checks.md)
 
 The user config and private `local.json` can set `actors.Executor` to
 `codex` or `claude`. It defaults to `claude`. The other local actors use
