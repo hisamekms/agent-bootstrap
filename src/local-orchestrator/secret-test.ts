@@ -1,3 +1,4 @@
+import { withVmJob } from "./vm-job.ts";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -623,31 +624,33 @@ export async function runSecretTest(
     await readFile(join(checkout, PROFILE_LOCK_PATH), "utf8"),
   );
   const baseImage = lock.base ?? ALPINE_3_23.reference;
-  const root = await mkdtemp(join(await secretSocketRoot(), "ab-test-"));
-  try {
-    const value = await readKeychainSecret(definition.keychainService);
+  return withVmJob(host.env, async () => {
+    const root = await mkdtemp(join(await secretSocketRoot(), "ab-test-"));
     try {
-      const report = await runProbe(
-        root,
-        checkout,
-        { binary, home },
-        resolveClaudeModel(effective),
-        baseImage,
-        variable,
-        value,
-      );
-      if (report.pass)
-        recordSecretTestPass(
-          userStateDirectory(host.env),
-          variable,
-          undefined,
+      const value = await readKeychainSecret(definition.keychainService);
+      try {
+        const report = await runProbe(
+          root,
+          checkout,
+          { binary, home },
+          resolveClaudeModel(effective),
           baseImage,
+          variable,
+          value,
         );
-      return report;
+        if (report.pass)
+          recordSecretTestPass(
+            userStateDirectory(host.env),
+            variable,
+            undefined,
+            baseImage,
+          );
+        return report;
+      } finally {
+        value.fill(0);
+      }
     } finally {
-      value.fill(0);
+      await rm(root, { recursive: true, force: true });
     }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  });
 }

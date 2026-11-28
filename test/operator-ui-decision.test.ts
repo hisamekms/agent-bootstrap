@@ -1025,6 +1025,30 @@ test("Problems drafts do not submit input and retry uses the displayed retry cou
   ]);
 });
 
+test("Problems retry directs the operator to clear a blocked host check", async (t) => {
+  const { click } = decisionDocument(t);
+  const root = problemActions(
+    {
+      async request(method) {
+        assert.equal(method, "task.retry");
+        throw new Error("host-check-blocked");
+      },
+    },
+    failure,
+    "文書",
+    () => [],
+    () => {},
+    () => assert.fail("Blocked retry must not produce a receipt"),
+  ) as unknown as TestElement;
+  click("retry:task-id", root);
+  click("confirm:task-id", root);
+  await settle();
+  assert.match(
+    root.textContent,
+    /先に Workplace の Task 詳細でホストチェックのブロックを解除してください。/,
+  );
+});
+
 test("discard binds the confirmed branch head, requires reconfirmation, and refuses unreadable heads", async (t) => {
   const { click, findAction } = decisionDocument(t);
   const calls: Array<[string, unknown]> = [];
@@ -2001,6 +2025,60 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
     elements.get("publish-settings")!.visibleText,
     /PR 公開.*有効.*origin.*main.*オフ.*local.json/,
   );
+});
+
+test("Workplace Task detail requires confirmation to clear a tampered host check", async (t) => {
+  const { elements, click, findAction } = hostDocument(t);
+  const methods = createPreviewMethods(
+    () => {},
+    () => {},
+  );
+  const goal = methods["goal.get"]({ id: "G1" });
+  const task = methods["task.get"]({ id: goal.tasks[0]!.id });
+  const job = {
+    status: "tampered",
+    name: "fixture-check",
+    proposalId: "check-a",
+    taskId: task.id,
+    msbHome: null,
+  } as const;
+  task.hostCheckJob = job;
+  const requests: Methods["hostCheck.clearInterrupted"]["params"][] = [];
+  methods["hostCheck.clearInterrupted"] = (params) => {
+    requests.push(params);
+    delete task.hostCheckJob;
+    return { id: params.id };
+  };
+  const host = createHostPanel({
+    socket: { readyState: 1 },
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      return methods[method](params);
+    },
+  } as unknown as WorkplaceChannel);
+  const goals = elements.get("goal-content")!;
+  host.connect();
+  elements.get("tab-goals")!.dispatchEvent(new Event("click"));
+  await settle();
+  click(goal.id, goals);
+  await settle();
+  click(task.id, goals);
+  await settle();
+  assert.match(goals.visibleText, /ホストチェック後に改変を検出/);
+  assert.match(goals.visibleText, /fixture-check/);
+  click("clear-host-check", goals);
+  await settle();
+  assert.equal(findAction("clear-host-check:confirm", goals)?.disabled, true);
+  assert.deepEqual(requests, []);
+  const input = byName(goals, "確認の文言")!;
+  input.value = "clear-interrupted-host-check check-a";
+  input.dispatchEvent(new Event("input"));
+  click("clear-host-check:confirm", goals);
+  await settle();
+  assert.deepEqual(requests, [{ id: "check-a", confirm: input.value }]);
+  assert.equal(findAction("clear-host-check", goals), undefined);
 });
 
 test("Goal publishing binds the fresh head and refreshes conflicts before accepting another phrase", async (t) => {

@@ -1,3 +1,4 @@
+import { withVmJob } from "../../src/local-orchestrator/vm-job.ts";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -181,32 +182,34 @@ async function main(): Promise<void> {
     const base = readOciLayout(await readFile(join(work, "base.tar")));
 
     stage = "build VM";
-    await withBuildSandbox({
-      ...vm,
-      image: recipe.base.reference,
-      digest: recipe.base.reference.slice(-64),
-      ...(packageDir === undefined ? {} : { packageDir }),
-      use: async (name, run) => {
-        await guestExec(run, name, BUILD_SCRIPT(profile), 10 * MINUTE);
-        stage = "root filesystem export";
-        await run(
-          ["copy", `${name}:/tmp/rootfs.tar`, join(work, "rootfs.tar")],
-          5 * MINUTE,
-        );
-        if (recipe.base.kind === "debian-snapshot") {
-          stage = "package list export";
-          const listPath = join(work, "packages.txt");
+    await withVmJob(vm.env, () =>
+      withBuildSandbox({
+        ...vm,
+        image: recipe.base.reference,
+        digest: recipe.base.reference.slice(-64),
+        ...(packageDir === undefined ? {} : { packageDir }),
+        use: async (name, run) => {
+          await guestExec(run, name, BUILD_SCRIPT(profile), 10 * MINUTE);
+          stage = "root filesystem export";
           await run(
-            ["copy", `${name}:/etc/agent-bootstrap-packages.txt`, listPath],
-            MINUTE,
+            ["copy", `${name}:/tmp/rootfs.tar`, join(work, "rootfs.tar")],
+            5 * MINUTE,
           );
-          packages = (await readFile(listPath, "utf8"))
-            .split("\n")
-            .filter((l) => l !== "")
-            .sort();
-        }
-      },
-    });
+          if (recipe.base.kind === "debian-snapshot") {
+            stage = "package list export";
+            const listPath = join(work, "packages.txt");
+            await run(
+              ["copy", `${name}:/etc/agent-bootstrap-packages.txt`, listPath],
+              MINUTE,
+            );
+            packages = (await readFile(listPath, "utf8"))
+              .split("\n")
+              .filter((l) => l !== "")
+              .sort();
+          }
+        },
+      }),
+    );
 
     stage = "image assembly";
     const rootfsPath = join(work, "rootfs.tar");
@@ -271,13 +274,15 @@ async function main(): Promise<void> {
 
     stage = "smoke test";
     const smoke = smokeTest(profile);
-    const output = await withBuildSandbox({
-      ...vm,
-      image: smokeReference,
-      digest,
-      smoke: true,
-      use: (name, run) => guestExec(run, name, smoke.script, 5 * MINUTE),
-    });
+    const output = await withVmJob(vm.env, () =>
+      withBuildSandbox({
+        ...vm,
+        image: smokeReference,
+        digest,
+        smoke: true,
+        use: (name, run) => guestExec(run, name, smoke.script, 5 * MINUTE),
+      }),
+    );
     const lines = output.split("\n").filter((l) => l !== "");
     if (lines.join("\n") !== smoke.expected.join("\n")) {
       // The smoke script prints only fixed markers and tool versions.

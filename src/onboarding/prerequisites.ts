@@ -1,3 +1,5 @@
+import { vmJobHeld } from "../local-orchestrator/vm-job.ts";
+import { OrchestratorStore } from "../local-orchestrator/store.ts";
 import { environmentDoctor, type EnvironmentStatus } from "./environment.ts";
 import {
   codexExecutorOptions,
@@ -458,6 +460,26 @@ export async function doctor(
       : legacyRecovery
         ? undefined
         : await resolveConfigTarget(path, root, host.env);
+    const job = target
+      ? OrchestratorStore.inspectHostCheckJob(
+          join(target.directory, "state.db"),
+        )
+      : null;
+    if (job?.status === "tampered") {
+      add(
+        check(
+          "host-check-tampered",
+          "wrong",
+          `Tampering detected after host check ${escapedJson(job.name)} (approval ${job.proposalId}). The target is blocked.`,
+          [
+            "Inspect the target configuration and approval state, then open Workplace and clear the tampered host check from Task detail.",
+          ],
+          false,
+          true,
+        ),
+        false,
+      );
+    }
     layers = loadConfig(host.env, target?.configDirectory, host.actorHarnesses);
     if (!concierge && lock?.profiles.bun) {
       if (target)
@@ -508,6 +530,35 @@ export async function doctor(
         ),
         !valid,
       );
+      if (job && job.status !== "tampered") {
+        const live = job.status === "running" && vmJobHeld(target.env);
+        if (!live) {
+          const listing =
+            job.msbHome && isAbsolute(job.msbHome)
+              ? await msb(host, job.msbHome, ["ls", "--format", "json"], 5000)
+                  .then((result) => {
+                    if (result.code !== 0) return null;
+                    const rows: unknown = JSON.parse(result.stdout);
+                    return Array.isArray(rows) ? rows.length : null;
+                  })
+                  .catch(() => null)
+              : null;
+          const vms = listing === null ? "unavailable" : `${listing} listed`;
+          add(
+            check(
+              "host-check-interrupted",
+              "wrong",
+              `Interrupted host check ${escapedJson(job.name)} (approval ${job.proposalId}). MSB_HOME ${job.msbHome ? escapedJson(job.msbHome) : "undeclared"}. Microsandbox inventory ${vms}.`,
+              [
+                "Inspect the Microsandbox home, clean up any leftover VMs, and clear the interrupted host check from Task detail in Workplace.",
+              ],
+              false,
+              true,
+            ),
+            false,
+          );
+        }
+      }
       const declarations = layers.config.hostChecks ?? [];
       if (declarations.length === 0)
         add(
@@ -519,7 +570,7 @@ export async function doctor(
           check(
             "host-checks-warning",
             "skipped",
-            "host-check runs are not implemented yet; matching Tasks will wait at the host-check gate",
+            "Matching Tasks run host checks after approval. Open the proposal detail to review the pin and approve.",
           ),
           false,
         );

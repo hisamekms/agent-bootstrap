@@ -46,6 +46,7 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "task.list",
   "task.get",
   "task.retry",
+  "hostCheck.clearInterrupted",
   "problem.list",
   "concierge.attach",
   "concierge.input",

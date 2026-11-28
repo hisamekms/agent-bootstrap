@@ -23,7 +23,7 @@ it rechecks the expected base, review evidence, and verification results.
 VM, with the host user's access to files, network, and Keychain. The design
 requires a human to approve each run against a pinned candidate. The current
 implementation validates private declarations and reports them in doctor.
-The approval gate and execution are pending. [Host checks ADR](host-checks/adr-0001-host-checks.md)
+An undelegated operator approval pins the candidate and check inputs. The target store records host-check start and finish audit events. [Host checks ADR](host-checks/adr-0001-host-checks.md)
 
 | Threat                                         | Intended control and evidence                                                                                                                                                                                 |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

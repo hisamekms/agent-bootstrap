@@ -44,6 +44,7 @@ export interface RunnerDeps {
   readonly tasks?: TaskExecutor;
   readonly autoApproveRegistrations?: boolean;
   readonly canScheduleTasks?: () => boolean;
+  readonly tryVmJobSlot?: () => (() => void) | undefined;
   /** Forward retry context to TrustedHost so its audit can link the attempts. */
   readonly runPlanner: PlannerCall;
   readonly runReviewer: (
@@ -378,49 +379,60 @@ export class ActorRunner {
     this.#draining ??= Promise.resolve().then(async () => {
       const skippedIntegrations = new Set<string>();
       try {
+        if (this.#deps.store.hostCheckJob()) return;
         if (
           this.#deps.tasks?.resumeHostChecks &&
           this.#deps.canScheduleTasks?.() !== false &&
-          performance.now() >= this.#nextHostCheckRefresh
+          (performance.now() >= this.#nextHostCheckRefresh ||
+            this.#deps.store.hasApprovedHostCheck())
         ) {
           await this.#deps.tasks.resumeHostChecks();
           this.#nextHostCheckRefresh = performance.now() + 30_000;
         }
         for (;;) {
+          if (this.#deps.store.hostCheckJob()) break;
           if (this.#deps.autoApproveRegistrations)
             await this.#scheduleRegistrationApprovals();
           await this.#scheduleTasks(skippedIntegrations);
-          const job = this.#queue.shift();
+          const job = this.#queue[0];
           if (!job) break;
-          if (job.kind === "task") {
-            if (this.#deps.canScheduleTasks?.() !== false)
-              await runTask(
-                this.#deps.store,
-                this.#deps.tasks!,
-                job.id,
-                this.#deps.canScheduleTasks,
-                this.#deps.scan,
-              );
-          } else if (job.kind === "integration") {
-            if (this.#deps.canScheduleTasks?.() === false) continue;
-            try {
-              await this.#deps.tasks!.integrate!(job.id);
-            } catch (error) {
-              if (
-                !(error instanceof OrchestratorStoreError) ||
-                ![
-                  "invalid-transition",
-                  "goal-inactive",
-                  "goal-pr-open",
-                  "integration-uncertain",
-                ].includes(error.code)
-              )
-                throw error;
-              skippedIntegrations.add(job.id);
-              console.error("concierge-integration-skipped");
+          const release = this.#deps.tryVmJobSlot?.();
+          if (this.#deps.tryVmJobSlot && !release) break;
+          this.#queue.shift();
+          try {
+            if (job.kind === "task") {
+              if (this.#deps.canScheduleTasks?.() !== false)
+                await runTask(
+                  this.#deps.store,
+                  this.#deps.tasks!,
+                  job.id,
+                  this.#deps.canScheduleTasks,
+                  this.#deps.scan,
+                );
+            } else if (job.kind === "integration") {
+              if (this.#deps.canScheduleTasks?.() === false) continue;
+              try {
+                await this.#deps.tasks!.integrate!(job.id);
+              } catch (error) {
+                if (
+                  !(error instanceof OrchestratorStoreError) ||
+                  ![
+                    "invalid-transition",
+                    "goal-inactive",
+                    "goal-pr-open",
+                    "integration-uncertain",
+                    "session-busy",
+                  ].includes(error.code)
+                )
+                  throw error;
+                skippedIntegrations.add(job.id);
+                console.error("concierge-integration-skipped");
+              }
+            } else {
+              await this.#run(job);
             }
-          } else {
-            await this.#run(job);
+          } finally {
+            release?.();
           }
         }
       } finally {
@@ -509,6 +521,8 @@ export class ActorRunner {
   }
 
   #checkQueue() {
+    if (this.#deps.store.blockedHostCheck())
+      throw new OrchestratorStoreError("session-busy");
     if (this.#queue.length >= this.#maxQueued)
       throw new RunnerError("queue-full");
   }

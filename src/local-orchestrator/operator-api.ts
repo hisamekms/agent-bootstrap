@@ -82,6 +82,7 @@ import {
 
 interface OperatorApiOptions extends InboxSource {
   stateDirectory: string;
+  tryHostCheckRecoverySlot?: () => (() => void) | undefined;
   repository?: { project: string; repositoryPath: string };
   scan?: CredentialScanner;
   maxLineBytes?: number;
@@ -153,6 +154,7 @@ const maxTerminalInputBytes = 16 * 1024;
 const maxDraftCharacters = 2000;
 const shutdownBlockedMethods = new Set([
   "task.retry",
+  "hostCheck.clearInterrupted",
   "goal.discard",
   "goal.export",
   "goal.publish",
@@ -433,7 +435,14 @@ export async function goalPublishAction(
           state: oneOf(state, ["open", "closed", "merged"]),
         };
       }
-      return { result: await publisher.publish(goal.id, head, expectedPr) };
+      return {
+        result: await publisher.publish(
+          goal.id,
+          head,
+          expectedPr,
+          "operator-ui",
+        ),
+      };
     }
     if (method === "goal.merge" || method === "goal.closePr") {
       const input = fields(
@@ -822,6 +831,16 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
   async function dispatch(method: string, params: unknown): Promise<Reply> {
     try {
       switch (method) {
+        case "hostCheck.clearInterrupted": {
+          const { id, confirm } = fields(params, ["id", "confirm"]);
+          const proposalId = identifier(id);
+          if (confirm !== `clear-interrupted-host-check ${proposalId}`)
+            return failure("confirmation-mismatch");
+          store.recoverHostCheck(options.tryHostCheckRecoverySlot);
+          return {
+            result: store.clearInterruptedHostCheck(proposalId, "operator-ui"),
+          };
+        }
         case "task.retry":
         case "goal.discard":
         case "goal.export":
@@ -1058,6 +1077,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                   message.method !== "proposal.answer" &&
                   message.method !== "proposal.answerMany" &&
                   message.method !== "task.retry" &&
+                  message.method !== "hostCheck.clearInterrupted" &&
                   message.method !== "goal.discard" &&
                   message.method !== "goal.completeAfterMerge" &&
                   message.method !== "goal.export" &&

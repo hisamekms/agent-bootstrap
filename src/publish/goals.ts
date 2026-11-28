@@ -317,10 +317,11 @@ export class GoalPublisher {
   }
 
   async #runCycle(now: number) {
+    if (this.#store.hostCheckJob()) return;
     const optIn = this.#store.goalPublishOptIn(this.#config.enabled);
     this.#cycleDelay = optIn === null ? idleCycleDelay : activeCycleDelay;
     for (const goal of this.#store.listGoals()) {
-      if (this.#stopped) return;
+      if (this.#stopped || this.#store.hostCheckJob()) return;
       const { id } = goal;
       const record = this.#store.goalPublishRecord(id);
       const opening = record?.pendingMutation?.step === "open-pr";
@@ -421,7 +422,7 @@ export class GoalPublisher {
     } else {
       this.#polling.delete(id);
     }
-    if (this.#stopped) return;
+    if (this.#stopped || this.#store.hostCheckJob()) return;
 
     const latest = this.#store.goalPublishRecord(id);
     if (latest?.prActionOutcome === "unknown") return;
@@ -518,7 +519,10 @@ export class GoalPublisher {
     id: string,
     expectedHead: string,
     expectedPr?: GoalPublishConfirmationPr,
+    origin: "cli" | "operator-ui" = "cli",
   ) {
+    if (origin !== "cli" && origin !== "operator-ui")
+      throw new OrchestratorStoreError("approval-forbidden");
     if (!this.#config.enabled) throw new PublishError("publish-disabled");
     const goal = this.#store.getGoal(id);
     if (!goal) throw new OrchestratorStoreError("not-found");
@@ -546,6 +550,8 @@ export class GoalPublisher {
     if (operation !== "close" && !mergeMethods.includes(operation))
       throw new OrchestratorStoreError("invalid-transition");
     if (this.#stopped) throw new PublishError("publish-disabled");
+    if (this.#store.hostCheckJob())
+      throw new OrchestratorStoreError("host-check-blocked");
     const release = lockPublisher(this.#directory);
     let authorizedGoalId: string | undefined;
     try {
@@ -704,7 +710,11 @@ export class GoalPublisher {
       if (error instanceof OrchestratorStoreError) {
         if (error.code === "export-head-mismatch")
           throw new PublishError("publish-stale-head");
-        if (error.code === "stale-confirmation") throw error;
+        if (
+          error.code === "stale-confirmation" ||
+          error.code === "host-check-blocked"
+        )
+          throw error;
         if (authorization && error.code === "invalid-transition")
           throw new PublishError("publish-not-ready");
       }
@@ -719,6 +729,8 @@ export class GoalPublisher {
     expectedPr?: GoalPublishConfirmationPr,
   ) {
     if (this.#stopped) throw new PublishError("publish-disabled");
+    if (this.#store.hostCheckJob())
+      throw new OrchestratorStoreError("host-check-blocked");
     const release = lockPublisher(this.#directory);
     try {
       await this.#publishLocked(goal, head, manual, expectedPr);
@@ -1144,7 +1156,8 @@ export class GoalPublisher {
     } catch (error) {
       if (
         error instanceof OrchestratorStoreError &&
-        error.code === "stale-confirmation"
+        (error.code === "stale-confirmation" ||
+          error.code === "host-check-blocked")
       )
         throw error;
       const code =

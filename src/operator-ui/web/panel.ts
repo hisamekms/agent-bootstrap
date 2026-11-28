@@ -2501,6 +2501,7 @@ function taskDetail(
   pending: PanelInboxItem | undefined,
   openDecisions: () => void,
   command: string | undefined,
+  hostCheckClear: Node | undefined,
 ) {
   const current = task.failure?.stage ?? task.stage;
   const currentIndex = taskStages.findIndex((stage) => stage === current);
@@ -2557,6 +2558,7 @@ function taskDetail(
         ]
       : []),
     ...failureCard(task, command),
+    ...(hostCheckClear ? [hostCheckClear] : []),
     group(
       "header",
       "card",
@@ -2701,6 +2703,43 @@ function taskDetail(
 }
 
 type OperatorRequest = Pick<WorkplaceChannel, "request">;
+
+function hostCheckBlock(
+  channel: OperatorRequest,
+  job: NonNullable<TaskDetail["hostCheckJob"]>,
+  refresh: () => void,
+) {
+  const { name, status, msbHome, proposalId } = job;
+  const tampered = status === "tampered";
+  const title = tampered
+    ? "ホストチェック後に改変を検出"
+    : "ホストチェックが中断";
+  const instructions = tampered
+    ? "対象の設定と承認の状態を調べ、必要な修復をしてから解除してください。"
+    : "MSB_HOME を調べ、残っている VM を片付けてから解除してください。";
+  return group(
+    "div",
+    "card banner-danger",
+    sectionTitle(title),
+    textElement("p", name),
+    ...(msbHome ? [textElement("code", msbHome)] : []),
+    confirmedAction(
+      "ホストチェックのブロックを解除",
+      "clear-host-check",
+      async () => ({
+        lines: [instructions],
+        phrase: `clear-interrupted-host-check ${proposalId}`,
+        danger: true,
+        apply: (confirm) =>
+          channel.request("hostCheck.clearInterrupted", {
+            id: proposalId,
+            confirm,
+          }),
+      }),
+      refresh,
+    ),
+  );
+}
 
 function confirmedAction(
   label: string,
@@ -4023,7 +4062,9 @@ export function problemActions(
                     ? "Goal は作業中のため、取り消せません。"
                     : code === "task-retry-changed"
                       ? "Task が変わりました。もう一度確認してください。"
-                      : "操作を確定できませんでした。";
+                      : code === "host-check-blocked"
+                        ? "先に Workplace の Task 詳細でホストチェックのブロックを解除してください。"
+                        : "操作を確定できませんでした。";
           });
       },
       danger ? "btn danger" : "btn primary",
@@ -5318,7 +5359,9 @@ export function createHostPanel(
           const decision = pending.find(
             (item) => item.subject.taskId === detail.id,
           );
-          const command = retryCommand(detail.id, items);
+          const command = detail.hostCheckJob
+            ? undefined
+            : retryCommand(detail.id, items);
           renderWork(
             [detail, decision?.id, command, goalTitle(detail.goalId)],
             () =>
@@ -5328,6 +5371,13 @@ export function createHostPanel(
                 decision,
                 () => navigate({ tab: "decisions" }, decision?.id),
                 command,
+                detail.hostCheckJob
+                  ? hostCheckBlock(
+                      channel,
+                      detail.hostCheckJob,
+                      () => void refresh(false),
+                    )
+                  : undefined,
               ),
             detail,
           );

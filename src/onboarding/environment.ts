@@ -1,3 +1,4 @@
+import { withVmJob } from "../local-orchestrator/vm-job.ts";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { loadConfig } from "../config/layers.ts";
@@ -240,32 +241,34 @@ export async function buildEnvironment(
     )
       throw error;
   }
-  const result = await provisionEnvironment(
-    {
-      tree: options.tree ?? (await committedTree(target)),
-      profile,
-      operation: "build",
-      allow: config.environment?.allow ?? [],
-    },
-    {
-      env: host.env,
-      store,
-      ...(signal && { signal }),
-      ...(host.openGateway && { openGateway: host.openGateway }),
-      run(args, timeout, extra, signal) {
-        return host.command(
-          "mise",
-          [...MISE_MSB, ...args],
-          {
-            ...offlineMiseEnv(host.env),
-            MSB_HOME: home.path,
-            ...extra,
-          },
-          timeout,
-          signal,
-        );
+  const result = await withVmJob(host.env, async () =>
+    provisionEnvironment(
+      {
+        tree: options.tree ?? (await committedTree(target)),
+        profile,
+        operation: "build",
+        allow: config.environment?.allow ?? [],
       },
-    },
+      {
+        env: host.env,
+        store,
+        ...(signal && { signal }),
+        ...(host.openGateway && { openGateway: host.openGateway }),
+        run(args, timeout, extra, signal) {
+          return host.command(
+            "mise",
+            [...MISE_MSB, ...args],
+            {
+              ...offlineMiseEnv(host.env),
+              MSB_HOME: home.path,
+              ...extra,
+            },
+            timeout,
+            signal,
+          );
+        },
+      },
+    ),
   );
   const { key, cacheHit, size, warning } = result;
   return { key, cacheHit, size, ...(warning && { warning }) };

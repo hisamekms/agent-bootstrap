@@ -8,6 +8,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,7 @@ import {
   loadConfig,
   parseConfig,
   projectConfigDirectory,
+  projectStateDirectory,
   userConfigPath,
   writePrivateConfig,
 } from "../src/config/layers.ts";
@@ -630,7 +632,7 @@ test("target doctor reports host check prerequisites without executing a check o
     checks.find(({ id }) => id === "host-checks-warning"),
     {
       detail:
-        "host-check runs are not implemented yet; matching Tasks will wait at the host-check gate",
+        "Matching Tasks run host checks after approval. Open the proposal detail to review the pin and approve.",
     },
   );
   const items = checks.filter(({ id }) => id.startsWith("host-check-"));
@@ -664,6 +666,64 @@ test("target doctor reports host check prerequisites without executing a check o
   );
   assert.ok(first && !items.includes(first));
 });
+
+for (const status of ["interrupted", "tampered"] as const) {
+  test(`doctor reports a ${status} check and inventories VMs after interruption`, async (t) => {
+    const { root, repo, env, project, local } = fixture(t);
+    const state = projectStateDirectory(project.name, env);
+    const home = join(root, "interrupted-msb");
+    const id = "fixture-approval";
+    mkdirSync(state, { recursive: true, mode: 0o700 });
+    const { Database } = createRequire(import.meta.url)("bun:sqlite");
+    const db = new Database(join(state, "state.db"));
+    try {
+      db.exec(`CREATE TABLE host_check_runs (
+      proposal_id TEXT, task_id TEXT, retries INTEGER, status TEXT,
+      check_name TEXT, msb_home TEXT, pid INTEGER
+    )`);
+      db.query(
+        "INSERT INTO host_check_runs VALUES (?, ?, 0, ?, ?, ?, 123)",
+      ).run(id, "fixture-task", status, "blocked-test", home);
+    } finally {
+      db.close();
+    }
+    if (status === "tampered") local([{ ...basic, unexpected: true }]);
+    let inventory = 0;
+    const { checks } = await doctor(
+      fileURLToPath(new URL("..", import.meta.url)),
+      {
+        ...systemHost,
+        env,
+        platform: "darwin",
+        arch: "arm64",
+        bun: BUN_VERSION,
+        async command(file, args, env) {
+          if (env?.MSB_HOME === home) {
+            assert.equal(file, "mise");
+            assert.deepEqual(args.slice(-3), ["ls", "--format", "json"]);
+            inventory++;
+            return { code: 0, stdout: '[{"name":"fixture-vm"}]' };
+          }
+          return { code: 1, stdout: "" };
+        },
+        fetch: async () => assert.fail("doctor tried the network"),
+      },
+      repo,
+    );
+    const finding = checks.find(({ id }) => id === `host-check-${status}`);
+    assert.ok(finding);
+    assert.ok(finding.detail.includes(id));
+    assert.ok(finding.detail.includes("blocked-test"));
+    if (status === "interrupted") {
+      assert.equal(inventory, 1);
+      assert.ok(finding.detail.includes(home));
+      assert.match(finding.detail, /1 listed/);
+    } else {
+      assert.equal(inventory, 0);
+      assert.match(finding.detail, /The target is blocked/);
+    }
+  });
+}
 
 test("approval digest pins commits, ordered declarations, archive and executable identity", async (t) => {
   const { root } = fixture(t);

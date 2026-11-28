@@ -1,3 +1,4 @@
+import { tryLockVmJob } from "./vm-job.ts";
 import {
   goalPrOpenGuidance,
   goalPublishConfirmation,
@@ -671,6 +672,7 @@ async function execute(
     }
     case "reconcile": {
       const rows = store.reconciliationPreview();
+      const recoverySlot = directory ? () => tryLockVmJob(env) : undefined;
       const count =
         rows.sessions.length + rows.executions.length + rows.tasks.length;
       if (count > 0) {
@@ -693,7 +695,9 @@ async function execute(
                 directory,
                 rows.tasks,
               ),
+              recoverySlot,
             );
+      if (!count) store.recoverHostCheck(recoverySlot);
       await writeCheckedJson({ reconciled });
       return 0;
     }
@@ -808,9 +812,13 @@ async function execute(
           const verificationNote = directory
             ? await readTaskVerificationNote(directory, task, scan)
             : undefined;
+          const hostChecks = store.hostCheckResults(task.id);
+          const hostCheckJob = store.blockedHostCheck();
           await writeCheckedJson({
             ...task,
             ...usage,
+            ...(hostChecks.length && { hostChecks }),
+            ...(hostCheckJob && { hostCheckJob }),
             budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
             ...(rejectedPaths && { rejectedPaths }),

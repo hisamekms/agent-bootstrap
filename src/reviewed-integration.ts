@@ -974,7 +974,10 @@ export class ReviewedIntegration {
    * review notes, read-only, in a new VM. The new candidate starts from the
    * original base, so it gets a new commit, diff and digest, and needs its own
    * review and human decision. */
-  async revise(id?: string): Promise<PinnedCandidate> {
+  async revise(
+    id?: string,
+    hostCheck?: { pin: PinnedCandidate; notes: string },
+  ): Promise<PinnedCandidate> {
     const events = await this.#journal.read();
     const target = await this.#target();
     const last = events.at(-1);
@@ -992,8 +995,18 @@ export class ReviewedIntegration {
     const rounds = events.filter(
       (event) => event.kind === "revision.requested",
     ).length;
+    const hostCheckFailed =
+      hostCheck !== undefined &&
+      last?.kind === "review.submitted" &&
+      review?.review === "pass" &&
+      hostCheck.pin.base === pin.base &&
+      hostCheck.pin.candidate === pin.candidate &&
+      hostCheck.pin.digest === pin.digest;
+    if (hostCheck && !hostCheckFailed)
+      throw new Error("Host check evidence does not match its durable pin");
     if (
       !rejected &&
+      !hostCheckFailed &&
       !verificationFailed &&
       (last?.kind !== "review.submitted" || review?.review === "pass")
     )
@@ -1003,20 +1016,25 @@ export class ReviewedIntegration {
     if (rounds >= MAX_REVISIONS) throw new Error("Revision limit reached");
     // Notes count only when recorded immediately before this review.
     const noted = events.at(-2);
-    const notes = rejected
-      ? last.notes
-      : verificationFailed
-        ? (verification.notes ??
-          (await this.#journal.saveNote(
-            verification.failure === "env-lock-mismatch"
-              ? environmentLockMismatchNote
-              : verification.failure === "env-output-collision"
-                ? environmentOutputCollisionNote
-                : "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
-          )))
-        : noted?.kind === "review.noted" && noted.run === review?.run
-          ? noted.notes
-          : NO_NOTES;
+    const notes = hostCheckFailed
+      ? await this.#journal.saveNote(
+          hostCheck.notes,
+          VERIFICATION_NOTE_LIMIT_BYTES,
+        )
+      : rejected
+        ? last.notes
+        : verificationFailed
+          ? (verification.notes ??
+            (await this.#journal.saveNote(
+              verification.failure === "env-lock-mismatch"
+                ? environmentLockMismatchNote
+                : verification.failure === "env-output-collision"
+                  ? environmentOutputCollisionNote
+                  : "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
+            )))
+          : noted?.kind === "review.noted" && noted.run === review?.run
+            ? noted.notes
+            : NO_NOTES;
     const append = this.#writer(events.length);
     // This sequence CAS wins before any snapshot or Worker VM.
     await append({
@@ -1033,7 +1051,7 @@ export class ReviewedIntegration {
               path: "review-notes.txt",
               bytes: await this.#journal.readNote(
                 notes,
-                verificationFailed
+                verificationFailed || hostCheckFailed
                   ? VERIFICATION_NOTE_LIMIT_BYTES
                   : NOTE_LIMIT_BYTES,
               ),

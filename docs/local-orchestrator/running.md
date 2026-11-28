@@ -377,7 +377,7 @@ up to 32 nonempty arguments and a timeout from 1,000 to 7,200,000 milliseconds.
 Use `env` for up to 32 literal, non-secret values and `keychain` for up to
 eight item names and their destination variables. Variable names use
 `[A-Z_][A-Z0-9_]*` and must be distinct across both fields. The host reserves
-`PATH`, `HOME`, and `TMPDIR`.
+`PATH`, `HOME`, and `TMPDIR`. Declare `MSB_HOME` in literal `env`.
 
 List 1 to 64 repository-relative triggers. A trailing slash matches a directory
 prefix. Without a trailing slash, a trigger matches only that exact path.
@@ -389,11 +389,42 @@ and neither may contain the other.
 
 `agent-bootstrap doctor --target <path>` reports whether the executable and
 declared Microsandbox home are available, along with trigger and VM counts
-and Keychain item names. It also warns that host-check runs are not implemented
-yet and matching Tasks will wait at the host-check gate. The web UI supports
-rejecting a host-check proposal. Approving one requires reading its details
-and submitting the displayed approval digest through the single-item operator
-API. [Host checks ADR](../host-checks/adr-0001-host-checks.md)
+and Keychain item names. Matching Tasks run the checks in declaration order
+after approval. The checks reserve the shared local VM job slot to validate
+and run an approved batch. Product launchers sharing a user state directory
+coordinate through that slot. The `sandbox shell`, `environment build`,
+`secrets test`, and `build-profile` commands refuse to start while the runner
+holds the slot for any job. Direct developer smoke scripts follow the
+repository's one-VM rule. Each check receives a fresh export of the pinned
+commit, a fresh home and temporary directory, and the cached environment
+from Verification when one was pinned. Approve from the proposal detail using its approval digest
+through the single-item operator API until the detail view supports approval.
+A combined approval integrates on pass. Otherwise the runner opens the
+integration gate.
+
+Task detail shows the masked output tail and per-check result. The target's
+state database records before and after audit events. A check failure sends
+the masked tail to the Executor as revision notes if the shared Verification
+and revision budget has attempts left. A tamper finding records the run as
+`tampered`, and doctor and Task detail report the block. The runner pauses
+all Tasks, revisions, integrations, and agent or delegated answers for the
+target. The shared slot refuses new VM jobs until an operator clears the
+block. Inspect and repair any changes to configuration, policies, or approval
+records before clearing it. Goal publishing also pauses while a check is
+running, interrupted or tampered. The operator cannot publish, merge or set
+auto-merge on a PR until the check finishes or the block is cleared.
+A `host-check-cleanup-failed`
+outcome also stops the Task and preserves the process audit evidence.
+
+After an interruption, doctor reports the check, proposal ID and declared
+`MSB_HOME`. Inspect that home and clean up any leftover VMs before clearing
+the block. For either an interrupted or tampered check, open the affected
+Task in Workplace and use the host-check clear action. It calls the operator
+API method `hostCheck.clearInterrupted` with the proposal ID as `id` and
+`clear-interrupted-host-check <id>` as `confirm`. If the launcher
+also left an active session, use the existing `reconcile` workflow. Retry
+the failed Task to submit a fresh candidate for approval.
+[Host checks ADR](../host-checks/adr-0001-host-checks.md)
 
 ### Run with secret files
 
