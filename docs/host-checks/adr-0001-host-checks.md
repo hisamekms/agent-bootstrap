@@ -76,13 +76,14 @@ cannot add, remove or change a check.
 - `triggers` uses the same matching as scope paths (NFC, folded case, and
   a trailing slash for a directory prefix).
 - `vmCount` is advisory and appears in the approval. When it is above
-  zero, `env` must set `MSB_HOME` to an absolute path that differs from
-  agent-bootstrap's own `MSB_HOME`.
+  zero, both the check's `env.MSB_HOME` and agent-bootstrap's own
+  `MSB_HOME` must be absolute paths. The homes must be distinct, and
+  neither may contain the other.
 
 ### H3. When a check is required
 
-A check that declares no `triggers` is always required, on every
-candidate.
+A check that omits `triggers` is always required, on every candidate.
+An empty trigger list is invalid.
 
 A check that declares `triggers` is required when any change between the
 candidate and the current expected base (after any base refresh) matches
@@ -90,8 +91,11 @@ them or a fixed host baseline that the declaration cannot remove:
 
 - any file named `package.json`, `bunfig.toml`, `.bunfig.toml`,
   `bun.lockb`, `tsconfig*.json`,
-  `mise.toml`, `.mise.toml`, `mise.lock`, `.tool-versions`, `.env`, `.env.*`,
-  `.npmrc`, or a lockfile that an environment adapter declares;
+  `mise.toml`, `.mise.toml`, `mise.local.toml`, `.mise.local.toml`,
+  `mise.*.toml`, `.mise.*.toml`, `mise.lock`, `.tool-versions`, `.env`,
+  `.env.*`, `.npmrc`, or a lockfile that an environment adapter declares;
+- at any depth, any path under `.config/mise/` or a file at
+  `mise/config.toml`, `.mise/config.toml`, or `.config/mise.toml`;
 - every adapter key file and output path (E3);
 - any added, removed or retargeted symlink, and any change of mode or file
   type.

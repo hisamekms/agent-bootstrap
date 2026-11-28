@@ -6,7 +6,8 @@ import {
 } from "../local-orchestrator/codex-executor.ts";
 import type { LocalActorHarnesses } from "../actors.ts";
 import { execFile, spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { userInfo } from "node:os";
 import {
@@ -25,6 +26,7 @@ import {
   type Layer,
 } from "../config/layers.ts";
 import { ConfigError } from "../config/messages.ts";
+import type { HostCheckDeclaration } from "../local-orchestrator/host-checks.ts";
 import { resolveMsbHome, type MsbHomeResolution } from "../config/msb-home.ts";
 import {
   hasSecretTestPass,
@@ -33,6 +35,7 @@ import {
 import { CLAUDE_CODE } from "../claude-code.ts";
 import {
   driftWarning,
+  escapedJson,
   listProjects,
   projectMissing,
 } from "../config/projects.ts";
@@ -163,6 +166,54 @@ export function check(
     needsNetwork: status !== "ok" && needsNetwork,
     needsHuman: status !== "ok" && needsHuman,
   };
+}
+
+async function declaredHostCheck(
+  declaration: HostCheckDeclaration,
+): Promise<Check> {
+  const {
+    name,
+    argv: [command],
+    triggers,
+    vmCount,
+    env,
+    keychain,
+  } = declaration;
+  const commandInfo = await stat(command).catch(() => undefined);
+  const executable =
+    commandInfo?.isFile() &&
+    (await access(command, constants.X_OK).then(
+      () => true,
+      () => false,
+    ));
+  const home = env?.MSB_HOME;
+  const homeInfo = home ? await stat(home).catch(() => undefined) : undefined;
+  const status =
+    !commandInfo || (home && !homeInfo)
+      ? "missing"
+      : !executable || (homeInfo && !homeInfo.isDirectory())
+        ? "wrong"
+        : "ok";
+  const commandStatus = !commandInfo
+    ? "missing or inaccessible"
+    : executable
+      ? "exists and is executable"
+      : "exists and is not executable";
+  const homeStatus = homeInfo?.isDirectory()
+    ? "exists"
+    : homeInfo
+      ? "exists and is not a directory"
+      : home === undefined
+        ? "undeclared"
+        : "missing or inaccessible";
+  const items = keychain?.length
+    ? ` Keychain items ${keychain.map(({ service }) => escapedJson(service)).join(", ")}.`
+    : "";
+  return check(
+    `host-check-${name}`,
+    status,
+    `${escapedJson(command)} ${commandStatus}. Triggers ${triggers?.length ?? 0}. vmCount ${vmCount}. MSB_HOME ${homeStatus}.${items}`,
+  );
 }
 
 export function msbHomeCheck(home: MsbHomeResolution): Check {
@@ -457,6 +508,14 @@ export async function doctor(
         ),
         !valid,
       );
+      const declarations = layers.config.hostChecks ?? [];
+      if (declarations.length === 0)
+        add(
+          check("host-checks", "skipped", "Target has no host checks."),
+          false,
+        );
+      for (const declaration of declarations)
+        add(await declaredHostCheck(declaration), false);
     }
   } catch (error) {
     configurationError = true;

@@ -12,6 +12,7 @@ import {
   hasEditableConfig,
   readLayer,
   userConfigPath,
+  validateLocalHostChecks,
   writePrivateConfig,
 } from "../config/layers.ts";
 import { ActorConfigError, ConfigError, invalid } from "../config/messages.ts";
@@ -407,7 +408,14 @@ export async function runBootstrap(
           "The editor did not complete successfully.",
           "Check EDITOR and retry.",
         );
-      readLayer(layer, directory, host.env, true);
+      const edited = readLayer(layer, directory, host.env, true);
+      if (edited.hostChecks?.some(({ vmCount }) => vmCount > 0))
+        validateLocalHostChecks(
+          edited.hostChecks,
+          readLayer("user", undefined, host.env),
+          host.env,
+          directory,
+        );
       if (json) print({ edited: true });
       return 0;
     }

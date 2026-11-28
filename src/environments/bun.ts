@@ -7,6 +7,21 @@ import { EnvironmentError, lockMissing } from "./adapter.ts";
 
 import { validPackageName } from "./lock.ts";
 
+const lockPath = "bun.lock";
+const manifestPath = "package.json";
+const outputDirectory = "node_modules";
+
+/** The diff alone cannot identify workspaces on either side of the change. */
+export function matchesBunEnvironmentPath(foldedPath: string): boolean {
+  const segments = foldedPath.split("/");
+  const name = segments.at(-1);
+  return (
+    name === lockPath ||
+    name === manifestPath ||
+    segments.includes(outputDirectory)
+  );
+}
+
 declare const Bun: {
   Glob: new (pattern: string) => { match(path: string): boolean };
 };
@@ -44,7 +59,7 @@ function record(value: unknown): value is Record<string, unknown> {
 /** Bun can omit an empty lock for a project with no workspace or dependencies. */
 export async function allowsEmptyLock(tree: EnvironmentTree, keyFiles: number) {
   if (keyFiles !== 2) return false;
-  const root = await tree.read("package.json");
+  const root = await tree.read(manifestPath);
   if (!root) return false;
   const manifest: unknown = JSON.parse(
     new TextDecoder("utf-8", { fatal: true }).decode(root),
@@ -66,7 +81,7 @@ export async function allowsEmptyLock(tree: EnvironmentTree, keyFiles: number) {
 
 async function layout(tree: EnvironmentTree): Promise<EnvironmentLayout> {
   try {
-    const root = await tree.read("package.json");
+    const root = await tree.read(manifestPath);
     const manifest: unknown = root
       ? JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(root))
       : {};
@@ -85,30 +100,30 @@ async function layout(tree: EnvironmentTree): Promise<EnvironmentLayout> {
         pattern.startsWith("!")
       )
         throw new EnvironmentError();
-      return new Bun.Glob(`${pattern.replace(/\/$/, "")}/package.json`);
+      return new Bun.Glob(`${pattern.replace(/\/$/, "")}/${manifestPath}`);
     });
     const manifests = [
       ...new Set(
         tree.paths.filter(
           (path) =>
-            path.endsWith("/package.json") &&
+            path.endsWith(`/${manifestPath}`) &&
             environmentPath(path) &&
-            !path.split("/").includes("node_modules") &&
+            !path.split("/").includes(outputDirectory) &&
             globs.some((glob) => glob.match(path)),
         ),
       ),
     ].sort();
     const outputs = [
-      "node_modules",
-      ...manifests.map((path) =>
-        path.replace(/package\.json$/, "node_modules"),
+      outputDirectory,
+      ...manifests.map(
+        (path) => path.slice(0, -manifestPath.length) + outputDirectory,
       ),
     ];
     return {
-      keyFiles: ["bun.lock", "package.json", ...manifests],
+      keyFiles: [lockPath, manifestPath, ...manifests],
       outputs,
       linkTargets: manifests.map((path) =>
-        path.replace(/\/package\.json$/, ""),
+        path.slice(0, -(manifestPath.length + 1)),
       ),
       pathEntries: outputs.map((path) => `${path}/.bin`),
     };
@@ -124,7 +139,7 @@ const networkConcurrency = "--network-concurrency=16";
 export const bunAdapter: EnvironmentAdapter = {
   name: "bun",
   recipeVersion: 2,
-  lockPath: "bun.lock",
+  lockPath,
   defaultEgress: [{ hostname: "registry.npmjs.org", port: 443 }],
   layout,
   command(operation, hasLock, names = [], allowMajor = false) {

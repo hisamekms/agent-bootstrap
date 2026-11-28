@@ -115,12 +115,12 @@ export function validateIntegrationContent(value: unknown): IntegrationContent {
   if (input.branch !== branch) throw new ContractError();
   const review = fields(input.review, ["result", "notes"]);
   const changedPaths = unique(input.changedPaths, 1, 10_000, (value) => {
-    const name = path(value);
+    const name = scopePath(value);
     if (name.endsWith("/")) throw new ContractError();
     return name;
   });
   const symlinks = Object.hasOwn(input, "symlinks")
-    ? unique(input.symlinks, 0, changedPaths.length, path)
+    ? unique(input.symlinks, 0, changedPaths.length, scopePath)
     : undefined;
   const verified = input.verified;
   if (Object.hasOwn(input, "verified") && typeof verified !== "boolean")
@@ -257,7 +257,7 @@ export function unique<T>(
   return items;
 }
 
-function path(value: unknown): string {
+export function scopePath(value: unknown): string {
   const name = string(value, 1, 4096);
   const segments = name.replace(/\/$/, "").split("/");
   if (
@@ -330,7 +330,7 @@ export function validateGoalContent(value: unknown): GoalContent {
   return freeze({
     ...shared(input),
     scope: {
-      paths: unique(scope.paths, 1, 64, path),
+      paths: unique(scope.paths, 1, 64, scopePath),
       profiles: unique(scope.profiles, 0, profiles.length, (item) =>
         oneOf(item, profiles),
       ),
@@ -395,8 +395,8 @@ export function validateTaskContent(value: unknown): TaskContent {
   const profile = oneOf(input.profile, profiles);
   const paths =
     actor === "Executor"
-      ? unique(input.paths, 1, 64, path)
-      : unique(input.paths, 0, 0, path);
+      ? unique(input.paths, 1, 64, scopePath)
+      : unique(input.paths, 0, 0, scopePath);
   return freeze({
     ...shared(input),
     goalId: identifier(input.goalId),
