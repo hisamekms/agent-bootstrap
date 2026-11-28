@@ -75,24 +75,28 @@ cannot add, remove or change a check.
   journal, Task detail or the decision UI.
 - `triggers` uses the same matching as scope paths (NFC, folded case, and
   a trailing slash for a directory prefix).
-- `vmCount` is advisory and appears in the approval.
+- `vmCount` is advisory and appears in the approval. When it is above
+  zero, `env` must set `MSB_HOME` to an absolute path that differs from
+  agent-bootstrap's own `MSB_HOME`.
 
 ### H3. When a check is required
 
-A check is required when any change between the candidate and the current
-expected base (after any base refresh) matches its triggers. The triggers
-are the declared ones plus a fixed host baseline that the declaration
-cannot remove:
+A check that declares no `triggers` is always required, on every
+candidate.
 
-- any file named `package.json`, `bunfig.toml`, `tsconfig*.json`,
+A check that declares `triggers` is required when any change between the
+candidate and the current expected base (after any base refresh) matches
+them or a fixed host baseline that the declaration cannot remove:
+
+- any file named `package.json`, `bunfig.toml`, `.bunfig.toml`,
+  `bun.lockb`, `tsconfig*.json`,
   `mise.toml`, `.mise.toml`, `mise.lock`, `.tool-versions`, `.env`, `.env.*`,
   `.npmrc`, or a lockfile that an environment adapter declares;
 - every adapter key file and output path (E3);
 - any added, removed or retargeted symlink, and any change of mode or file
   type.
 
-Both sides of a rename count as changes. A check that declares no
-`triggers` is always required. Otherwise the check is skipped, and the
+Both sides of a rename count as changes. Otherwise the check is skipped, and the
 skip is recorded with the reason `no-trigger` and the list of changed
 paths. Approval (H4) shows the matched paths.
 
@@ -108,8 +112,10 @@ The order for a Task that requires a host check is:
 3. Host check run.
 4. Gate `integration` (unchanged).
 
-**Who can answer.** Only an undelegated human answer is accepted, through
-the operator UI or the CLI from a TTY. The gate rejects:
+**Who can answer.** Only an undelegated human answer through the operator
+UI is accepted. The CLI cannot answer this gate, because a TTY check does
+not prove that a human is present. An agent on the host can open a
+pseudo-terminal. The gate also rejects:
 
 - answers with a `delegate`, which is how an agent session answers for a
   human;
@@ -120,13 +126,13 @@ the operator UI or the CLI from a TTY. The gate rejects:
 Its policy source is always `invariant`.
 
 **What the approval pins.** One digest, recomputed and compared
-immediately before each exec, covers:
+immediately before each check in the ordered list starts, covers:
 
 - the candidate commit and the expected base commit;
 - the declaration of each required check;
 - the resolved `argv[0]` (its real path and SHA-256) and the fixed `PATH`;
 - the environment archive digest, when one is used;
-- the Keychain item identities (service and account).
+- the Keychain item service names.
 
 If any of these changes, including a new candidate produced by a revision
 or by `stale-base` handling, the approval lapses. The gate opens again.
@@ -141,7 +147,9 @@ or by `stale-base` handling, the approval lapses. The gate opens again.
 **Combining the gates.** By default the two gates are separate. The
 operator can instead choose "approve and integrate on pass", which records
 both decisions together. Integration then runs only if every required
-check passes. The integration half also lapses with the pinned digest.
+check passes. Every existing integration invariant still applies:
+verification, review, the symlink rules and acknowledging the protected
+paths. The integration half also lapses with the pinned digest.
 
 Rejection at `host-check` fails the Task, as a rejection at `integration`
 does.
@@ -158,16 +166,23 @@ does.
   object, never from a worktree. The export goes to a new 0700 directory
   outside the agent-bootstrap state, configuration and audit roots, and
   outside the target checkout. The directory is removed after the run.
-- **Packages.** When environments are enabled, the host unpacks the
-  candidate's cached environment first. It then refuses the run if the
-  candidate tree places a symlink at or above an adapter output path, or if
-  any unpacked link resolves outside the directory. A cache miss fails the
-  check. A check never builds an environment and never reaches the package
-  network.
-- **Integrity after the run.** After the process exits, the host reads the
-  declaration again, rehashes it and verifies the audit chain. If either
-  changed unexpectedly, the run fails, and integration and revision are
-  blocked until a human looks.
+- **Packages.** When environments are enabled, the host first validates the
+  exported candidate tree. It refuses the run if the tree has a symlink at
+  or above an adapter output path. It then unpacks the cached environment
+  without following links and refuses any entry that would resolve outside
+  the directory. A cache miss fails the check. A check never builds an
+  environment and never reaches the package network.
+- **Tamper detection after the run.** Before and after the process runs,
+  the host hashes:
+  - the target's `local.json` and the user `config.json`;
+  - the delegation rules, the Goal policies and the open approval rows in
+    the store.
+
+  If any hash changed, the run fails. Integration and revision stay
+  blocked until a human looks. This is a best-effort detector, not a
+  guarantee. A check can change state and restore it before it exits, and
+  it can write state that is not hashed.
+
 - **One job.** The runner's single job slot is held only while the check
   runs, never while the gate waits. While it runs, no other
   agent-bootstrap VM starts. The check may start up to `vmCount` VMs
@@ -179,8 +194,9 @@ does.
   first failure.
 - **Interruption.** If the host stops during a check, the run is recorded
   as `interrupted` on restart. It never reruns without a new approval.
-  Cleaning up VMs left under the check's `MSB_HOME` is the user's job, and
-  doctor reports the location.
+  VMs may still be running under the check's `MSB_HOME`. The job slot
+  stays blocked until a human clears it. Doctor reports the location and
+  any VMs found there, and cleaning them up is the user's job.
 
 ### H6. Audit and results
 
@@ -227,13 +243,15 @@ check passes. Task detail and the integration gate show both.
 - Fetching the artifacts a check needs. The user fetches them, and a check
   can verify them itself.
 - Running checks without human approval, for example for trusted paths.
+- Authenticating the human behind the operator UI beyond the local
+  channel. This gap is shared with the `integration` gate.
 - Model-driven work on the host. This is left to dagq-lite.
 
 ## Implementation order
 
 1. This ADR.
-2. Declaration parsing, layer restrictions, validation and the doctor
-   output.
+2. Declaration parsing, layer restrictions, validation, the doctor output,
+   and the `docs/trust-model.md` entry.
 3. The gate and answer validation, the pinned digest, the run, the audit
    and the revision path, with a fake check in tests.
 4. Task detail and the decision UI.
