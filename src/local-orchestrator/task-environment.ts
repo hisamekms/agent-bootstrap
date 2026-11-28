@@ -19,7 +19,11 @@ import {
   checkEnvironmentTree,
   validateEnvironmentArchive,
 } from "../environments/archive.ts";
-import { allowsEmptyLock, bunAdapter } from "../environments/bun.ts";
+import {
+  allowsEmptyLock,
+  bunAdapter,
+  hasBunLayout,
+} from "../environments/bun.ts";
 import {
   provisionEnvironment,
   type ProvisionerHost,
@@ -46,6 +50,25 @@ export type TaskEnvironmentOptions = {
   readonly host: ProvisionerHost;
   readonly requireAudit: (executionId: string) => void;
 };
+
+/** Read the candidate cache entry selected by Verification without provisioning it. */
+export async function hostCheckArchiveDigest(
+  options: TaskEnvironmentOptions | undefined,
+  repository: string,
+  candidate: string,
+  verificationProfile: ProfileName | undefined,
+): Promise<string | null> {
+  if (!options || verificationProfile !== "bun") return null;
+  const tree = await LocalGitIntegration.committedTree(repository, candidate);
+  if (!hasBunLayout(tree)) return null;
+  if (!options.profile) throw new EnvironmentError("env-missing");
+  const { key } = await identifyEnvironment(
+    tree,
+    options.profile.image.slice(-64),
+    bunAdapter,
+  );
+  return options.host.store.archiveDigest(key);
+}
 
 async function withBuildSlot<T>(host: ProvisionerHost, run: () => Promise<T>) {
   const deadline = performance.now() + buildWaitMs;

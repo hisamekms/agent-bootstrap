@@ -1,3 +1,21 @@
+import {
+  hostCheckDigest,
+  recomputeHostCheckApprovalDigest,
+  type HostCheckDeclaration,
+} from "../src/local-orchestrator/host-checks.ts";
+import {
+  answerFromPanel,
+  answerManyFromPanel,
+  parsePanelAnswer,
+} from "../src/local-orchestrator/proposal-answer.ts";
+import {
+  operatorInbox,
+  operatorProposal,
+} from "../src/local-orchestrator/operator-read.ts";
+import {
+  ContractError,
+  validatePolicies,
+} from "../src/local-orchestrator/model.ts";
 import { goalPublishConfirmation } from "../src/publish/protocol.ts";
 import { buildGoalPullRequest, GoalPublisher } from "../src/publish/goals.ts";
 import {
@@ -87,7 +105,10 @@ import {
   OrchestratorStore,
   OrchestratorStoreError,
 } from "../src/local-orchestrator/store.ts";
-import { taskEnvironment } from "../src/local-orchestrator/task-environment.ts";
+import {
+  hostCheckArchiveDigest,
+  taskEnvironment,
+} from "../src/local-orchestrator/task-environment.ts";
 import {
   prepareTargetDirectory,
   resolveTarget,
@@ -2422,12 +2443,16 @@ function stage3Fixture(
   verification?: "pass" | "deny-integration" | "revise-review",
   runnerOverrides?: Parameters<typeof runner>[2],
   title?: string,
+  hostChecks?: Parameters<typeof createTaskExecutor>[0]["hostChecks"],
+  link = false,
+  protectedPaths?: () => readonly string[],
 ) {
   const { root, store } = state;
   const f = goalBaseFixture(state, true, policies, title);
   const taskId = task(store, f.goalId);
   const scratch = join(root, "candidate");
   mkdirSync(join(scratch, "docs"), { recursive: true });
+  if (link) symlinkSync("a.md", join(scratch, "docs/link.md"));
   let workers = 0;
   const verificationIds: string[] = [];
   const executor = createTaskExecutor({
@@ -2436,12 +2461,19 @@ function stage3Fixture(
     store,
     worker: () => harness,
     reviewer: harness,
+    ...(hostChecks && { hostChecks }),
+    ...(protectedPaths && { protectedPaths }),
     ...(verification
       ? { verification: { command: { argv: ["verify"], timeoutMs: 1000 } } }
       : {}),
     host: {
       async runWorker(_plan, id) {
         writeFileSync(join(scratch, "docs/a.md"), `Candidate ${++workers}\n`);
+        const paths = ["docs"];
+        if (hostChecks && f.bareGit(["rev-parse", f.ref]) === f.next) {
+          writeFileSync(join(scratch, "on-new-main"), "new main\n");
+          paths.push("on-new-main");
+        }
         return {
           id: id!,
           outcome: "ok",
@@ -2453,7 +2485,7 @@ function stage3Fixture(
                 "ustar",
                 "-cf",
                 "-",
-                "docs",
+                ...paths,
               ]),
             ),
           },
@@ -2502,6 +2534,7 @@ function stage3Fixture(
     ...f,
     taskId,
     work,
+    executor,
     journal,
     verificationIds,
     verifications: () => verificationIds.length,
@@ -2523,6 +2556,850 @@ function stage3Fixture(
     },
   };
 }
+
+function hostCheckFixture(
+  state: TaskState,
+  triggers = ["docs/"],
+  options: {
+    link?: boolean;
+    verification?: "revise-review" | "disabled";
+    protectedPaths?: () => readonly string[];
+  } = {},
+) {
+  const command = join(state.root, "fake-host-check");
+  writeFileSync(command, "fixture executable, never invoked", { mode: 0o700 });
+  const declarations: HostCheckDeclaration[] = [
+    {
+      name: "local-check",
+      argv: [command, "arg"],
+      env: { FEATURE_FLAG: "literal-value" },
+      keychain: [{ service: "fixture-service", env: "SERVICE_KEY" }],
+      vmCount: 0,
+      timeoutMs: 1000,
+      triggers,
+    },
+  ];
+  const flow = stage3Fixture(
+    state,
+    { integration: "agent" },
+    options.verification === "disabled"
+      ? undefined
+      : (options.verification ?? "pass"),
+    undefined,
+    undefined,
+    () => declarations,
+    options.link,
+    options.protectedPaths,
+  );
+  return {
+    ...flow,
+    command,
+    declarations,
+    async gate() {
+      await flow.executor.resumeHostChecks?.();
+      await flow.work.drain();
+      const [gate] = state.store.activeHostCheckGates();
+      assert.ok(gate, JSON.stringify(failure(state.store, flow.taskId)));
+      return gate;
+    },
+  };
+}
+
+const panelAnswerer = { kind: "human", channel: "operator-ui" } as const;
+
+test(
+  "host-check gate follows Verification and Review and exposes only names",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    store.setTaskIntegrationPolicy(f.taskId, "agent", "cli");
+    const gate = await f.gate();
+    assert.equal(f.verifications(), 1);
+    assert.deepEqual(store.pendingIntegrations(), []);
+    const display = await operatorProposal(store, f.directory, gate.id);
+    assert.equal(display?.kind, "host-check");
+    assert.partialDeepStrictEqual(display, {
+      effectivePolicy: "human",
+      policySource: "invariant",
+      diff: {
+        base: gate.content.base,
+        candidate: gate.content.candidate,
+        digest: gate.content.digest,
+      },
+      approvalDigest: gate.content.hostCheck.digest,
+      protectedPaths: [],
+      checks: [
+        {
+          name: "local-check",
+          declarationDigest: hostCheckDigest(f.declarations[0]!),
+          matchedPaths: ["docs/a.md"],
+          argv: [f.command, "arg"],
+          envNames: ["FEATURE_FLAG", "SERVICE_KEY"],
+          keychainServices: ["fixture-service"],
+          vmCount: 0,
+        },
+      ],
+    });
+    assert.doesNotMatch(JSON.stringify(display), /literal-value/);
+    assert.equal(
+      store.effectivePolicy("host-check", { taskId: f.taskId }).source,
+      "invariant",
+    );
+    assert.equal(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .some((event) => event.kind === "host-check.opened"),
+      true,
+    );
+    assert.ok(display?.kind === "host-check");
+    assert.equal(
+      display.approvalDigest,
+      await recomputeHostCheckApprovalDigest(
+        gate.content,
+        f.declarations,
+        null,
+      ),
+    );
+    const inbox = operatorInbox(
+      store,
+      projectInbox({ store, target: f.repoRoot }),
+    );
+    const item = inbox.find(({ subject }) => subject.proposalId === gate.id);
+    assert.partialDeepStrictEqual(item, {
+      answer: {
+        approve: false,
+        reject: true,
+        approveReason: "host-check-detail-required",
+      },
+    });
+    assert.ok(item && "answer" in item);
+    assert.equal("approvalDigest" in item.answer, false);
+    const oneClick = {
+      id: item.answer.id,
+      digest: item.answer.digest,
+      decision: "approve",
+    };
+    const refused = { id: gate.id, error: { code: "stale-digest" } };
+    assert.deepEqual(
+      await answerFromPanel(store, f.directory, parsePanelAnswer(oneClick)),
+      refused,
+    );
+    assert.deepEqual(
+      await answerFromPanel(
+        store,
+        f.directory,
+        parsePanelAnswer({
+          ...oneClick,
+          approvalDigest: "0".repeat(64),
+        }),
+      ),
+      refused,
+    );
+    const answer = parsePanelAnswer({
+      ...oneClick,
+      approvalDigest: display.approvalDigest,
+    });
+    assert.deepEqual(
+      await answerManyFromPanel(store, f.directory, {
+        answers: [answer, { ...oneClick, decision: "reject" }],
+      }),
+      Array(2).fill({ id: gate.id, error: { code: "approval-forbidden" } }),
+    );
+    assert.equal(store.getProposal(gate.id)?.status, "pending");
+    assert.deepEqual(await answerFromPanel(store, f.directory, answer), {
+      id: gate.id,
+      ok: true,
+    });
+    await f.work.drain();
+    assert.equal(store.getTask(f.taskId)?.status, "awaiting-host-check");
+    assert.equal(store.nextApprovedIntegration(), undefined);
+    assert.equal(store.getProposal(gate.id)?.status, "approved");
+    assert.equal(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .some(
+          ({ data, kind }) =>
+            kind === "task.status" &&
+            (data as { code?: string }).code ===
+              "host-check-approved-pending-run",
+        ),
+      true,
+    );
+  },
+);
+
+test(
+  "host-check gate refuses CLI, delegates, Reviewer, Concierge, rule policy and takeover",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    const input = { digest: gate.digest, decision: "approve" } as const;
+    const forbidden = { code: "approval-forbidden" };
+    for (const isTTY of [false, true]) {
+      const result = await f.cli(
+        ["approve", gate.id],
+        isTTY,
+        () => `approve ${gate.digest.slice(0, 12)}`,
+      );
+      assert.equal(result.code, 1);
+      assert.equal(result.questions.length, 0);
+    }
+    assert.throws(
+      () => store.decide(gate.id, { ...input, answerer: { kind: "human" } }),
+      forbidden,
+    );
+    const delegate = {
+      agent: "claude-code",
+      session: "fixture",
+      authorization: "fixture",
+    } as const;
+    assert.throws(
+      () =>
+        store.decide(gate.id, {
+          ...input,
+          answerer: { kind: "human", delegate },
+        }),
+      forbidden,
+    );
+    assert.throws(
+      () =>
+        store.decide(gate.id, {
+          ...input,
+          answerer: { ...panelAnswerer, delegate } as typeof panelAnswerer,
+        }),
+      ContractError,
+    );
+    assert.throws(
+      () =>
+        store.getProposalForAgentApproval(gate.id, { allowRejectOnly: true }),
+      forbidden,
+    );
+    const execution = store.createExecution({
+      actor: "Reviewer",
+      mode: "approval",
+      taskId: f.taskId,
+      requestedBy: { kind: "host" },
+    });
+    store.startExecution(execution.id);
+    assert.throws(
+      () =>
+        store.decide(gate.id, {
+          ...input,
+          answerer: { kind: "agent", executionId: execution.id, model },
+        }),
+      forbidden,
+    );
+    assert.throws(
+      () =>
+        store.decide(gate.id, {
+          ...input,
+          answerer: panelAnswerer,
+          takeover: true,
+        }),
+      forbidden,
+    );
+    assert.throws(
+      () =>
+        store.decide(
+          gate.id,
+          { ...input, answerer: panelAnswerer },
+          { ruleId: "rule", ruleName: "Rule" },
+        ),
+      { code: "stale-policy" },
+    );
+    assert.throws(
+      () =>
+        store.setRules(
+          [
+            {
+              id: "try",
+              name: "Try",
+              gate: "host-check",
+              enabled: true,
+              action: "agent",
+              order: 0,
+              conditions: { pathsWithin: ["docs/**"] },
+            },
+          ],
+          "operator-ui",
+        ),
+      ContractError,
+    );
+    assert.throws(
+      () =>
+        store.setGoalPolicy(
+          f.goalId,
+          "host-check" as "integration",
+          "agent",
+          "operator-ui",
+        ),
+      ContractError,
+    );
+    for (const content of [
+      store.getGoal(f.goalId)!.content,
+      store.getTask(f.taskId)!.content,
+    ]) {
+      const policies = { "host-check": "agent" };
+      assert.throws(
+        () =>
+          "actor" in content
+            ? store.proposeTask({ ...content, policies }, origin)
+            : store.proposeGoal({ ...content, policies }, origin),
+        ContractError,
+      );
+      assert.throws(() => validatePolicies(policies), ContractError);
+    }
+    using db = new Database(state.filename);
+    db.query("UPDATE proposals SET source_json = ? WHERE id = ?").run(
+      JSON.stringify({ kind: "actor", actor: "Concierge" }),
+      gate.id,
+    );
+    assert.throws(
+      () => store.decide(gate.id, { ...input, answerer: panelAnswerer }),
+      forbidden,
+    );
+    assert.equal(store.getProposal(gate.id)?.status, "pending");
+  },
+);
+
+test(
+  "host-check gate requires Verification and pins the accepted revision",
+  gitTestOptions,
+  async () => {
+    {
+      using state = orchestratorFixture("lo-host-gate-");
+      const f = hostCheckFixture(state, undefined, {
+        verification: "disabled",
+      });
+      await f.work.drain();
+      assert.equal(state.store.activeHostCheckGates().length, 0);
+      assert.deepEqual(state.store.pendingIntegrations(), []);
+      assert.partialDeepStrictEqual(failure(state.store, f.taskId), {
+        code: "host-check-verification-required",
+      });
+    }
+    {
+      using state = orchestratorFixture("lo-host-gate-");
+      const f = hostCheckFixture(state, undefined, {
+        verification: "revise-review",
+      });
+      const gate = await f.gate();
+      assert.equal(f.verifications(), 2);
+      const candidates = (await f.journal.read()).filter(
+        (event) => event.kind === "candidate.created",
+      );
+      assert.equal(candidates.length, 2);
+      assert.equal(gate.content.candidate, candidates[1]?.candidate);
+      assert.notEqual(gate.content.candidate, candidates[0]?.candidate);
+    }
+  },
+);
+
+test(
+  "host-check gate requires explicit protected-path acknowledgement for combined approval",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state, ["unmatched/"], { link: true });
+    const gate = await f.gate();
+    assert.deepEqual(gate.content.hostCheck.protectedPaths, ["docs/link.md"]);
+    assert.deepEqual(gate.content.hostCheck.checks[0]?.matchedPaths, [
+      "docs/link.md",
+    ]);
+    const answer = {
+      id: gate.id,
+      digest: gate.digest,
+      approvalDigest: gate.content.hostCheck.digest,
+      decision: "approve",
+    } as const;
+    for (const acknowledgeProtected of [
+      [],
+      ["docs/a.md"],
+      ["docs/link.md", "docs/link.md"],
+    ]) {
+      assert.deepEqual(
+        await answerFromPanel(
+          state.store,
+          f.directory,
+          parsePanelAnswer({
+            ...answer,
+            integrateOnPass: { acknowledgeProtected },
+          }),
+        ),
+        { id: gate.id, error: { code: "approval-forbidden" } },
+      );
+    }
+    assert.deepEqual(
+      await answerFromPanel(
+        state.store,
+        f.directory,
+        parsePanelAnswer({
+          ...answer,
+          integrateOnPass: { acknowledgeProtected: ["docs/link.md"] },
+        }),
+      ),
+      { id: gate.id, ok: true },
+    );
+    assert.equal(state.store.nextApprovedIntegration(), undefined);
+  },
+);
+
+test(
+  "host-check gate journals a skip and proceeds through ordinary integration",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state, ["test/"]);
+    const integration = await f.proposal();
+    assert.equal(state.store.activeHostCheckGates().length, 0);
+    const event = state.store
+      .listEvents({ subjectId: f.taskId, limit: 50 })
+      .find(({ kind }) => kind === "host-check.skipped");
+    assert.deepEqual(event?.data, {
+      reason: "no-trigger",
+      checks: ["local-check"],
+      changedPaths: ["docs/a.md"],
+    });
+    approve(state.store, integration);
+    await f.work.drain();
+    assert.equal(state.store.getTask(f.taskId)?.status, "succeeded");
+  },
+);
+
+test(
+  "host-check gate lapses a combined approval when the expected base moves",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    const old = await f.gate();
+    const answer = parsePanelAnswer({
+      id: old.id,
+      digest: old.digest,
+      approvalDigest: old.content.hostCheck.digest,
+      decision: "approve",
+      integrateOnPass: { acknowledgeProtected: [] },
+    });
+    assert.deepEqual(await answerFromPanel(store, f.directory, answer), {
+      id: old.id,
+      ok: true,
+    });
+    assert.partialDeepStrictEqual(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .find(({ kind }) => kind === "host-check.answered"),
+      {
+        data: {
+          integrationDecision: "approve-on-pass",
+          digest: old.content.hostCheck.digest,
+        },
+      },
+    );
+    assert.equal(store.nextApprovedIntegration(), undefined);
+    let updated = false;
+    await assert.rejects(
+      store.updateGoalBase(f.goalId, f.base, f.next, async () => {
+        updated = true;
+      }),
+      { code: "goal-base-ineligible" },
+    );
+    assert.equal(updated, false);
+    // An out-of-band ref move still lapses the approval.
+    f.git(["push", f.bare, `${f.next}:${f.ref}`]);
+    await f.executor.resumeHostChecks?.();
+    assert.equal(store.getProposal(old.id)?.status, "lapsed");
+    assert.equal(store.getTask(f.taskId)?.status, "registered");
+    assert.deepEqual(store.activeHostCheckGates(), []);
+    assert.partialDeepStrictEqual(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .find(({ kind }) => kind === "host-check.lapsed"),
+      { data: { proposalId: old.id, reason: "stale-base" } },
+    );
+    assert.deepEqual(await answerFromPanel(store, f.directory, answer), {
+      id: old.id,
+      error: { code: "invalid-transition" },
+    });
+    assert.equal(store.nextApprovedIntegration(), undefined);
+  },
+);
+
+test(
+  "host-check gate lapses when a candidate is superseded on the same base",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    const original = await f.gate();
+    store.decide(original.id, {
+      digest: original.digest,
+      approvalDigest: original.content.hostCheck.digest,
+      decision: "approve",
+      answerer: panelAnswerer,
+    });
+    // Simulate the start of a candidate rebuild in the durable journal.
+    const events = await f.journal.read();
+    await f.journal.append(events.length, {
+      kind: "candidate.created",
+      candidate: "a".repeat(40),
+      digest: "b".repeat(64),
+    });
+    const fresh = await f.gate();
+    assert.equal(fresh.content.base, original.content.base);
+    assert.notEqual(fresh.content.candidate, original.content.candidate);
+    assert.notEqual(
+      fresh.content.hostCheck.digest,
+      original.content.hostCheck.digest,
+    );
+    assert.equal(store.getProposal(original.id)?.status, "lapsed");
+    assert.partialDeepStrictEqual(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .find(({ kind }) => kind === "host-check.lapsed"),
+      { data: { proposalId: original.id, reason: "candidate-changed" } },
+    );
+  },
+);
+
+test(
+  "host-check gate supersedes an ordinary approval if a check becomes required",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state, ["unmatched/"]);
+    const integration = await f.proposal();
+    const { id, digest } = integration;
+    const wrongGate = parsePanelAnswer({
+      id,
+      digest,
+      decision: "approve",
+      integrateOnPass: { acknowledgeProtected: [] },
+    });
+    assert.deepEqual(
+      await answerFromPanel(state.store, f.directory, wrongGate),
+      { id, error: { code: "approval-forbidden" } },
+    );
+    approve(state.store, integration);
+    f.declarations[0] = { ...f.declarations[0]!, triggers: ["docs/"] };
+    const gate = await f.gate();
+    assert.equal(gate.status, "pending");
+    assert.equal(state.store.getProposal(integration.id)?.status, "lapsed");
+    assert.equal(state.store.goalIntegrationHead(f.goalId), null);
+    assert.equal(state.store.nextApprovedIntegration(), undefined);
+    assert.equal(f.verifications(), 2);
+  },
+);
+
+test(
+  "leaving the host-check gate journals every proposal lapsed by the Task transition",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store, filename } = state;
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    const approvedId = randomUUID();
+    const rejectedId = randomUUID();
+    // Populate older open rows to exercise the bulk lapse during rejection.
+    {
+      using db = new Database(filename);
+      const copy = db.query(
+        `INSERT INTO proposals
+         SELECT ?, kind, content_json, digest, source_json, ?, created_at, decided_at
+         FROM proposals WHERE id = ?`,
+      );
+      copy.run(approvedId, "approved", gate.id);
+      copy.run(rejectedId, "pending", gate.id);
+    }
+    store.decide(rejectedId, {
+      digest: gate.digest,
+      decision: "reject",
+      answerer: panelAnswerer,
+    });
+
+    assert.equal(store.getTask(f.taskId)?.status, "failed");
+    assert.equal(store.getProposal(rejectedId)?.status, "rejected");
+    for (const id of [gate.id, approvedId])
+      assert.equal(store.getProposal(id)?.status, "lapsed");
+    const lapses = store
+      .listEvents({ subjectId: f.taskId, limit: 50 })
+      .filter(({ kind }) => kind === "host-check.lapsed")
+      .map(({ data }) => data);
+    assert.equal(lapses.length, 2);
+    assert.deepEqual(
+      new Set(lapses),
+      new Set(
+        [gate.id, approvedId].map((proposalId) => ({
+          proposalId,
+          digest: gate.content.hostCheck.digest,
+          reason: "host-check-rejected",
+        })),
+      ),
+    );
+  },
+);
+
+test(
+  "ordinary integration refuses a path protected after approval",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    let paths: string[] = [];
+    const f = hostCheckFixture(state, ["unmatched/"], {
+      protectedPaths: () => paths,
+    });
+    const proposal = await f.proposal();
+    assert.deepEqual(proposal.content.changedPaths, ["docs/a.md"]);
+    approve(store, proposal);
+    const events = await f.journal.read();
+
+    paths = ["docs/"];
+    await f.work.drain();
+
+    assert.equal(f.head(), f.base);
+    assert.deepEqual(await f.journal.read(), events);
+    assert.deepEqual(failure(store, f.taskId), {
+      status: "failed",
+      code: "candidate-mismatch",
+    });
+  },
+);
+
+test(
+  "host-check gate reopens on changed executable or private declaration",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    state.store.decide(gate.id, {
+      digest: gate.digest,
+      approvalDigest: gate.content.hostCheck.digest,
+      decision: "approve",
+      answerer: panelAnswerer,
+    });
+    writeFileSync(f.command, "updated fixture executable");
+    const fresh = await f.gate();
+    assert.equal(state.store.getProposal(gate.id)?.status, "lapsed");
+    assert.equal(fresh.content.candidate, gate.content.candidate);
+    assert.notEqual(
+      fresh.content.hostCheck.digest,
+      gate.content.hostCheck.digest,
+    );
+    f.declarations[0] = { ...f.declarations[0]!, timeoutMs: 2000 };
+    const refreshed = await f.gate();
+    assert.notEqual(
+      refreshed.content.hostCheck.digest,
+      fresh.content.hostCheck.digest,
+    );
+    assert.equal(f.verifications(), 1);
+  },
+);
+
+test(
+  "host-check gate reopens with the integration plan's protected paths",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    let paths = ["docs/"];
+    const f = hostCheckFixture(state, ["docs/"], {
+      protectedPaths: () => paths,
+    });
+    const gate = await f.gate();
+    assert.deepEqual(gate.content.hostCheck.protectedPaths, ["docs/a.md"]);
+    state.store.decide(gate.id, {
+      digest: gate.digest,
+      approvalDigest: gate.content.hostCheck.digest,
+      decision: "approve",
+      answerer: panelAnswerer,
+      integrateOnPass: { acknowledgeProtected: ["docs/a.md"] },
+    });
+    paths = ["elsewhere/"];
+    const fresh = await f.gate();
+    assert.equal(state.store.getProposal(gate.id)?.status, "lapsed");
+    assert.equal(fresh.content.candidate, gate.content.candidate);
+    assert.notEqual(
+      fresh.content.hostCheck.digest,
+      gate.content.hostCheck.digest,
+    );
+    assert.deepEqual(fresh.content.hostCheck.protectedPaths, []);
+    assert.equal(f.verifications(), 1);
+    paths = ["docs/"];
+    const reopened = await f.gate();
+    assert.deepEqual(reopened.content.hostCheck.protectedPaths, ["docs/a.md"]);
+    assert.equal(
+      reopened.content.hostCheck.digest,
+      gate.content.hostCheck.digest,
+    );
+  },
+);
+
+test(
+  "host-check gate retries temporarily unavailable inputs before and after opening",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    const saved = f.command + ".saved";
+    renameSync(f.command, saved);
+    await f.work.drain();
+    assert.equal(store.getTask(f.taskId)?.status, "awaiting-host-check");
+    assert.deepEqual(store.activeHostCheckGates(), []);
+    using reopened = openTestStore(state.filename);
+    assert.equal(reopened.store.waitingHostCheckInputs().length, 1);
+    renameSync(saved, f.command);
+    const gate = await f.gate();
+    assert.equal(reopened.store.waitingHostCheckInputs().length, 0);
+    renameSync(f.command, saved);
+    await f.executor.resumeHostChecks?.();
+    assert.equal(store.getProposal(gate.id)?.status, "pending");
+    assert.equal(store.getTask(f.taskId)?.status, "awaiting-host-check");
+    assert.partialDeepStrictEqual(
+      store
+        .listEvents({ subjectId: f.taskId, limit: 50 })
+        .find(({ kind }) => kind === "host-check.inputs-unavailable"),
+      { data: { reason: "approval-inputs-unavailable", proposalId: gate.id } },
+    );
+    renameSync(saved, f.command);
+    assert.equal((await f.gate()).id, gate.id);
+    const events = await f.journal.read();
+    const review =
+      events.findIndex(({ kind }) => kind === "review.submitted") + 1;
+    assert.ok(review > 0);
+    const eventFile = join(
+      f.directory,
+      "integrations",
+      f.taskId,
+      `${f.taskId}.${review}.json`,
+    );
+    renameSync(eventFile, eventFile + ".saved");
+    await f.executor.resumeHostChecks?.();
+    assert.equal(store.getProposal(gate.id)?.status, "pending");
+    assert.equal(store.getTask(f.taskId)?.status, "awaiting-host-check");
+    renameSync(eventFile + ".saved", eventFile);
+    assert.equal((await f.gate()).id, gate.id);
+    assert.equal(f.verifications(), 1);
+  },
+);
+
+test(
+  "stale gates cannot lapse the latest gate and all open gates close on exit",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const { store } = state;
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    const latest = randomUUID();
+    using db = new Database(state.filename);
+    db.query(
+      `INSERT INTO proposals
+    SELECT ?, kind, content_json, digest, source_json, status, created_at, decided_at
+    FROM proposals WHERE id = ?`,
+    ).run(latest, gate.id);
+    store.lapseHostCheck(gate.id, "candidate-changed");
+    assert.equal(store.getProposal(gate.id)?.status, "pending");
+    assert.deepEqual(
+      store.activeHostCheckGates().map(({ id }) => id),
+      [latest],
+    );
+    store.decide(latest, {
+      digest: gate.digest,
+      decision: "reject",
+      answerer: panelAnswerer,
+    });
+    assert.equal(store.getTask(f.taskId)?.status, "failed");
+    assert.equal(store.getProposal(latest)?.status, "rejected");
+    assert.equal(store.getProposal(gate.id)?.status, "lapsed");
+  },
+);
+
+test(
+  "pending host-check proposals independently block a Goal base update",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state);
+    await f.gate();
+    assert.throws(() => state.store.goalBaseForUpdate(f.goalId), {
+      code: "goal-base-ineligible",
+    });
+    using db = new Database(state.filename);
+    db.query("UPDATE tasks SET status = 'registered' WHERE id = ?").run(
+      f.taskId,
+    );
+    assert.throws(() => state.store.goalBaseForUpdate(f.goalId), {
+      code: "goal-base-ineligible",
+    });
+  },
+);
+
+test(
+  "host-check gate rolls back an answer if its audit event cannot be written",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    using db = new Database(state.filename);
+    db.exec(`CREATE TRIGGER fail_answer BEFORE INSERT ON events
+    WHEN NEW.kind = 'host-check.answered' BEGIN SELECT RAISE(ABORT, 'fixture'); END;`);
+    const answer = {
+      digest: gate.digest,
+      approvalDigest: gate.content.hostCheck.digest,
+      decision: "approve",
+      answerer: panelAnswerer,
+    } as const;
+    assert.throws(() => state.store.decide(gate.id, answer), {
+      code: "write-failed",
+    });
+    using reopened = openTestStore(state.filename);
+    assert.equal(reopened.store.getProposal(gate.id)?.status, "pending");
+    assert.equal(reopened.store.nextApprovedIntegration(), undefined);
+    assert.equal(
+      reopened.store
+        .listEvents({ subjectId: gate.id, limit: 50 })
+        .some(({ kind }) => kind === "proposal.decided"),
+      false,
+    );
+  },
+);
+
+test(
+  "host-check gate rejection fails the Task and bypasses integration",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-host-gate-");
+    const f = hostCheckFixture(state);
+    const gate = await f.gate();
+    assert.deepEqual(
+      await answerFromPanel(
+        state.store,
+        f.directory,
+        parsePanelAnswer({
+          id: gate.id,
+          digest: gate.digest,
+          decision: "reject",
+        }),
+      ),
+      { id: gate.id, ok: true },
+    );
+    assert.equal(state.store.getTask(f.taskId)?.status, "failed");
+    assert.partialDeepStrictEqual(failure(state.store, f.taskId), {
+      code: "host-check-rejected",
+    });
+    assert.equal(state.store.nextApprovedIntegration(), undefined);
+  },
+);
 
 test(
   "integrates a verified approval and uses its committed head for a dependent",
@@ -3720,6 +4597,256 @@ test("Task environment records failures when the profile or commit is unavailabl
     assert.equal(finished.failure, "env-build-failed");
   }
 });
+
+for (const change of [
+  "archive bytes",
+  "disabled delivery",
+  "Verification profile change",
+] as const)
+  test(
+    `host-check gate pins the candidate lockfile archive and lapses on ${change}`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-host-env-");
+      const { store, root } = state;
+      const repoRoot = join(root, "source");
+      mkdirSync(repoRoot);
+      const git = (args: string[]) =>
+        command("/usr/bin/git", repoRoot, args, "utf8");
+      git(["init", "--template=", "--initial-branch=main"]);
+      git(["commit", "--allow-empty", "-m", "no adapter layout"]);
+      const withoutLayout = String(git(["rev-parse", "HEAD"])).trim();
+      const manifest = '{"name":"fixture"}';
+      const baseLock = '{"lockfileVersion":1,"packages":{}}';
+      const candidateLock = baseLock + "\n";
+      writeFileSync(join(repoRoot, "package.json"), manifest);
+      writeFileSync(join(repoRoot, "bun.lock"), baseLock);
+      git(["add", "."]);
+      git(["commit", "-m", "base"]);
+      const env = configEnv(root);
+      addProject(repoRoot, undefined, env);
+      const target = await resolveTarget(repoRoot, root, env);
+      const { directory } = target;
+      await prepareTargetDirectory(root, directory, env);
+      const goalId = goal(store, undefined, "bun");
+      const taskId = task(store, goalId, {
+        paths: ["bun.lock"],
+        profile: "bun",
+      });
+      const cache = new EnvironmentStore(target.project.id, env);
+      const profileDigest = "a".repeat(64);
+      function tarEntry(
+        path: string,
+        type: "directory" | "file",
+        content = "",
+      ) {
+        return {
+          path,
+          type,
+          mode: type === "directory" ? 0o755 : 0o644,
+          linkname: "",
+          data: Buffer.from(content),
+        };
+      }
+      const baseArchive = writeWorkspaceTar([
+        tarEntry("node_modules", "directory"),
+      ]);
+      const candidateArchive = writeWorkspaceTar([
+        tarEntry("node_modules", "directory"),
+        tarEntry("node_modules/fixture", "file", "candidate archive"),
+      ]);
+      async function publish(lock: string, archive: Uint8Array) {
+        const { key } = await identifyEnvironment(
+          {
+            paths: ["package.json", "bun.lock"],
+            async read(path) {
+              return Buffer.from(path === "bun.lock" ? lock : manifest);
+            },
+          },
+          profileDigest,
+          bunAdapter,
+        );
+        await cache.publish(
+          {
+            key,
+            profileDigest,
+            size: archive.byteLength,
+            adapter: "bun",
+            hasLock: true,
+            packages: [],
+            createdAt: new Date().toISOString(),
+          },
+          archive,
+        );
+        return key;
+      }
+      const baseKey = await publish(baseLock, baseArchive);
+      const candidateKey = await publish(candidateLock, candidateArchive);
+      assert.notEqual(baseKey, candidateKey);
+      const archivePath = join(
+        cache.directory,
+        "entries",
+        candidateKey,
+        "outputs.tar",
+      );
+      const executable = join(root, "fixture-check");
+      writeFileSync(executable, "never executed", { mode: 0o700 });
+      const declarations = [
+        {
+          name: "fixture",
+          argv: [executable],
+          vmCount: 0,
+          timeoutMs: 1000,
+          triggers: ["bun.lock"],
+        },
+      ] as const;
+      const taskOptions: Parameters<typeof createTaskExecutor>[0] = {
+        directory,
+        repoRoot,
+        store,
+        worker: () => harness,
+        reviewer: harness,
+        verification: configuredVerification({
+          profile: "bun",
+          argv: ["bun", "test"],
+        }),
+        environment: {
+          profile: {
+            image: `localhost/agent-bootstrap/bun@sha256:${profileDigest}`,
+            recipeDigest: profileDigest,
+            memoryMiB: 2048,
+            cpus: 2,
+          },
+          allow: [],
+          requireAudit() {},
+          host: {
+            env,
+            store: cache,
+            async run() {
+              assert.fail("unexpected provisioning");
+            },
+            async openGateway() {
+              assert.fail("unexpected gateway");
+            },
+          },
+        },
+        hostChecks: declarations,
+        host: {
+          async runWorker(plan, id) {
+            assert.deepEqual(plan.sandbox.environment?.archive, baseArchive);
+            return {
+              id: id!,
+              outcome: "ok",
+              artifacts: {
+                files: [],
+                tree: writeWorkspaceTar([
+                  tarEntry("package.json", "file", manifest),
+                  tarEntry("bun.lock", "file", candidateLock),
+                ]),
+              },
+            };
+          },
+          async runVerification(plan, id) {
+            assert.deepEqual(
+              plan.sandbox.environment?.archive,
+              candidateArchive,
+            );
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from('{"review":"pass"}'),
+            };
+          },
+          async runReviewer(_plan, id) {
+            renameSync(archivePath, archivePath + ".saved");
+            return {
+              id: id!,
+              outcome: "ok",
+              response: Buffer.from(
+                JSON.stringify({ result: '{"review":"pass"}' }),
+              ),
+            };
+          },
+        },
+      };
+      const executor = createTaskExecutor(taskOptions);
+      await runTask(store, executor, taskId);
+      assert.equal(
+        store.getTask(taskId)?.status,
+        "awaiting-host-check",
+        JSON.stringify(failure(store, taskId)),
+      );
+      assert.deepEqual(store.activeHostCheckGates(), []);
+      renameSync(archivePath + ".saved", archivePath);
+      await executor.resumeHostChecks?.();
+      const [gate] = store.activeHostCheckGates();
+      assert.ok(gate?.kind === "host-check");
+      const digest = (bytes: Uint8Array) =>
+        createHash("sha256").update(bytes).digest("hex");
+      assert.equal(
+        gate.content.hostCheck.digest,
+        await recomputeHostCheckApprovalDigest(
+          gate.content,
+          declarations,
+          digest(candidateArchive),
+        ),
+      );
+      assert.notEqual(
+        gate.content.hostCheck.digest,
+        await recomputeHostCheckApprovalDigest(
+          gate.content,
+          declarations,
+          digest(baseArchive),
+        ),
+      );
+      assert.equal(
+        await hostCheckArchiveDigest(
+          undefined,
+          join(directory, "repository.git"),
+          gate.content.candidate,
+          "bun",
+        ),
+        null,
+      );
+      await executor.resumeHostChecks?.();
+      assert.equal(store.getProposal(gate.id)?.status, "pending");
+      assert.equal(
+        await hostCheckArchiveDigest(
+          taskOptions.environment,
+          join(directory, "repository.git"),
+          withoutLayout,
+          "bun",
+        ),
+        null,
+      );
+      if (change === "archive bytes") {
+        // A different archive under the same key needs a fresh Verification.
+        const replacement = writeWorkspaceTar([
+          tarEntry("node_modules", "directory"),
+          tarEntry("node_modules/fixture", "file", "different archive"),
+        ]);
+        assert.equal(replacement.byteLength, candidateArchive.byteLength);
+        writeFileSync(archivePath, replacement);
+        await executor.resumeHostChecks?.();
+      } else {
+        const { environment: _previousEnvironment, ...disabled } = taskOptions;
+        const restarted =
+          change === "disabled delivery"
+            ? disabled
+            : {
+                ...taskOptions,
+                verification: configuredVerification({
+                  profile: "base",
+                  argv: ["verify"],
+                }),
+              };
+        await createTaskExecutor(restarted).resumeHostChecks?.();
+      }
+      assert.equal(store.getProposal(gate.id)?.status, "lapsed");
+      assert.equal(store.getTask(taskId)?.status, "registered");
+      assert.deepEqual(store.activeHostCheckGates(), []);
+    },
+  );
 
 for (const scenario of [
   "build",

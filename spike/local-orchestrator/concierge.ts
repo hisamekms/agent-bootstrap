@@ -534,6 +534,9 @@ async function launchConcierge(
           install,
           auth,
           config: effective.config,
+          readHostChecks: () =>
+            loadConfig({ ...process.env, MSB_HOME: home }, configDirectory)
+              .config.hostChecks ?? [],
           baseImage,
           ...(effective.config.environment?.enabled
             ? {

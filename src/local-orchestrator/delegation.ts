@@ -19,6 +19,7 @@ export const TASK_POLICIES = ["rule", "human", "agent"] as const;
 export type GoalPolicy = (typeof GOAL_POLICIES)[number];
 export type TaskPolicy = (typeof TASK_POLICIES)[number];
 export const POLICY_INVARIANTS = [
+  "host-check",
   "integration-verification",
   "integration-symlinks",
   "integration-symlink-evidence",
@@ -297,6 +298,8 @@ export function resolveDelegation(
   },
 ): EffectivePolicy {
   const { fallback, invariant, task, goal, rules, facts } = options;
+  if (gate === "host-check")
+    return { policy: "human", source: "invariant", invariant: "host-check" };
   if (invariant) return { policy: "human", source: "invariant", invariant };
   if (gate === "integration" && (task === "human" || task === "agent"))
     return { policy: task, source: "operator-task" };

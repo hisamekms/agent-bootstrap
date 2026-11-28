@@ -106,6 +106,7 @@ function eventFields(kind: unknown, data: Row) {
           "registered",
           "running",
           "awaiting-integration",
+          "awaiting-host-check",
           "succeeded",
           "failed",
           "cancelled",
@@ -190,7 +191,10 @@ const queries = {
         ...row,
         execution_id: label(source.executionId),
         goal_id: row.kind === "goal" ? null : label(content.goalId),
-        task_id: row.kind === "integration" ? label(content.taskId) : null,
+        task_id:
+          row.kind === "integration" || row.kind === "host-check"
+            ? label(content.taskId)
+            : null,
       };
     },
   },

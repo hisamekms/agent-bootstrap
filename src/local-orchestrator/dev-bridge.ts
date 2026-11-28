@@ -243,6 +243,18 @@ export function startDevBridge(options: {
             );
             return;
           }
+          // Host-check detail and approval are not available in the web panel until step 4.
+          if (
+            request.method === "proposal.answer" &&
+            request.params !== null &&
+            typeof request.params === "object" &&
+            Object.hasOwn(request.params, "approvalDigest")
+          ) {
+            ws.sendText(
+              JSON.stringify({ id, error: { code: "approval-forbidden" } }),
+            );
+            return;
+          }
           // Re-encode to keep each WebSocket message on exactly one API line.
           line = JSON.stringify({
             id,

@@ -133,6 +133,7 @@ export interface ConciergeDeps {
   readonly install: ClaudeCodeInstall;
   readonly auth: ClaudeCodeAuth;
   readonly config: Config;
+  readonly readHostChecks?: () => NonNullable<Config["hostChecks"]>;
   readonly baseImage: string;
   readonly note?: (message: string) => void;
   readonly verification?: Verification;
@@ -672,6 +673,7 @@ export async function startConcierge(
               });
             },
             reviewer,
+            hostChecks: deps.readHostChecks ?? config.hostChecks ?? [],
             ...(deps.verification ? { verification: deps.verification } : {}),
             ...(environment ? { environment } : {}),
           })

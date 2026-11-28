@@ -4,7 +4,7 @@ import type {
   RuleGate,
 } from "../../local-orchestrator/delegation.ts";
 import type {
-  Gate,
+  PolicyGate,
   Policy,
   TaskCategory,
 } from "../../local-orchestrator/model.ts";
@@ -404,7 +404,9 @@ export function delegationPanel(
     ),
   );
   const defaults = policyControls("既定", saved);
-  for (const gate of Object.keys(gateLabels) as Gate[]) {
+  for (const gate of Object.keys(gateLabels).filter(
+    (gate): gate is PolicyGate => gate !== "host-check",
+  )) {
     const untouched = !settings.explicitDefaults.includes(gate);
     defaults.controls.append(
       segmented(

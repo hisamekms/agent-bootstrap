@@ -11,14 +11,16 @@ export const ACTOR_KINDS = Object.freeze([
   "Reviewer",
 ] as const);
 export type ActorKind = (typeof ACTOR_KINDS)[number];
+// Gates accepted in configurable policy layers. Host-check policy is an invariant.
 export const GATES = Object.freeze([
   "goal-registration",
   "task-registration",
   "integration",
 ] as const);
-export type Gate = (typeof GATES)[number];
+export type PolicyGate = (typeof GATES)[number];
+export type Gate = PolicyGate | "host-check";
 export type Policy = "human" | "agent";
-export type PolicySet = Partial<Record<Gate, Policy>>;
+export type PolicySet = Partial<Record<PolicyGate, Policy>>;
 export const TASK_CATEGORIES = [
   "bugfix",
   "docs",
@@ -199,7 +201,7 @@ export function integer(value: unknown, min: number, max: number): number {
   return value === 0 ? 0 : value;
 }
 
-function string(value: unknown, min: number, max: number): string {
+export function string(value: unknown, min: number, max: number): string {
   if (
     typeof value !== "string" ||
     value.length < min ||
@@ -511,7 +513,7 @@ export interface PolicyLayers {
 }
 
 export function resolvePolicy(
-  gate: Gate,
+  gate: PolicyGate,
   layers: PolicyLayers,
 ): { policy: Policy; source: PolicySource } {
   for (const source of ["task", "goal", "request"] as const) {

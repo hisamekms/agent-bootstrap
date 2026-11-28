@@ -66,6 +66,7 @@ const labels = {
   running: "実行",
   review: "レビュー",
   "awaiting-integration": "統合待ち",
+  "awaiting-host-check": "ホスト検証待ち",
   done: "完了",
   failed: "失敗",
   cancelled: "キャンセル",
@@ -73,6 +74,7 @@ const labels = {
 } as const;
 
 const answerLabels = {
+  "host-check": "ホスト検証",
   goal: "Goal の提案",
   task: "Task の提案",
   integration: "統合",
@@ -93,6 +95,7 @@ function displayState(state: keyof typeof labels) {
     running: "accent",
     review: "accent",
     "awaiting-integration": "warn",
+    "awaiting-host-check": "warn",
     done: "ok",
     failed: "danger",
     cancelled: "info",
@@ -795,6 +798,17 @@ export function createInboxPanel(
     takeover?: true,
   ) {
     if (answering) return;
+    if (
+      rows.some(
+        (item) => "answer" in item && item.answer.kind === "host-check",
+      ) &&
+      (decision === "approve" || rows.length !== 1)
+    ) {
+      status.replaceChildren(
+        textElement("p", answerError("approval-forbidden"), "status-error"),
+      );
+      return;
+    }
     answering = true;
     updateControls();
     const pinned = rows.flatMap((item) =>
@@ -1093,6 +1107,10 @@ export function createInboxPanel(
     const keyFact = textElement("div", "", "decision-key-fact");
     keyFact.hidden = true;
     const warnings = group("div", "stack decision-warnings");
+    if (answer?.approveReason === "host-check-detail-required")
+      warnings.append(
+        textElement("p", "ホスト検証の承認には詳細画面が必要です。", "muted"),
+      );
     if (answer?.agentGates.length)
       warnings.append(delegationWarning(answer.agentGates, item.id));
     const detail = textElement("div", "", "stack decision-detail");
@@ -1148,6 +1166,7 @@ export function createInboxPanel(
       },
       "link",
     );
+    toggle.hidden = answer?.kind === "host-check";
     const hint = textElement("span", "読んだ内容で確定します", "muted");
     const actions = group(
       "div",
@@ -1288,7 +1307,7 @@ export function createInboxPanel(
         renderEvidence();
         return;
       }
-      if (!id) return;
+      if (!id || answer?.kind === "host-check") return;
       if (!detail.hidden) info.textContent = "提案の詳細を読み込み中…";
       if (loading) return;
       loading = true;
@@ -1952,6 +1971,7 @@ function taskStepper(task: TaskSummary) {
     running: [steps[index], "start", "current"],
     review: [steps[index], "start", "current"],
     "awaiting-integration": [steps[index], "start", "current"],
+    "awaiting-host-check": [labels["awaiting-host-check"], "start", "current"],
   } as const;
   const [status, glyph, tone] = markers[task.stage];
   const label = `現在: ${status}`;

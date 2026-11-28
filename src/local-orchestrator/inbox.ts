@@ -11,6 +11,7 @@ type Kind =
   | "goal-registration"
   | "task-registration"
   | "integration"
+  | "host-check"
   | "task-failed"
   | "execution-over-budget"
   | "pr-merge"
@@ -103,17 +104,23 @@ export function projectInbox(
     switch (kind) {
       case "goal-registration":
       case "task-registration":
+      case "host-check":
       case "integration": {
         const gate =
           kind === "goal-registration"
             ? "Goal registration"
             : kind === "task-registration"
               ? "Task registration"
-              : "Integration";
+              : kind === "host-check"
+                ? "Host check"
+                : "Integration";
         title = row.resolved
           ? `${gate} proposal ${proposalId?.slice(0, 8)} closed`
           : `${gate} approval waiting for ${task ? `Task ${task}` : `proposal ${proposalId?.slice(0, 8)}`}`;
-        next = `${row.resolved ? "show" : "approve"} ${proposalId}`;
+        next =
+          kind === "host-check" && !row.resolved
+            ? "Host-check approval requires a detail view. The operator UI can reject this proposal."
+            : `${row.resolved ? "show" : "approve"} ${proposalId}`;
         break;
       }
       case "task-failed": {

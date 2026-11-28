@@ -220,6 +220,8 @@ type Plan = {
   readonly path?: string;
   /** Tree mode: the Worker edits a whole repository workspace. */
   readonly tree?: TreePlan;
+  /** Live host policy for integration approval, independent of the reviewed tree. */
+  readonly readProtectedPaths?: () => readonly string[];
   readonly worker: SandboxCommand;
   readonly reviewer: SandboxCommand;
   readonly verification?: Verification | undefined;
@@ -520,6 +522,9 @@ export class ReviewedIntegration {
     this.#plan = {
       ...(plan.path !== undefined ? { path: plan.path } : {}),
       ...(plan.tree !== undefined ? { tree: copyTree(plan.tree) } : {}),
+      ...(plan.readProtectedPaths && {
+        readProtectedPaths: plan.readProtectedPaths,
+      }),
       ...(plan.prepareEnvironmentUpdate && {
         prepareEnvironmentUpdate: plan.prepareEnvironmentUpdate,
         previousAttempt: plan.previousAttempt,
@@ -1201,11 +1206,44 @@ export class ReviewedIntegration {
     return diff;
   }
 
-  /** The current candidate when its latest review passed, else null. */
-  async reviewedPin(): Promise<PinnedCandidate | null> {
+  /** Return the latest reviewed candidate. When given a previously reviewed
+   * pin, require its review evidence before treating a different pin as superseding it. */
+  async reviewedPin(
+    expected?: PinnedCandidate,
+  ): Promise<PinnedCandidate | null> {
     const events = await this.#journal.read();
+    const target = await this.#target();
+    if (expected) {
+      const authorized = events.findLastIndex(
+        (event) =>
+          event.kind === "review.authorized" && samePin(event, expected),
+      );
+      const submitted = events
+        .slice(authorized + 1)
+        .find(
+          (event) =>
+            event.kind === "review.submitted" ||
+            event.kind === "review.authorized" ||
+            event.kind === "candidate.created",
+        );
+      if (
+        authorized < 0 ||
+        submitted?.kind !== "review.submitted" ||
+        submitted.digest !== expected.digest ||
+        submitted.review !== "pass"
+      )
+        throw new Error("Prior review evidence is unavailable");
+      const requested = events[0];
+      if (requested?.kind === "requested" && requested.target !== target)
+        return null;
+      if (!samePin(candidatePin(events, target), expected)) return null;
+      const { pin, review } = latestPin(events, target);
+      if (review !== "pass")
+        throw new Error("Current review evidence is unavailable");
+      return pin;
+    }
     try {
-      const { pin, review } = latestPin(events, await this.#target());
+      const { pin, review } = latestPin(events, target);
       return review === "pass" ? pin : null;
     } catch {
       return null;
@@ -1259,11 +1297,10 @@ export class ReviewedIntegration {
   }
 
   #protectedPaths(pin: PinnedCandidate): Promise<string[]> {
-    return this.#git.protectedPaths(
-      pin.base,
-      pin.candidate,
-      this.#plan.tree?.protectedPaths ?? [],
-    );
+    return this.#git.protectedPaths(pin.base, pin.candidate, [
+      ...(this.#plan.tree?.protectedPaths ?? []),
+      ...(this.#plan.readProtectedPaths?.() ?? []),
+    ]);
   }
 
   /** Return the protected paths of the current pinned tree candidate. */

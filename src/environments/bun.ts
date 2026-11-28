@@ -56,6 +56,10 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+export function hasBunLayout(tree: EnvironmentTree): boolean {
+  return tree.paths.includes(manifestPath);
+}
+
 /** Bun can omit an empty lock for a project with no workspace or dependencies. */
 export async function allowsEmptyLock(tree: EnvironmentTree, keyFiles: number) {
   if (keyFiles !== 2) return false;

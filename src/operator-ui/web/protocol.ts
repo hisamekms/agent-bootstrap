@@ -13,7 +13,11 @@ import type {
   TaskPolicy,
   RuleConditions,
 } from "../../local-orchestrator/delegation.ts";
-import type { Gate, Policy } from "../../local-orchestrator/model.ts";
+import type {
+  Gate,
+  Policy,
+  PolicyGate,
+} from "../../local-orchestrator/model.ts";
 import type { readOperatorGoal } from "../../local-orchestrator/operator-api.ts";
 import type { OrchestratorStore } from "../../local-orchestrator/store.ts";
 import type { WorkplaceEnvironment } from "../../local-orchestrator/workplace-environment.ts";
@@ -42,7 +46,7 @@ import type {
 type HostProposal = NonNullable<Awaited<ReturnType<typeof operatorProposal>>>;
 type IntegrationProposal = Extract<HostProposal, { kind: "integration" }>;
 export type Proposal =
-  | Exclude<HostProposal, IntegrationProposal>
+  | Exclude<HostProposal, { kind: "integration" | "host-check" }>
   | (Omit<IntegrationProposal, "modelText"> & {
       modelText: Omit<IntegrationProposal["modelText"], "verdict"> & {
         verdict: "pass" | "concern";
@@ -80,9 +84,11 @@ export const gateLabels: Record<Gate, string> = {
   "goal-registration": "Goal の登録",
   "task-registration": "Task の登録",
   integration: "統合",
+  "host-check": "ホスト検証",
 };
 
 export const invariantLabels: Record<PolicyInvariant, string> = {
+  "host-check": "ホスト検証は操作画面で人が判断します。",
   "integration-verification": "検証に合格していない統合は人が判断します。",
   "integration-symlinks":
     "シンボリックリンクの変更を含む統合は人が判断します。",
@@ -211,7 +217,7 @@ export interface Methods extends GoalPublishMethods {
   status: { params: Record<string, never>; result: Status };
   "policy.get": { params: Record<string, never>; result: PolicySettings };
   "policy.setDefault": {
-    params: { gate: Gate; policy: Policy };
+    params: { gate: PolicyGate; policy: Policy };
     result: SettingsReceipt;
   };
   "policy.setRules": {
@@ -243,11 +249,11 @@ export interface Methods extends GoalPublishMethods {
   "inbox.markSeen": { params: { ids: string[] }; result: { marked: number } };
   "proposal.get": { params: { id: string }; result: Proposal };
   "proposal.answer": {
-    params: PanelAnswer;
+    params: Omit<PanelAnswer, "approvalDigest">;
     result: Extract<PanelAnswerResult, { ok: true }>;
   };
   "proposal.answerMany": {
-    params: { answers: PanelAnswer[] };
+    params: { answers: Omit<PanelAnswer, "approvalDigest">[] };
     result: PanelAnswerResult[];
   };
   "goal.list": {

@@ -305,6 +305,7 @@ export class ActorRunner {
   readonly #approvalTimeoutMs: number;
   readonly #queue: Job[] = [];
   #draining: Promise<void> | undefined;
+  #nextHostCheckRefresh = 0;
 
   constructor(deps: RunnerDeps) {
     this.#deps = deps;
@@ -377,6 +378,14 @@ export class ActorRunner {
     this.#draining ??= Promise.resolve().then(async () => {
       const skippedIntegrations = new Set<string>();
       try {
+        if (
+          this.#deps.tasks?.resumeHostChecks &&
+          this.#deps.canScheduleTasks?.() !== false &&
+          performance.now() >= this.#nextHostCheckRefresh
+        ) {
+          await this.#deps.tasks.resumeHostChecks();
+          this.#nextHostCheckRefresh = performance.now() + 30_000;
+        }
         for (;;) {
           if (this.#deps.autoApproveRegistrations)
             await this.#scheduleRegistrationApprovals();

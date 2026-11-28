@@ -514,6 +514,15 @@ export async function doctor(
           check("host-checks", "skipped", "Target has no host checks."),
           false,
         );
+      else
+        add(
+          check(
+            "host-checks-warning",
+            "skipped",
+            "host-check runs are not implemented yet; matching Tasks will wait at the host-check gate",
+          ),
+          false,
+        );
       for (const declaration of declarations)
         add(await declaredHostCheck(declaration), false);
     }
