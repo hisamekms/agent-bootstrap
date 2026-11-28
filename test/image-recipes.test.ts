@@ -172,10 +172,10 @@ describe("image recipes", () => {
     });
   });
 
-  test("bun pins an offline archive, installs Bun and checks Bun and Git", () => {
+  test("bun pins an offline archive, installs Bun and checks Bun, Git and bash", () => {
     assert.deepEqual(PROFILE_RECIPES.bun, {
       base: ALPINE_3_23,
-      features: ["bun", "zstd", "git"],
+      features: ["bun", "zstd", "git", "bash"],
       memoryMiB: 2048,
       cpus: 2,
     });
@@ -201,8 +201,9 @@ describe("image recipes", () => {
     assert.match(script, /sha256sum -c -\nchmod 0755 \/usr\/local\/bin\/bun/);
     assert.match(script, /ln -s bun \/usr\/local\/bin\/bunx/);
     assert.deepEqual(smokeTest("bun"), {
-      script: "bun --version\ngit --version >/dev/null && echo git-ok",
-      expected: ["1.4.5", "git-ok"],
+      script:
+        "bun --version\ngit --version >/dev/null && echo git-ok\n/bin/bash -c 'echo bash-ok'",
+      expected: ["1.4.5", "git-ok", "bash-ok"],
     });
     const entry = lockEntry("bun", DIGEST);
     const lock = parseProfileLock(

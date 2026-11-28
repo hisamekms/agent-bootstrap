@@ -315,8 +315,8 @@
       "cpus": 2
     },
     "bun": {
-      "image": "localhost/agent-bootstrap/bun@sha256:b53d9f39fe39dfcdf701a4f617a1b821e859666531799bfe7861a44b4688bcc3",
-      "recipeDigest": "9b4bcee5cd54b42639c91f255ff02e4ac1778e3821e0699b3f9020e67bd9c1ba",
+      "image": "localhost/agent-bootstrap/bun@sha256:7c9fb58f490bfc4c25b9a1657e3e5d400489a471d75029de3e9539d8583745f3",
+      "recipeDigest": "c7f67bb4672f30eb9db6dee62382f586634f83f9a98b0fd6d63121388668af30",
       "memoryMiB": 2048,
       "cpus": 2
     }

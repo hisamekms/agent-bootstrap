@@ -276,6 +276,16 @@ export const FEATURES = {
   zstd: {
     packages: [ZSTD_PACKAGE],
   },
+  // Target test suites and guest scripts often assume /bin/bash.
+  bash: {
+    packages: [
+      pkg(
+        "bash-5.3.3-r1.apk",
+        "5557dc5d3dbf3bb3e64f7aad4cfe535a6bffe4c2c13b81d527ef25dd6c438652",
+      ),
+      ...READLINE_PACKAGES,
+    ],
+  },
 } as const satisfies Record<string, Feature>;
 
 export type FeatureName = keyof typeof FEATURES;
@@ -384,7 +394,7 @@ export const PROFILE_RECIPES: Readonly<
   },
   bun: {
     base: ALPINE_3_23,
-    features: ["bun", "zstd", "git"],
+    features: ["bun", "zstd", "git", "bash"],
     memoryMiB: 2048,
     cpus: 2,
   },
@@ -667,6 +677,10 @@ export function smokeTest(name: string): {
   if (features.includes("git")) {
     script.push("git --version >/dev/null && echo git-ok");
     expected.push("git-ok");
+  }
+  if (features.includes("bash")) {
+    script.push("/bin/bash -c 'echo bash-ok'");
+    expected.push("bash-ok");
   }
   return { script: script.join("\n"), expected };
 }
