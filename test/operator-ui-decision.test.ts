@@ -8,6 +8,7 @@ import {
   environmentControls,
   goalBaseUpdate,
   goalExport,
+  goalProgress,
   problemActions,
   workplaceStopControls,
 } from "../src/operator-ui/web/panel.ts";
@@ -2094,4 +2095,23 @@ test("Goal details expose accessible tabs and remember the selection for each Go
   await settle();
   assert.equal(tab("details").attributes.get("aria-selected"), "true");
   assert.equal(panel("details").hidden, false);
+});
+
+test("each Goal progress segment names its stage and count on hover", (t) => {
+  decisionDocument(t);
+  const goal = fixtureGoal("goal-progress", "G7");
+  const metrics = goalProgress({
+    ...goal,
+    progress: { ...goal.progress, total: 7, done: 1, running: 3, failed: 1 },
+  });
+  const titles = Array.from(
+    metrics.querySelectorAll<HTMLElement>(".goal-progress-segment"),
+    ({ title }) => title,
+  );
+  assert.deepEqual(titles, [
+    "完了 1 件",
+    "実行中 3 件",
+    "待機 2 件",
+    "失敗 1 件",
+  ]);
 });

@@ -1516,24 +1516,26 @@ function shortEta(estimate: GoalSummary["estimate"]) {
     : [];
 }
 
-function goalProgress(goal: GoalSummary) {
+export function goalProgress(goal: GoalSummary) {
   const { done, total, running, failed, cancelled = 0 } = goal.progress;
   const waiting = total - done - running - failed - cancelled;
   const segments = [
-    ["done", "check", done],
-    ["running", "start", running],
-    ["waiting", "hourglass", waiting],
-    ["failed", "cross", failed],
-    ["cancelled", "rejected", cancelled],
+    ["done", "check", done, "完了"],
+    ["running", "start", running, "実行中"],
+    ["waiting", "hourglass", waiting, "待機"],
+    ["failed", "cross", failed, "失敗"],
+    ["cancelled", "rejected", cancelled, "キャンセル"],
   ] as const;
   const bar = group("span", "goal-progress-bar");
-  for (const [stage, glyph, count] of segments) {
+  for (const [stage, glyph, count, name] of segments) {
     if (!count) continue;
     const segment = group(
       "span",
       `goal-progress-segment ${stage}`,
       icon(glyph),
     );
+    // Hovering one segment names its stage and count.
+    segment.title = `${name} ${count} 件`;
     segment.style.flexGrow = String(count);
     bar.append(segment);
   }
