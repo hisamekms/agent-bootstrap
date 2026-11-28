@@ -1,18 +1,19 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
-  fstatSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
+  type BigIntStats,
 } from "node:fs";
 import { join } from "node:path";
 import {
@@ -183,11 +184,29 @@ function manifest(value: unknown): EnvironmentManifest {
   return entry;
 }
 
+function archiveIdentity({ dev, ino, size, mtimeNs, ctimeNs }: BigIntStats) {
+  return [dev, ino, size, mtimeNs, ctimeNs].join(":");
+}
+
+function readArchiveBytes(fd: number, size: number) {
+  const bytes = Buffer.alloc(size);
+  for (let offset = 0; offset < size;) {
+    const length = readSync(fd, bytes, offset, size - offset, offset);
+    if (!length) throw new EnvironmentError();
+    offset += length;
+  }
+  return bytes;
+}
+
 export class EnvironmentStore {
   readonly directory: string;
   readonly #state: string;
   readonly #root: string;
   readonly #entries: string;
+  readonly #archiveDigests = new Map<
+    string,
+    { identity: string; digest: string }
+  >();
 
   constructor(targetId: string, env = process.env) {
     if (!/^[a-f0-9]{12}$/.test(targetId)) throw new EnvironmentError();
@@ -316,44 +335,65 @@ export class EnvironmentStore {
     }
   }
 
-  /** Read under a hold. Callers validate these bytes against the current layout. */
-  readArchive(key: string): Uint8Array {
-    const manifest = this.get(key);
-    if (!manifest || manifest.size > environmentArchiveLimit)
-      throw new EnvironmentError();
+  #withArchive<T>(
+    { key, size }: EnvironmentManifest,
+    read: (fd: number, info: BigIntStats) => T,
+  ): T {
+    if (size > environmentArchiveLimit) throw new EnvironmentError();
     try {
       const fd = openSync(
         join(this.#entry(key), "outputs.tar"),
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       );
       try {
-        const info = fstatSync(fd);
+        const info = fstatSync(fd, { bigint: true });
         if (
           !info.isFile() ||
-          (process.getuid && info.uid !== process.getuid()) ||
-          (info.mode & 0o777) !== 0o600 ||
-          info.size !== manifest.size
+          (process.getuid && info.uid !== BigInt(process.getuid())) ||
+          (info.mode & 0o777n) !== 0o600n ||
+          info.size !== BigInt(size)
         )
           throw new EnvironmentError();
-        const bytes = Buffer.alloc(info.size);
-        for (let offset = 0; offset < bytes.length;) {
-          const length = readSync(
-            fd,
-            bytes,
-            offset,
-            bytes.length - offset,
-            offset,
-          );
-          if (!length) throw new EnvironmentError();
-          offset += length;
-        }
-        if (fstatSync(fd).size !== info.size) throw new EnvironmentError();
-        return bytes;
+        return read(fd, info);
       } finally {
         closeSync(fd);
       }
     } catch {
       throw new EnvironmentError();
+    }
+  }
+
+  /** Read under a hold. Callers validate these bytes against the current layout. */
+  readArchive(key: string): Uint8Array {
+    const manifest = this.get(key);
+    if (!manifest) throw new EnvironmentError();
+    return this.#withArchive(manifest, (fd, info) => {
+      const bytes = readArchiveBytes(fd, manifest.size);
+      if (fstatSync(fd).size !== Number(info.size))
+        throw new EnvironmentError();
+      return bytes;
+    });
+  }
+
+  archiveDigest(key: string): string {
+    const manifest = this.get(key);
+    if (!manifest) throw new EnvironmentError("env-missing");
+    const release = this.hold(key);
+    try {
+      return this.#withArchive(manifest, (fd, info) => {
+        const identity = archiveIdentity(info);
+        const cached = this.#archiveDigests.get(key);
+        if (cached?.identity === identity) return cached.digest;
+        const digest = createHash("sha256")
+          .update(readArchiveBytes(fd, manifest.size))
+          .digest("hex");
+        if (archiveIdentity(fstatSync(fd, { bigint: true })) !== identity)
+          throw new EnvironmentError();
+        this.#archiveDigests.set(key, { identity, digest });
+        return digest;
+      });
+    } finally {
+      release();
     }
   }
 

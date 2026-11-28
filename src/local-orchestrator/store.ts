@@ -1,4 +1,8 @@
 import {
+  validateHostCheckContent,
+  type HostCheckContent,
+} from "./host-checks.ts";
+import {
   publishDefaults,
   autoMergeMethods,
   type AutoMerge,
@@ -73,6 +77,7 @@ import {
   validateTaskContent,
   type ActorKind,
   type Gate,
+  type PolicyGate,
   type GoalContent,
   type IntegrationContent,
   type Policy,
@@ -190,6 +195,7 @@ export const proposalStatuses = Object.freeze([
   "approved",
   "rejected",
   "registered",
+  "lapsed",
 ] as const);
 type ProposalStatus = (typeof proposalStatuses)[number];
 const finalExecutionStatuses = [
@@ -201,13 +207,16 @@ const finalExecutionStatuses = [
 type FinalExecutionStatus = (typeof finalExecutionStatuses)[number];
 type ExecutionStatus = "queued" | "running" | FinalExecutionStatus;
 type Decision = "approve" | "reject";
+type HostCheckLapseReason =
+  "stale-base" | "candidate-changed" | "approval-inputs-changed";
 type ApprovalPolicy = EffectivePolicy;
 type SettingsOrigin = "cli" | "operator-ui";
 
 const applicationId = 0x4c4f5231;
-const schemaVersion = 9;
+const schemaVersion = 10;
 const environmentBuildAuthorization = "environment.build-authorized";
 const eventDataLimit = 4096;
+const hostCheckSkipLimit = 16 * 1024;
 const environmentAuthorizationLimit = 64 * 1024;
 const refsMigration = `
   ALTER TABLE goals ADD COLUMN ref TEXT NOT NULL DEFAULT '';
@@ -238,16 +247,16 @@ const refsMigration = `
 const inboxSeenSchema = "CREATE TABLE inbox_seen (id TEXT PRIMARY KEY) STRICT;";
 export const MAX_TASK_RETRIES = 3;
 const proposalColumnsSql = `
-    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration', 'host-check')),
     content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'registered')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'registered', 'lapsed')),
     created_at TEXT NOT NULL, decided_at TEXT
   `;
 const taskColumnsSql = `
     id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id),
     proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
     content_json TEXT NOT NULL, digest TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'awaiting-integration', 'succeeded', 'failed', 'cancelled')),
+    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'awaiting-integration', 'awaiting-host-check', 'succeeded', 'failed', 'cancelled')),
     attempts INTEGER NOT NULL CHECK (attempts >= 0), created_at TEXT NOT NULL
   `;
 const approvalRunColumnsSql = `
@@ -257,13 +266,36 @@ const approvalRunColumnsSql = `
   `;
 const approvalColumnsSql = `
     id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
-    gate TEXT NOT NULL CHECK (gate IN ('goal-registration', 'task-registration', 'integration')),
+    gate TEXT NOT NULL CHECK (gate IN ('goal-registration', 'task-registration', 'integration', 'host-check')),
     digest TEXT NOT NULL, policy TEXT NOT NULL CHECK (policy IN ('human', 'agent')),
     policy_source TEXT NOT NULL CHECK (policy_source IN ('default', 'request', 'goal', 'task', 'invariant', 'operator-task', 'operator-goal', 'rule')),
     answerer_kind TEXT NOT NULL CHECK (answerer_kind IN ('human', 'agent')), answerer_json TEXT NOT NULL,
     decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')), at TEXT NOT NULL,
     policy_details_json TEXT, reasons_json TEXT
   `;
+const hostCheckApprovalColumnsSql = `
+  ${approvalColumnsSql},
+  host_check_digest TEXT,
+  integrate_on_pass INTEGER CHECK (integrate_on_pass IN (0, 1)),
+  CHECK (
+    (gate <> 'host-check' AND host_check_digest IS NULL AND integrate_on_pass IS NULL)
+    OR (gate = 'host-check' AND policy = 'human' AND policy_source = 'invariant'
+      AND answerer_kind = 'human' AND json_extract(answerer_json, '$.kind') IS 'human'
+      AND json_extract(answerer_json, '$.channel') IS 'operator-ui'
+      AND json_type(answerer_json, '$.delegate') IS NULL
+      AND host_check_digest IS NOT NULL AND length(host_check_digest) = 64
+      AND host_check_digest NOT GLOB '*[^0-9a-f]*'
+      AND integrate_on_pass IS NOT NULL AND (integrate_on_pass = 0 OR decision = 'approve')
+    )
+  )
+`;
+const hostCheckInputsSchema = `
+  CREATE TABLE IF NOT EXISTS host_check_inputs (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    execution_id TEXT NOT NULL REFERENCES executions(id),
+    content_json TEXT NOT NULL CHECK (json_valid(content_json))
+  ) STRICT;
+`;
 const delegationSchema = `
   CREATE TABLE delegation_rules (id INTEGER PRIMARY KEY CHECK (id = 1), rules_json TEXT NOT NULL) STRICT;
   INSERT INTO delegation_rules VALUES (1, '[]');
@@ -281,8 +313,10 @@ const eventDefinition = `
   id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
   subject_id TEXT NOT NULL, session_id TEXT, execution_id TEXT,
   data TEXT NOT NULL CHECK (
-    length(CAST(data AS BLOB)) <= CASE WHEN kind = '${environmentBuildAuthorization}'
-      THEN ${environmentAuthorizationLimit} ELSE ${eventDataLimit} END
+    length(CAST(data AS BLOB)) <= CASE kind
+      WHEN '${environmentBuildAuthorization}' THEN ${environmentAuthorizationLimit}
+      WHEN 'host-check.skipped' THEN ${hostCheckSkipLimit}
+      ELSE ${eventDataLimit} END
     AND json_valid(data)
   )
 `;
@@ -327,7 +361,7 @@ const schema = `
   ) STRICT;
   CREATE TABLE tasks (${taskColumnsSql}) STRICT;
   CREATE INDEX tasks_goal ON tasks(goal_id);
-  CREATE TABLE approvals (${approvalColumnsSql}) STRICT;
+  CREATE TABLE approvals (${hostCheckApprovalColumnsSql}) STRICT;
   CREATE TABLE executions (
     id TEXT PRIMARY KEY, actor TEXT NOT NULL, mode TEXT NOT NULL, requested_by_json TEXT NOT NULL,
     goal_id TEXT REFERENCES goals(id), task_id TEXT REFERENCES tasks(id),
@@ -417,9 +451,15 @@ function parseAnswerer(value: unknown): Answerer {
   };
 }
 
+const hostCheckPolicy = {
+  policy: "human",
+  source: "invariant",
+  invariant: "host-check",
+} as const;
+
 type ProposalRow = {
   id: string;
-  kind: "goal" | "task" | "integration";
+  kind: "goal" | "task" | "integration" | "host-check";
   contentJson: string;
   digest: string;
   sourceJson: string;
@@ -445,6 +485,7 @@ type TaskRow = RegisteredRow & {
   status:
     | "registered"
     | "running"
+    | "awaiting-host-check"
     | "awaiting-integration"
     | "succeeded"
     | "failed"
@@ -503,7 +544,7 @@ const laterTaskStatus = `EXISTS (
   WHERE later.subject_id = t.id AND later.subject_kind = 'task'
     AND later.kind = 'task.status' AND later.rowid > e.rowid
     AND json_extract(later.data, '$.status') IN (
-      'running', 'awaiting-integration', 'failed', 'succeeded', 'cancelled'
+      'running', 'awaiting-integration', 'awaiting-host-check', 'failed', 'succeeded', 'cancelled'
     )
 )`;
 const taskBudgetResolved = `t.status IN ('succeeded', 'cancelled') OR EXISTS (
@@ -551,6 +592,13 @@ function proposalRecord({
         kind,
         source,
         content: validateTaskContent(raw),
+      });
+    case "host-check":
+      return freeze({
+        ...row,
+        kind,
+        source,
+        content: validateHostCheckContent(raw),
       });
     case "integration":
       return freeze({
@@ -760,6 +808,7 @@ export class OrchestratorStore {
               version !== 6 &&
               version !== 7 &&
               version !== 8 &&
+              version !== 9 &&
               version !== schemaVersion
             ) {
               throw new Error();
@@ -779,7 +828,9 @@ export class OrchestratorStore {
                 ALTER TABLE project_policy ADD COLUMN explicit_json TEXT NOT NULL DEFAULT '[]';
                 ALTER TABLE integration_approval_runs RENAME TO proposal_approval_runs;
                 CREATE TABLE next_approvals (${approvalColumnsSql}) STRICT;
-                INSERT INTO next_approvals SELECT *, NULL, NULL FROM approvals;
+                INSERT INTO next_approvals SELECT id, proposal_id, gate, digest,
+                  policy, policy_source, answerer_kind, answerer_json, decision,
+                  at, NULL, NULL FROM approvals;
                 DROP TABLE approvals;
                 ALTER TABLE next_approvals RENAME TO approvals;
               `);
@@ -787,7 +838,7 @@ export class OrchestratorStore {
                 throw new Error();
             }
             if (version < 7) connection.exec(refsMigration);
-            if (version < 8) {
+            if (version < 10) {
               // Activity revisions and event ordering use the original rowids.
               connection.exec(`
                 CREATE TABLE next_events (${eventDefinition}) STRICT;
@@ -798,11 +849,39 @@ export class OrchestratorStore {
                 ${eventGuards}
               `);
             }
-            if (version < 9)
-              connection.exec(
-                `${publishAuditSchema} PRAGMA user_version=${schemaVersion}`,
-              );
+            if (version < 9) connection.exec(publishAuditSchema);
+            if (version < 10) {
+              for (const [table, definition] of [
+                ["proposals", proposalColumnsSql],
+                ["tasks", taskColumnsSql + ", ref TEXT NOT NULL DEFAULT ''"],
+              ]) {
+                connection.exec(`
+                  CREATE TABLE next_${table} (${definition}) STRICT;
+                  INSERT INTO next_${table} SELECT * FROM ${table} ORDER BY rowid;
+                  DROP TABLE ${table};
+                  ALTER TABLE next_${table} RENAME TO ${table};
+                `);
+              }
+              connection.exec(`
+                CREATE TABLE next_approvals (${hostCheckApprovalColumnsSql}) STRICT;
+                INSERT INTO next_approvals SELECT id, proposal_id, gate, digest, policy,
+                  policy_source, answerer_kind, answerer_json, decision, at,
+                  policy_details_json, reasons_json, NULL, NULL FROM approvals ORDER BY rowid;
+                DROP TABLE approvals;
+                ALTER TABLE next_approvals RENAME TO approvals;
+                CREATE INDEX tasks_goal ON tasks(goal_id);
+                CREATE UNIQUE INDEX tasks_ref ON tasks(ref COLLATE NOCASE);
+                CREATE TRIGGER tasks_ref_required BEFORE INSERT ON tasks
+                  WHEN NEW.ref = '' BEGIN SELECT RAISE(ABORT, 'ref required'); END;
+                CREATE TRIGGER tasks_ref_immutable BEFORE UPDATE OF ref ON tasks
+                  WHEN NEW.ref <> OLD.ref BEGIN SELECT RAISE(ABORT, 'immutable ref'); END;
+                PRAGMA user_version=${schemaVersion};
+              `);
+              if (connection.query("PRAGMA foreign_key_check").get())
+                throw new Error();
+            }
           }
+          connection.exec(hostCheckInputsSchema);
         })
         .immediate();
       connection.exec("PRAGMA foreign_keys=ON");
@@ -885,7 +964,9 @@ export class OrchestratorStore {
         data,
         kind === environmentBuildAuthorization
           ? environmentAuthorizationLimit
-          : eventDataLimit,
+          : kind === "host-check.skipped"
+            ? hostCheckSkipLimit
+            : eventDataLimit,
       ),
     );
     return id;
@@ -1212,7 +1293,7 @@ export class OrchestratorStore {
 
   #newProposal(
     kind: ProposalRow["kind"],
-    content: GoalContent | TaskContent | IntegrationContent,
+    content: GoalContent | TaskContent | IntegrationContent | HostCheckContent,
     source: Origin,
     status: ProposalStatus,
     at: string,
@@ -1267,7 +1348,7 @@ export class OrchestratorStore {
   }
 
   #resolveGate(
-    gate: Gate,
+    gate: PolicyGate,
     layers: PolicyLayers,
     context: {
       goalId?: string;
@@ -1531,20 +1612,24 @@ export class OrchestratorStore {
     proposalId: string,
     answer: {
       digest: string;
+      approvalDigest?: string;
       decision: Decision;
       answerer: Answerer;
       reasons?: readonly string[];
       takeover?: true;
+      integrateOnPass?: { acknowledgeProtected: readonly string[] };
     },
     expectedRule?: { ruleId: string | undefined; ruleName: string | undefined },
   ): DecisionReceipt {
     const id = identifier(proposalId);
     const input = fields(answer, [
       "digest",
+      "approvalDigest",
       "decision",
       "answerer",
       "reasons",
       "takeover",
+      "integrateOnPass",
     ]);
     if (typeof input.digest !== "string") throw new ContractError();
     const decision = oneOf(input.decision, ["approve", "reject"]);
@@ -1568,6 +1653,19 @@ export class OrchestratorStore {
         ))
     )
       throw new ContractError();
+    let acknowledgeProtected: readonly string[] | undefined;
+    if (Object.hasOwn(input, "integrateOnPass")) {
+      const combined = fields(input.integrateOnPass, ["acknowledgeProtected"]);
+      const paths = combined.acknowledgeProtected;
+      if (
+        decision !== "approve" ||
+        !Array.isArray(paths) ||
+        paths.length > 10_000 ||
+        paths.some((path) => typeof path !== "string")
+      )
+        throw new ContractError();
+      acknowledgeProtected = paths;
+    }
     const reasonsJson = reasons === undefined ? null : canonicalJson(reasons);
     return this.#write((at) => {
       const row = required(this.#proposal(id));
@@ -1592,6 +1690,46 @@ export class OrchestratorStore {
         throw new OrchestratorStoreError("stale-policy");
       if (gate === null || policy === null || source === null)
         throw new OrchestratorStoreError("invalid-transition");
+      if (proposal.kind === "host-check") {
+        if (
+          answerer.kind !== "human" ||
+          answerer.channel !== "operator-ui" ||
+          answerer.delegate !== undefined ||
+          proposal.source.kind !== "host" ||
+          takeover !== undefined
+        )
+          throw new OrchestratorStoreError("approval-forbidden");
+        const task = required(this.#task(proposal.content.taskId));
+        this.#activeGoal(task.goalId);
+        if (
+          task.status !== "awaiting-host-check" ||
+          this.#latestOpenHostCheckId(task.id) !== id ||
+          task.goalId !== proposal.content.goalId
+        )
+          throw new OrchestratorStoreError("invalid-transition");
+        const base =
+          this.goalIntegrationHead(task.goalId) ??
+          this.#goal(task.goalId)?.baseCommit;
+        if (base && proposal.content.base !== base)
+          throw new OrchestratorStoreError("stale-digest");
+        if (
+          decision === "approve" &&
+          input.approvalDigest !== proposal.content.hostCheck.digest
+        )
+          throw new OrchestratorStoreError("stale-digest");
+        if (acknowledgeProtected !== undefined) {
+          this.#assertGoalPrAllowsChanges(task.goalId);
+          this.#checkHostCheckIntegrationAnswer(
+            proposal.content,
+            acknowledgeProtected,
+          );
+        }
+      } else if (
+        acknowledgeProtected !== undefined ||
+        input.approvalDigest !== undefined
+      ) {
+        throw new OrchestratorStoreError("approval-forbidden");
+      }
       const integration =
         proposal.kind === "integration" ? proposal.content : null;
       if (integration) {
@@ -1662,7 +1800,7 @@ export class OrchestratorStore {
         id,
       );
       this.#run(
-        "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         approvalId,
         id,
         gate,
@@ -1675,6 +1813,12 @@ export class OrchestratorStore {
         at,
         canonicalJson(setting),
         reasonsJson,
+        proposal.kind === "host-check"
+          ? proposal.content.hostCheck.digest
+          : null,
+        proposal.kind === "host-check"
+          ? Number(acknowledgeProtected !== undefined)
+          : null,
       );
       const correlation = {
         ...(origin.kind === "actor" && origin.sessionId !== undefined
@@ -1733,6 +1877,27 @@ export class OrchestratorStore {
             },
             { executionId },
           );
+      }
+      if (proposal.kind === "host-check") {
+        const { taskId, hostCheck } = proposal.content;
+        this.#event(at, "host-check.answered", "task", taskId, {
+          proposalId: id,
+          approvalId,
+          digest: hostCheck.digest,
+          decision,
+          ...(acknowledgeProtected !== undefined && {
+            integrationDecision: "approve-on-pass",
+          }),
+        });
+        this.#setTaskStatus(
+          taskId,
+          decision === "approve" ? "awaiting-host-check" : "failed",
+          decision === "approve"
+            ? "host-check-approved-pending-run"
+            : "host-check-rejected",
+          at,
+        );
+        return freeze({ status });
       }
       if (integration) {
         if (decision === "reject")
@@ -1829,6 +1994,26 @@ export class OrchestratorStore {
     rejectedPaths?: readonly PathViolation[],
     missingEnvironmentRole?: InboxRow["missingEnvironmentRole"],
   ) {
+    if (
+      status !== "awaiting-host-check" &&
+      this.#task(id)?.status === "awaiting-host-check"
+    ) {
+      const lapsed = this.#db
+        .query<{ id: string; digest: string }>(
+          `UPDATE proposals SET status = 'lapsed', decided_at = coalesce(decided_at, ?)
+         WHERE kind = 'host-check' AND status IN ('pending', 'approved')
+         AND json_extract(content_json, '$.taskId') = ?
+         RETURNING id, json_extract(content_json, '$.hostCheck.digest') AS digest`,
+        )
+        .all(at, id);
+      for (const { id: proposalId, digest } of lapsed)
+        this.#event(at, "host-check.lapsed", "task", id, {
+          proposalId,
+          digest,
+          reason: code ?? "task-status-changed",
+        });
+      this.#db.query("DELETE FROM host_check_inputs WHERE task_id = ?").run(id);
+    }
     this.#run("UPDATE tasks SET status = ? WHERE id = ?", status, id);
     this.#event(at, "task.status", "task", id, {
       status,
@@ -1906,6 +2091,361 @@ export class OrchestratorStore {
     });
   }
 
+  #checkReviewedCandidate(
+    task: ReturnType<typeof taskRecord>,
+    content: IntegrationContent,
+    executionId: string,
+  ) {
+    const execution = required(this.#execution(executionId));
+    this.#activeGoal(task.goalId);
+    const result = execution.resultJson
+      ? JSON.parse(execution.resultJson)
+      : null;
+    if (
+      task.status !== "running" ||
+      task.goalId !== content.goalId ||
+      execution.taskId !== task.id ||
+      execution.actor !== "Reviewer" ||
+      execution.mode !== "review" ||
+      execution.status !== "succeeded" ||
+      result?.review !== "pass" ||
+      result.pin?.base !== content.base ||
+      result.pin?.candidate !== content.candidate ||
+      result.pin?.digest !== content.digest ||
+      content.changedPaths.some((path) => !allowsPath(task.content.paths, path))
+    )
+      throw new OrchestratorStoreError("invalid-transition");
+  }
+
+  #checkHostCheckIntegrationAnswer(
+    content: HostCheckContent,
+    acknowledgeProtected: readonly string[],
+  ) {
+    const paths = content.hostCheck.protectedPaths;
+    if (
+      content.verified !== true ||
+      content.symlinks === undefined ||
+      content.symlinks.some((path) => !paths.includes(path)) ||
+      acknowledgeProtected.length !== paths.length ||
+      new Set(acknowledgeProtected).size !== paths.length ||
+      acknowledgeProtected.some((path) => !paths.includes(path))
+    )
+      throw new OrchestratorStoreError("approval-forbidden");
+  }
+
+  #openHostCheck(at: string, content: HostCheckContent, executionId: string) {
+    const row = this.#newProposal(
+      "host-check",
+      content,
+      { kind: "host" },
+      "pending",
+      at,
+    );
+    const { taskId, goalId, hostCheck } = content;
+    this.#event(
+      at,
+      "proposal.created",
+      "proposal",
+      row.id,
+      {
+        kind: "host-check",
+        gate: "host-check",
+        ...hostCheckPolicy,
+        digest: row.digest,
+        taskId,
+        goalId,
+      },
+      { executionId },
+    );
+    this.#event(
+      at,
+      "host-check.opened",
+      "task",
+      taskId,
+      {
+        proposalId: row.id,
+        digest: hostCheck.digest,
+      },
+      { executionId },
+    );
+    this.#setTaskStatus(
+      taskId,
+      "awaiting-host-check",
+      "host-check-awaiting-approval",
+      at,
+    );
+    return row.id;
+  }
+
+  #hostCheckVerification(
+    taskId: string,
+    pin: Pick<IntegrationContent, "base" | "candidate" | "digest">,
+  ) {
+    return this.#db
+      .query<{ archive: string | null }>(
+        `
+      SELECT json_extract(result_json, '$.environmentArchiveDigest') AS archive
+      FROM executions WHERE task_id = ? AND mode = 'verification'
+        AND status = 'succeeded' AND json_extract(result_json, '$.pin.base') = ?
+        AND json_extract(result_json, '$.pin.candidate') = ?
+        AND json_extract(result_json, '$.pin.digest') = ?
+      ORDER BY rowid DESC LIMIT 1
+    `,
+      )
+      .get(taskId, pin.base, pin.candidate, pin.digest);
+  }
+
+  hostCheckVerificationArchive(
+    taskId: string,
+    pin: Pick<IntegrationContent, "base" | "candidate" | "digest">,
+  ) {
+    return this.#read(() => this.#hostCheckVerification(taskId, pin)?.archive);
+  }
+
+  #checkVerifiedHostCheckCandidate(
+    task: ReturnType<typeof taskRecord>,
+    content: IntegrationContent,
+    executionId: string,
+  ) {
+    this.#checkReviewedCandidate(task, content, executionId);
+    if (
+      content.verified !== true ||
+      !this.#hostCheckVerification(task.id, content)
+    )
+      throw new OrchestratorStoreError("invalid-transition");
+  }
+
+  proposeHostCheck(value: HostCheckContent, reviewedBy: string) {
+    const input = validateHostCheckContent(value);
+    const executionId = identifier(reviewedBy);
+    return this.#write((at) => {
+      const task = taskRecord(required(this.#task(input.taskId)));
+      const content = { ...input, taskId: task.id };
+      this.#checkVerifiedHostCheckCandidate(task, content, executionId);
+      return this.#openHostCheck(at, content, executionId);
+    });
+  }
+
+  waitForHostCheckInputs(value: IntegrationContent, reviewedBy: string) {
+    const input = validateIntegrationContent(value);
+    const executionId = identifier(reviewedBy);
+    this.#write((at) => {
+      const task = taskRecord(required(this.#task(input.taskId)));
+      const content = { ...input, taskId: task.id };
+      this.#checkVerifiedHostCheckCandidate(task, content, executionId);
+      this.#run(
+        "INSERT INTO host_check_inputs VALUES (?, ?, ?)",
+        task.id,
+        executionId,
+        canonicalJson(content),
+      );
+      this.#setTaskStatus(
+        task.id,
+        "awaiting-host-check",
+        "approval-inputs-unavailable",
+        at,
+      );
+      this.#noteUnavailableHostCheckInputs(at, task.id);
+    });
+  }
+
+  waitingHostCheckInputs() {
+    return this.#read(() =>
+      this.#db
+        .query<{ executionId: string; contentJson: string }>(
+          `
+        SELECT h.execution_id AS executionId, h.content_json AS contentJson
+        FROM host_check_inputs h JOIN tasks t ON h.task_id = t.id JOIN goals g ON t.goal_id = g.id
+        WHERE t.status = 'awaiting-host-check' AND g.status = 'active' ORDER BY h.rowid
+      `,
+        )
+        .all()
+        .map(({ executionId, contentJson }) => ({
+          executionId,
+          content: validateIntegrationContent(JSON.parse(contentJson)),
+        })),
+    );
+  }
+
+  resolveHostCheckInputs(
+    taskId: string,
+    executionId: string,
+    outcome: HostCheckContent["hostCheck"] | HostCheckLapseReason,
+  ) {
+    this.#write((at) => {
+      const waiting = this.#db
+        .query<{ contentJson: string }>(
+          `
+        SELECT content_json AS contentJson FROM host_check_inputs WHERE task_id = ? AND execution_id = ?
+      `,
+        )
+        .get(taskId, executionId);
+      if (!waiting) return;
+      const task = required(this.#task(taskId));
+      if (
+        task.status !== "awaiting-host-check" ||
+        this.#goal(task.goalId)?.status !== "active"
+      )
+        return;
+      if (typeof outcome === "string") {
+        if (!this.#requeueTask(task, at))
+          this.#setTaskStatus(taskId, "failed", outcome, at);
+      } else {
+        const content = validateHostCheckContent({
+          ...JSON.parse(waiting.contentJson),
+          hostCheck: outcome,
+        });
+        this.#run("DELETE FROM host_check_inputs WHERE task_id = ?", taskId);
+        this.#openHostCheck(at, content, executionId);
+      }
+    });
+  }
+
+  recordHostCheckSkip(
+    taskId: string,
+    checks: string[],
+    changedPaths: readonly string[],
+  ) {
+    this.#write((at) => {
+      const data = { checks, reason: "no-trigger" };
+      let paths: string[] = [];
+      let bytes = Buffer.byteLength(
+        canonicalJson({ ...data, changedPaths: [] }),
+      );
+      const overhead = bytes;
+      for (const path of changedPaths) {
+        const size = Buffer.byteLength(JSON.stringify(path)) + 1;
+        if (bytes + size > hostCheckSkipLimit && paths.length) {
+          this.#event(at, "host-check.skipped", "task", taskId, {
+            ...data,
+            changedPaths: paths,
+          });
+          paths = [];
+          bytes = overhead;
+        }
+        paths.push(path);
+        bytes += size;
+      }
+      this.#event(at, "host-check.skipped", "task", taskId, {
+        ...data,
+        changedPaths: paths,
+      });
+    });
+  }
+
+  activeHostCheckGates() {
+    return this.#read(() =>
+      this.#db
+        .query<ProposalRow>(
+          `
+        SELECT ${proposalColumns} FROM proposals WHERE kind = 'host-check'
+          AND status IN ('pending', 'approved') AND EXISTS (
+            SELECT 1 FROM tasks t JOIN goals g ON g.id = t.goal_id
+            WHERE t.id = json_extract(proposals.content_json, '$.taskId')
+              AND t.status = 'awaiting-host-check' AND g.status = 'active'
+          ) ORDER BY rowid
+      `,
+        )
+        .all()
+        .map(proposalRecord)
+        .filter(
+          (
+            row,
+          ): row is Extract<
+            ReturnType<typeof proposalRecord>,
+            { kind: "host-check" }
+          > =>
+            row.kind === "host-check" &&
+            this.#latestOpenHostCheckId(row.content.taskId) === row.id,
+        ),
+    );
+  }
+
+  #latestOpenHostCheckId(taskId: string) {
+    return this.#db
+      .query<{ id: string }>(
+        `
+      SELECT id FROM proposals WHERE kind = 'host-check' AND status IN ('pending', 'approved')
+        AND json_extract(content_json, '$.taskId') = ? ORDER BY rowid DESC LIMIT 1
+    `,
+      )
+      .get(taskId)?.id;
+  }
+
+  #noteUnavailableHostCheckInputs(
+    at: string,
+    taskId: string,
+    proposalId?: string,
+  ) {
+    this.#event(at, "host-check.inputs-unavailable", "task", taskId, {
+      reason: "approval-inputs-unavailable",
+      ...(proposalId && { proposalId }),
+    });
+  }
+
+  noteUnavailableHostCheckInputs(
+    taskId: string,
+    reference: { id: string } | { executionId: string },
+  ) {
+    this.#write((at) => {
+      if (this.#task(taskId)?.status !== "awaiting-host-check") return;
+      if ("id" in reference) {
+        if (this.#latestOpenHostCheckId(taskId) === reference.id)
+          this.#noteUnavailableHostCheckInputs(at, taskId, reference.id);
+      } else if (
+        this.#db
+          .query(
+            "SELECT 1 FROM host_check_inputs WHERE task_id = ? AND execution_id = ?",
+          )
+          .get(taskId, reference.executionId)
+      ) {
+        this.#noteUnavailableHostCheckInputs(at, taskId);
+      }
+    });
+  }
+
+  lapseHostCheck(
+    id: string,
+    reason: HostCheckLapseReason,
+    replacement?: HostCheckContent["hostCheck"],
+  ) {
+    return this.#write((at) => {
+      const row = this.#proposal(id);
+      if (!row || (row.status !== "pending" && row.status !== "approved"))
+        return;
+      const proposal = proposalRecord(row);
+      if (proposal.kind !== "host-check") return;
+      const { content } = proposal;
+      const task = required(this.#task(content.taskId));
+      if (
+        task.status !== "awaiting-host-check" ||
+        this.#goal(task.goalId)?.status !== "active" ||
+        this.#latestOpenHostCheckId(task.id) !== id
+      )
+        return;
+      this.#run(
+        "UPDATE proposals SET status = 'lapsed', decided_at = coalesce(decided_at, ?) WHERE id = ?",
+        at,
+        id,
+      );
+      this.#event(at, "host-check.lapsed", "task", task.id, {
+        proposalId: id,
+        digest: content.hostCheck.digest,
+        reason,
+      });
+      if (replacement) {
+        const { executionId } = required(this.#integrationReview(id));
+        this.#openHostCheck(
+          at,
+          validateHostCheckContent({ ...content, hostCheck: replacement }),
+          executionId,
+        );
+      } else if (!this.#requeueTask(task, at)) {
+        this.#setTaskStatus(task.id, "failed", reason, at);
+      }
+    });
+  }
+
   proposeIntegration(
     value: IntegrationContent,
     reviewedBy: string,
@@ -1925,27 +2465,7 @@ export class OrchestratorStore {
     return this.#write((at) => {
       const task = taskRecord(required(this.#task(input.taskId)));
       const content = { ...input, taskId: task.id };
-      const execution = required(this.#execution(executionId));
-      this.#activeGoal(task.goalId);
-      const result = execution.resultJson
-        ? JSON.parse(execution.resultJson)
-        : null;
-      if (
-        task.status !== "running" ||
-        task.goalId !== content.goalId ||
-        execution.taskId !== task.id ||
-        execution.actor !== "Reviewer" ||
-        execution.mode !== "review" ||
-        execution.status !== "succeeded" ||
-        result?.review !== "pass" ||
-        result.pin?.base !== content.base ||
-        result.pin?.candidate !== content.candidate ||
-        result.pin?.digest !== content.digest ||
-        content.changedPaths.some(
-          (path) => !allowsPath(task.content.paths, path),
-        )
-      )
-        throw new OrchestratorStoreError("invalid-transition");
+      this.#checkReviewedCandidate(task, content, executionId);
       const row = this.#newProposal(
         "integration",
         content,
@@ -2089,6 +2609,23 @@ export class OrchestratorStore {
     );
   }
 
+  requireHostCheckForIntegration(id: string) {
+    this.#write((at) => {
+      const { proposal } = this.#approvedIntegration(id);
+      const task = required(this.#task(proposal.content.taskId));
+      const reason = "host-check-required";
+      this.#run("UPDATE proposals SET status = 'lapsed' WHERE id = ?", id);
+      this.#event(at, "proposal.lapsed", "proposal", id, {
+        reason,
+        taskId: task.id,
+      });
+      // Legacy proposals and Tasks configured before this change need a fresh,
+      // candidate-pinned Verification and Review before opening a host gate.
+      if (!this.#requeueTask(task, at))
+        this.#setTaskStatus(task.id, "failed", reason, at);
+    });
+  }
+
   beginIntegration(id: string, digest: string, approvalId: string) {
     this.#write((at) => {
       const current = this.#approvedIntegration(id);
@@ -2133,14 +2670,14 @@ export class OrchestratorStore {
     });
   }
 
-  #requeueLockConflict(task: TaskRow, at: string, proposalId: string) {
+  #requeueTask(task: TaskRow, at: string, lockConflictProposal?: string) {
     if (task.retries >= MAX_TASK_RETRIES) return false;
     this.#setTaskStatus(task.id, "registered", null, at);
     this.#event(at, "task.retried", "task", task.id, {
       retries: task.retries + 1,
       origin: { kind: "host" },
       budgetReset: true,
-      lockConflictProposal: proposalId,
+      ...(lockConflictProposal && { lockConflictProposal }),
     });
     return true;
   }
@@ -2188,7 +2725,7 @@ export class OrchestratorStore {
       if (
         code === "stale-base" &&
         resolveLockConflict &&
-        this.#requeueLockConflict(task, at, id)
+        this.#requeueTask(task, at, id)
       )
         return;
       this.#setTaskStatus(task.id, "failed", identifier(code), at);
@@ -2236,7 +2773,7 @@ export class OrchestratorStore {
       else if (!(
         code === "stale-base" &&
         resolveLockConflict &&
-        this.#requeueLockConflict(task, at, id)
+        this.#requeueTask(task, at, id)
       ))
         this.#setTaskStatus(
           taskId,
@@ -3341,12 +3878,12 @@ export class OrchestratorStore {
       !this.#ownsGoalBranch(id) ||
       this.#db
         .query(
-          "SELECT 1 FROM tasks WHERE goal_id = ? AND status IN ('running', 'awaiting-integration', 'succeeded') LIMIT 1",
+          "SELECT 1 FROM tasks WHERE goal_id = ? AND status IN ('running', 'awaiting-integration', 'awaiting-host-check', 'succeeded') LIMIT 1",
         )
         .get(id) ||
       this.#db
         .query(
-          "SELECT 1 FROM proposals WHERE kind = 'integration' AND (status = 'pending' OR ? IS NULL) AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
+          "SELECT 1 FROM proposals WHERE kind IN ('integration', 'host-check') AND (status = 'pending' OR ? IS NULL) AND json_extract(content_json, '$.goalId') = ? LIMIT 1",
         )
         .get(goal.baseCommit, id)
     )
@@ -3358,7 +3895,7 @@ export class OrchestratorStore {
           `SELECT 1 FROM tasks JOIN events ON events.subject_id = tasks.id
           WHERE tasks.goal_id = ? AND events.subject_kind = 'task'
             AND events.kind = 'task.status'
-            AND json_extract(events.data, '$.status') IN ('awaiting-integration', 'succeeded')
+            AND json_extract(events.data, '$.status') IN ('awaiting-integration', 'awaiting-host-check', 'succeeded')
           LIMIT 1`,
         )
         .get(id) ||
@@ -3439,7 +3976,7 @@ export class OrchestratorStore {
       this.#db
         .query(
           `SELECT 1 WHERE EXISTS (
-            SELECT 1 FROM tasks WHERE goal_id = ?1 AND status IN ('running', 'awaiting-integration')
+            SELECT 1 FROM tasks WHERE goal_id = ?1 AND status IN ('running', 'awaiting-integration', 'awaiting-host-check')
           ) OR EXISTS (
             SELECT 1 FROM executions AS x LEFT JOIN tasks AS t ON x.task_id = t.id
             WHERE (x.goal_id = ?1 OR t.goal_id = ?1) AND x.status IN ('queued', 'running')
@@ -3781,6 +4318,8 @@ export class OrchestratorStore {
     source: EffectivePolicy["source"] | null;
     loosening: Gate[];
   } {
+    if (proposal.kind === "host-check")
+      return { gate: "host-check", loosening: [], ...hostCheckPolicy };
     if (proposal.kind === "goal")
       return this.#goalPolicy(proposal.content, proposal.source);
     if (proposal.status === "registered")
@@ -3897,7 +4436,7 @@ export class OrchestratorStore {
         .get(proposal.id);
       return this.#subjectRefs(goal?.id ?? null, null);
     }
-    if (proposal.kind === "integration")
+    if (proposal.kind === "integration" || proposal.kind === "host-check")
       return this.#subjectRefs(
         proposal.content.goalId,
         proposal.content.taskId,
@@ -4051,7 +4590,8 @@ export class OrchestratorStore {
                 id: proposal.id,
                 kind: proposal.kind,
                 ...this.#proposalRefs(proposal),
-                ...(proposal.kind === "integration"
+                ...(proposal.kind === "integration" ||
+                proposal.kind === "host-check"
                   ? {
                       goalId: proposal.content.goalId,
                       taskId: proposal.content.taskId,
@@ -4322,7 +4862,7 @@ export class OrchestratorStore {
           kind: "approved" | "rejected" | "integrated" | "exported";
           at: string;
           ref: string | null;
-          proposalKind: "goal" | "task" | "integration" | null;
+          proposalKind: ProposalRow["kind"] | null;
         }>(
           `SELECT kind, at, ref, proposalKind FROM (
              SELECT CASE a.decision WHEN 'approve' THEN 'approved' ELSE 'rejected' END AS kind,
@@ -4849,7 +5389,7 @@ export class OrchestratorStore {
                      modelText, wasResolved, code, rejectedCount, info, canRetry,
                      position, rejectedPathsJson) AS (
           SELECT CASE p.kind WHEN 'goal' THEN 'goal-registration'
-                    WHEN 'task' THEN 'task-registration' ELSE 'integration' END,
+                    WHEN 'task' THEN 'task-registration' ELSE p.kind END,
                  p.id, p.created_at, json_extract(p.content_json, '$.goalId'),
                  json_extract(p.content_json, '$.taskId'), p.id, NULL,
                  json_extract(p.content_json, '$.title'), p.status <> 'pending', NULL, NULL, 0, 0,
@@ -5087,7 +5627,7 @@ export class OrchestratorStore {
     gate: Gate,
     context: { goalId?: string; taskId?: string } = {},
   ): ApprovalPolicy {
-    const validGate = oneOf(gate, GATES);
+    const validGate = oneOf(gate, [...GATES, "host-check"]);
     const input = fields(context, ["goalId", "taskId"]);
     const goalId = Object.hasOwn(input, "goalId")
       ? identifier(input.goalId)
@@ -5104,6 +5644,7 @@ export class OrchestratorStore {
           if (task && suppliedGoalId !== null && task.goalId !== suppliedGoalId)
             throw new OrchestratorStoreError("context-mismatch");
           const id = task?.goalId ?? suppliedGoalId;
+          if (validGate === "host-check") return freeze(hostCheckPolicy);
           const layers =
             id === null
               ? { defaults: this.#defaults() }

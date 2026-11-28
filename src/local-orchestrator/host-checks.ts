@@ -1,10 +1,23 @@
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { access, open, realpath } from "node:fs/promises";
 import { realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { invalid, type ConfigFix } from "../config/messages.ts";
 import { matchesBunEnvironmentPath } from "../environments/bun.ts";
 import type { LocalGitIntegration } from "../git-integration.ts";
 import { foldTreePath, matchesTreePaths } from "../workspace-tree.ts";
-import { contentDigest, fields, scopePath } from "./model.ts";
+import {
+  ContractError,
+  contentDigest,
+  fields,
+  integer,
+  scopePath,
+  string,
+  unique,
+  validateIntegrationContent,
+  type IntegrationContent,
+} from "./model.ts";
 
 export interface HostCheckDeclaration {
   readonly name: string;
@@ -342,7 +355,8 @@ const baselineNames = new Set([
 type CandidateChange = Awaited<
   ReturnType<LocalGitIntegration["candidateChanges"]>
 >[number];
-type ChangedPath = Pick<CandidateChange, "path" | "oldMode" | "newMode">;
+type ChangedPath = Pick<CandidateChange, "path" | "newMode"> &
+  Partial<Pick<CandidateChange, "oldMode">>;
 
 function fileDirectoryReplacements(
   changes: readonly ChangedPath[],
@@ -388,7 +402,10 @@ export function matchHostCheck(
     if (
       oldMode === "120000" ||
       newMode === "120000" ||
-      (oldMode !== "000000" && newMode !== "000000" && oldMode !== newMode) ||
+      (oldMode !== undefined &&
+        oldMode !== "000000" &&
+        newMode !== "000000" &&
+        oldMode !== newMode) ||
       baselineNames.has(basename) ||
       /^\.?mise\..*\.toml$/s.test(basename) ||
       /(?:^|\/)\.config\/mise\//.test(folded) ||
@@ -401,4 +418,216 @@ export function matchHostCheck(
       matched.add(path);
   }
   return { required: matched.size > 0, matched: [...matched].sort() };
+}
+
+export const HOST_CHECK_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+export const hostCheckExposure =
+  "This runs the candidate as you, with access to your files, network and Keychain. It can change files you can write and read other Keychain items available without a prompt.";
+
+type RequiredCheck = {
+  declaration: HostCheckDeclaration;
+  matched: readonly string[];
+};
+
+export interface HostCheckContent extends IntegrationContent {
+  readonly hostCheck: {
+    readonly digest: string;
+    readonly protectedPaths: readonly string[];
+    readonly checks: readonly {
+      readonly name: string;
+      readonly declarationDigest: string;
+      readonly matchedPaths: readonly string[];
+      readonly argv: readonly string[];
+      readonly envNames: readonly string[];
+      readonly keychainServices: readonly string[];
+      readonly vmCount: number;
+    }[];
+  };
+}
+
+export function validateHostCheckContent(value: unknown): HostCheckContent {
+  const { hostCheck, ...pin } = fields(value, [
+    "taskId",
+    "goalId",
+    "branch",
+    "base",
+    "candidate",
+    "digest",
+    "changedPaths",
+    "verified",
+    "symlinks",
+    "review",
+    "hostCheck",
+  ]);
+  const integration = validateIntegrationContent(pin);
+  const data = fields(hostCheck, ["digest", "protectedPaths", "checks"]);
+  const digest = string(data.digest, 64, 64);
+  if (
+    !/^[a-f0-9]{64}$/.test(digest) ||
+    integration.verified !== true ||
+    !Array.isArray(data.checks) ||
+    data.checks.length < 1 ||
+    data.checks.length > 8
+  )
+    throw new ContractError();
+  const changed = new Set(integration.changedPaths);
+  const paths = (value: unknown) =>
+    unique(value, 0, changed.size, (path) => {
+      const result = scopePath(path);
+      if (!changed.has(result)) throw new ContractError();
+      return result;
+    });
+  const checks = data.checks.map((check: unknown) => {
+    const {
+      name,
+      declarationDigest,
+      matchedPaths,
+      argv,
+      envNames,
+      keychainServices,
+      vmCount,
+    } = fields(check, [
+      "name",
+      "declarationDigest",
+      "matchedPaths",
+      "argv",
+      "envNames",
+      "keychainServices",
+      "vmCount",
+    ]);
+    if (
+      !Array.isArray(argv) ||
+      argv.length < 1 ||
+      argv.length > 32 ||
+      !Array.isArray(keychainServices) ||
+      keychainServices.length > 8
+    )
+      throw new ContractError();
+    const args = Array.from(argv, (arg) => string(arg, 1, 1024));
+    const checkDigest = string(declarationDigest, 64, 64);
+    if (!isAbsolute(args[0]!) || !/^[a-f0-9]{64}$/.test(checkDigest))
+      throw new ContractError();
+    return {
+      name: string(name, 1, 32),
+      declarationDigest: checkDigest,
+      matchedPaths: paths(matchedPaths),
+      argv: args,
+      envNames: unique(envNames, 0, 40, (name) => string(name, 1, 1024)),
+      keychainServices: Array.from(keychainServices, (service) =>
+        string(service, 1, 128),
+      ),
+      vmCount: integer(vmCount, 0, 4),
+    };
+  });
+  return {
+    ...integration,
+    hostCheck: { digest, protectedPaths: paths(data.protectedPaths), checks },
+  };
+}
+
+const executableDigests = new Map<
+  string,
+  { identity: string; sha256: string }
+>();
+
+async function executableIdentity(command: string) {
+  const path = await realpath(command);
+  await access(path, constants.X_OK);
+  const file = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const identityOf = async () => {
+      const stat = await file.stat({ bigint: true });
+      if (!stat.isFile() || (stat.mode & 0o111n) === 0n)
+        throw new Error("Invalid host check executable");
+      return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(
+        ":",
+      );
+    };
+    const identity = await identityOf();
+    const cached = executableDigests.get(path);
+    if (cached?.identity === identity) return { path, sha256: cached.sha256 };
+    const hash = createHash("sha256");
+    for await (const bytes of file.createReadStream({ autoClose: false }))
+      hash.update(bytes);
+    if ((await identityOf()) !== identity)
+      throw new Error("Host check executable changed during hashing");
+    const sha256 = hash.digest("hex");
+    executableDigests.set(path, { identity, sha256 });
+    return { path, sha256 };
+  } finally {
+    await file.close();
+  }
+}
+
+/** Recompute against current declarations, executables and cached archive before use. */
+export async function recomputeHostCheckApprovalDigest(
+  { base, candidate }: Pick<IntegrationContent, "base" | "candidate">,
+  declarations: readonly HostCheckDeclaration[],
+  environmentArchiveDigest: string | null,
+  protectedPaths: readonly string[] = [],
+): Promise<string> {
+  const checks = [];
+  for (const declaration of declarations) {
+    checks.push({
+      declaration: hostCheckDigest(declaration),
+      executable: await executableIdentity(declaration.argv[0]),
+      keychainServices:
+        declaration.keychain?.map(({ service }) => service) ?? [],
+    });
+  }
+  return contentDigest({
+    base,
+    candidate,
+    checks,
+    path: HOST_CHECK_PATH,
+    environmentArchiveDigest,
+    protectedPaths: [...new Set(protectedPaths)].sort(),
+  });
+}
+
+export function hostCheckRequirement(
+  declarations: readonly HostCheckDeclaration[],
+  changes: readonly ChangedPath[],
+) {
+  const required: RequiredCheck[] = [];
+  const skipped: string[] = [];
+  for (const declaration of declarations) {
+    const { required: runs, matched } = matchHostCheck(declaration, changes);
+    if (runs) required.push({ declaration, matched });
+    else skipped.push(declaration.name);
+  }
+  return { required, skipped };
+}
+
+export async function hostCheckApproval(
+  pin: Pick<IntegrationContent, "base" | "candidate">,
+  required: readonly RequiredCheck[],
+  protectedPaths: readonly string[],
+  environmentArchiveDigest: string | null,
+): Promise<HostCheckContent["hostCheck"]> {
+  return {
+    digest: await recomputeHostCheckApprovalDigest(
+      pin,
+      required.map(({ declaration }) => declaration),
+      environmentArchiveDigest,
+      protectedPaths,
+    ),
+    protectedPaths,
+    checks: required.map(({ declaration, matched }) => ({
+      name: declaration.name,
+      declarationDigest: hostCheckDigest(declaration),
+      matchedPaths: matched,
+      argv: declaration.argv,
+      envNames: [
+        ...Object.keys(declaration.env ?? {}),
+        ...(declaration.keychain?.map(({ env }) => env) ?? []),
+      ].sort(),
+      keychainServices:
+        declaration.keychain?.map(({ service }) => service) ?? [],
+      vmCount: declaration.vmCount,
+    })),
+  };
 }

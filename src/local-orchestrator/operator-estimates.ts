@@ -14,7 +14,7 @@ type TimelineEvent = ReturnType<
   OrchestratorStore["operatorTaskTimeline"]
 >[number];
 type TaskStatus = NonNullable<TimelineEvent["status"]>;
-type TaskStage = TrackStage | "failed" | "cancelled";
+type TaskStage = TrackStage | "failed" | "cancelled" | "awaiting-host-check";
 
 export function taskStage(
   status: TaskStatus,
@@ -99,7 +99,12 @@ export function taskEstimate(
   means: StageMeans,
 ): Estimate {
   if (stage === "done") return estimate(0);
-  if (stage === "failed" || stage === "cancelled") return estimate(null);
+  if (
+    stage === "failed" ||
+    stage === "cancelled" ||
+    stage === "awaiting-host-check"
+  )
+    return estimate(null);
   const remaining = timedStages
     .slice(timedStages.indexOf(stage))
     .map((key) => means[key]);
@@ -153,7 +158,13 @@ export function taskTimings(events: readonly TimelineEvent[]) {
         : event.mode === "task" && event.actor === "Executor"
           ? "running"
           : undefined;
-    if (!stage || stage === "failed" || stage === "cancelled") continue;
+    if (
+      !stage ||
+      stage === "failed" ||
+      stage === "cancelled" ||
+      stage === "awaiting-host-check"
+    )
+      continue;
     if (event.mode === "review" || event.mode === "verification")
       task.lastReviewMode = event.mode;
     task.lastStage = stage;

@@ -474,6 +474,77 @@ test("store publishes private per-target entries and prunes by count or age with
   assert.deepEqual(store.prune({ keep: 0 }), [first]);
 });
 
+test("archive digest uses the identity of the file opened during a path swap", async (t) => {
+  const { env, store } = await fixture(t);
+  const key = "1".repeat(64);
+  await store.publish(
+    {
+      key,
+      adapter: "bun",
+      profileDigest: digest,
+      createdAt: new Date(0).toISOString(),
+      size: 1,
+      packages: [],
+      hasLock: false,
+    },
+    Buffer.from("a"),
+  );
+  const entry = join(store.directory, "entries", key);
+  const replacement = entry + ".replacement";
+  await mkdir(replacement, { mode: 0o700 });
+  await writeFile(join(replacement, "outputs.tar"), "b", { mode: 0o600 });
+
+  // Isolate the builtin mock in a child. Swap the parent directory so the
+  // original archive's inode and timestamps survive the ABA replacement.
+  const script = `
+    import assert from "node:assert/strict";
+    import { mock } from "bun:test";
+    import { createHash } from "node:crypto";
+    import * as fs from "node:fs";
+    const [module, project, key, entry, replacement] = process.argv.slice(1);
+    const archive = entry + "/outputs.tar";
+    const saved = entry + ".saved";
+    const { openSync, readSync, renameSync } = fs;
+    let swap = true;
+    let archiveFd;
+    let reads = 0;
+    mock.module("node:fs", () => ({
+      ...fs,
+      openSync(path, ...args) {
+        if (path !== archive) return openSync(path, ...args);
+        if (!swap) return archiveFd = openSync(path, ...args);
+        swap = false;
+        renameSync(entry, saved);
+        renameSync(replacement, entry);
+        try {
+          return archiveFd = openSync(path, ...args);
+        } finally {
+          renameSync(entry, replacement);
+          renameSync(saved, entry);
+        }
+      },
+      readSync(fd, ...args) {
+        if (fd === archiveFd) reads++;
+        return readSync(fd, ...args);
+      },
+    }));
+    const { EnvironmentStore } = await import(module);
+    const store = new EnvironmentStore(project);
+    const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+    assert.equal(store.archiveDigest(key), sha256("b"));
+    assert.equal(store.archiveDigest(key), sha256("a"));
+    assert.equal(store.archiveDigest(key), sha256("a"));
+    assert.equal(reads, 2);
+  `;
+  const module = new URL("../src/environments/store.ts", import.meta.url).href;
+  const child = spawnSync(
+    process.execPath,
+    ["-e", script, module, project, key, entry, replacement],
+    { env, encoding: "utf8", timeout: 5_000 },
+  );
+  assert.equal(child.status, 0, child.stderr);
+});
+
 test("store recovers dead and expired pruning and hold markers", async (t) => {
   const { store } = await fixture(t);
   const key = "1".repeat(64);

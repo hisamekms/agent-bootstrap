@@ -28,6 +28,7 @@ import {
   hostCheckDigest,
   matchHostCheck,
   parseHostChecks,
+  recomputeHostCheckApprovalDigest,
   validateHostCheckHome,
 } from "../src/local-orchestrator/host-checks.ts";
 import { runBootstrap } from "../src/onboarding/cli.ts";
@@ -625,6 +626,13 @@ test("target doctor reports host check prerequisites without executing a check o
     },
     repo,
   );
+  assert.partialDeepStrictEqual(
+    checks.find(({ id }) => id === "host-checks-warning"),
+    {
+      detail:
+        "host-check runs are not implemented yet; matching Tasks will wait at the host-check gate",
+    },
+  );
   const items = checks.filter(({ id }) => id.startsWith("host-check-"));
   assert.deepEqual(
     items.map(({ id, status }) => [id, status]),
@@ -655,4 +663,72 @@ test("target doctor reports host check prerequisites without executing a check o
     items.every(({ needsNetwork, needsHuman }) => !needsNetwork && !needsHuman),
   );
   assert.ok(first && !items.includes(first));
+});
+
+test("approval digest pins commits, ordered declarations, archive and executable identity", async (t) => {
+  const { root } = fixture(t);
+  const command = join(root, "declared-check");
+  const first = join(root, "first");
+  const second = join(root, "second");
+  for (const file of [first, second])
+    writeFileSync(file, "fixture executable, never invoked", { mode: 0o700 });
+  symlinkSync(first, command);
+  const declaration = parse({
+    argv: [command, "run"],
+    keychain: [{ service: "one", env: "SERVICE_KEY" }],
+  });
+  const other = { ...declaration, name: "second-check" };
+  const pin = { base: "a".repeat(40), candidate: "b".repeat(40) };
+  const checks = [declaration, other];
+  const archive = "c".repeat(64);
+  const digest = await recomputeHostCheckApprovalDigest(pin, checks, archive);
+  assert.match(digest, /^[a-f0-9]{64}$/);
+  assert.equal(
+    await recomputeHostCheckApprovalDigest(pin, checks, archive),
+    digest,
+  );
+  for (const newPin of [
+    { ...pin, base: "d".repeat(40) },
+    { ...pin, candidate: "d".repeat(40) },
+  ])
+    assert.notEqual(
+      await recomputeHostCheckApprovalDigest(newPin, checks, archive),
+      digest,
+    );
+  assert.notEqual(
+    await recomputeHostCheckApprovalDigest(pin, checks, null),
+    digest,
+  );
+  assert.notEqual(
+    await recomputeHostCheckApprovalDigest(pin, checks, "d".repeat(64)),
+    digest,
+  );
+  assert.notEqual(
+    await recomputeHostCheckApprovalDigest(pin, [...checks].reverse(), archive),
+    digest,
+  );
+  assert.notEqual(
+    await recomputeHostCheckApprovalDigest(
+      pin,
+      [
+        { ...declaration, keychain: [{ service: "two", env: "SERVICE_KEY" }] },
+        other,
+      ],
+      archive,
+    ),
+    digest,
+  );
+  rmSync(command);
+  symlinkSync(second, command);
+  const retargeted = await recomputeHostCheckApprovalDigest(
+    pin,
+    checks,
+    archive,
+  );
+  assert.notEqual(retargeted, digest);
+  writeFileSync(second, "updated fixture");
+  assert.notEqual(
+    await recomputeHostCheckApprovalDigest(pin, checks, archive),
+    retargeted,
+  );
 });

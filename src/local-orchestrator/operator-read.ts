@@ -1,3 +1,4 @@
+import { hostCheckExposure } from "./host-checks.ts";
 import {
   publishFailure,
   publishView,
@@ -104,7 +105,7 @@ export function operatorStatus(store: OrchestratorStore) {
       ref: proposal.ref,
       goalRef: proposal.goalRef,
       taskRef: proposal.taskRef,
-      ...(proposal.kind === "integration"
+      ...(proposal.kind === "integration" || proposal.kind === "host-check"
         ? {
             goalId: proposal.content.goalId,
             taskId: proposal.content.taskId,
@@ -149,16 +150,20 @@ export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
       return item;
     const proposal = store.getProposalDetails(id);
     if (proposal?.status !== "pending") return item;
-    const approve = permitsPanelAnswer(proposal.origin, proposal, "approve");
+    const approve =
+      proposal.kind !== "host-check" &&
+      permitsPanelAnswer(proposal.origin, proposal, "approve");
     const reject = permitsPanelAnswer(proposal.origin, proposal, "reject");
     const takeover = proposal.policy === "agent" && (!approve || !reject);
     if (!approve && !reject && !takeover) return item;
     const title =
-      proposal.kind === "integration"
+      proposal.kind === "integration" || proposal.kind === "host-check"
         ? store.getTask(proposal.content.taskId)?.content.title
         : proposal.content.title;
     const policies =
-      proposal.kind === "integration" ? undefined : proposal.content.policies;
+      proposal.kind === "goal" || proposal.kind === "task"
+        ? proposal.content.policies
+        : undefined;
     return {
       ...item,
       answer: {
@@ -168,6 +173,9 @@ export function operatorInbox(store: OrchestratorStore, items: InboxItem[]) {
         title: title === undefined ? null : escapeTerminalControls(title),
         agentGates: GATES.filter((gate) => policies?.[gate] === "agent"),
         approve,
+        ...(proposal.kind === "host-check" && {
+          approveReason: "host-check-detail-required" as const,
+        }),
         reject,
         ...(takeover && { takeover: true as const }),
       },
@@ -249,7 +257,7 @@ function strictSources(value: unknown): string[] {
 }
 
 export async function screenOperatorProposal(
-  proposal: ProposalDetails,
+  input: ProposalDetails,
   stateDirectory: string,
   scan?: CredentialScanner,
   displayDigest?: string,
@@ -258,6 +266,34 @@ export async function screenOperatorProposal(
     scan ?? builtInCredentialScanner,
     displayDigest,
   );
+  if (input.kind === "host-check") {
+    const proposal = input;
+    const { branch, base, candidate, digest, hostCheck } = proposal.content;
+    const { digest: approvalDigest, ...details } = hostCheck;
+    const response = {
+      id: proposal.id,
+      kind: proposal.kind,
+      status: proposal.status,
+      digest: proposal.digest,
+      ref: proposal.ref,
+      goalRef: proposal.goalRef,
+      taskRef: proposal.taskRef,
+      ...proposalPolicy(proposal),
+      origin: { kind: "host" as const },
+      diff: { branch, base, candidate, digest },
+      ...details,
+      approvalDigest,
+      exposure: hostCheckExposure,
+      diffStat: null,
+      maskedFields: undefined,
+    };
+    // The proposal digest is the answer token. The separate approval digest
+    // pins the inputs that will be rechecked before a future run.
+    if (!(await check([strictSources(response)])).every(credentialScanClean))
+      throw new ClaudeRunError("credential-leak");
+    return response;
+  }
+  const proposal = input;
   const rawFields = new Map<ProposalScreenedField, RawField>();
   function screen(
     field: ProposalScreenedField,
@@ -714,7 +750,9 @@ function taskSummary(
     stage === "failed" ? (timing?.lastStage ?? "registered") : undefined;
   const started = timing?.times.running;
   const stageStarted =
-    stage === "failed" || stage === "cancelled"
+    stage === "failed" ||
+    stage === "cancelled" ||
+    stage === "awaiting-host-check"
       ? undefined
       : timing?.times[stage];
   return {

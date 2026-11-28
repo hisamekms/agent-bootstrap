@@ -47,10 +47,13 @@ export function proposalField(
   }
 }
 
-export function proposalWithheldFields(proposal: {
-  modelText: Record<string, unknown>;
-}) {
+export function proposalWithheldFields(proposal: Record<string, unknown>) {
+  const { modelText } = proposal;
+  const text =
+    modelText && typeof modelText === "object"
+      ? (modelText as Record<string, unknown>)
+      : {};
   return proposalScreenedFields.filter((field) =>
-    isWithheld(proposalField(proposal, proposal.modelText, field)),
+    isWithheld(proposalField(proposal, text, field)),
   );
 }

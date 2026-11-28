@@ -29,17 +29,47 @@ export function displayProposal({
 const maxPanelAnswers = 20;
 
 export function parsePanelAnswer(params: unknown) {
-  const input = fields(params, ["id", "digest", "decision", "takeover"]);
-  const { id, digest, decision, takeover } = input;
+  const input = fields(params, [
+    "id",
+    "digest",
+    "approvalDigest",
+    "decision",
+    "takeover",
+    "integrateOnPass",
+  ]);
+  const { id, digest, approvalDigest, decision, takeover, integrateOnPass } =
+    input;
   if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest))
     throw new ContractError();
+  if (
+    Object.hasOwn(input, "approvalDigest") &&
+    (typeof approvalDigest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(approvalDigest))
+  )
+    throw new ContractError();
   if (Object.hasOwn(input, "takeover") && takeover !== true)
+    throw new ContractError();
+  const combined = Object.hasOwn(input, "integrateOnPass")
+    ? fields(integrateOnPass, ["acknowledgeProtected"]).acknowledgeProtected
+    : undefined;
+  if (
+    Object.hasOwn(input, "integrateOnPass") &&
+    (decision !== "approve" ||
+      takeover !== undefined ||
+      !Array.isArray(combined) ||
+      combined.length > 10_000 ||
+      combined.some((path) => typeof path !== "string"))
+  )
     throw new ContractError();
   return {
     id: identifier(id),
     digest,
+    ...(typeof approvalDigest === "string" && { approvalDigest }),
     decision: oneOf(decision, ["approve", "reject"]),
     ...(takeover === true && { takeover }),
+    ...(Array.isArray(combined) && {
+      integrateOnPass: { acknowledgeProtected: combined as string[] },
+    }),
   };
 }
 
@@ -66,7 +96,11 @@ export async function answerManyFromPanel(
   await scan?.(JSON.stringify(parsed.map(({ id }) => id)));
   const results: PanelAnswerResult[] = [];
   for (const answer of parsed)
-    results.push(await answerFromPanel(store, directory, answer, scan));
+    results.push(
+      store.getProposal(answer.id)?.kind === "host-check"
+        ? { id: answer.id, error: { code: "approval-forbidden" } }
+        : await answerFromPanel(store, directory, answer, scan),
+    );
   return results;
 }
 
@@ -131,6 +165,8 @@ function panelApprovalPreview(
       },
     };
   }
+  if (proposal.kind === "host-check" || display.kind === "host-check")
+    throw new ContractError();
   if (proposal.kind === "integration" || display.kind === "integration")
     throw new ContractError();
   const modelText = {
@@ -151,7 +187,14 @@ function panelApprovalPreview(
 export async function answerFromPanel(
   store: OrchestratorStore,
   directory: string,
-  { id, digest, decision, takeover }: PanelAnswer,
+  {
+    id,
+    digest,
+    approvalDigest,
+    decision,
+    takeover,
+    integrateOnPass,
+  }: PanelAnswer,
   scan?: CredentialScanner,
 ): Promise<PanelAnswerResult> {
   try {
@@ -174,7 +217,13 @@ export async function answerFromPanel(
       if (proposalWithheldFields(display).length)
         throw new OrchestratorStoreError("write-failed");
       if (scan)
-        await scan(JSON.stringify(panelApprovalPreview(proposal, display)));
+        await scan(
+          JSON.stringify(
+            display.kind === "host-check"
+              ? display
+              : panelApprovalPreview(proposal, display),
+          ),
+        );
     } else {
       const preview = await proposalDecisionPreview(
         directory,
@@ -189,9 +238,11 @@ export async function answerFromPanel(
       id,
       {
         digest,
+        ...(approvalDigest !== undefined && { approvalDigest }),
         decision,
         answerer: { kind: "human", channel: "operator-ui" },
         ...(takeover === true && { takeover }),
+        ...(integrateOnPass && { integrateOnPass }),
       },
       expectedRule,
     );

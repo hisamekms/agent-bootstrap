@@ -829,6 +829,11 @@ async function execute(
         includeDelegation: command.kind === "show",
       });
       if (!proposal) return refuse(io, "Proposal was not found.");
+      if (proposal.kind === "host-check" && command.kind !== "show")
+        return refuse(
+          io,
+          "Host checks require an answer through the operator UI.",
+        );
       if (proposal.kind === "integration" && directory === undefined)
         return refuse(
           io,

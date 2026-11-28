@@ -389,8 +389,11 @@ and neither may contain the other.
 
 `agent-bootstrap doctor --target <path>` reports whether the executable and
 declared Microsandbox home are available, along with trigger and VM counts
-and Keychain item names. These checks are informational. The approval gate
-and execution are pending. [Host checks ADR](../host-checks/adr-0001-host-checks.md)
+and Keychain item names. It also warns that host-check runs are not implemented
+yet and matching Tasks will wait at the host-check gate. The web UI supports
+rejecting a host-check proposal. Approving one requires reading its details
+and submitting the displayed approval digest through the single-item operator
+API. [Host checks ADR](../host-checks/adr-0001-host-checks.md)
 
 ### Run with secret files
 

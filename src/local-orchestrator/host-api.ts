@@ -236,7 +236,7 @@ function prepareTool(
           ref: proposal.ref,
           goalRef: proposal.goalRef,
           taskRef: proposal.taskRef,
-          ...(proposal.kind === "integration"
+          ...(proposal.kind === "integration" || proposal.kind === "host-check"
             ? {
                 goalId: proposal.content.goalId,
                 taskId: proposal.content.taskId,
@@ -246,7 +246,10 @@ function prepareTool(
     }
     case "get_proposal": {
       const id = identifier(input.id);
-      return () => store.getProposalDetails(id);
+      return () => {
+        const proposal = store.getProposalDetails(id);
+        return proposal?.kind === "host-check" ? null : proposal;
+      };
     }
     case "list_goals":
       return () => {

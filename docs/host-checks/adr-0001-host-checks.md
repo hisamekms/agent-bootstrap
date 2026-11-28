@@ -135,7 +135,8 @@ immediately before each check in the ordered list starts, covers:
 - the candidate commit and the expected base commit;
 - the declaration of each required check;
 - the resolved `argv[0]` (its real path and SHA-256) and the fixed `PATH`;
-- the environment archive digest, when one is used;
+- the candidate environment archive digest, when one is used;
+- the protected paths changed by the candidate;
 - the Keychain item service names.
 
 If any of these changes, including a new candidate produced by a revision

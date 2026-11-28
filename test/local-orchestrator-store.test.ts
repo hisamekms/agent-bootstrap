@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ContractError,
+  goalBranch,
   resolvePolicy,
 } from "../src/local-orchestrator/model.ts";
 import {
@@ -19,7 +20,10 @@ import {
 const { Database } = createRequire(import.meta.url)("bun:sqlite") as {
   Database: new (filename: string) => {
     exec(sql: string): unknown;
-    query(sql: string): { get(...values: string[]): unknown };
+    query(sql: string): {
+      get(...values: string[]): unknown;
+      all(...values: string[]): unknown[];
+    };
     close(): void;
   };
 };
@@ -459,6 +463,240 @@ test("version 7 event migration preserves ordering and accepts a full environmen
     assert.throws(() => migrated.exec("DELETE FROM events"), /append-only/);
   } finally {
     migrated.close();
+  }
+});
+
+function normalizeSchemaSql(row: unknown) {
+  const value = row as { sql: string };
+  return { ...value, sql: value.sql.replace(/\s+/g, " ").trim() };
+}
+
+test("opening a current database restores the missing host-check inputs table", () => {
+  store.close();
+  const db = new Database(filename);
+  try {
+    db.exec("DROP TABLE host_check_inputs");
+  } finally {
+    db.close();
+  }
+  store = OrchestratorStore.open(filename);
+  assert.deepEqual(store.waitingHostCheckInputs(), []);
+});
+
+test("host-check migration preserves legacy evidence and constrains the new approval", () => {
+  const id = goalId();
+  const registered = store.proposeTask({ ...task, goalId: id }, operator);
+  assert.equal(registered.status, "registered");
+  if (registered.status !== "registered")
+    throw new Error("Task registration failed");
+  const { taskId } = registered;
+  const previous = store.listEvents({ limit: 20 });
+  store.close();
+  const oldDb = new Database(filename);
+  const schemaObjects = `SELECT name, type, tbl_name, sql FROM sqlite_schema
+    WHERE type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY name`;
+  const approvalRows = `SELECT id, proposal_id, gate, digest, policy, policy_source, answerer_kind,
+        answerer_json, decision, at, policy_details_json, reasons_json FROM approvals ORDER BY rowid`;
+  let legacyApprovals: unknown[];
+  let legacyObjects: unknown[];
+  try {
+    // Rebuild the altered tables with the version 9 constraints and indexes.
+    // The shared tables and their populated foreign keys stay in place.
+    oldDb.exec(`
+      PRAGMA foreign_keys=OFF;
+      DROP TABLE host_check_inputs;
+      CREATE TABLE v9_proposals (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'integration')),
+    content_json TEXT NOT NULL, digest TEXT NOT NULL, source_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'registered')),
+    created_at TEXT NOT NULL, decided_at TEXT
+      ) STRICT;
+      INSERT INTO v9_proposals SELECT * FROM proposals;
+      DROP TABLE proposals;
+      ALTER TABLE v9_proposals RENAME TO proposals;
+      CREATE TABLE v9_tasks (
+    id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id),
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
+    content_json TEXT NOT NULL, digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('registered', 'running', 'awaiting-integration', 'succeeded', 'failed', 'cancelled')),
+    attempts INTEGER NOT NULL CHECK (attempts >= 0), created_at TEXT NOT NULL, ref TEXT NOT NULL DEFAULT ''
+      ) STRICT;
+      INSERT INTO v9_tasks SELECT * FROM tasks;
+      DROP TABLE tasks;
+      ALTER TABLE v9_tasks RENAME TO tasks;
+      CREATE TABLE v9_approvals (
+    id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id),
+    gate TEXT NOT NULL CHECK (gate IN ('goal-registration', 'task-registration', 'integration')),
+    digest TEXT NOT NULL, policy TEXT NOT NULL CHECK (policy IN ('human', 'agent')),
+    policy_source TEXT NOT NULL CHECK (policy_source IN ('default', 'request', 'goal', 'task', 'invariant', 'operator-task', 'operator-goal', 'rule')),
+    answerer_kind TEXT NOT NULL CHECK (answerer_kind IN ('human', 'agent')), answerer_json TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')), at TEXT NOT NULL,
+    policy_details_json TEXT, reasons_json TEXT
+      ) STRICT;
+      INSERT INTO v9_approvals SELECT id, proposal_id, gate, digest, policy, policy_source, answerer_kind,
+        answerer_json, decision, at, policy_details_json, reasons_json FROM approvals;
+      DROP TABLE approvals;
+      ALTER TABLE v9_approvals RENAME TO approvals;
+      CREATE TABLE v9_events (
+  id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject_kind TEXT NOT NULL,
+  subject_id TEXT NOT NULL, session_id TEXT, execution_id TEXT,
+  data TEXT NOT NULL CHECK (
+    length(CAST(data AS BLOB)) <= CASE WHEN kind = 'environment.build-authorized'
+      THEN 65536 ELSE 4096 END
+    AND json_valid(data)
+  )
+      ) STRICT;
+      INSERT INTO v9_events (rowid, id, at, kind, subject_kind, subject_id, session_id, execution_id, data) SELECT rowid, * FROM events;
+      DROP TABLE events;
+      ALTER TABLE v9_events RENAME TO events;
+      CREATE INDEX tasks_goal ON tasks(goal_id);
+      CREATE UNIQUE INDEX tasks_ref ON tasks(ref COLLATE NOCASE);
+      CREATE TRIGGER tasks_ref_required BEFORE INSERT ON tasks
+        WHEN NEW.ref = '' BEGIN SELECT RAISE(ABORT, 'ref required'); END;
+      CREATE TRIGGER tasks_ref_immutable BEFORE UPDATE OF ref ON tasks
+        WHEN NEW.ref <> OLD.ref BEGIN SELECT RAISE(ABORT, 'immutable ref'); END;
+  CREATE INDEX events_subject ON events(subject_id);
+  CREATE INDEX events_decisions_at ON events(at) WHERE kind = 'proposal.decided';
+  CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+  CREATE TRIGGER events_no_replace BEFORE INSERT ON events
+    WHEN EXISTS (SELECT 1 FROM events WHERE id = NEW.id OR rowid = NEW.rowid)
+    BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+      PRAGMA user_version=9;
+    `);
+    for (const statement of [
+      "UPDATE proposals SET kind = 'host-check'",
+      "UPDATE proposals SET status = 'lapsed'",
+      "UPDATE tasks SET status = 'awaiting-host-check'",
+      "UPDATE approvals SET gate = 'host-check'",
+    ])
+      assert.throws(() => oldDb.exec(statement), /CHECK constraint/);
+    legacyApprovals = oldDb.query(approvalRows).all();
+    assert.ok(legacyApprovals.length > 0);
+    legacyObjects = oldDb.query(schemaObjects).all();
+    assert.deepEqual(oldDb.query("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    oldDb.close();
+  }
+  store = OrchestratorStore.open(filename);
+  assert.deepEqual(store.listEvents({ limit: 20 }), previous);
+  assert.equal(store.getTask("G1-1")?.id, taskId);
+  assert.ok(store.claimTask(taskId));
+  const pin = {
+    base: "a".repeat(40),
+    candidate: "b".repeat(40),
+    digest: "c".repeat(64),
+  };
+  const verification = store.createExecution({
+    actor: "Reviewer",
+    mode: "verification",
+    taskId,
+    requestedBy: host,
+  });
+  store.startExecution(verification.id);
+  store.finishExecution(verification.id, "succeeded", { pin, tokens: 0 });
+  const review = store.createExecution({
+    actor: "Reviewer",
+    mode: "review",
+    taskId,
+    requestedBy: host,
+  });
+  store.startExecution(review.id);
+  store.finishExecution(review.id, "succeeded", {
+    review: "pass",
+    pin,
+    tokens: 0,
+  });
+  const pinned = "d".repeat(64);
+  const gateId = store.proposeHostCheck(
+    {
+      ...pin,
+      taskId,
+      goalId: id,
+      branch: goalBranch(id),
+      changedPaths: task.paths,
+      review: { result: "pass" },
+      verified: true,
+      symlinks: [],
+      hostCheck: {
+        digest: pinned,
+        protectedPaths: [],
+        checks: [
+          {
+            name: "fixture",
+            declarationDigest: "e".repeat(64),
+            argv: ["/fixture/check"],
+            matchedPaths: task.paths,
+            envNames: [],
+            keychainServices: [],
+            vmCount: 0,
+          },
+        ],
+      },
+    },
+    review.id,
+  );
+  store.decide(gateId, {
+    digest: store.getProposal(gateId)!.digest,
+    decision: "approve",
+    approvalDigest: pinned,
+    answerer: { kind: "human", channel: "operator-ui" },
+    integrateOnPass: { acknowledgeProtected: [] },
+  });
+  const db = new Database(filename);
+  try {
+    assert.deepEqual(
+      db
+        .query(
+          approvalRows.replace(
+            "ORDER BY",
+            "WHERE gate <> 'host-check' ORDER BY",
+          ),
+        )
+        .all(),
+      legacyApprovals,
+    );
+    assert.deepEqual(
+      db.query(schemaObjects).all().map(normalizeSchemaSql),
+      legacyObjects.map(normalizeSchemaSql),
+    );
+    assert.throws(
+      () => db.exec("UPDATE tasks SET ref = 'changed'"),
+      /immutable ref/,
+    );
+    assert.throws(() => db.exec("DELETE FROM events"), /append-only/);
+    assert.deepEqual(
+      db
+        .query(
+          `SELECT gate, policy, policy_source, host_check_digest,
+      integrate_on_pass FROM approvals WHERE proposal_id = ?`,
+        )
+        .get(gateId),
+      {
+        gate: "host-check",
+        policy: "human",
+        policy_source: "invariant",
+        host_check_digest: pinned,
+        integrate_on_pass: 1,
+      },
+    );
+    assert.throws(
+      () =>
+        db.exec(
+          "UPDATE approvals SET policy = 'agent' WHERE gate = 'host-check'",
+        ),
+      /CHECK constraint/,
+    );
+    assert.throws(
+      () =>
+        db.exec(
+          "UPDATE approvals SET host_check_digest = NULL WHERE gate = 'host-check'",
+        ),
+      /CHECK constraint/,
+    );
+    assert.deepEqual(db.query("PRAGMA foreign_key_check").get(), null);
+  } finally {
+    db.close();
   }
 });
 

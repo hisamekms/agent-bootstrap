@@ -1,5 +1,11 @@
+import {
+  hostCheckApproval,
+  hostCheckRequirement,
+  type HostCheckContent,
+  type HostCheckDeclaration,
+} from "./host-checks.ts";
 import { DeclarationError } from "../environments/declarations.ts";
-import { bunAdapter } from "../environments/bun.ts";
+import { bunAdapter, hasBunLayout } from "../environments/bun.ts";
 import { EnvironmentError } from "../environments/adapter.ts";
 import {
   environmentMissingReason,
@@ -7,6 +13,7 @@ import {
 } from "./operator-attention.ts";
 import {
   hasDerivedLockConflict,
+  hostCheckArchiveDigest,
   taskEnvironmentPlan,
   type TaskEnvironmentOptions,
 } from "./task-environment.ts";
@@ -75,6 +82,7 @@ type ActorResult = Partial<ReturnType<typeof readClaudeRunMetrics>> & {
   outcome?: string;
   code?: string;
   invocationId?: string;
+  environmentArchiveDigest?: string;
   tokens?: number;
   usage?: TokenUsage;
   isError?: boolean;
@@ -108,6 +116,11 @@ export interface TaskFlow {
   reject(candidate: PinnedCandidate): Promise<void>;
   changes(candidate: PinnedCandidate): Promise<CandidateChange[]>;
   diffSize?(candidate: PinnedCandidate): Promise<DiffSize>;
+  hostChecks?: {
+    declarations: readonly HostCheckDeclaration[];
+    protectedPaths(pin: PinnedCandidate): Promise<readonly string[]>;
+    archiveDigest(pin: PinnedCandidate): Promise<string | null>;
+  };
 }
 
 export interface TaskExecutor {
@@ -115,6 +128,7 @@ export interface TaskExecutor {
   existingBase?(goalId: string): Promise<string | null>;
   diff(content: IntegrationContent): Promise<Uint8Array>;
   integrate?(proposalId: string): Promise<void>;
+  resumeHostChecks?(): Promise<void>;
 }
 
 const sha256 = (bytes: Uint8Array) =>
@@ -448,15 +462,31 @@ export function createTaskExecutor(options: {
   worker: (profile: ProfileName) => RoleHarness;
   reviewer: RoleHarness;
   verification?: Verification;
+  protectedPaths?: () => readonly string[];
+  hostChecks?:
+    readonly HostCheckDeclaration[] | (() => readonly HostCheckDeclaration[]);
   environment?: TaskEnvironmentOptions;
   scan?: CredentialScanner;
 }): TaskExecutor {
   const { directory, repoRoot, store, host, verification, scan } = options;
+  const readHostChecks = () =>
+    typeof options.hostChecks === "function"
+      ? options.hostChecks()
+      : (options.hostChecks ?? []);
+  const repository = join(directory, "repository.git");
+  const archiveDigest = ({ candidate }: PinnedCandidate) =>
+    hostCheckArchiveDigest(
+      options.environment,
+      repository,
+      candidate,
+      verification?.profile,
+    );
 
   function taskFlow(
     task: Task,
     git: LocalGitIntegration,
     journal: IntegrationJournal,
+    declarations: readonly HostCheckDeclaration[] = [],
   ) {
     const worker = options.worker(task.content.profile);
     const { reviewer } = options;
@@ -541,6 +571,11 @@ export function createTaskExecutor(options: {
           return run;
         },
         async runVerification(...args) {
+          const archive = args[0].sandbox.environment?.archive;
+          if (declarations.length && archive)
+            verificationResult.environmentArchiveDigest = createHash("sha256")
+              .update(archive)
+              .digest("hex");
           const run = await host.runVerification(...args);
           verificationResult.outcome = run.outcome;
           verificationResult.invocationId = run.id;
@@ -552,6 +587,9 @@ export function createTaskExecutor(options: {
       journal,
       {
         tree: {},
+        ...(options.protectedPaths && {
+          readProtectedPaths: options.protectedPaths,
+        }),
         ...environmentPlan,
         ...(task.retries > 0 &&
           environmentPlan.prepareEnvironmentUpdate && {
@@ -622,7 +660,17 @@ export function createTaskExecutor(options: {
         ? {
             async verify(id, observed) {
               verificationResult = observed;
-              return integration.verifyCandidate(id);
+              const passed = await integration.verifyCandidate(id);
+              if (passed && observed.environmentArchiveDigest !== undefined) {
+                const { candidate } = await integration.currentCandidate();
+                const tree = await LocalGitIntegration.committedTree(
+                  repository,
+                  candidate,
+                );
+                if (!hasBunLayout(tree))
+                  delete observed.environmentArchiveDigest;
+              }
+              return passed;
             },
           }
         : {}),
@@ -635,6 +683,14 @@ export function createTaskExecutor(options: {
       reject: (candidate) => integration.rejectCandidate(candidate),
       changes: ({ base, candidate }) => git.candidateChanges(base, candidate),
       diffSize: ({ base, candidate }) => git.diffSize(base, candidate),
+      ...(declarations.length > 0 && {
+        hostChecks: {
+          declarations,
+          protectedPaths: (pin: PinnedCandidate) =>
+            integration.protectedPaths(pin),
+          archiveDigest,
+        },
+      }),
     };
     return { flow, integration };
   }
@@ -644,7 +700,6 @@ export function createTaskExecutor(options: {
     async open(task) {
       const branch = goalBranch(task.goalId);
       const git = localGit(directory, branch);
-      const repository = join(directory, "repository.git");
       const journalRoot = join(directory, "integrations");
       const taskRoot = join(journalRoot, task.id);
       await privateDirectory(journalRoot);
@@ -698,8 +753,87 @@ export function createTaskExecutor(options: {
           throw new TaskError("goal-base-mismatch");
       }
 
-      return taskFlow(task, git, taskJournal(directory, task.id, task.retries))
-        .flow;
+      return taskFlow(
+        task,
+        git,
+        taskJournal(directory, task.id, task.retries),
+        readHostChecks(),
+      ).flow;
+    },
+    // Step 3b resumes approved checks here, after refreshing the pin and
+    // committing the per-check authorization before handing off to a runner.
+    async resumeHostChecks() {
+      const gates = [
+        ...store.activeHostCheckGates(),
+        ...store.waitingHostCheckInputs(),
+      ];
+      for (const gate of gates) {
+        const { content } = gate;
+        const task = store.getTask(content.taskId);
+        if (!task) continue;
+        const git = localGit(directory, content.branch);
+        const previous =
+          "id" in gate ? gate.content.hostCheck.digest : undefined;
+        let reason:
+          | "stale-base"
+          | "candidate-changed"
+          | "approval-inputs-changed"
+          | undefined;
+        let approval: HostCheckContent["hostCheck"] | undefined;
+        try {
+          const base = await git.branchHead();
+          if (base !== content.base) {
+            reason = "stale-base";
+          } else {
+            const journal = taskJournal(directory, task.id, task.retries);
+            const { integration } = taskFlow(task, git, journal);
+            if (!(await integration.reviewedPin(content))) {
+              reason = "candidate-changed";
+            } else {
+              const changes = await git.candidateChanges(
+                base,
+                content.candidate,
+              );
+              const { required } = hostCheckRequirement(
+                readHostChecks(),
+                changes,
+              );
+              if (required.length) {
+                const archive = await archiveDigest(content);
+                if (
+                  archive ===
+                  store.hostCheckVerificationArchive(task.id, content)
+                ) {
+                  approval = await hostCheckApproval(
+                    content,
+                    required,
+                    await integration.protectedPaths(content),
+                    archive,
+                  );
+                }
+              }
+              if (approval?.digest !== previous || !approval) {
+                reason = "approval-inputs-changed";
+                if (approval)
+                  await scan?.(
+                    JSON.stringify({ ...content, hostCheck: approval }),
+                  );
+              }
+            }
+          }
+        } catch {
+          store.noteUnavailableHostCheckInputs(task.id, gate);
+          continue;
+        }
+        if (!reason) continue;
+        if ("id" in gate) store.lapseHostCheck(gate.id, reason, approval);
+        else
+          store.resolveHostCheckInputs(
+            task.id,
+            gate.executionId,
+            approval ?? reason,
+          );
+      }
     },
     integrate(proposalId) {
       return integrateApprovedProposal(
@@ -719,6 +853,7 @@ export function createTaskExecutor(options: {
               return hasDerivedLockConflict(git, content, await git.head());
             }
           : undefined,
+        readHostChecks,
       );
     },
     async diff(content) {
@@ -941,6 +1076,7 @@ export async function runTask(
         break;
       }
       let verified = false;
+      let verifiedArchiveDigest: string | null = null;
       if (flow.verify) {
         const verify = flow.verify;
         const verification = await execute(
@@ -949,9 +1085,21 @@ export async function runTask(
           undefined,
           async (runId, observed) => {
             const passed = await verify(runId, observed);
+            verifiedArchiveDigest = observed.environmentArchiveDigest ?? null;
             return {
               value: passed,
-              ...(passed ? {} : { code: "verification-failed" }),
+              ...(passed
+                ? flow.hostChecks
+                  ? {
+                      result: {
+                        pin:
+                          (await flow.currentCandidate?.()) ??
+                          worker.value!.pin,
+                        environmentArchiveDigest: verifiedArchiveDigest,
+                      },
+                    }
+                  : {}
+                : { code: "verification-failed" }),
             };
           },
         );
@@ -1030,6 +1178,40 @@ export async function runTask(
         },
       };
       await scan?.(JSON.stringify(proposal));
+      if (flow.hostChecks) {
+        const host = flow.hostChecks;
+        const { required, skipped } = hostCheckRequirement(
+          host.declarations,
+          await flow.changes(pin),
+        );
+        if (skipped.length)
+          store.recordHostCheckSkip(task.id, skipped, changedPaths);
+        if (required.length) {
+          if (!verified)
+            throw new TaskError("host-check-verification-required");
+          let content: HostCheckContent;
+          try {
+            const archive = await host.archiveDigest(pin);
+            if (archive !== verifiedArchiveDigest)
+              throw new TaskError("approval-inputs-unavailable");
+            content = {
+              ...proposal,
+              hostCheck: await hostCheckApproval(
+                pin,
+                required,
+                await host.protectedPaths(pin),
+                archive,
+              ),
+            };
+            await scan?.(JSON.stringify(content));
+          } catch {
+            store.waitForHostCheckInputs(proposal, review.executionId);
+            return;
+          }
+          store.proposeHostCheck(content, review.executionId);
+          return;
+        }
+      }
       const diffSize = await flow.diffSize?.(pin).catch(() => undefined);
       store.proposeIntegration(
         proposal,
@@ -1040,7 +1222,7 @@ export async function runTask(
     }
   } catch (error) {
     code =
-      error instanceof ClaudeRunError
+      error instanceof ClaudeRunError || error instanceof EnvironmentError
         ? error.code
         : error instanceof TaskError
           ? error.message
@@ -1082,6 +1264,7 @@ export async function integrateApprovedProposal(
     git: LocalGitIntegration,
     content: IntegrationContent,
   ) => Promise<boolean>,
+  readHostChecks?: () => readonly HostCheckDeclaration[],
 ): Promise<void> {
   let resolveStale: (() => Promise<boolean>) | undefined;
   let isPreGitFailure: (() => Promise<boolean>) | undefined;
@@ -1122,6 +1305,18 @@ export async function integrateApprovedProposal(
       );
 
     const protectedPaths = await integration.protectedPaths(pin);
+    const linkPaths = new Set(
+      changes
+        .filter(
+          ({ oldMode, newMode }) =>
+            oldMode === "120000" || newMode === "120000",
+        )
+        .map(({ path }) => path),
+    );
+    // Ordinary integration approvals only record symlinks. A configured
+    // protected file needs an approval that explicitly covers that path.
+    if (protectedPaths.some((path) => !linkPaths.has(path)))
+      throw new TaskError("candidate-mismatch");
     if (protectedPaths.length && answerer.kind !== "human")
       throw new OrchestratorStoreError("approval-forbidden");
     if (content.symlinks !== undefined) {
@@ -1144,6 +1339,16 @@ export async function integrateApprovedProposal(
         shouldResolveStale(task, git, content).catch(() => false);
     if ((await git.branchHead()) !== base)
       throw new GitIntegrationError("stale-base");
+    // A pending integration may predate the declarations or this gate.
+    // Step 3b must replace this re-evaluation with a check that
+    // a passed host-check record exists for this exact pin and digest.
+    if (
+      readHostChecks &&
+      hostCheckRequirement(readHostChecks(), changes).required.length
+    ) {
+      store.requireHostCheckForIntegration(proposalId);
+      return;
+    }
     store.beginIntegration(proposalId, proposal.digest, approvalId);
     isPreGitFailure = () =>
       Promise.all([git.branchHead(), journal.read()]).then(

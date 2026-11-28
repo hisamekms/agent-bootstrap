@@ -307,6 +307,22 @@ test(
             error: { code: "unknown-method" },
           });
         }
+        client.ws.send(
+          JSON.stringify({
+            id: "host-approval",
+            method: "proposal.answer",
+            params: {
+              id: "host-check",
+              decision: "approve",
+              digest: "a".repeat(64),
+              approvalDigest: "b".repeat(64),
+            },
+          }),
+        );
+        assert.deepEqual(await client.next(), {
+          id: "host-approval",
+          error: { code: "approval-forbidden" },
+        });
         for (const method of [
           "status",
           "proposal.answer",
