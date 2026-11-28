@@ -17,7 +17,11 @@
 - Use `agent-bootstrap sandbox shell --json` to plan a VM experiment and
   `agent-bootstrap sandbox shell --run` from a TTY to start it. Use
   `--allow <host:port>` for explicitly authorized destinations. Do not run
-  `msb` directly for experiments. The product uses the pinned Microsandbox
+  `msb` directly for experiments. Exception: a target's host check
+  (`docs/host-checks/`) may start Microsandbox through the target's own
+  tooling, only under the `MSB_HOME` that check declares. It is not an
+  agent-bootstrap experiment, and it still counts as the one VM job.
+  The product uses the pinned Microsandbox
   0.7.16 backend with mise configuration and activation hooks disabled.
 - `src/contracts.ts` owns agent contracts. `src/sandbox-runtime.ts` owns the
   provider-neutral sandbox port, `src/microsandbox.ts` owns the first adapter,
