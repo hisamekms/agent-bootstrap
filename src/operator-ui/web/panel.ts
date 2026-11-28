@@ -1,4 +1,8 @@
 import {
+  proposalWithheldFields,
+  type ProposalScreenedField,
+} from "../../local-orchestrator/proposal-screening.ts";
+import {
   action,
   disclosure,
   element,
@@ -27,7 +31,6 @@ import {
   planningDraft,
   groupProblems,
   retryCommand,
-  withheld,
   type Activity,
   type ActivityRow,
   type AgentDecision,
@@ -189,6 +192,8 @@ function answerError(code: string) {
   switch (code) {
     case "stale-digest":
       return "内容が変わりました。もう一度確認してください";
+    case "stale-policy":
+      return "適用ルールが変わりました。もう一度確認してください。";
     case "invalid-transition":
       return "この提案はすでに判断待ちではありません。";
     case "approval-forbidden":
@@ -213,11 +218,24 @@ function proposalList(
     : textElement("pre", value.join("\n") || "なし", classes);
 }
 
+const proposalFieldLabels: Record<ProposalScreenedField, string> = {
+  description: "説明",
+  acceptance: "受け入れ条件",
+  findings: "所見",
+  paths: "対象パス",
+  pathViolations: "範囲外のパス",
+  changedPaths: "変更パス",
+  diffStat: "変更規模",
+  ruleId: "ルール ID",
+  ruleName: "ルール名",
+};
+
+function maskedExplanation(fields: readonly ProposalScreenedField[]) {
+  return `${fields.map((field) => proposalFieldLabels[field]).join("・")}に資格情報らしい文字列があり、伏せています。`;
+}
+
 function proposalHasWithheld(proposal: Proposal) {
-  return (
-    Object.values(proposal).some(withheld) ||
-    Object.values(proposal.modelText).some(withheld)
-  );
+  return proposalWithheldFields(proposal).length > 0;
 }
 
 function aiPending(item: PanelInboxItem) {
@@ -430,6 +448,7 @@ function proposalWarnings(
   key: string,
 ) {
   const violations = proposal.pathViolations;
+  const hidden = proposalWithheldFields(proposal);
   const gates = [...new Set([...pendingGates, ...proposal.loosening])];
   return [
     ...("withheld" in violations || violations.length
@@ -444,8 +463,23 @@ function proposalWarnings(
         ]
       : []),
     ...(gates.length ? [delegationWarning(gates, key)] : []),
-    ...(proposalHasWithheld(proposal)
-      ? [textElement("p", withheldApproval, "warning")]
+    ...(proposal.maskedFields
+      ? [
+          warningSummary(
+            "伏せ字あり",
+            maskedExplanation(proposal.maskedFields),
+            `masked:${key}`,
+          ),
+        ]
+      : []),
+    ...(hidden.length
+      ? [
+          textElement(
+            "p",
+            `${withheldApproval} 非表示の項目は${hidden.map((field) => proposalFieldLabels[field]).join("・")}です。`,
+            "warning",
+          ),
+        ]
       : []),
   ];
 }
@@ -575,6 +609,9 @@ function proposalEvidence(
     ...(gates.length
       ? [textElement("p", delegationExplanation(gates), "warning")]
       : []),
+    ...(proposal.maskedFields
+      ? [textElement("p", maskedExplanation(proposal.maskedFields), "warning")]
+      : []),
     evidence,
     model,
     group(
@@ -689,9 +726,13 @@ export function createInboxPanel(
     return pending;
   }
 
-  function staleAnswer(answer: AnswerableProposal, item: PanelInboxItem) {
-    if (stale.get(answer.id) === answer.digest) return;
-    stale.set(answer.id, answer.digest);
+  function staleAnswer(
+    answer: AnswerableProposal,
+    item: PanelInboxItem,
+    policyChanged = false,
+  ) {
+    if (!policyChanged && stale.get(answer.id) === answer.digest) return;
+    if (!policyChanged) stale.set(answer.id, answer.digest);
     expanded.add(item.id);
     previews.delete(answer.id);
     revision++;
@@ -743,7 +784,11 @@ export function createInboxPanel(
         if (!match) continue;
         const { item, answer } = match;
         if ("error" in outcome) {
-          if (outcome.error.code === "stale-digest") staleAnswer(answer, item);
+          if (
+            outcome.error.code === "stale-digest" ||
+            outcome.error.code === "stale-policy"
+          )
+            staleAnswer(answer, item, outcome.error.code === "stale-policy");
           report(outcome.error.code);
           continue;
         }
@@ -781,8 +826,9 @@ export function createInboxPanel(
       }
     } catch (error) {
       const code = error instanceof Error ? error.message : "write-failed";
-      if (code === "stale-digest")
-        for (const { answer, item } of pinned) staleAnswer(answer, item);
+      if (code === "stale-digest" || code === "stale-policy")
+        for (const { answer, item } of pinned)
+          staleAnswer(answer, item, code === "stale-policy");
       report(code);
     } finally {
       for (const { id } of answers) chosen.delete(id);
@@ -886,8 +932,8 @@ export function createInboxPanel(
           if (!("answer" in item)) return "提案を取得できませんでした。";
           const { answer } = item;
           try {
-            await validate(answer);
-            return "";
+            const proposal = await validate(answer);
+            return { masked: Boolean(proposal.maskedFields?.length) };
           } catch (error) {
             const code = error instanceof Error ? error.message : "read-failed";
             if (code === "stale-digest") staleAnswer(answer, item);
@@ -901,7 +947,13 @@ export function createInboxPanel(
         }),
       ).then((messages) => {
         if (cancelConfirmation !== close) return;
-        const errors = [...new Set(messages.filter(Boolean))];
+        const errors = [
+          ...new Set(messages.filter((result) => typeof result === "string")),
+        ];
+        if (
+          messages.some((result) => typeof result === "object" && result.masked)
+        )
+          msg.textContent = `${message} 伏せ字を含む提案があります。`;
         status.replaceChildren(
           ...errors.map((error) => textElement("p", error, "warning")),
         );

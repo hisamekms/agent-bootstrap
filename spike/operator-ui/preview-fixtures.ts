@@ -5,6 +5,7 @@ import {
 } from "../../src/local-orchestrator/delegation.ts";
 import { contentDigest } from "../../src/local-orchestrator/model.ts";
 import { parsePanelAnswer } from "../../src/local-orchestrator/proposal-answer.ts";
+import { credentialMaskMarker } from "../../src/local-orchestrator/proposal-screening.ts";
 import { remoteGoalBranch } from "../../src/publish/journal.ts";
 import {
   groupProblems,
@@ -311,6 +312,23 @@ function proposalFixtures(main: GoalDetail, active: GoalDetail) {
         },
       },
       title: "テンプレート更新の統合を AI に委ねる",
+    },
+    {
+      proposal: {
+        ...taskProposal,
+        id: "proposal-masked",
+        digest: "b".repeat(64),
+        maskedFields: ["description"],
+        modelText: {
+          ...taskProposal.modelText,
+          description:
+            `接続例にある sk-ant-${"x".repeat(30)} を環境変数に置き換えます。`.replace(
+              /sk-ant-x{30}/,
+              credentialMaskMarker,
+            ),
+        },
+      },
+      title: "接続例を更新する",
     },
     {
       proposal: {

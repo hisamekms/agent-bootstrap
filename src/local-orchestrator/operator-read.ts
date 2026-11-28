@@ -5,6 +5,13 @@ import { executionDisplay } from "./execution-display.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import {
   builtInCredentialScanner,
+  credentialScanClean,
+  credentialScanCovered,
+  maskCredentialSpans,
+  maxCredentialMasks,
+  proposalCredentialCheck,
+  serializedTextSpan,
+  type CredentialSpan,
   type CredentialScanner,
 } from "./credential-scan.ts";
 import { MAX_REVISIONS } from "../integration-journal.ts";
@@ -31,6 +38,16 @@ import {
   taskStageMeans,
   taskTimings,
 } from "./operator-estimates.ts";
+import {
+  isWithheld,
+  proposalField,
+  proposalMaskableFields,
+  proposalScreenedFields,
+  withheldField,
+  type ProposalMaskableField,
+  type ProposalScreenedField,
+} from "./proposal-screening.ts";
+import { ClaudeRunError } from "./claude-errors.ts";
 import { readPathViolations } from "./path-violations.ts";
 import { candidateDiffStat } from "./tasks.ts";
 import { permitsPanelAnswer, type OrchestratorStore } from "./store.ts";
@@ -146,27 +163,223 @@ export async function operatorProposal(
   scan?: CredentialScanner,
 ) {
   const proposal = store.getProposalDetails(id, { includeEvidence: true });
-  if (!proposal) return null;
-  const check = scan ?? builtInCredentialScanner;
-  const withheld = { withheld: true } as const;
-  async function screen(text: string, multiline = false) {
-    try {
-      await check(text);
-      return multiline
-        ? escapeMultilineText(text)
-        : escapeTerminalControls(text);
-    } catch {
-      return withheld;
+  return proposal
+    ? screenOperatorProposal(proposal, stateDirectory, scan, proposal.digest)
+    : null;
+}
+
+type RawField = {
+  sources: readonly string[];
+  list: boolean;
+  multiline: boolean;
+  masked?: CredentialSpan[][];
+};
+
+function serializeRawDisplay(
+  fields: { modelText: Record<string, unknown> },
+  rawFields: ReadonlyMap<string, RawField>,
+) {
+  const covered: CredentialSpan[] = [];
+  let text = "";
+  function record(values: Record<string, unknown>) {
+    text += "{";
+    let separator = "";
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) continue;
+      text += separator + JSON.stringify(key) + ":";
+      separator = ",";
+      if (key === "modelText") {
+        record(fields.modelText);
+        continue;
+      }
+      const field = rawFields.get(key);
+      if (!field) {
+        text += JSON.stringify(value);
+        continue;
+      }
+      const start = text.length;
+      if (field.list) text += "[";
+      for (const [index, source] of field.sources.entries()) {
+        if (index) text += ",";
+        for (const span of field.masked?.[index] ?? [])
+          covered.push(serializedTextSpan(source, text.length, span));
+        text += JSON.stringify(source);
+      }
+      if (field.list) text += "]";
+      if (isWithheld(value)) covered.push([start, text.length]);
     }
+    text += "}";
   }
-  async function screenList(text: readonly string[], multiline = false) {
-    if (!text.length) return [];
-    try {
-      await check(...text, JSON.stringify(text));
-      return text.map(multiline ? escapeMultilineText : escapeTerminalControls);
-    } catch {
-      return withheld;
+  record(fields);
+  return { text, covered };
+}
+
+function fieldSources(values: readonly string[], list: boolean) {
+  return list ? [...values, JSON.stringify(values)] : values;
+}
+
+function strictSources(value: unknown): string[] {
+  if (value == null) return [];
+  if (typeof value === "string") return [value];
+  if (typeof value === "object")
+    return [
+      JSON.stringify(value),
+      ...Object.values(value).flatMap(strictSources),
+    ];
+  return [JSON.stringify(value)];
+}
+
+export async function screenOperatorProposal(
+  proposal: ProposalDetails,
+  stateDirectory: string,
+  scan?: CredentialScanner,
+  displayDigest?: string,
+) {
+  const check = proposalCredentialCheck(
+    scan ?? builtInCredentialScanner,
+    displayDigest,
+  );
+  const rawFields = new Map<ProposalScreenedField, RawField>();
+  function screen(
+    field: ProposalScreenedField,
+    text: string,
+    multiline = false,
+  ): string | typeof withheldField {
+    rawFields.set(field, { sources: [text], list: false, multiline });
+    return text;
+  }
+  function screenList(
+    field: ProposalScreenedField,
+    text: readonly string[],
+    multiline = false,
+  ): readonly string[] | typeof withheldField {
+    if (text.length)
+      rawFields.set(field, { sources: text, list: true, multiline });
+    return text;
+  }
+  let candidateSources: readonly (string | Uint8Array)[] = [];
+  let candidateError: { error: unknown } | undefined;
+  async function screenedDisplay<
+    T extends { modelText: Record<string, unknown> },
+  >(fields: T): Promise<T & { maskedFields?: ProposalMaskableField[] }> {
+    const modelText = { ...fields.modelText };
+    const output = { ...fields, modelText };
+    const top: Record<string, unknown> = output;
+    const slots = [...rawFields];
+    const { text: raw } = serializeRawDisplay(fields, rawFields);
+    const strict = [
+      ...Object.entries(top)
+        .filter(
+          ([field]) =>
+            field !== "modelText" &&
+            !rawFields.has(field as ProposalScreenedField),
+        )
+        .flatMap(([, value]) =>
+          isWithheld(value) ? [] : strictSources(value),
+        ),
+      ...Object.entries(modelText)
+        .filter(([field]) => !rawFields.has(field as ProposalScreenedField))
+        .flatMap(([, value]) => strictSources(value)),
+      ...strictSources(
+        proposal.kind === "integration"
+          ? proposal.content.symlinks
+          : proposal.kind === "goal"
+            ? proposal.content.policies
+            : {
+                category: proposal.content.category,
+                dependsOn: proposal.content.dependsOn,
+                environment: proposal.content.environment,
+                policies: proposal.content.policies,
+              },
+      ),
+    ];
+    const [aggregate, metadata, candidate, ...originals] = await check([
+      [raw],
+      strict,
+      candidateSources,
+      ...slots.map(([, { sources, list }]) => fieldSources(sources, list)),
+    ]);
+
+    function set(field: ProposalScreenedField, value: unknown) {
+      if (Object.hasOwn(modelText, field)) modelText[field] = value;
+      else top[field] = value;
     }
+    const maskedFields: ProposalMaskableField[] = [];
+    const rechecks: (readonly string[])[] = [];
+    for (const [index, [field, slot]] of slots.entries()) {
+      if (
+        field === "diffStat" &&
+        (isWithheld(top.changedPaths) ||
+          !credentialScanClean(candidate ?? null))
+      ) {
+        set(field, withheldField);
+        continue;
+      }
+      const { sources, list, multiline } = slot;
+      const result = originals[index] ?? null;
+      const escape = multiline ? escapeMultilineText : escapeTerminalControls;
+      let values = sources;
+      if (!credentialScanClean(result)) {
+        const maskable = proposalMaskableFields.find((name) => name === field);
+        const masks =
+          maskable &&
+          sources.map((source, i) => {
+            const matches = result?.[i];
+            return matches && maskCredentialSpans(source, matches);
+          });
+        const covered: CredentialSpan[] = [];
+        if (!masks || masks.some((mask) => !mask)) {
+          set(field, withheldField);
+          continue;
+        }
+        let itemStart = 1;
+        for (const [i, source] of sources.entries()) {
+          for (const span of masks[i]!.spans)
+            covered.push(serializedTextSpan(source, itemStart, span));
+          itemStart += JSON.stringify(source).length + 1;
+        }
+        if (
+          !covered.length ||
+          covered.length > maxCredentialMasks ||
+          (list &&
+            !credentialScanCovered([result?.[sources.length] ?? null], covered))
+        ) {
+          set(field, withheldField);
+          continue;
+        }
+        values = masks.map((mask) => mask!.text);
+        slot.masked = masks.map((mask) => mask!.spans);
+        maskedFields.push(maskable!);
+      }
+      const escaped = values.map(escape);
+      set(field, list ? escaped : escaped[0]);
+      rechecks.push(fieldSources(values, list));
+      if (escaped.some((value, i) => value !== values[i]))
+        rechecks.push(fieldSources(escaped, list));
+    }
+    if (candidateError && !isWithheld(top.changedPaths))
+      throw candidateError.error;
+
+    const { covered } = serializeRawDisplay(output, rawFields);
+    const display = maskedFields.length ? { ...output, maskedFields } : output;
+    if (
+      credentialScanClean(metadata ?? null) &&
+      credentialScanCovered(aggregate ?? null, covered)
+    ) {
+      const checked = await check([[JSON.stringify(display)], ...rechecks]);
+      if (checked.every(credentialScanClean)) return display;
+    }
+
+    // A match spanning fields cannot reliably be mapped back to the source.
+    for (const field of proposalScreenedFields) {
+      const value = proposalField(top, modelText, field);
+      if (value != null && (!Array.isArray(value) || value.length))
+        set(field, withheldField);
+    }
+    const checked = await check([strict, [JSON.stringify(output)]]);
+    if (!checked.every(credentialScanClean))
+      throw new ClaudeRunError("credential-leak");
+    return output;
   }
   const { ruleId, ruleName, ...policy } = proposalPolicy(proposal);
   const common = {
@@ -177,34 +390,44 @@ export async function operatorProposal(
     goalRef: proposal.goalRef,
     taskRef: proposal.taskRef,
     ...policy,
-    ...(ruleId !== undefined && { ruleId: await screen(ruleId) }),
-    ...(ruleName !== undefined && { ruleName: await screen(ruleName) }),
+    ...(ruleId !== undefined && { ruleId: screen("ruleId", ruleId) }),
+    ...(ruleName !== undefined && {
+      ruleName: screen("ruleName", ruleName),
+    }),
     origin:
       proposal.origin.kind === "actor"
         ? { kind: proposal.origin.kind, actor: proposal.origin.actor }
         : proposal.origin,
   };
   if (proposal.kind === "integration") {
-    const rawStat = await candidateDiffStat(
-      stateDirectory,
-      proposal.content,
-      scan,
+    const changedPaths = screenList(
+      "changedPaths",
+      proposal.content.changedPaths,
     );
-    const changedPaths = await screenList(proposal.content.changedPaths);
-    // The stat repeats changed paths in Git's display format.
-    let diffStat: string | typeof withheld = withheld;
-    if (!("withheld" in changedPaths)) {
-      const escaped = escapeMultilineText(rawStat);
-      try {
-        await check(rawStat, escaped);
-        diffStat = escaped;
-      } catch {}
+    // A diff stat can abbreviate paths. Screen the pinned candidate in the
+    // same batch and withhold the stat if its paths or candidate are blocked.
+    let diffStat: string | typeof withheldField = withheldField;
+    try {
+      const rawStat = await candidateDiffStat(
+        stateDirectory,
+        proposal.content,
+        scan &&
+          (async (...sources) => {
+            candidateSources = sources;
+          }),
+      );
+      if (!rawStat.includes("\ufffd"))
+        diffStat = screen("diffStat", rawStat, true);
+    } catch (error) {
+      candidateError = { error };
     }
     const review = proposal.pinnedReview;
     if (!review || !proposal.budgets)
       throw new Error("Missing integration evidence");
     const { notes } = proposal.content.review;
-    return {
+    const findings =
+      notes === undefined ? null : screen("findings", notes, true);
+    return screenedDisplay({
       ...common,
       kind: proposal.kind,
       diffStat,
@@ -217,35 +440,41 @@ export async function operatorProposal(
       reviewExecutionId: review.executionId,
       modelText: {
         verdict: review.verdict,
-        findings: notes === undefined ? null : await screen(notes, true),
+        findings,
       },
-    };
+    });
   }
   const { content } = proposal;
   const modelText = {
-    description: await screen(content.description, true),
-    acceptance: await screenList(content.acceptance, true),
+    description: screen("description", content.description, true),
+    acceptance: screenList("acceptance", content.acceptance, true),
   };
   const registration = { ...common, diffStat: null, modelText };
   if (proposal.kind === "goal") {
     const { paths, ...scope } = proposal.content.scope;
-    return {
+    const screenedPaths = screenList("paths", paths);
+    return screenedDisplay({
       ...registration,
       kind: proposal.kind,
       ...scope,
-      paths: await screenList(paths),
+      paths: screenedPaths,
       pathViolations: [],
-    };
+    });
   }
-  return {
+  const paths = screenList("paths", proposal.content.paths);
+  const pathViolations = screenList(
+    "pathViolations",
+    proposal.pathViolations ?? [],
+  );
+  return screenedDisplay({
     ...registration,
     kind: proposal.kind,
     budgets: proposal.content.budgets,
-    paths: await screenList(proposal.content.paths),
-    pathViolations: await screenList(proposal.pathViolations ?? []),
+    paths,
+    pathViolations,
     actor: proposal.content.actor,
     profile: proposal.content.profile,
-  };
+  });
 }
 
 export function operatorActivity(source: InboxSource) {

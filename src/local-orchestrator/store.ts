@@ -1527,6 +1527,7 @@ export class OrchestratorStore {
       reasons?: readonly string[];
       takeover?: true;
     },
+    expectedRule?: { ruleId: string | undefined; ruleName: string | undefined },
   ): DecisionReceipt {
     const id = identifier(proposalId);
     const input = fields(answer, [
@@ -1574,6 +1575,12 @@ export class OrchestratorStore {
           : undefined;
       const { gate, policy, source, loosening, ...details } =
         this.#proposalGate(proposal);
+      if (
+        expectedRule &&
+        (details.ruleId !== expectedRule.ruleId ||
+          details.ruleName !== expectedRule.ruleName)
+      )
+        throw new OrchestratorStoreError("stale-policy");
       if (gate === null || policy === null || source === null)
         throw new OrchestratorStoreError("invalid-transition");
       const integration =
