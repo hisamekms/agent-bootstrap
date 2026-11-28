@@ -180,7 +180,7 @@ test("configured proposal screening masks fields and withholds on failed re-scan
   };
   for (const display of [
     await check(["Keep demo-12 private"], ["demo-\\d+", "伏せ字"]),
-    await check(["a".repeat(120) + "!"], ["(a+)+$"]),
+    await check(["a".repeat(120) + "!"], ["^(a+)+$"]),
     await check(
       Array.from(
         { length: 11 },
