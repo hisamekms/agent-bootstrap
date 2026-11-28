@@ -207,6 +207,8 @@ agent-bootstrap --target /path/to/project reject "$proposal_id"
 agent-bootstrap --target /path/to/project approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"
 agent-bootstrap --target /path/to/project export-goal-branch "$goal_id"
 agent-bootstrap --target /path/to/project publish-goal "$goal_id"
+agent-bootstrap --target /path/to/project merge-goal "$goal_id"
+agent-bootstrap --target /path/to/project close-goal-pr "$goal_id"
 agent-bootstrap --target /path/to/project complete-goal "$goal_id"
 agent-bootstrap --target /path/to/project set-auto-merge "$goal_id" off
 ```
@@ -442,6 +444,8 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap verification show | verification clear | verification set --profile <name> -- <argv...>` → { profile, argv } or null for show. { target, current, verification } for set or clear.
 - `agent-bootstrap export-goal-branch <goalId> [--target <checkout>]` → { goalId, checkout, branch, from, to } for the completed export.
 - `agent-bootstrap publish-goal <goalId>` → Goal publish state and PR details.
+- `agent-bootstrap merge-goal <goalId> [--method <squash|merge|rebase>] [--no-checks]` → PR check state preview, followed by the Goal publish state and PR details on confirmation. The confirmation phrase includes the displayed check state.
+- `agent-bootstrap close-goal-pr <goalId>` → Goal publish state and PR details after closing the PR.
 - `agent-bootstrap complete-goal <goalId>` → PR number, merged head and Goal head, followed by the completion receipt on confirmation.
 - `agent-bootstrap set-auto-merge <goalId> <off|squash|merge|rebase>` → { autoMerge, autoMergeSource }
 - `agent-bootstrap analyze [--audit <file>] [--out <dir>] [--sql <file>]` → { report } with human-readable tables, export path, and manual DuckDB command.

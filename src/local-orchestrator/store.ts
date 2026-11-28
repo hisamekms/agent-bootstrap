@@ -12,6 +12,8 @@ import type {
 import { mergedHeadDiffers, remoteGoalBranch } from "../publish/journal.ts";
 import {
   goalMergeCompletionConfirmation,
+  goalPrConfirmation,
+  type GoalPrActions,
   type GoalAutoMergeConfirmations,
 } from "../publish/protocol.ts";
 import {
@@ -2394,13 +2396,20 @@ export class OrchestratorStore {
   goalAutoMergeConfirmations(id: string): GoalAutoMergeConfirmations {
     const current = this.goalAutoMerge(id);
     const head = this.goalIntegrationHead(id) ?? this.getGoal(id)?.baseCommit;
-    const prNumber = this.goalPublishRecord(id)?.pr?.number;
+    const pr = this.goalPublishRecord(id)?.pr;
     return Object.fromEntries(
       autoMergeMethods.map((method) => [
         method,
         createHash("sha256")
           .update(
-            JSON.stringify([id, current.revision, method, head, prNumber]),
+            JSON.stringify([
+              id,
+              current.revision,
+              method,
+              head,
+              pr?.number,
+              pr?.head,
+            ]),
           )
           .digest("hex"),
       ]),
@@ -2422,11 +2431,18 @@ export class OrchestratorStore {
       throw new ContractError();
     return this.#write((at) => {
       const goal = required(this.#goal(identifier(id)));
-      const pr = this.goalPublishRecord(goal.id)?.pr;
-      if (origin === "operator-ui" && !this.goalPublishEnabled)
+      const record = this.goalPublishRecord(goal.id);
+      const pr = record?.pr;
+      if (
+        origin === "operator-ui" &&
+        !this.goalPublishEnabled &&
+        !(pr && autoMerge === "off")
+      )
         throw new OrchestratorStoreError("publish-disabled");
       if (goal.status === "cancelled" || (pr && pr.state !== "open"))
         throw new OrchestratorStoreError("invalid-transition");
+      if (pr && autoMerge !== "off" && pr.head !== record?.pushedHead)
+        throw new OrchestratorStoreError("export-head-mismatch");
       if (this.goalAutoMergeConfirmations(goal.id)[autoMerge] !== confirm)
         throw new OrchestratorStoreError("stale-confirmation");
       this.#event(at, "goal.auto-merge-set", "goal", goal.id, {
@@ -2435,6 +2451,40 @@ export class OrchestratorStore {
       });
       return this.goalAutoMerge(goal.id);
     });
+  }
+
+  goalPrActions(id: string): GoalPrActions {
+    const goal = this.getGoal(id);
+    const record = this.goalPublishRecord(id);
+    const pr = record?.pr;
+    if (
+      !goal ||
+      goal.status === "cancelled" ||
+      pr?.state !== "open" ||
+      record?.prActionOutcome === "unknown"
+    )
+      return {};
+    const autoMerge = this.goalAutoMergeConfirmations(id);
+    const integrationHead = this.goalIntegrationHead(id);
+    if (
+      pr.head !== record?.pushedHead ||
+      pr.head !== (integrationHead ?? goal.baseCommit)
+    )
+      return pr.autoMerge !== "off" ? { autoMerge } : {};
+    return {
+      close: goalPrConfirmation(goal.ref, pr, "close"),
+      ...(integrationHead === pr.head &&
+        this.goalIsPublishReady(id) && {
+          merge: {
+            squash: goalPrConfirmation(goal.ref, pr, "squash"),
+            merge: goalPrConfirmation(goal.ref, pr, "merge"),
+            rebase: goalPrConfirmation(goal.ref, pr, "rebase"),
+          },
+        }),
+      ...(this.goalPublishEnabled || pr.autoMerge !== "off"
+        ? { autoMerge }
+        : {}),
+    };
   }
 
   goalIsPublishReady(id: string) {
@@ -2463,17 +2513,51 @@ export class OrchestratorStore {
     );
   }
 
+  openGoalPullRequests() {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          id: string;
+          ref: string;
+          title: string;
+          number: number;
+          autoMerge: AutoMerge;
+          at: string | null;
+        }>(
+          `SELECT g.id, g.ref, json_extract(g.content_json, '$.title') AS title,
+              json_extract(e.data, '$.record.pr.number') AS number,
+              json_extract(e.data, '$.record.pr.autoMerge') AS autoMerge,
+              coalesce(json_extract(e.data, '$.record.lastCheckedAt'),
+                json_extract(e.data, '$.record.prOpenedAt')) AS at
+            FROM goals g JOIN events e ON e.rowid = (
+              SELECT rowid FROM events WHERE subject_id = g.id
+              AND subject_kind = 'goal' AND kind LIKE 'publish.%'
+              AND json_type(data, '$.record') = 'object' ORDER BY rowid DESC LIMIT 1
+            )
+            WHERE json_extract(e.data, '$.record.pr.state') = 'open'
+            ORDER BY g.rowid`,
+        )
+        .all(),
+    );
+  }
+
   goalPublishRecord(id: string): GoalPublishRecord | null {
     return this.#read(() => {
       const row = this.#db
-        .query<{ data: string }>(
-          `SELECT data FROM events WHERE subject_id = ? AND subject_kind = 'goal'
+        .query<{ at: string; data: string }>(
+          `SELECT at, data FROM events WHERE subject_id = ? AND subject_kind = 'goal'
           AND kind LIKE 'publish.%' AND json_type(data, '$.record') = 'object' ORDER BY rowid DESC LIMIT 1`,
         )
         .get(id);
-      return row
-        ? (JSON.parse(row.data) as { record: GoalPublishRecord }).record
-        : null;
+      if (!row) return null;
+      const { record } = JSON.parse(row.data) as { record: GoalPublishRecord };
+      const code = record.failure;
+      // Older journal records stored PR action failures as publish failures.
+      if (code === "publish-merge-failed" || code === "publish-close-failed") {
+        delete record.failure;
+        record.prActionFailure ??= { code, at: row.at };
+      }
+      return record;
     });
   }
 
@@ -2516,11 +2600,28 @@ export class OrchestratorStore {
       if (record && record.destination.branch !== remoteGoalBranch(goal))
         throw new OrchestratorStoreError("context-mismatch");
       if (authorization) {
+        const integrationHead = this.goalIntegrationHead(id);
+        const head = gitCommit(authorization.head);
+        if (authorization.prNumber !== undefined) {
+          const latest = this.goalPublishRecord(id);
+          if (
+            goal.status === "cancelled" ||
+            latest?.pr?.state !== "open" ||
+            latest.pr.number !== authorization.prNumber ||
+            latest.prActionOutcome === "unknown"
+          )
+            throw new OrchestratorStoreError("invalid-transition");
+          if (
+            latest.pr.head !== head ||
+            latest.pushedHead !== head ||
+            (authorization.requireFinished && integrationHead !== head)
+          )
+            throw new OrchestratorStoreError("export-head-mismatch");
+        }
         if (
           goal.status === "cancelled" ||
           this.#goalIntegrationInProgress(id) ||
-          (this.goalIntegrationHead(id) ?? goal.baseCommit) !==
-            gitCommit(authorization.head)
+          (integrationHead ?? goal.baseCommit) !== head
         )
           throw new OrchestratorStoreError("export-head-mismatch");
         if (authorization.requireFinished && !this.goalIsPublishReady(id))
@@ -4579,6 +4680,7 @@ export class OrchestratorStore {
           'goal.registered', 'goal.status', 'goal.base-pinned', 'goal.base-updated',
           'goal.exported', 'goal.auto-merge-set', 'publish.pushed', 'publish.pr-opened',
           'publish.auto-merge-set', 'publish.auto-merge-unavailable', 'publish.failed', 'publish.polled',
+          'publish.pr-merged', 'publish.pr-closed',
           'task.registered', 'task.auto-registered', 'task.status', 'task.integrated',
           'task.retried', 'task.budget-exceeded',
           'goal.proposed', 'task.proposed', 'proposal.created', 'proposal.blocked', 'proposal.decided',

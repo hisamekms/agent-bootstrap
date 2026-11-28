@@ -1953,7 +1953,8 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
   elements.get("tab-goals")!.dispatchEvent(new Event("click"));
   await settle();
   const goals = elements.get("goal-content")!;
-  assert.ok(byName(goals, "あなたの番。 PR #12"));
+  assert.ok(byName(goals, "PR のマージ"));
+  assert.match(goals.visibleText, /PR #12マージできます/);
   const prLink = goals.find(
     (node) => node.tag === "a" && node.textContent === "PR #12",
   )!;
@@ -2047,7 +2048,7 @@ test("Goal publishing binds the fresh head and refreshes conflicts before accept
   render();
   assert.equal(findAction(key, root)?.textContent, "もう一度送る");
   assert.ok(findAction(`publish-discard:${id}`, root));
-  assert.equal(byName(root, "自動マージの方式")?.disabled, true);
+  assert.equal(byName(root, "マージの方式"), undefined);
   assert.match(root.textContent, /クローズ済み/);
   click(key, root);
   await settle();
@@ -2081,7 +2082,7 @@ test("Goal publishing binds the fresh head and refreshes conflicts before accept
   ]);
 });
 
-test("Goal overview limits PR links and confirms the selected auto-merge method", async (t) => {
+test("Goal overview shows PR facts, confirms its project method, and limits links", async (t) => {
   const { click, findAction } = decisionDocument(t);
   const methods = createPreviewMethods(
     () => {},
@@ -2096,8 +2097,8 @@ test("Goal overview limits PR links and confirms the selected auto-merge method"
     },
   };
   const root = new TestElement();
-  const goal = methods["goal.get"]({ id: "G12" });
-  const key = `auto-merge:${goal.id}`;
+  const ready = methods["goal.get"]({ id: "G11" });
+  ready.publish.mergeMethod = "merge";
   const render = (detail: GoalDetail) =>
     root.replaceChildren(
       ...(goalPublishPanel(
@@ -2107,89 +2108,269 @@ test("Goal overview limits PR links and confirms the selected auto-merge method"
         () => {},
       ) as unknown as TestElement[]),
     );
-  render(goal);
+  render(ready);
   const link = root.find(({ tag }) => tag === "a")!;
-  assert.equal(link.attributes.get("href"), goal.publish.prUrl);
+  assert.equal(link.attributes.get("href"), ready.publish.prUrl);
   assert.equal(link.attributes.get("target"), "_blank");
   assert.equal(link.attributes.get("rel"), "noopener noreferrer");
-  assert.match(root.visibleText, /チェック失敗.*この Goal の設定/);
-  const control = byName(root, "自動マージの方式")!;
-  assert.equal(control.value, "squash");
-  assert.equal(findAction(key, root)?.hidden, true);
-  control.value = "rebase";
-  control.dispatchEvent(new Event("change"));
-  assert.equal(findAction(key, root)?.hidden, false);
-  click(key, root);
+  assert.match(
+    root.visibleText,
+    /最終確認.*チェック.*build.*test.*レビュー承認.*変更3 ファイル\+57−4.*ぶつかりなし/,
+  );
+  assert.match(root.visibleText, /merge（既定）/);
+  assert.equal(
+    findAction(`pr-merge:${ready.id}`, root)?.visibleText,
+    "マージ（merge）",
+  );
+  assert.equal(
+    findAction(`pr-auto:${ready.id}`, root)?.visibleText,
+    "自動マージ",
+  );
+  assert.equal(
+    findAction(`pr-close:${ready.id}`, root)?.visibleText,
+    "PR を閉じる",
+  );
+  const noChecks = {
+    ...ready,
+    publish: {
+      ...ready.publish,
+      checks: "none" as const,
+      checkRuns: [],
+      checkCounts: { pass: 0, pending: 0, fail: 0 },
+    },
+  };
+  render(noChecks);
+  assert.ok(
+    root.find(
+      (node) =>
+        node.className === "chip neutral" &&
+        node.visibleText === "チェックなし",
+    ),
+  );
+  assert.equal(
+    findAction(`pr-merge:${ready.id}`, root)?.className,
+    "btn secondary",
+  );
+  assert.ok(findAction(`pr-auto:${ready.id}`, root));
+  click(`pr-merge:${ready.id}`, root);
+  assert.match(root.visibleText, /チェックがありません/);
+  click(`pr-merge:${ready.id}:cancel`, root);
+  render({
+    ...ready,
+    publish: { ...ready.publish, checks: "unknown", checkRuns: [] },
+  });
+  assert.match(root.visibleText, /チェックの状態は不明/);
+  assert.equal(findAction(`pr-merge:${ready.id}`, root), undefined);
+  assert.ok(findAction(`pr-auto:${ready.id}`, root));
+  render({
+    ...ready,
+    publish: { ...ready.publish, prActionOutcome: "unknown" },
+    prActions: {},
+  });
+  assert.match(root.visibleText, /結果を確認中/);
+  assert.equal(findAction(`pr-merge:${ready.id}`, root), undefined);
+  render(ready);
+  const select = byName(root, "マージの方式")!;
+  select.value = "rebase";
+  select.dispatchEvent(new Event("change"));
+  click(`pr-merge:${ready.id}`, root);
+  assert.match(
+    root.visibleText,
+    /PR #12 を rebase でマージします。 チェックは通過しています。/,
+  );
+  click(`pr-merge:${ready.id}:cancel`, root);
+  assert.equal(ready.prState, "open");
+  click(`pr-merge:${ready.id}`, root);
+  click(`pr-merge:${ready.id}:confirm`, root);
   await settle();
-  assert.equal(control.disabled, true);
-  assert.match(root.visibleText, /自動マージを「リベース」に変更します/);
-  click(`${key}:cancel`, root);
-  assert.equal(control.disabled, false);
-  control.value = "squash";
-  control.dispatchEvent(new Event("change"));
-  assert.equal(findAction(key, root)?.hidden, true);
-  control.value = "rebase";
-  control.dispatchEvent(new Event("change"));
-  click(key, root);
-  await settle();
-  assert.equal(goal.publish.autoMerge, "squash");
-  click(`${key}:confirm`, root);
-  await settle();
-  assert.equal(control.disabled, false);
-  assert.equal(goal.publish.autoMerge, "rebase");
-  const publish = { ...goal.publish };
+  assert.equal(ready.status, "done");
+  render(ready);
+  assert.match(root.visibleText, /マージ済み/);
+  assert.equal(findAction(`pr-merge:${ready.id}`, root), undefined);
+
+  const failed = methods["goal.get"]({ id: "G12" });
   for (const prUrl of [
     "https://github.com/example/example/issues/13",
     "https://github.com/example/example/pull/14",
     "https://github.com/example/example/pull/13/files",
     "https://github.com/example/example/pull/13?x=1",
     "https://github.com/../example/pull/13",
+    "https://github.com.example.org/pull/13",
   ]) {
-    render({ ...goal, publish: { ...publish, prUrl } });
+    render({ ...failed, publish: { ...failed.publish, prUrl } });
     assert.equal(
       root.find(({ tag }) => tag === "a"),
       undefined,
       prUrl,
     );
   }
-  render({
-    ...goal,
-    publish: {
-      ...goal.publish,
-      enabled: false,
-      prUrl: "https://github.com.example.org/pull/13",
-    },
-  });
-  assert.equal(
-    root.find(({ tag }) => tag === "a"),
-    undefined,
+  render(failed);
+  assert.match(root.visibleText, /チェック失敗.*PR を見るPR を閉じる/);
+  assert.equal(byName(root, "マージの方式"), undefined);
+  click(`pr-close:${failed.id}`, root);
+  assert.match(
+    root.visibleText,
+    /PR #13 を閉じます。Goal は「止まっている」に移ります。/,
   );
-  assert.ok(byName(root, "自動マージの方式")?.disabled);
-  assert.equal(findAction(key, root), undefined);
-  assert.match(root.visibleText, /プロジェクトで PR 公開が無効/);
+  click(`pr-close:${failed.id}:confirm`, root);
+  await settle();
+  render(failed);
+  assert.ok(findAction(`publish-discard:${failed.id}`, root));
+
+  const pending = methods["goal.get"]({ id: "G16" });
+  render(pending);
+  assert.match(
+    root.visibleText,
+    /自動マージは使えません（GitHub の設定を確認してください）/,
+  );
+  assert.equal(findAction(`pr-merge:${pending.id}`, root), undefined);
+  assert.equal(
+    findAction(`pr-auto:${pending.id}`, root)?.visibleText,
+    "自動マージ",
+  );
+
+  const armed = methods["goal.get"]({ id: "G18" });
+  render(armed);
+  assert.match(
+    root.visibleText,
+    /チェックが通ったら、GitHub が squash でマージします。/,
+  );
+  assert.equal(
+    findAction(`pr-off:${armed.id}`, root)?.visibleText,
+    "自動マージを解除",
+  );
+  assert.equal(findAction(`pr-merge:${armed.id}`, root), undefined);
+
   render(methods["goal.get"]({ id: "G14" }));
   assert.match(
     root.visibleText,
     /自動マージを解除できない.*GitHub で PR の自動マージを解除/,
   );
-  const unavailable = methods["goal.get"]({ id: "G16" });
-  render(unavailable);
-  assert.match(
-    root.visibleText,
-    /自動マージは使えません（GitHub の設定を確認してください）/,
+});
+
+test("Workplace PR cards use a split menu, confirm the choice, and move armed PRs out of the counts", async (t) => {
+  const { inbox, elements, click, findAction } = hostDocument(t);
+  const methods = createPreviewMethods(
+    () => {},
+    () => {},
   );
-  assert.equal(findAction(`publish:${unavailable.id}`, root), undefined);
-  const closed = methods["goal.get"]({ id: "G13" });
-  render({
-    ...closed,
-    publish: {
-      ...closed.publish,
-      state: "failed",
-      failure: "publish-non-fast-forward",
+  methods["goal.get"]({ id: "G11" }).publish.prActionFailure = {
+    code: "publish-merge-failed",
+    at: "2026-11-28T00:00:00.000Z",
+  };
+  const host = createHostPanel({
+    socket: { readyState: 1 },
+    async request<M extends keyof Methods>(
+      method: M,
+      params: Methods[M]["params"],
+    ) {
+      return methods[method](params);
     },
-  });
-  assert.ok(byName(root, "自動マージの方式")?.disabled);
-  assert.ok(findAction(`publish-discard:${closed.id}`, root));
+  } as unknown as WorkplaceChannel);
+  const ready = "goal-G11";
+  const failed = "goal-G12";
+  const pending = "goal-G16";
+  const conflict = "goal-G17";
+  const armed = "goal-G18";
+  const badge = elements.get("badge-decisions")!;
+  const pill = elements.get("now-toggle")!;
+  elements.get("now-popover")!.hidden = true;
+  host.connect();
+  await settle();
+  assert.equal(badge.textContent, "12");
+  assert.match(pill.title, /あなたの番 12 件/);
+  assert.ok(byName(inbox, "PR のマージ"));
+  assert.ok(byName(inbox, "通過 5"));
+  assert.ok(byName(inbox, "GitHub のレビュー 承認"));
+  assert.match(inbox.visibleText, /3 ファイル\+57−4/);
+  assert.match(inbox.visibleText, /PR をマージできませんでした/);
+  assert.equal(
+    findAction(`pr-merge:${ready}`, inbox)?.visibleText,
+    "マージ（squash）",
+  );
+  assert.equal(findAction(`pr-close:${ready}`, inbox), undefined);
+  click(`pr-method:${ready}`, inbox);
+  const menu = byName(inbox, "マージの方式")!;
+  assert.equal(menu.attributes.get("role"), "menu");
+  const rebase = findAction(`pr-method:${ready}:rebase`, inbox)!;
+  assert.equal(rebase.attributes.get("role"), "menuitemradio");
+  assert.match(rebase.visibleText, /コミットを main に積み直す/);
+  assert.equal(
+    findAction(`pr-method:${ready}:squash`, inbox)?.attributes.get(
+      "aria-checked",
+    ),
+    "true",
+  );
+  click(`pr-method:${ready}:rebase`, inbox);
+  assert.equal(menu.hidden, true);
+  click(`pr-merge:${ready}`, inbox);
+  assert.match(inbox.visibleText, /PR #12 を rebase でマージします。/);
+  assert.equal(
+    findAction(`pr-merge:${ready}:confirm`, inbox)?.visibleText,
+    "マージを確定",
+  );
+  click(`pr-merge:${ready}:cancel`, inbox);
+
+  assert.match(inbox.visibleText, /チェック失敗 1（test）/);
+  assert.match(inbox.visibleText, /main とぶつかっています/);
+  assert.equal(findAction(`pr-auto:${failed}`, inbox), undefined);
+  assert.equal(findAction(`pr-merge:${conflict}`, inbox), undefined);
+  assert.equal(
+    findAction(`pr-close:${failed}`, inbox)?.visibleText,
+    "PR を閉じる",
+  );
+  assert.equal(
+    findAction(`pr-close:${conflict}`, inbox)?.visibleText,
+    "PR を閉じる",
+  );
+
+  const waiting = inbox
+    .querySelectorAll("details.fold")
+    .find((fold) => fold.visibleText.includes("自動マージ待ち"))!;
+  assert.equal(waiting.open, false);
+  assert.equal(waiting.visibleText, "自動マージ待ち（1 件）");
+  waiting.open = true;
+  waiting.dispatchEvent(new Event("toggle"));
+  assert.match(waiting.visibleText, /G18.*チェック中 1squash解除/);
+
+  assert.match(inbox.visibleText, /チェック中のため、いまはマージできません/);
+  click(`pr-method:${pending}`, inbox);
+  click(`pr-method:${pending}:merge`, inbox);
+  click(`pr-auto:${pending}`, inbox);
+  assert.match(
+    inbox.visibleText,
+    /チェックが通ったら、PR #17 を merge で自動マージします。/,
+  );
+  click(`pr-auto:${pending}:confirm`, inbox);
+  await settle();
+  assert.equal(badge.textContent, "11");
+  assert.match(pill.title, /あなたの番 11 件/);
+  assert.match(inbox.visibleText, /自動マージ待ち（2 件）/);
+
+  click(`pr-off:${armed}`, inbox);
+  assert.match(inbox.visibleText, /PR #19 の自動マージを解除します。/);
+  click(`pr-off:${armed}:confirm`, inbox);
+  await settle();
+  assert.equal(badge.textContent, "12");
+  assert.match(pill.title, /あなたの番 12 件/);
+
+  elements.get("tab-goals")!.dispatchEvent(new Event("click"));
+  await settle();
+  const goals = elements.get("goal-content")!;
+  assert.equal(findAction(`inline:${pending}`, goals), undefined);
+  click(`inline:${ready}`, goals);
+  assert.ok(findAction(`pr-merge:${ready}`, goals));
+  click(ready, goals);
+  await settle();
+  click("task-G11-1", goals);
+  await settle();
+  assert.match(goals.visibleText, /この Task は PR #12 に含まれます/);
+  assert.equal(
+    goals
+      .find((node) => node.tag === "a" && node.textContent === "PR #12")
+      ?.attributes.get("rel"),
+    "noopener noreferrer",
+  );
 });
 
 test("Goal overview confirms the PR and commits a manual completion", async (t) => {

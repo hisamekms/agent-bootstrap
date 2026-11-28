@@ -1,14 +1,17 @@
 import type {
+  PublishConfig,
   PublishDestination,
   PublishFailure,
   PublishPullRequest,
 } from "./port.ts";
-import type { GoalPublishView } from "./protocol.ts";
+import type { GoalPrActionFailure, GoalPublishView } from "./protocol.ts";
 
 export type PublishEventKind =
   | "publish.authorized"
   | "publish.pushed"
   | "publish.pr-opened"
+  | "publish.pr-merged"
+  | "publish.pr-closed"
   | "publish.auto-merge-set"
   | "publish.auto-merge-unavailable"
   | "publish.completed-manually"
@@ -19,6 +22,7 @@ export interface PublishAuthorization {
   head: string;
   requireFinished: boolean;
   autoMergeRevision?: number | undefined;
+  prNumber?: number;
 }
 
 export type PublishMutation =
@@ -42,6 +46,8 @@ export interface GoalPublishRecord {
   pr?: PublishPullRequest;
   lastCheckedAt?: string;
   prOpenedAt?: string;
+  prActionOutcome?: "unknown" | undefined;
+  prActionFailure?: GoalPrActionFailure | undefined;
   failure?: PublishFailure | undefined;
   autoMergeUnavailable?: true | undefined;
   disarmFailure?: "auto-merge-disarm-failed" | undefined;
@@ -73,7 +79,7 @@ export function mergedHeadDiffers(
 }
 
 export function publishView(
-  enabled: boolean,
+  config: PublishConfig,
   branch: string,
   record: GoalPublishRecord | null,
   setting: {
@@ -82,6 +88,7 @@ export function publishView(
   },
   currentHead: string | null,
 ): GoalPublishView {
+  const { enabled, mergeMethod } = config;
   const { pr, pushedHead, lastCheckedAt } = record ?? {};
   const code = pr?.state === "merged" ? undefined : publishFailure(record);
   const state =
@@ -108,13 +115,27 @@ export function publishView(
     branch,
     autoMerge: setting.method,
     autoMergeSource: setting.source,
-    ...(pr && {
-      prNumber: pr.number,
-      prUrl: pr.url,
-      ...(pr.checks && { checks: pr.checks }),
-      ...(pr.autoMerge !== "off" && { autoMergeEnabled: pr.autoMerge }),
-    }),
+    ...(pr &&
+      record && {
+        prNumber: pr.number,
+        prUrl: pr.url,
+        base: record.destination.base,
+        mergeMethod,
+        ...(pr.checkRuns !== undefined && { checkRuns: pr.checkRuns }),
+        ...(pr.checkCounts !== undefined && { checkCounts: pr.checkCounts }),
+        ...(pr.mergeable !== undefined && { mergeable: pr.mergeable }),
+        ...(pr.review !== undefined && { review: pr.review }),
+        ...(pr.additions !== undefined && { additions: pr.additions }),
+        ...(pr.deletions !== undefined && { deletions: pr.deletions }),
+        ...(pr.changedFiles !== undefined && { changedFiles: pr.changedFiles }),
+        ...(pr.checks && { checks: pr.checks }),
+        ...(pr.state === "open" &&
+          pr.autoMerge !== "off" && { autoMergeEnabled: pr.autoMerge }),
+      }),
     ...(lastCheckedAt && { lastCheckedAt }),
+    ...(record?.prActionOutcome && { prActionOutcome: record.prActionOutcome }),
+    ...(pr?.state === "open" &&
+      record?.prActionFailure && { prActionFailure: record.prActionFailure }),
     ...(pr?.state === "open" &&
       (record?.autoMergeUnavailable ||
         record?.failure === "auto-merge-unavailable") && {

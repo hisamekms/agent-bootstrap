@@ -35,6 +35,8 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "goal.publish",
   "goal.completeAfterMerge",
   "goal.setAutoMerge",
+  "goal.merge",
+  "goal.closePr",
   "goal.updateBase",
   "environment.status",
   "environment.buildPreview",

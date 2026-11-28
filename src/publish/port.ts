@@ -1,4 +1,6 @@
-export const autoMergeMethods = ["off", "squash", "merge", "rebase"] as const;
+export const mergeMethods = ["squash", "merge", "rebase"] as const;
+export type MergeMethod = (typeof mergeMethods)[number];
+export const autoMergeMethods = ["off", ...mergeMethods] as const;
 export type AutoMerge = (typeof autoMergeMethods)[number];
 
 export interface PublishConfig {
@@ -6,6 +8,7 @@ export interface PublishConfig {
   remote: string;
   base: string;
   autoMerge: AutoMerge;
+  mergeMethod: MergeMethod;
 }
 
 export function validPublishRef(value: unknown): value is string {
@@ -36,6 +39,7 @@ export const publishDefaults: PublishConfig = {
   remote: "origin",
   base: "main",
   autoMerge: "off",
+  mergeMethod: "squash",
 };
 
 export interface PublishDestination {
@@ -45,8 +49,21 @@ export interface PublishDestination {
   branch: string;
 }
 
-export type PublishChecks = "pending" | "failed" | "passed";
-export interface PublishPullRequest {
+export type PublishChecks =
+  "none" | "pending" | "failed" | "passed" | "unknown";
+export type PublishCheckState = "pass" | "pending" | "fail";
+
+export interface PublishPrFacts {
+  checkRuns?: { name: string; state: PublishCheckState }[];
+  checkCounts?: Record<PublishCheckState, number>;
+  mergeable?: "clean" | "conflict" | "blocked" | "unknown";
+  review?: "approved" | "changes-requested" | "review-required" | "none";
+  additions?: number;
+  deletions?: number;
+  changedFiles?: number;
+}
+
+export interface PublishPullRequest extends PublishPrFacts {
   number: number;
   url: string;
   state: "open" | "merged" | "closed";
@@ -72,6 +89,13 @@ export type PublishFailure =
   | "publish-screen-blocked"
   | "publish-push-failed"
   | "publish-pr-failed"
+  | "publish-merge-failed"
+  | "publish-close-failed"
+  | "publish-checks-failed"
+  | "publish-checks-pending"
+  | "publish-checks-unknown"
+  | "publish-not-mergeable"
+  | "publish-no-checks"
   | "publish-auto-merge-failed"
   | "auto-merge-disarm-failed"
   | "auto-merge-unavailable"
@@ -108,6 +132,16 @@ export interface PublishProvider {
     destination: PublishDestination,
     title: string,
     body: string,
+  ): Promise<void>;
+  mergePullRequest(
+    destination: PublishDestination,
+    number: number,
+    method: MergeMethod,
+    expectedHead: string,
+  ): Promise<void>;
+  closePullRequest(
+    destination: PublishDestination,
+    number: number,
   ): Promise<void>;
   setAutoMerge(
     destination: PublishDestination,

@@ -5,6 +5,7 @@ import {
 import type { GoalPublisher } from "../publish/goals.ts";
 import {
   autoMergeMethods,
+  mergeMethods,
   PublishError,
   type PublishFailure,
 } from "../publish/port.ts";
@@ -89,7 +90,7 @@ interface OperatorApiOptions extends InboxSource {
   workplace?: { signal: AbortSignal; stop(): void };
   environment?: WorkplaceEnvironment;
   publisher?: Pick<GoalPublisher, "publish"> &
-    Partial<Pick<GoalPublisher, "wake">>;
+    Partial<Pick<GoalPublisher, "wake" | "actOnPullRequest">>;
 }
 
 type GoalExportTarget = Pick<
@@ -157,6 +158,8 @@ const shutdownBlockedMethods = new Set([
   "goal.publish",
   "goal.completeAfterMerge",
   "goal.setAutoMerge",
+  "goal.merge",
+  "goal.closePr",
   "goal.updateBase",
   "proposal.answer",
   "proposal.answerMany",
@@ -386,7 +389,12 @@ export async function operatorAction(
 export async function goalPublishAction(
   store: OrchestratorStore,
   publisher: OperatorApiOptions["publisher"],
-  method: "goal.publish" | "goal.setAutoMerge" | "goal.completeAfterMerge",
+  method:
+    | "goal.publish"
+    | "goal.setAutoMerge"
+    | "goal.completeAfterMerge"
+    | "goal.merge"
+    | "goal.closePr",
   params: unknown,
 ): Promise<Reply> {
   try {
@@ -426,6 +434,30 @@ export async function goalPublishAction(
         };
       }
       return { result: await publisher.publish(goal.id, head, expectedPr) };
+    }
+    if (method === "goal.merge" || method === "goal.closePr") {
+      const input = fields(
+        params,
+        method === "goal.merge"
+          ? ["id", "method", "confirm", "noChecks"]
+          : ["id", "confirm"],
+      );
+      const id = identifier(input.id);
+      const operation =
+        method === "goal.merge" ? oneOf(input.method, mergeMethods) : "close";
+      if (typeof input.confirm !== "string") throw new ContractError();
+      if (Object.hasOwn(input, "noChecks") && input.noChecks !== true)
+        throw new ContractError();
+      if (!publisher?.actOnPullRequest) return failure("publish-disabled");
+      return {
+        result: await publisher.actOnPullRequest(
+          id,
+          operation,
+          input.confirm,
+          "operator-ui",
+          input.noChecks === true,
+        ),
+      };
     }
     const input = fields(params, ["id", "method", "confirm"]);
     const id = identifier(input.id);
@@ -798,6 +830,8 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         case "goal.publish":
         case "goal.completeAfterMerge":
         case "goal.setAutoMerge":
+        case "goal.merge":
+        case "goal.closePr":
           return goalPublishAction(store, options.publisher, method, params);
         case "workplace.stopPreview":
         case "workplace.stop":

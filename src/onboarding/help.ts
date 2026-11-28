@@ -152,6 +152,8 @@ export const helpTopics = {
       `${target} approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"`,
       `${target} export-goal-branch "$goal_id"`,
       `${target} publish-goal "$goal_id"`,
+      `${target} merge-goal "$goal_id"`,
+      `${target} close-goal-pr "$goal_id"`,
       `${target} complete-goal "$goal_id"`,
       `${target} set-auto-merge "$goal_id" off`,
     ],
@@ -388,6 +390,16 @@ export const operatorOutputs = {
     usage: "publish-goal <goalId>",
     json: "Goal publish state and PR details.",
     next: "Use events --subject <goalId> to inspect the publish audit.",
+  },
+  "merge-goal": {
+    usage: "merge-goal <goalId> [--method <squash|merge|rebase>] [--no-checks]",
+    json: "PR check state preview, followed by the Goal publish state and PR details on confirmation. The confirmation phrase includes the displayed check state.",
+    next: "Use set-auto-merge while checks are pending or unknown. Use events --subject <goalId> to inspect the merge and Goal status.",
+  },
+  "close-goal-pr": {
+    usage: "close-goal-pr <goalId>",
+    json: "Goal publish state and PR details after closing the PR.",
+    next: "Review the Goal or use publish-goal to send it again.",
   },
   "complete-goal": {
     usage: "complete-goal <goalId>",
