@@ -1,5 +1,5 @@
 import { goalPublishConfirmation } from "../src/publish/protocol.ts";
-import { GoalPublisher } from "../src/publish/goals.ts";
+import { buildGoalPullRequest, GoalPublisher } from "../src/publish/goals.ts";
 import {
   PublishError,
   type PublishProvider,
@@ -11,6 +11,7 @@ import { identifyEnvironment } from "../src/environments/adapter.ts";
 import { bunAdapter } from "../src/environments/bun.ts";
 import {
   operatorActivity,
+  operatorGoalList,
   operatorProblems,
   operatorTask,
 } from "../src/local-orchestrator/operator-read.ts";
@@ -2166,7 +2167,7 @@ test("approval keeps usage when a human answers while the Reviewer runs", async 
 function stage3Fixture(
   state: TaskState,
   policies?: PolicySet,
-  verification?: "pass" | "deny-integration",
+  verification?: "pass" | "deny-integration" | "revise-review",
   runnerOverrides?: Parameters<typeof runner>[2],
   title?: string,
 ) {
@@ -2211,7 +2212,14 @@ function stage3Fixture(
           id: id!,
           outcome: "ok",
           response: Buffer.from(
-            JSON.stringify({ result: '{"review":"pass"}' }),
+            JSON.stringify({
+              result: JSON.stringify({
+                review:
+                  verification === "revise-review" && workers === 1
+                    ? "revise"
+                    : "pass",
+              }),
+            }),
           ),
         };
       },
@@ -2373,6 +2381,7 @@ test("runner skips raced integrations and processes another Goal in the same dra
   const codes = [
     "invalid-transition",
     "goal-inactive",
+    "goal-pr-open",
     "integration-uncertain",
   ] as const;
   for (let i = 0; i <= codes.length; i++) task(store, goal(store));
@@ -4830,9 +4839,14 @@ function fakePublishRemote() {
         controls.pr = { ...controls.pr, head };
       }
     },
-    async findPullRequest() {
+    async findPullRequest(_destination, recoveringHead, afterPrNumber = 0) {
       calls.push("find-pr");
-      return observedPr();
+      const pr = observedPr();
+      return pr &&
+        pr.number > afterPrNumber &&
+        (pr.state === "open" || pr.head === recoveringHead)
+        ? pr
+        : null;
     },
     async readPullRequest() {
       calls.push("read-pr");
@@ -4851,9 +4865,10 @@ function fakePublishRemote() {
       files.push({ title, body });
       assert.ok(remoteHead);
       assert.equal(destination.base, "main");
+      const number = (controls.pr?.number ?? 11) + 1;
       controls.pr = {
-        number: 12,
-        url: "https://github.com/fixture/project/pull/12",
+        number,
+        url: `https://github.com/fixture/project/pull/${number}`,
         head: remoteHead,
         state: "open",
         autoMerge: "off",
@@ -4887,6 +4902,9 @@ function fakePublishRemote() {
       controls.pr = { ...controls.pr, head };
       remoteHead = head;
     },
+    deleteBranch() {
+      remoteHead = null;
+    },
   };
 }
 
@@ -4898,21 +4916,42 @@ async function integratedGoal(state: TaskState, title?: string) {
   return { ...fixture, integratedHead: proposal.content.candidate };
 }
 
+// Model journal state from before Task changes were blocked while a PR was open.
+async function withLegacyOpenPr<T>(
+  store: OrchestratorStore,
+  goalId: string,
+  fn: () => T | Promise<T>,
+) {
+  const record = store.goalPublishRecord(goalId)!;
+  assert.equal(record.pr?.state, "open");
+  store.recordGoalPublish(goalId, "publish.polled", {
+    ...record,
+    pr: { ...record.pr!, state: "closed" },
+  });
+  try {
+    return await fn();
+  } finally {
+    store.recordGoalPublish(goalId, "publish.polled", record);
+  }
+}
+
 async function integrateNext(
   state: TaskState,
   f: ReturnType<typeof stage3Fixture>,
 ) {
-  const taskId = task(state.store, f.goalId);
-  await f.work.drain();
-  const proposal = state.store
-    .pendingIntegrations()
-    .find(
-      (item) => item.kind === "integration" && item.content.taskId === taskId,
-    );
-  assert.ok(proposal?.kind === "integration");
-  approve(state.store, proposal);
-  await f.work.drain();
-  return proposal.content.candidate;
+  return withLegacyOpenPr(state.store, f.goalId, async () => {
+    const taskId = task(state.store, f.goalId);
+    await f.work.drain();
+    const proposal = state.store
+      .pendingIntegrations()
+      .find(
+        (item) => item.kind === "integration" && item.content.taskId === taskId,
+      );
+    assert.ok(proposal?.kind === "integration");
+    approve(state.store, proposal);
+    await f.work.drain();
+    return proposal.content.candidate;
+  });
 }
 
 function publishAudit(db: InstanceType<typeof Database>) {
@@ -4922,6 +4961,431 @@ function publishAudit(db: InstanceType<typeof Database>) {
     )
     .all();
 }
+
+test(
+  "Goal stays active through pending, push and PR closure, and can be published again or discarded",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-publish-");
+    const { store } = state;
+    const f = stage3Fixture(state);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true },
+    );
+    const now = Date.now();
+    await publisher.tick(now);
+    const proposal = await f.proposal();
+    approve(store, proposal);
+    await f.work.drain();
+    const expectedHead = proposal.content.candidate;
+    async function detail() {
+      const detail = (await readOperatorGoal(store, f.directory, f.goalId))!;
+      const summary = operatorGoalList(store, "active")[0]!;
+      assert.equal(detail.status, "active");
+      assert.deepEqual(summary.turn, detail.turn);
+      assert.deepEqual(summary.publish, detail.publish);
+      return detail;
+    }
+    assert.partialDeepStrictEqual(await detail(), {
+      turn: { owner: "ai", reason: { kind: "publishing" } },
+      publish: { state: "pending" },
+      publishPreview: { expectedHead },
+    });
+    remote.controls.beforePush = async () => {
+      assert.partialDeepStrictEqual(await detail(), {
+        turn: { owner: "ai", reason: { kind: "publishing" } },
+        publish: { state: "pushing" },
+      });
+    };
+    await publisher.tick(now + 1);
+    assert.deepEqual((await detail()).turn, {
+      owner: "human",
+      reason: {
+        kind: "pr-open",
+        prNumber: 12,
+        checks: "pending",
+        autoMerge: "off",
+      },
+    });
+
+    remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
+    await publisher.tick(now + 100_000);
+    const closed = await detail();
+    assert.deepEqual(closed.turn, {
+      owner: "stopped",
+      reason: { kind: "pr-closed", prNumber: 12 },
+    });
+    assert.deepEqual(closed.publishPreview, { expectedHead });
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.setAutoMerge", {
+        id: f.goalId,
+        method: "squash",
+        confirm: closed.autoMergeConfirmations.squash,
+      }),
+      { error: { code: "invalid-transition" } },
+    );
+
+    const confirmed = {
+      id: f.goalId,
+      expectedHead,
+      confirm: goalPublishConfirmation("G1", expectedHead),
+      expectedPr: { number: 12, state: "closed" },
+    } as const;
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.publish", {
+        ...confirmed,
+        expectedPr: null,
+      }),
+      { error: { code: "stale-confirmation" } },
+    );
+    remote.controls.pr = { ...remote.controls.pr!, state: "open" };
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.publish", confirmed),
+      { error: { code: "stale-confirmation" } },
+    );
+    assert.equal((await detail()).turn.reason.kind, "pr-open");
+    assert.equal(remote.mutations.length, 2);
+    remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
+    await publisher.tick(now + 200_000);
+    const reply = await goalPublishAction(
+      store,
+      publisher,
+      "goal.publish",
+      confirmed,
+    );
+    assert.partialDeepStrictEqual(reply, {
+      result: { prNumber: 13, state: "pr-open" },
+    });
+    assert.deepEqual((await detail()).turn, {
+      owner: "human",
+      reason: {
+        kind: "pr-open",
+        prNumber: 13,
+        checks: "pending",
+        autoMerge: "off",
+      },
+    });
+    assert.equal(
+      remote.mutations.filter((value) => value.startsWith("push ")).length,
+      1,
+    );
+
+    remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
+    await publisher.tick(now + 300_000);
+    assert.deepEqual(
+      await goalPublishAction(store, publisher, "goal.publish", confirmed),
+      { error: { code: "stale-confirmation" } },
+    );
+    assert.deepEqual(
+      await operatorAction(store, f.directory, "goal.discard", {
+        id: f.goalId,
+        expectedHead,
+        confirm: "G1",
+        expectedClosedPrNumber: 12,
+      }),
+      { error: { code: "stale-confirmation" } },
+    );
+    assert.partialDeepStrictEqual(
+      await operatorAction(store, f.directory, "goal.discard", {
+        id: f.goalId,
+        expectedHead,
+        confirm: "G1",
+        expectedClosedPrNumber: 13,
+      }),
+      { result: { status: "cancelled" } },
+    );
+    assert.deepEqual(
+      (await readOperatorGoal(store, f.directory, f.goalId))?.turn,
+      {
+        owner: "stopped",
+        reason: { kind: "cancelled" },
+      },
+    );
+  },
+);
+
+test(
+  "closed PR with a deleted branch can be republished and failed attempts stay retryable",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-publish-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const publisher = (enabled: boolean) =>
+      new GoalPublisher(store, f.directory, f.repoRoot, remote.provider, {
+        enabled,
+      });
+    const enabled = publisher(true);
+    const head = f.integratedHead;
+    await enabled.publish(f.goalId, head);
+    await enabled.stop();
+    remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
+    remote.deleteBranch();
+    const disabled = publisher(false);
+    const mutations = [...remote.mutations];
+    await disabled.tick();
+    assert.equal(store.goalPublishRecord(f.goalId)?.pr?.state, "closed");
+    assert.deepEqual(remote.mutations, mutations);
+    await disabled.stop();
+
+    const resumed = publisher(true);
+    const publish = () =>
+      goalPublishAction(store, resumed, "goal.publish", {
+        id: f.goalId,
+        expectedHead: head,
+        confirm: goalPublishConfirmation("G1", head),
+        expectedPr: { number: 12, state: "closed" },
+      });
+    remote.controls.rejectPush = true;
+    assert.deepEqual(await publish(), {
+      error: { code: "publish-non-fast-forward" },
+    });
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, f.goalId),
+      {
+        turn: {
+          owner: "stopped",
+          reason: { kind: "publish-failed", code: "publish-non-fast-forward" },
+        },
+        publish: { state: "failed", failure: "publish-non-fast-forward" },
+        publishPreview: { expectedHead: head },
+        prState: "closed",
+      },
+    );
+    delete remote.controls.rejectPush;
+    assert.partialDeepStrictEqual(await publish(), {
+      result: { state: "pr-open", prNumber: 13 },
+    });
+    assert.deepEqual(remote.mutations.slice(-2), [mutations[0], "open-pr"]);
+    assert.equal(
+      await remote.provider.remoteHead(
+        store.goalPublishRecord(f.goalId)!.destination,
+      ),
+      head,
+    );
+  },
+);
+
+test(
+  "open and merged PRs lock Task registration, integration and Goal base updates",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-publish-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true },
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    const { pending, integration } = await withLegacyOpenPr(
+      store,
+      f.goalId,
+      async () => {
+        const pending = store.proposeTask(
+          { ...store.getTask(f.taskId)!.content, paths: ["outside-scope/"] },
+          planner,
+        );
+        const id = task(store, f.goalId);
+        await f.work.drain();
+        const integration = store
+          .pendingIntegrations()
+          .find(
+            (item) => item.kind === "integration" && item.content.taskId === id,
+          )!;
+        approve(store, integration);
+        return { pending, integration };
+      },
+    );
+    const baseUpdate = () =>
+      operatorAction(
+        store,
+        f.directory,
+        "goal.updateBase",
+        {
+          id: f.goalId,
+          confirm: "unused",
+          from: f.integratedHead,
+          to: "a".repeat(40),
+        },
+        { target: f.repoRoot },
+      );
+    const assertLocked = async () => {
+      assert.throws(() => task(store, f.goalId), { code: "goal-pr-open" });
+      assert.throws(() => approve(store, pending), { code: "goal-pr-open" });
+      assert.throws(() => store.approvedIntegration(integration.id), {
+        code: "goal-pr-open",
+      });
+      assert.equal(store.nextApprovedIntegration(), undefined);
+      assert.deepEqual(await baseUpdate(), { error: { code: "goal-pr-open" } });
+    };
+    await assertLocked();
+    remote.controls.pr = {
+      ...remote.controls.pr!,
+      state: "merged",
+    };
+    await publisher.tick();
+    assert.equal(store.getGoal(f.goalId)?.status, "active");
+    await assertLocked();
+    // Queued work for the Goal hides manual completion until it ends.
+    const queued = store.createExecution({
+      actor: "Planner",
+      mode: "planning",
+      requestedBy: { kind: "host" },
+      goalId: f.goalId,
+    });
+    assert.equal(store.goalMergeCompletion(f.goalId), null);
+    store.startExecution(queued.id);
+    store.finishExecution(queued.id, "cancelled");
+    const detail = (await readOperatorGoal(store, f.directory, f.goalId))!;
+    assert.equal(detail.publish.state, "merged");
+    assert.equal(detail.mergeCompletion?.mergedHead, f.integratedHead);
+    assert.partialDeepStrictEqual(
+      await goalPublishAction(store, undefined, "goal.completeAfterMerge", {
+        id: f.goalId,
+        confirm: detail.mergeCompletion!.confirm,
+      }),
+      { result: { status: "done" } },
+    );
+  },
+);
+
+for (const scenario of ["stale", "foreign"] as const) {
+  test(
+    `opted-out polling observes a ${scenario} merge and only a matching confirmation completes it`,
+    gitTestOptions,
+    async () => {
+      using state = orchestratorFixture("lo-publish-");
+      const { store } = state;
+      const f = await integratedGoal(state);
+      const remote = fakePublishRemote();
+      const publisher = (enabled: boolean) =>
+        new GoalPublisher(store, f.directory, f.repoRoot, remote.provider, {
+          enabled,
+        });
+      const enabled = publisher(true);
+      await enabled.tick();
+      await enabled.publish(f.goalId, f.integratedHead);
+      const goalHead =
+        scenario === "stale" ? await integrateNext(state, f) : f.integratedHead;
+      const mergedHead =
+        scenario === "stale" ? f.integratedHead : "a".repeat(40);
+      await enabled.stop();
+      const disabled = publisher(false);
+      const mutations = [...remote.mutations];
+      remote.controls.pr = {
+        ...remote.controls.pr!,
+        state: "merged",
+        head: mergedHead,
+      };
+      await disabled.tick();
+      assert.deepEqual(remote.mutations, mutations);
+      const detail = (await readOperatorGoal(store, f.directory, f.goalId))!;
+      assert.equal(detail.status, "active");
+      assert.equal(detail.publish.state, "merged-stale");
+      const confirm = `complete-goal G1 #12 ${mergedHead}`;
+      assert.deepEqual(detail.mergeCompletion, {
+        prNumber: 12,
+        mergedHead,
+        goalHead,
+        confirm,
+      });
+      const complete = (confirm: string, currentStore = store) =>
+        goalPublishAction(currentStore, undefined, "goal.completeAfterMerge", {
+          id: f.goalId,
+          confirm,
+        });
+      const stale = { error: { code: "stale-confirmation" } };
+      assert.deepEqual(await complete(confirm.replace("#12", "#11")), stale);
+      assert.deepEqual(await complete(confirm.slice(0, -1)), stale);
+      const db = new Database(state.filename);
+      try {
+        db.exec(`CREATE TRIGGER reject_manual_completion BEFORE INSERT ON goal_publish_audit
+          WHEN NEW.kind = 'publish.completed-manually' BEGIN SELECT RAISE(ABORT, 'fixture'); END`);
+        assert.deepEqual(await complete(confirm), {
+          error: { code: "write-failed" },
+        });
+        assert.equal(store.getGoal(f.goalId)?.status, "active");
+        db.exec("DROP TRIGGER reject_manual_completion");
+        using reopened = openTestStore(state.filename);
+        assert.deepEqual(await complete(confirm, reopened.store), {
+          result: { id: f.goalId, ref: "G1", status: "done" },
+        });
+        assert.deepEqual(await complete(confirm, reopened.store), stale);
+        const audit = publishAudit(db).at(-1)!;
+        assert.equal(audit.kind, "publish.completed-manually");
+        assert.deepEqual(JSON.parse(audit.data), {
+          prNumber: 12,
+          head: mergedHead,
+          goalHead,
+          manual: true,
+          origin: "operator-ui",
+        });
+      } finally {
+        db.close();
+      }
+    },
+  );
+}
+
+test(
+  "merge observation commits Goal status and publish audit together",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-publish-");
+    const { store } = state;
+    const f = await integratedGoal(state);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true },
+    );
+    await publisher.publish(f.goalId, f.integratedHead);
+    remote.controls.pr = {
+      ...remote.controls.pr!,
+      state: "merged",
+      checks: "passed",
+    };
+    const db = new Database(state.filename);
+    try {
+      const audit = publishAudit(db);
+      db.exec(`CREATE TRIGGER reject_goal_completion BEFORE INSERT ON events
+      WHEN NEW.kind = 'goal.status' BEGIN SELECT RAISE(ABORT, 'fixture'); END`);
+      const now = Date.now();
+      await publisher.tick(now);
+      assert.equal(store.getGoal(f.goalId)?.status, "active");
+      assert.equal(store.goalPublishRecord(f.goalId)?.pr?.state, "open");
+      assert.deepEqual(publishAudit(db), audit);
+      db.exec("DROP TRIGGER reject_goal_completion");
+      using restarted = openTestStore(state.filename);
+      const resumed = new GoalPublisher(
+        restarted.store,
+        f.directory,
+        f.repoRoot,
+        remote.provider,
+        { enabled: true },
+      );
+      await resumed.tick(now + 100_000);
+      assert.equal(restarted.store.getGoal(f.goalId)?.status, "done");
+      assert.equal(publishAudit(db).at(-1)?.kind, "publish.polled");
+    } finally {
+      db.close();
+    }
+  },
+);
 
 test(
   "a stale PR read after a push waits for the latest host-pushed head",
@@ -4973,7 +5437,7 @@ test(
 );
 
 test(
-  "later integrations disarm auto-merge before push and restore it once the Goal finishes",
+  "legacy integrations disarm auto-merge before push and restore it once the Goal finishes",
   gitTestOptions,
   async () => {
     using state = orchestratorFixture("lo-publish-");
@@ -5017,12 +5481,8 @@ test(
     assert.equal(store.goalExported(f.goalId)?.head, first);
     assert.equal(remote.files[0]?.title, "Goal");
     assert.match(remote.files[0]!.body, /Valid docs/);
-    assert.match(remote.files[0]!.body, /G1-1 .*\(succeeded\)/);
-    assert.match(remote.files[0]!.body, /Verification: 2 passed, 0 failed/);
-    assert.match(
-      remote.files[0]!.body,
-      /Review: 1 passed, 0 requested revision/,
-    );
+    assert.match(remote.files[0]!.body, /G1-1 ✓ Task/);
+    assert.match(remote.files[0]!.body, /G1-1 ✓ \/ ✓/);
     assert.ok(remote.files[0]!.body.includes(first));
     assert.ok(remote.files[0]!.body.includes(f.goalId));
     assert.partialDeepStrictEqual(
@@ -5036,8 +5496,13 @@ test(
           autoMergeSource: "project",
         },
         turn: {
-          owner: "done",
-          reason: { kind: "published", branch, prNumber: 12 },
+          owner: "human",
+          reason: {
+            kind: "pr-open",
+            checks: "pending",
+            autoMerge: "squash",
+            prNumber: 12,
+          },
         },
       },
     );
@@ -5056,7 +5521,9 @@ test(
         code: "stale-confirmation",
       },
     );
-    const unfinished = task(store, f.goalId);
+    const unfinished = await withLegacyOpenPr(store, f.goalId, () =>
+      task(store, f.goalId),
+    );
     await publisher.tick(2);
     assert.equal(store.getTask(unfinished)?.status, "registered");
     assert.deepEqual(remote.mutations, [
@@ -5071,16 +5538,19 @@ test(
     assert.equal(remote.controls.pr?.autoMerge, "off");
     await publisher.tick(3);
     assert.equal(remote.controls.pr?.autoMerge, "off");
-    await f.work.drain();
-    const third = store
-      .pendingIntegrations()
-      .find(
-        (item) =>
-          item.kind === "integration" && item.content.taskId === unfinished,
-      );
-    assert.ok(third?.kind === "integration");
-    approve(store, third);
-    await f.work.drain();
+    const third = await withLegacyOpenPr(store, f.goalId, async () => {
+      await f.work.drain();
+      const proposal = store
+        .pendingIntegrations()
+        .find(
+          (item) =>
+            item.kind === "integration" && item.content.taskId === unfinished,
+        );
+      assert.ok(proposal?.kind === "integration");
+      approve(store, proposal);
+      await f.work.drain();
+      return proposal;
+    });
     await publisher.tick(4);
     assert.deepEqual(remote.mutations.slice(-2), [
       `push ${third.content.candidate}:${branch}`,
@@ -5102,15 +5572,32 @@ test(
 
     remote.controls.pr = { ...remote.controls.pr!, checks: "failed" };
     await publisher.tick(10000);
-    assert.equal(
-      (await readOperatorGoal(store, f.directory, f.goalId))?.publish.checks,
-      "failed",
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, f.goalId),
+      {
+        publish: { checks: "failed" },
+        turn: {
+          owner: "human",
+          reason: {
+            kind: "pr-open",
+            checks: "failed",
+            autoMerge: "squash",
+            prNumber: 12,
+          },
+        },
+      },
     );
     remote.controls.rejectPoll = true;
     await publisher.tick(20000);
-    assert.equal(
-      (await readOperatorGoal(store, f.directory, f.goalId))?.publish.failure,
-      "publish-poll-failed",
+    assert.partialDeepStrictEqual(
+      await readOperatorGoal(store, f.directory, f.goalId),
+      {
+        publish: { failure: "publish-poll-failed" },
+        turn: {
+          owner: "stopped",
+          reason: { kind: "publish-failed", code: "publish-poll-failed" },
+        },
+      },
     );
     const count = remote.calls.length;
     await publisher.tick(20001);
@@ -5130,15 +5617,33 @@ test(
         lastCheckedAt: store.goalPublishRecord(f.goalId)?.lastCheckedAt,
       },
     );
-    assert.equal(store.getGoal(f.goalId)?.status, "active");
-    const afterMerge = await integrateNext(state, f);
-    assert.notEqual(afterMerge, third.content.candidate);
+    assert.equal(store.getGoal(f.goalId)?.status, "done");
+    assert.deepEqual(
+      (await readOperatorGoal(store, f.directory, f.goalId))?.turn,
+      {
+        owner: "done",
+        reason: { kind: "merged", prNumber: 12 },
+      },
+    );
+    assert.equal(
+      store
+        .listEvents({ subjectId: f.goalId, limit: 100 })
+        .filter(
+          ({ kind, data }) =>
+            kind === "goal.status" &&
+            (data as { status?: string }).status === "done",
+        ).length,
+      1,
+    );
+    await assert.rejects(publisher.publish(f.goalId, third.content.candidate), {
+      code: "publish-not-ready",
+    });
     const finalCalls = remote.calls.length;
     await publisher.tick(999_999);
     assert.equal(remote.calls.length, finalCalls);
     assert.equal(
       (await readOperatorGoal(store, f.directory, f.goalId))?.publish.state,
-      "merged-stale",
+      "merged",
     );
   },
 );
@@ -5328,14 +5833,29 @@ test(
       1,
     );
     assert.partialDeepStrictEqual(
-      (await readOperatorGoal(store, f.directory, f.goalId))!.publish,
+      await readOperatorGoal(store, f.directory, f.goalId),
       {
-        state: "pr-open",
-        autoMerge: "merge",
-        autoMergeSource: "goal",
-        failure: "auto-merge-unavailable",
+        publish: {
+          state: "pr-open",
+          autoMerge: "merge",
+          autoMergeSource: "goal",
+          autoMergeUnavailable: true,
+        },
+        turn: { owner: "human", reason: { kind: "pr-open" } },
       },
     );
+    const unavailable = (await readOperatorGoal(store, f.directory, f.goalId))!;
+    assert.equal(unavailable.publish.failure, undefined);
+    assert.equal(unavailable.publishPreview, undefined);
+    const db = new Database(state.filename);
+    try {
+      assert.equal(
+        publishAudit(db).at(-1)?.kind,
+        "publish.auto-merge-unavailable",
+      );
+    } finally {
+      db.close();
+    }
     remote.controls.pr = { ...remote.controls.pr!, state: "closed" };
     await publisher.tick(Date.now() + 100_000);
     assert.equal(
@@ -5382,6 +5902,7 @@ test(
     for (const args of [
       ["publish-goal", "G1"],
       ["set-auto-merge", "G1", "rebase"],
+      ["complete-goal", "G1"],
     ]) {
       assert.equal(
         await run(args, false, () => {
@@ -5401,6 +5922,22 @@ test(
     );
     assert.equal(await run(["publish-goal", "G1"], true, answer), 0);
     assert.equal(remote.mutations.at(-1), "auto-merge rebase");
+    const record = state.store.goalPublishRecord(f.goalId)!;
+    const mergedHead = "a".repeat(40);
+    state.store.recordGoalPublish(f.goalId, "publish.polled", {
+      ...record,
+      pr: { ...record.pr!, state: "merged", head: mergedHead },
+    });
+    assert.equal(await run(["complete-goal", "G1"], true, () => "yes"), 1);
+    assert.equal(state.store.getGoal(f.goalId)?.status, "active");
+    assert.equal(
+      await run(["complete-goal", "G1"], true, (message) => {
+        assert.equal(answer(message), `complete-goal G1 #12 ${mergedHead}`);
+        return answer(message);
+      }),
+      0,
+    );
+    assert.equal(state.store.getGoal(f.goalId)?.status, "done");
   },
 );
 
@@ -5425,7 +5962,7 @@ test(
     assert.equal(
       (await readOperatorGoal(state.store, f.directory, f.goalId))?.turn.reason
         .kind,
-      "exported",
+      "publish-failed",
     );
     delete remote.controls.overrideReadHead;
     assert.equal(
@@ -5435,7 +5972,7 @@ test(
     assert.equal(
       (await readOperatorGoal(state.store, f.directory, f.goalId))?.turn.reason
         .kind,
-      "published",
+      "pr-open",
     );
     remote.controls.overrideReadHead = "a".repeat(40);
     await publisher.tick();
@@ -5443,7 +5980,12 @@ test(
       await readOperatorGoal(state.store, f.directory, f.goalId),
       {
         publish: { failure: "publish-remote-head-changed" },
-        turn: { reason: { kind: "exported" } },
+        turn: {
+          reason: {
+            kind: "publish-failed",
+            code: "publish-remote-head-changed",
+          },
+        },
       },
     );
     assert.equal(remote.mutations.length, 2);
@@ -5497,6 +6039,19 @@ test(
       state.store.goalPublishRecord(f.goalId)?.pendingMutation?.step,
       "open-pr",
     );
+    assert.throws(() => task(state.store, f.goalId), { code: "goal-pr-open" });
+    const disabled = new GoalPublisher(
+      state.store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: false },
+    );
+    await disabled.tick();
+    await disabled.stop();
+    assert.equal(state.store.goalPublishRecord(f.goalId)?.pr?.number, 12);
+    assert.equal(state.store.goalPublishRecord(f.goalId)?.failure, undefined);
+    assert.equal(remote.mutations.length, 2);
     using reopened = openTestStore(state.filename);
     const restarted = new GoalPublisher(
       reopened.store,
@@ -5675,9 +6230,9 @@ for (const reason of ["goal-cancelled", "remote-head-changed"] as const) {
             store.goalPublishRecord(f.goalId)?.pr?.head,
             foreignHead,
           );
-          const later = await integrateNext(state, f);
+          assert.throws(() => task(store, f.goalId), { code: "goal-pr-open" });
           await publisher.tick(now + 600_001);
-          await assert.rejects(publisher.publish(f.goalId, later), {
+          await assert.rejects(publisher.publish(f.goalId, f.integratedHead), {
             code: "publish-remote-head-changed",
           });
           assert.equal(
@@ -5739,7 +6294,7 @@ test(
     const now = Date.now();
     const callCount = remote.calls.length;
     await disabled.tick(now);
-    assert.equal(remote.calls.length, callCount);
+    assert.deepEqual(remote.calls.slice(callCount), ["read-pr"]);
     assert.partialDeepStrictEqual(
       await operatorAction(store, f.directory, "goal.discard", {
         id: f.goalId,
@@ -5762,6 +6317,10 @@ test(
           state: "failed",
           failure: "auto-merge-disarm-failed",
           autoMergeEnabled: "squash",
+        },
+        turn: {
+          owner: "stopped",
+          reason: { kind: "publish-failed", code: "auto-merge-disarm-failed" },
         },
       },
     );
@@ -6077,11 +6636,11 @@ test(
 );
 
 test(
-  "PR titles normalize whitespace, remove formatting controls and neutralize mentions",
+  "PR titles wrap scoped tokens in code and neutralize other mentions",
   gitTestOptions,
   async () => {
     using state = orchestratorFixture("lo-publish-");
-    const raw = `@orga\u200bnization/team\u2028  (#321) file@example.org   ${"x".repeat(140)}`;
+    const raw = `@orga\u200bnization/team\u2028  (#321) @notify @Scope/name @scope/package-name_1.2 file@example.org   ${"x".repeat(90)}`;
     const f = await integratedGoal(state, raw);
     const remote = fakePublishRemote();
     const screened: Array<string | Uint8Array> = [];
@@ -6099,10 +6658,117 @@ test(
     const title = remote.files[0]!.title;
     assert.equal(
       title,
-      `＠organization/team (＃321) file@example.org ${"x".repeat(140)}`,
+      `\`@organization/team\` (＃321) ＠notify ＠Scope/name \`@scope/package-name_1.2\` file＠example.org ${"x".repeat(90)}`,
     );
     assert.ok(Array.from(title).length <= 200);
     assert.ok(screened.includes(raw));
     assert.ok(screened.includes(title));
   },
 );
+
+test(
+  "PR text reports the final candidate once and counts earlier revisions",
+  gitTestOptions,
+  async () => {
+    using state = orchestratorFixture("lo-publish-");
+    const { store } = state;
+    const f = stage3Fixture(state, undefined, "revise-review");
+    const proposal = await f.proposal();
+    approve(store, proposal);
+    await f.work.drain();
+    assert.equal(f.verifications(), 3);
+    const remote = fakePublishRemote();
+    const publisher = new GoalPublisher(
+      store,
+      f.directory,
+      f.repoRoot,
+      remote.provider,
+      { enabled: true },
+    );
+    await publisher.publish(f.goalId, proposal.content.candidate);
+    assert.deepEqual(store.goalPublishEvidence(f.goalId).get(f.taskId!), {
+      verification: true,
+      review: true,
+      revisions: 1,
+    });
+    const body = remote.files[0]!.body;
+    assert.match(body, /## 検証とレビュー[\s\S]*G1-1 ✓ \/ ✓（やり直し 1 回）/);
+    assert.equal(body.match(/✓ \/ ✓/g)?.length, 1);
+    assert.doesNotMatch(body, /✕/);
+  },
+);
+
+test("PR text keeps each bounded task row, abbreviates model text and screens every original field", () => {
+  using state = orchestratorFixture("lo-publish-text-");
+  const { store } = state;
+  const id = goal(store);
+  const taskId = task(store, id)!;
+  const originalTask = store.getTask(taskId)!;
+  const originalGoal = store.getGoal(id)!;
+  const omittedTitle = "省略された Task の原文";
+  const title = "目標の表題";
+  const description = "長い計画の本文";
+  const acceptance = "大きい条件".repeat(4000);
+  const tasks = Array.from({ length: 183 }, (_, index) => ({
+    ...originalTask,
+    ref: `G1-${index + 1}`,
+    id: String(index),
+    status:
+      index === 0
+        ? ("succeeded" as const)
+        : index === 1
+          ? ("failed" as const)
+          : ("registered" as const),
+    content: {
+      ...originalTask.content,
+      title:
+        index === 182
+          ? omittedTitle
+          : `作業 ${index + 1} ${"長い表題".repeat(45)}`,
+    },
+  }));
+  const head = "a".repeat(40);
+  const { body, screened } = buildGoalPullRequest(
+    {
+      listTasks: () => tasks,
+      goalPublishEvidence: () =>
+        new Map([["0", { verification: false, review: true, revisions: 2 }]]),
+    },
+    {
+      ...originalGoal,
+      content: {
+        ...originalGoal.content,
+        title,
+        description,
+        acceptance: [acceptance],
+      },
+    },
+    head,
+  );
+
+  assert.ok(Buffer.byteLength(body) <= 24 * 1024);
+  assert.ok(body.includes("## 目標"));
+  assert.ok(body.includes(title));
+  assert.ok(body.includes(`Goal G1 · ${id}`));
+  assert.ok(body.includes(head));
+  assert.match(body, /### 受け入れ条件\n\n    - 大きい条件/);
+  assert.ok(!body.includes(description));
+  const taskSection = body
+    .split("## Task 一覧")[1]!
+    .split("## 検証とレビュー")[0]!;
+  assert.equal(taskSection.match(/^    G1-\d+ [✓✕–]/gm)?.length, 180);
+  assert.match(taskSection, /G1-1 ✓ 作業 1/);
+  assert.match(taskSection, /G1-2 ✕ 作業 2/);
+  assert.match(taskSection, /G1-180 – 作業 180/);
+  assert.match(taskSection, /ほか 3 件の Task を省略しました/);
+  assert.match(body, /G1-1 ✕ \/ ✓（やり直し 2 回）/);
+  assert.match(body, /G1-2 – \/ –/);
+  for (const original of [
+    title,
+    description,
+    acceptance,
+    omittedTitle,
+    tasks[0]!.content.title,
+  ])
+    assert.ok(screened.includes(original));
+});

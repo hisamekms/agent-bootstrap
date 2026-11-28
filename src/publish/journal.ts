@@ -10,6 +10,8 @@ export type PublishEventKind =
   | "publish.pushed"
   | "publish.pr-opened"
   | "publish.auto-merge-set"
+  | "publish.auto-merge-unavailable"
+  | "publish.completed-manually"
   | "publish.failed"
   | "publish.polled";
 
@@ -33,6 +35,7 @@ export interface GoalPublishRecord {
   destination: PublishDestination;
   head: string;
   manualStart?: true;
+  afterPrNumber?: number;
   phase: "push" | "pr" | "auto-merge" | "complete";
   pushedHead?: string;
   pendingMutation?: PublishMutation | undefined;
@@ -40,6 +43,7 @@ export interface GoalPublishRecord {
   lastCheckedAt?: string;
   prOpenedAt?: string;
   failure?: PublishFailure | undefined;
+  autoMergeUnavailable?: true | undefined;
   disarmFailure?: "auto-merge-disarm-failed" | undefined;
   pollFailure?:
     "publish-poll-failed" | "publish-remote-head-changed" | undefined;
@@ -48,6 +52,24 @@ export interface GoalPublishRecord {
 
 export function remoteGoalBranch({ id, ref }: { id: string; ref: string }) {
   return `ab/${ref.toLowerCase()}-${id.slice(0, 8)}`;
+}
+
+export function publishFailure(record: GoalPublishRecord | null) {
+  return (
+    record?.disarmFailure ??
+    (record?.failure === "auto-merge-unavailable"
+      ? undefined
+      : record?.failure) ??
+    record?.pollFailure
+  );
+}
+
+export function mergedHeadDiffers(
+  record: GoalPublishRecord,
+  currentHead: string | null,
+) {
+  const head = record.pr?.head;
+  return head !== currentHead || head !== record.pushedHead;
 }
 
 export function publishView(
@@ -60,23 +82,26 @@ export function publishView(
   },
   currentHead: string | null,
 ): GoalPublishView {
-  const { pr, failure, disarmFailure, pollFailure, pushedHead, lastCheckedAt } =
-    record ?? {};
-  const code = disarmFailure ?? failure ?? pollFailure;
+  const { pr, pushedHead, lastCheckedAt } = record ?? {};
+  const code = pr?.state === "merged" ? undefined : publishFailure(record);
   const state =
-    pr && pr.state !== "open"
-      ? pr.state === "merged" && currentHead && currentHead !== pr.head
+    pr?.state === "merged"
+      ? mergedHeadDiffers(record!, currentHead)
         ? "merged-stale"
-        : pr.state
-      : disarmFailure || (failure && failure !== "auto-merge-unavailable")
+        : "merged"
+      : code
         ? "failed"
         : pr
-          ? "pr-open"
+          ? pr.state === "open"
+            ? "pr-open"
+            : "closed"
           : pushedHead && pushedHead === record?.head
             ? "pushed"
-            : enabled
-              ? "pending"
-              : "disabled";
+            : record?.phase === "push" && enabled
+              ? "pushing"
+              : enabled || record
+                ? "pending"
+                : "disabled";
   return {
     enabled,
     state,
@@ -90,6 +115,11 @@ export function publishView(
       ...(pr.autoMerge !== "off" && { autoMergeEnabled: pr.autoMerge }),
     }),
     ...(lastCheckedAt && { lastCheckedAt }),
+    ...(pr?.state === "open" &&
+      (record?.autoMergeUnavailable ||
+        record?.failure === "auto-merge-unavailable") && {
+        autoMergeUnavailable: true as const,
+      }),
     ...(code && { failure: code }),
   };
 }

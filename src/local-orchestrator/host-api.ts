@@ -1,6 +1,7 @@
 import { projectInbox, type InboxSource } from "./inbox.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
+import { goalPrOpenGuidance } from "../publish/protocol.ts";
 import { operatorGoalTurn } from "./operator-read.ts";
 import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, unlinkSync } from "node:fs";
@@ -347,6 +348,7 @@ type ToolCode =
   | "invalid-request"
   | "wait-in-progress"
   | "not-found"
+  | "goal-pr-open"
   | "tool-failed"
   | "session-inactive"
   | "audit-unavailable";
@@ -362,7 +364,14 @@ function toolResult(text: string, isError = false) {
 }
 
 function toolError(code: ToolCode) {
-  return toolResult(JSON.stringify({ code }), true);
+  return toolResult(
+    JSON.stringify(
+      code === "goal-pr-open"
+        ? { code, message: goalPrOpenGuidance }
+        : { code },
+    ),
+    true,
+  );
 }
 
 function duration(start: number) {
@@ -459,8 +468,8 @@ async function callTool(
         error instanceof ClaudeRunError && error.code === "credential-leak"
           ? "credential-leak"
           : error instanceof OrchestratorStoreError &&
-              error.code === "not-found"
-            ? "not-found"
+              (error.code === "not-found" || error.code === "goal-pr-open")
+            ? error.code
             : "tool-failed";
       outcome = "error";
     }

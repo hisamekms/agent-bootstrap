@@ -360,7 +360,7 @@ export function githubGh(
         );
       }
     },
-    async findPullRequest(destination, recoveringHead) {
+    async findPullRequest(destination, recoveringHead, afterPrNumber = 0) {
       const value = json(
         output(
           await gh([
@@ -389,7 +389,8 @@ export function githubGh(
             typeof item === "object" &&
             item.isCrossRepository === false,
         )
-        .map((item) => pullRequest(item, destination));
+        .map((item) => pullRequest(item, destination))
+        .filter((pr) => pr.number > afterPrNumber);
       return (
         requests.find((pr) => pr.state === "open") ??
         requests.find((pr) => pr.head === recoveringHead) ??

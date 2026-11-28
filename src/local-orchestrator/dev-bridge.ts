@@ -33,6 +33,7 @@ export const operatorBridgeMethods: ReadonlySet<string> = new Set([
   "goal.discard",
   "goal.export",
   "goal.publish",
+  "goal.completeAfterMerge",
   "goal.setAutoMerge",
   "goal.updateBase",
   "environment.status",

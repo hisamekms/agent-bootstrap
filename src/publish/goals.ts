@@ -29,6 +29,7 @@ import {
   type PublishProvider,
   type PublishPullRequest,
 } from "./port.ts";
+import type { GoalPublishConfirmationPr } from "./protocol.ts";
 
 interface LockDatabase {
   exec(sql: string): void;
@@ -56,93 +57,146 @@ const longPollDelay = 10 * 60_000;
 const transientFailures = new Set([
   "publish-audit-failed",
   "publish-busy",
+  "publish-poll-failed",
   "publish-stale-head",
   "stale-confirmation",
   "auto-merge-disarm-failed",
 ]);
 
-function prTitle(title: string) {
-  const line = title
+function oneLine(text: string) {
+  return text
     .replace(/\s+/gu, " ")
     .replace(/[\p{Cc}\p{Cf}]/gu, "")
     .replace(/ +/g, " ")
-    .trim()
-    .replace(
-      /(^|[^\p{L}\p{N}_])([@#])(?=[\p{L}\p{N}_])/gu,
-      (_, prefix, marker) => prefix + (marker === "@" ? "＠" : "＃"),
-    );
-  return Array.from(line).slice(0, 200).join("").trimEnd();
+    .trim();
 }
-const maxBodyBytes = 24 * 1024;
 
-function prText(store: OrchestratorStore, goal: Goal, head: string) {
-  const { title, description, acceptance } = goal.content;
-  const evidence = store.goalPublishEvidence(goal.id);
-  // Indent model text so Markdown, mentions and images are displayed as text.
-  const block = (value: string) => value.replace(/^/gm, "    ");
-  const tasks = store.listTasks(goal.id);
-  const summary = `
-
-## Verification and review
-
-Verification: ${evidence.verificationPassed} passed, ${evidence.verificationFailed} failed.
-Review: ${evidence.reviewPassed} passed, ${evidence.reviewRevised} requested revision.
-
-## Audit references
-
-Goal: ${goal.id}
-Export head: ${head}
-`;
-  const note = "\n\nSome text was shortened to fit.";
-  const descriptionPreview = boundedText(block(description), 6000);
-  const acceptancePreviews = acceptance.map((item) =>
-    boundedText(block(`- ${item}`), 300),
-  );
-  const intro = `## Goal
-
-${descriptionPreview}
-
-## Acceptance
-
-${acceptancePreviews.join("\n")}
-
-## Tasks
-
-`;
-  let truncated =
-    descriptionPreview !== block(description) ||
-    acceptancePreviews.some(
-      (item, index) => item !== block(`- ${acceptance[index]}`),
+function prTitle(title: string) {
+  const line = oneLine(title)
+    .replaceAll("`", "｀")
+    .replace(
+      /(?<![\\\p{L}\p{N}_])@[a-z0-9-]+\/[a-z0-9._-]+(?![\p{L}\p{N}_/.-])|@|#(?=[\p{L}\p{N}_])/gu,
+      (value) => (value === "@" ? "＠" : value === "#" ? "＃" : `\`${value}\``),
     );
-  let bytes = Buffer.byteLength(intro + summary + note);
-  // Screen the full Goal text and every Task title, including shortened text.
-  const screened = [title, description, ...acceptance];
-  const lines: string[] = [];
-  for (const task of tasks) {
-    const line = block(`${task.ref} ${task.content.title} (${task.status})`);
-    screened.push(line);
-    if (bytes + Buffer.byteLength(line) + 1 > maxBodyBytes) {
-      truncated = true;
-      continue;
-    }
-    bytes += Buffer.byteLength(line) + 1;
-    lines.push(line);
-  }
+  const bounded = Array.from(line).slice(0, 200).join("").trimEnd();
+  return bounded.split("`").length % 2 === 0
+    ? bounded.slice(0, bounded.lastIndexOf("`")) +
+        bounded.slice(bounded.lastIndexOf("`") + 1).replaceAll("@", "＠")
+    : bounded;
+}
+
+const maxBodyBytes = 24 * 1024;
+const maxBodyTasks = 180;
+
+function resultIcon(passed: boolean | null) {
+  return passed === null ? "–" : passed ? "✓" : "✕";
+}
+
+export function buildGoalPullRequest(
+  store: Pick<OrchestratorStore, "listTasks" | "goalPublishEvidence">,
+  goal: Goal,
+  head: string,
+) {
+  const { title, description, acceptance } = goal.content;
+  const tasks = store.listTasks(goal.id);
+  const evidence = store.goalPublishEvidence(goal.id);
+  const shown = tasks.slice(0, maxBodyTasks);
+  const bytes = Buffer.byteLength;
+  // Indent model text so Markdown, mentions and images are displayed as text.
+  const intro = `## 目標
+
+    ${oneLine(title)}
+
+Goal ${goal.ref} · ${goal.id}
+
+### 受け入れ条件
+
+`;
+  const taskHeading = "\n\n## Task 一覧\n\n";
+  const omitted = tasks.length - shown.length;
+  const summary = `${omitted ? `\n\nほか ${omitted} 件の Task を省略しました。` : ""}
+
+## 検証とレビュー
+
+結果は検証、レビューの順です。
+
+${shown
+  .map(({ id, ref }) => {
+    const result = evidence.get(id);
+    const revisions = result?.revisions ?? 0;
+    const verification = resultIcon(result?.verification ?? null);
+    const review = resultIcon(result?.review ?? null);
+    return `    ${ref} ${verification} / ${review}${revisions ? `（やり直し ${revisions} 回）` : ""}`;
+  })
+  .join("\n")}
+
+## 監査情報
+
+書き出したコミット ${head}
+`;
+  const note = "\n一部の文章を短くしました。\n";
+  const prefixes = shown.map(({ ref, status }) => {
+    const result =
+      status === "succeeded" ? true : status === "failed" ? false : null;
+    return `    ${ref} ${resultIcon(result)} `;
+  });
+  const fixed = intro + taskHeading + prefixes.join("\n") + summary + note;
+  const available = maxBodyBytes - bytes(fixed);
+  const acceptanceLines = acceptance.map((item) => `    - ${oneLine(item)}`);
+  const minimumAcceptance = acceptanceLines
+    .map((line) => boundedText(line, 48))
+    .join("\n");
+  const titles = shown.map(({ content }) => oneLine(content.title));
+  const totalTitleBytes = titles.reduce((sum, value) => sum + bytes(value), 0);
+  const taskBudget = available - bytes(minimumAcceptance);
+  const taskTitles =
+    totalTitleBytes <= taskBudget
+      ? titles
+      : titles.map((value) =>
+          boundedText(
+            value,
+            Math.max(0, Math.floor(taskBudget / shown.length)),
+          ),
+        );
+  const acceptanceBudget = Math.max(
+    0,
+    available - taskTitles.reduce((sum, value) => sum + bytes(value), 0),
+  );
+  const acceptanceBody = acceptanceLines.join("\n");
+  const acceptancePreview =
+    bytes(acceptanceBody) <= acceptanceBudget
+      ? acceptanceBody
+      : bytes(minimumAcceptance) <= acceptanceBudget
+        ? minimumAcceptance
+        : boundedText(minimumAcceptance, acceptanceBudget);
+  const shortened =
+    acceptancePreview !== acceptanceBody ||
+    taskTitles.some((value, index) => value !== titles[index]);
   const body =
     intro +
-    (lines.length ? lines.join("\n") : "No integrated Tasks listed.") +
-    (truncated ? note : "") +
-    summary;
+    acceptancePreview +
+    taskHeading +
+    prefixes.map((prefix, index) => prefix + taskTitles[index]).join("\n") +
+    summary +
+    (shortened ? note : "");
+  // Screen the original Goal text and every Task title, including omitted text.
+  const screened = [
+    title,
+    description,
+    ...acceptance,
+    ...tasks.map((task) => task.content.title),
+  ];
   return { title: prTitle(title) || `Goal ${goal.ref}`, body, screened };
 }
 
 function boundedText(value: string, bytes: number) {
   if (Buffer.byteLength(value) <= bytes) return value;
-  // Drop a partial trailing UTF-8 character.
-  return Buffer.from(value)
-    .subarray(0, bytes)
+  if (bytes < 3) return "";
+  const prefix = Buffer.from(value)
+    .subarray(0, bytes - 3)
     .toString("utf8")
     .replace(/\uFFFD$/, "");
+  return `${prefix.trimEnd()}…`;
 }
 
 function lockPublisher(directory: string) {
@@ -264,10 +318,23 @@ export class GoalPublisher {
       if (this.#stopped) return;
       const { id } = goal;
       const record = this.#store.goalPublishRecord(id);
-      if (optIn === null && !disarmPending(goal, record)) continue;
+      const opening = record?.pendingMutation?.step === "open-pr";
+      if (
+        optIn === null &&
+        record?.pr?.state !== "merged" &&
+        record?.pr?.state !== "open" &&
+        !opening
+      )
+        continue;
       try {
         if ((this.#retry.get(id)?.next ?? 0) > now) continue;
-        await this.#cycleGoal(goal, record, optIn, now);
+        if (record?.pr?.state === "merged") this.#store.reconcileMergedGoal(id);
+        else if (
+          opening &&
+          (optIn === null || record.failure || goal.status === "cancelled")
+        )
+          await this.#reconcileFailedMutation(id, optIn === null);
+        else await this.#cycleGoal(goal, record, optIn, now);
         this.#retry.delete(id);
       } catch (error) {
         if (
@@ -286,7 +353,7 @@ export class GoalPublisher {
       } finally {
         if (
           optIn === null &&
-          disarmPending(goal, this.#store.goalPublishRecord(id))
+          this.#store.goalPublishRecord(id)?.pr?.state === "open"
         )
           this.#cycleDelay = activeCycleDelay;
       }
@@ -320,7 +387,7 @@ export class GoalPublisher {
         const start = Number.isFinite(opened) ? Math.min(opened, now) : now;
         let changed = false;
         try {
-          changed = await this.#poll(goal, record, now);
+          changed = await this.#poll(goal, record, now, optIn !== null);
         } finally {
           const needsDisarm = disarmPending(
             goal,
@@ -418,11 +485,15 @@ export class GoalPublisher {
     );
   }
 
-  async publish(id: string, expectedHead: string) {
+  async publish(
+    id: string,
+    expectedHead: string,
+    expectedPr?: GoalPublishConfirmationPr,
+  ) {
     if (!this.#config.enabled) throw new PublishError("publish-disabled");
     const goal = this.#store.getGoal(id);
     if (!goal) throw new OrchestratorStoreError("not-found");
-    await this.#publish(goal, expectedHead, true);
+    await this.#publish(goal, expectedHead, true, expectedPr);
     return publishView(
       true,
       remoteGoalBranch(goal),
@@ -455,25 +526,65 @@ export class GoalPublisher {
     }
   }
 
-  async #publish(goal: Goal, head: string, manual: boolean) {
+  async #publish(
+    goal: Goal,
+    head: string,
+    manual: boolean,
+    expectedPr?: GoalPublishConfirmationPr,
+  ) {
     if (this.#stopped) throw new PublishError("publish-disabled");
     const release = lockPublisher(this.#directory);
     try {
-      await this.#publishLocked(goal, head, manual);
+      await this.#publishLocked(goal, head, manual, expectedPr);
     } finally {
       release();
     }
   }
 
-  async #publishLocked(goal: Goal, head: string, manual: boolean) {
+  async #publishLocked(
+    goal: Goal,
+    head: string,
+    manual: boolean,
+    expectedPr?: GoalPublishConfirmationPr,
+  ) {
     const { id } = goal;
     const current = this.#store.getGoal(id);
-    const previous = this.#store.goalPublishRecord(id);
+    let previous = this.#store.goalPublishRecord(id);
+    if (
+      expectedPr !== undefined &&
+      (previous?.pr?.number !== expectedPr?.number ||
+        previous?.pr?.state !== expectedPr?.state)
+    )
+      throw new OrchestratorStoreError("stale-confirmation");
     if (!current || !this.#eligible(current, previous))
       throw new PublishError("publish-not-ready");
     if ((this.#store.goalIntegrationHead(id) ?? current.baseCommit) !== head)
       throw new PublishError("publish-stale-head");
-    if (previous?.pr && previous.pr.state !== "open") return;
+    if (manual && previous?.pr?.state === "closed") {
+      const pr = await this.#provider
+        .readPullRequest(previous.destination, previous.pr.number)
+        .catch((error: unknown) => {
+          const code =
+            error instanceof PublishError ? error.code : "publish-pr-failed";
+          this.#record(
+            id,
+            "publish.failed",
+            { ...previous!, failure: code },
+            { code, head },
+          );
+          throw new PublishError(code);
+        });
+      if (pr.state !== "closed") {
+        previous = await this.#observePr(id, previous, pr, Date.now());
+        if (expectedPr?.state === "closed")
+          throw new OrchestratorStoreError("stale-confirmation");
+        if (pr.state === "merged") return;
+      }
+    }
+    const reopening =
+      manual && previous?.pr?.state === "closed" ? previous.pr.number : null;
+    if (previous?.pr && previous.pr.state !== "open" && !reopening)
+      throw new PublishError("publish-not-ready");
     if (!manual && previous?.failure && previous.phase !== "complete") return;
     const setting = this.#store.goalAutoMerge(id);
     const branch = remoteGoalBranch(goal);
@@ -490,6 +601,16 @@ export class GoalPublisher {
       }),
       ...(manual && { manualStart: true }),
     };
+    if (reopening) {
+      record = {
+        destination: record.destination,
+        head: record.head,
+        phase: "pr",
+        manualStart: true,
+        afterPrNumber: reopening,
+        ...(record.pushedHead && { pushedHead: record.pushedHead }),
+      };
+    }
     const save = (
       kind: PublishEventKind,
       changes: Partial<GoalPublishRecord>,
@@ -499,7 +620,11 @@ export class GoalPublisher {
       this.#record(id, kind, next, detail);
       record = next;
     };
-    const authorize = (mutation: PublishMutation, requireFinished: boolean) => {
+    const authorize = (
+      mutation: PublishMutation,
+      requireFinished: boolean,
+      expectedRemoteHead?: string | null,
+    ) => {
       const { step } = mutation;
       if (this.#stopped) throw new PublishError("publish-disabled");
       const pending = { ...record, pendingMutation: mutation };
@@ -516,7 +641,7 @@ export class GoalPublisher {
             autoMerge: mutation.method,
           }),
           ...(mutation.step === "push" && {
-            expectedRemoteHead: record.pushedHead ?? null,
+            expectedRemoteHead,
           }),
         },
         {
@@ -549,15 +674,15 @@ export class GoalPublisher {
       const changingSetting = this.#needsSettingSync(id, previous, setting);
       const needsPush = previous?.pushedHead !== head;
       const recovering =
-        previous?.destination.repository && previous.phase !== "complete";
+        record.destination.repository && record.phase !== "complete";
       if (
         !needsPush &&
         previous?.phase === "complete" &&
         !changingSetting &&
+        !reopening &&
         !(
           manual &&
-          (previous.failure ||
-            previous.pollFailure === "publish-remote-head-changed")
+          (previous.failure || previous.pollFailure || previous.disarmFailure)
         )
       )
         return;
@@ -618,7 +743,9 @@ export class GoalPublisher {
         }
       }
 
-      const text = !record.pr ? prText(this.#store, current, head) : undefined;
+      const text = !record.pr
+        ? buildGoalPullRequest(this.#store, current, head)
+        : undefined;
       if (text) {
         try {
           const key = createHash("sha256")
@@ -673,10 +800,24 @@ export class GoalPublisher {
       if (remoteHead === undefined && (needsPush || recovering))
         remoteHead = await this.#provider.remoteHead(destination);
       if (recovering && !record.pr) {
-        const pr = await this.#provider.findPullRequest(destination, priorHead);
+        let pr = await this.#provider.findPullRequest(
+          destination,
+          priorHead,
+          record.afterPrNumber,
+        );
+        if (!pr && manual && !reopening && record.afterPrNumber) {
+          const original = await this.#provider.readPullRequest(
+            destination,
+            record.afterPrNumber,
+          );
+          if (original.state !== "closed") pr = original;
+        }
         if (pr) {
           save("publish.pr-opened", {
             pr,
+            ...(record.pendingMutation?.step === "open-pr" && {
+              pendingMutation: undefined,
+            }),
             prOpenedAt: new Date().toISOString(),
             lastCheckedAt: new Date().toISOString(),
           });
@@ -700,10 +841,17 @@ export class GoalPublisher {
           { recovered: true },
         );
       }
-      record = { ...record, head, failure: undefined };
+      record = {
+        ...record,
+        head,
+        failure: undefined,
+        autoMergeUnavailable: undefined,
+      };
 
-      if (record.pushedHead !== head) {
-        const expected = record.pushedHead ?? null;
+      const recreateBranch =
+        !record.pr && record.afterPrNumber !== undefined && remoteHead === null;
+      if (record.pushedHead !== head || recreateBranch) {
+        const expected = recreateBranch ? null : (record.pushedHead ?? null);
         if (remoteHead !== expected) {
           if (record.pr && remoteHead)
             record = await this.#observePr(
@@ -722,7 +870,7 @@ export class GoalPublisher {
         record = { ...record, phase: "push" };
         record = await this.#disableAutoMerge(id, record, "before-push");
 
-        authorize({ step: "push", head }, !record.pr);
+        authorize({ step: "push", head }, !record.pr, expected);
         await this.#provider.push(destination, head, expected);
         save("publish.pushed", {
           pushedHead: head,
@@ -739,13 +887,18 @@ export class GoalPublisher {
             throw new PublishError("publish-remote-head-changed");
         }
       } else if (recovering && record.phase === "pr" && remoteHead !== head) {
-        throw new PublishError("publish-destination-changed");
+        throw new PublishError(
+          record.afterPrNumber
+            ? "publish-remote-head-changed"
+            : "publish-destination-changed",
+        );
       }
 
       if (!record.pr) {
         let pr = await this.#provider.findPullRequest(
           destination,
           recovering ? head : undefined,
+          record.afterPrNumber,
         );
         if (!pr) {
           record = { ...record, phase: "pr" };
@@ -755,7 +908,11 @@ export class GoalPublisher {
             text!.title,
             text!.body,
           );
-          pr = await this.#provider.findPullRequest(destination, head);
+          pr = await this.#provider.findPullRequest(
+            destination,
+            head,
+            record.afterPrNumber,
+          );
           if (!pr) throw new PublishError("publish-pr-failed");
         }
         save("publish.pr-opened", {
@@ -785,7 +942,7 @@ export class GoalPublisher {
           record = await this.#disableAutoMerge(id, record, "setting-change");
         if (method !== "off") await setAutoMerge(method);
       }
-      if (record.phase !== "complete" || changingSetting || record.failure) {
+      if (record.phase !== "complete" || changingSetting || previous?.failure) {
         save(
           "publish.auto-merge-set",
           {
@@ -806,6 +963,19 @@ export class GoalPublisher {
         throw error;
       const code =
         error instanceof PublishError ? error.code : "publish-pr-failed";
+      if (code === "auto-merge-unavailable") {
+        save(
+          "publish.auto-merge-unavailable",
+          {
+            autoMergeUnavailable: true,
+            pendingMutation: undefined,
+            phase: "complete",
+            autoMergeRevision: setting.revision,
+          },
+          { code, head },
+        );
+        return;
+      }
       if (
         !transientFailures.has(code) &&
         !(
@@ -818,13 +988,13 @@ export class GoalPublisher {
           "publish.failed",
           {
             failure: code,
-            ...((code === "auto-merge-unavailable" ||
-              code === "publish-non-fast-forward") && {
+            ...(reopening &&
+              previous?.pr &&
+              !record.pr &&
+              (!record.pendingMutation ||
+                code === "publish-non-fast-forward") && { pr: previous.pr }),
+            ...(code === "publish-non-fast-forward" && {
               pendingMutation: undefined,
-            }),
-            ...(code === "auto-merge-unavailable" && {
-              phase: "complete" as const,
-              autoMergeRevision: setting.revision,
             }),
           },
           { code, head },
@@ -836,17 +1006,61 @@ export class GoalPublisher {
 
   /** A command can time out after GitHub accepted it. Probe once per launcher
    * before leaving a failed operation for a manual retry. */
-  async #reconcileFailedMutation(id: string) {
+  async #reconcileFailedMutation(id: string, readOnly = false) {
     const release = lockPublisher(this.#directory);
     try {
       const record = this.#store.goalPublishRecord(id);
       const pending = record?.pendingMutation;
-      if (!record?.failure || !pending) return;
+      if (!record || !pending) return;
       const { destination, head } = record;
+      if (pending.step === "open-pr") {
+        let pr;
+        try {
+          pr = await this.#provider.findPullRequest(
+            destination,
+            head,
+            record.afterPrNumber,
+          );
+          if (!pr && record.afterPrNumber) {
+            const original = await this.#provider.readPullRequest(
+              destination,
+              record.afterPrNumber,
+            );
+            if (original.state !== "closed") pr = original;
+          }
+        } catch {
+          throw new PublishError("publish-poll-failed");
+        }
+        const now = Date.now();
+        const next: GoalPublishRecord = {
+          ...record,
+          pendingMutation: undefined,
+        };
+        if (pr) {
+          const recovered: GoalPublishRecord = {
+            ...next,
+            failure: undefined,
+            pr,
+            phase: "auto-merge",
+            prOpenedAt: new Date(now).toISOString(),
+            lastCheckedAt: new Date(now).toISOString(),
+          };
+          this.#record(id, "publish.pr-opened", recovered, { recovered: true });
+          await this.#observePr(id, recovered, pr, now, !readOnly);
+        } else {
+          this.#record(id, "publish.polled", next, { recovered: false });
+        }
+        return;
+      }
+      if (!record.failure || readOnly) return;
       const remoteHead = await this.#provider.remoteHead(destination);
       const pr = record.pr
         ? await this.#provider.readPullRequest(destination, record.pr.number)
-        : await this.#provider.findPullRequest(destination, head);
+        : await this.#provider.findPullRequest(
+            destination,
+            head,
+            record.afterPrNumber,
+          );
       const next = {
         ...record,
         failure: undefined,
@@ -861,20 +1075,6 @@ export class GoalPublisher {
             head: pending.head ?? head,
             pushedHead: pending.head ?? head,
             phase: record.pr ? "auto-merge" : "pr",
-          },
-          { recovered: true },
-        );
-      }
-      if (pending.step === "open-pr" && pr?.head === head) {
-        this.#record(
-          id,
-          "publish.pr-opened",
-          {
-            ...next,
-            pr,
-            phase: "auto-merge",
-            prOpenedAt: new Date().toISOString(),
-            lastCheckedAt: new Date().toISOString(),
           },
           { recovered: true },
         );
@@ -962,6 +1162,7 @@ export class GoalPublisher {
     record: GoalPublishRecord,
     pr: PublishPullRequest,
     now: number,
+    canDisarmForeign = true,
   ) {
     // During a push the PR view may still report the immediately preceding head.
     const foreign =
@@ -979,8 +1180,14 @@ export class GoalPublisher {
       );
     // A confirmed manual publish clears the pause after both heads agree.
     const pollFailure =
-      foreign || record.pollFailure === "publish-remote-head-changed"
+      pr.state === "open" &&
+      (foreign || record.pollFailure === "publish-remote-head-changed")
         ? ("publish-remote-head-changed" as const)
+        : undefined;
+    const failure = pr.state === "open" ? record.failure : undefined;
+    const autoMergeUnavailable =
+      pr.state === "open" && pr.autoMerge === "off"
+        ? record.autoMergeUnavailable
         : undefined;
     const disarmFailure =
       pr.state === "open" && pr.autoMerge !== "off"
@@ -993,12 +1200,16 @@ export class GoalPublisher {
       pr.head !== previous?.head ||
       pr.checks !== previous?.checks ||
       pr.autoMerge !== previous?.autoMerge ||
+      failure !== record.failure ||
+      autoMergeUnavailable !== record.autoMergeUnavailable ||
       pollFailure !== record.pollFailure ||
       disarmFailure !== record.disarmFailure
     ) {
       next = {
         ...record,
         pr,
+        failure,
+        autoMergeUnavailable,
         pollFailure,
         disarmFailure,
         ...(foreign && { autoMergeRevision: undefined }),
@@ -1012,7 +1223,7 @@ export class GoalPublisher {
       );
     }
     const cancelled = this.#store.getGoal(id)?.status === "cancelled";
-    if (pollFailure || cancelled)
+    if ((pollFailure && canDisarmForeign) || cancelled)
       next = await this.#disableAutoMerge(
         id,
         next,
@@ -1021,7 +1232,12 @@ export class GoalPublisher {
     return next;
   }
 
-  async #poll(goal: Goal, record: GoalPublishRecord, now: number) {
+  async #poll(
+    goal: Goal,
+    record: GoalPublishRecord,
+    now: number,
+    canDisarmForeign: boolean,
+  ) {
     const release = lockPublisher(this.#directory);
     try {
       const latest = this.#store.goalPublishRecord(goal.id);
@@ -1051,7 +1267,15 @@ export class GoalPublisher {
         return false;
       }
       try {
-        return (await this.#observePr(goal.id, latest, pr, now)) !== latest;
+        return (
+          (await this.#observePr(
+            goal.id,
+            latest,
+            pr,
+            now,
+            canDisarmForeign,
+          )) !== latest
+        );
       } catch (error) {
         if (
           error instanceof PublishError &&

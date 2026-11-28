@@ -1,4 +1,5 @@
 import { GitIntegrationError } from "../git-integration.ts";
+import { goalPrOpenGuidance } from "../publish/protocol.ts";
 import { unsafeInputSymlinkNext } from "../workspace-tree.ts";
 import type { CredentialScanner } from "./credential-scan.ts";
 import { SecretTestRequiredError } from "./secret-launch.ts";
@@ -401,6 +402,7 @@ export class ActorRunner {
                 ![
                   "invalid-transition",
                   "goal-inactive",
+                  "goal-pr-open",
                   "integration-uncertain",
                 ].includes(error.code)
               )
@@ -439,6 +441,7 @@ export class ActorRunner {
             "invalid-transition",
             "goal-inactive",
             "task-constraints",
+            "goal-pr-open",
             "integration-uncertain",
           ].includes(error.code)
         )
@@ -479,6 +482,7 @@ export class ActorRunner {
             "approval-forbidden",
             "invalid-transition",
             "goal-inactive",
+            "goal-pr-open",
             "integration-uncertain",
           ].includes(error.code)
         )
@@ -600,7 +604,14 @@ export class ActorRunner {
           status: "failed",
           result: { code: error.code, next: unsafeInputSymlinkNext },
         };
-      else completion = { status: "failed", result: { code } };
+      else
+        completion = {
+          status: "failed",
+          result: {
+            code,
+            ...(code === "goal-pr-open" && { next: goalPrOpenGuidance }),
+          },
+        };
     } finally {
       // Respect cancellation while a host call was in flight.
       if (store.getExecution(job.id)?.status !== "cancelled") {

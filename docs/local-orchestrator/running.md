@@ -587,16 +587,27 @@ the host exports the local `lo/goal-<id8>` branch, pushes the exact commit
 to `ab/<goal-ref>-<id8>`,
 and opens or finds the PR. The host screens the export and PR text and
 records each outward step in the Goal journal and the append-only
-`goal_publish_audit` table in the private target state database. Later
-integrations fast-forward that branch while the PR remains open. The host
-disables auto-merge before advancing an open PR and restores the Goal setting
-when the Goal finishes. A discarded Goal triggers an audited auto-merge disable
-on its open PR even when publishing is disabled. A PR head the host never
-pushed also triggers a disable. Once the expected head is restored, use
-`publish-goal` to resume. Git rejects non-fast-forward pushes. After a merge,
-later integrations are shown as `merged-stale`.
+`goal_publish_audit` table in the private target state database. After all Tasks
+are integrated, Workplace shows an open PR under the operator's turn. It
+records the Goal as done when the PR merges the current host-pushed head.
+If the PR closes without merging, use the Goal overview to publish again or
+discard the Goal. A retry recreates a deleted remote branch. If the branch
+points to an unexpected commit, restore the last host-pushed head before
+retrying. Git rejects non-fast-forward pushes.
 
-Workplace polls for changes in checks, auto-merge and PR state. Routine
+Task registration, integration and Goal base updates return `goal-pr-open`
+while the Goal's PR is open or merged. Close an open PR in GitHub or discard
+the Goal to continue. A discarded Goal triggers an audited auto-merge disable
+on its open PR even when publishing is disabled. When publishing is enabled,
+an unexpected PR head also triggers a disable. Once the expected head is
+restored, use `publish-goal` to resume. If a PR merged a stale or foreign head,
+Workplace shows `merged-stale`. Review the merged commit in GitHub, then use
+「手で完了にする」 or `complete-goal` to record the Goal as done. The
+same action is available if a merged Goal still has unfinished legacy work.
+The confirmation identifies the PR number and full merged head.
+
+Workplace polls open PRs for changes in checks, auto-merge and PR state even
+when publishing is disabled. Routine
 polling slows to ten-minute intervals after the first hour and stops at merge
 or closure. Goals that finish while publishing is disabled require
 `publish-goal`, including after publishing is re-enabled. Use the same command
@@ -608,14 +619,17 @@ disable and retries failures reported as `auto-merge-disarm-failed`.
 ```sh
 agent-bootstrap --target <checkout> publish-goal <goal>
 agent-bootstrap --target <checkout> set-auto-merge <goal> <off|squash|merge|rebase>
+agent-bootstrap --target <checkout> complete-goal <goal>
 ```
 
-Both CLI commands use typed TTY confirmations. `publish-goal` pins the
+The Goal overview also offers these actions and shows the PR, check results,
+and current auto-merge setting. Workplace Settings shows the project defaults.
+These CLI commands use typed TTY confirmations. `publish-goal` pins the
 displayed head for a retry. New Goals inherit the configured auto-merge
 default at registration. An operator can override it for an individual
 Goal. The running host applies setting changes to open PRs. When
-GitHub refuses auto-merge, the PR stays open and the host records
-`auto-merge-unavailable`. Merge the PR yourself when auto-merge is off.
+GitHub reports that auto-merge is unavailable, the PR stays open for the
+operator and Workplace shows a note about the GitHub settings.
 
 Use `agent-bootstrap events --subject <goal>` to inspect publish
 events. An interrupted publish is reconciled against the remote branch

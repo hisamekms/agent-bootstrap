@@ -16,7 +16,12 @@ test("the workplace serves three self-contained assets under its strict CSP", as
     assert.equal(asset.contentType, contentType);
     assert.ok(asset.body instanceof Uint8Array);
     const text = decoder.decode(asset.body);
-    assert.doesNotMatch(text, /https?:/, path);
+    // Only the GitHub pull request link origin may appear (navigation only).
+    assert.doesNotMatch(
+      text.replaceAll('"https://github.com"', '""'),
+      /https?:/,
+      path,
+    );
     return text;
   }
 

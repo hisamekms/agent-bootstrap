@@ -18,6 +18,16 @@ import {
 } from "./delegation-panel.ts";
 import { taskStages } from "../../local-orchestrator/operator-estimates.ts";
 import { failureReason } from "../../local-orchestrator/operator-attention.ts";
+import {
+  goalPublishConfirmation,
+  goalPrOpenGuidance,
+  type GoalPublishConfirmationPr,
+} from "../../publish/protocol.ts";
+import {
+  autoMergeMethods,
+  type PublishChecks,
+  type PublishFailure,
+} from "../../publish/port.ts";
 import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
 import {
@@ -198,6 +208,8 @@ function answerError(code: string) {
       return "この提案はすでに判断待ちではありません。";
     case "approval-forbidden":
       return "現在のポリシーではパネルから回答できません。";
+    case "goal-pr-open":
+      return goalPrOpenGuidance;
     case "not-found":
       return "提案が見つかりません。";
     default:
@@ -1511,7 +1523,8 @@ const turnGroups = [
 
 const publishStateLabels = {
   disabled: "無効",
-  pending: "公開待ち",
+  pending: "未公開",
+  pushing: "送信中",
   pushed: "プッシュ済み",
   "pr-open": "オープン",
   merged: "マージ済み",
@@ -1519,6 +1532,118 @@ const publishStateLabels = {
   closed: "クローズ済み",
   failed: "公開処理に失敗",
 } satisfies Record<GoalSummary["publish"]["state"], string>;
+
+const publishStateIcons = {
+  disabled: "idle",
+  pending: "hourglass",
+  pushing: "export",
+  pushed: "export",
+  "pr-open": "pullRequest",
+  merged: "merge",
+  "merged-stale": "merge",
+  closed: "cross",
+  failed: "warning",
+} as const;
+
+const checkState = {
+  pending: ["hourglass", "チェック中"],
+  failed: ["cross", "チェック失敗"],
+  passed: ["check", "チェック通過"],
+} as const satisfies Record<PublishChecks, readonly [string, string]>;
+
+const autoMergeLabels = {
+  off: "オフ",
+  squash: "スカッシュ",
+  merge: "マージコミット",
+  rebase: "リベース",
+} as const;
+
+const publishFailures = {
+  "publish-disabled": [
+    "PR 公開が無効",
+    "local.json の公開設定を確認してください。",
+  ],
+  "publish-not-ready": [
+    "公開の準備ができていない",
+    "Task の統合と判断待ちを確認してください。",
+  ],
+  "publish-busy": [
+    "別の処理が実行中",
+    "処理が終わってからもう一度送ってください。",
+  ],
+  "publish-stale-head": [
+    "Goal の先端が変更された",
+    "最新の先端を確認してもう一度送ってください。",
+  ],
+  "publish-destination-invalid": [
+    "公開先が無効",
+    "local.json のリモートとベースを確認してください。",
+  ],
+  "publish-destination-changed": [
+    "公開先が変更された",
+    "最初に使った公開先とブランチを確認してください。",
+  ],
+  "publish-remote-head-changed": [
+    "リモートの先端が変更された",
+    "リモートを最後に送った先端に戻してから、もう一度送ってください。",
+  ],
+  "publish-export-failed": [
+    "書き出しに失敗",
+    "手元のブランチを確認してから、もう一度送ってください。",
+  ],
+  "branch-checked-out": [
+    "書き出し先が使用中",
+    "書き出し先を使用中の worktree で別のブランチに切り替えてください。",
+  ],
+  "non-fast-forward": [
+    "手元のブランチを早送りできない",
+    "手元のブランチの履歴を確認してください。",
+  ],
+  "invalid-object": [
+    "コミットを確認できない",
+    "手元に Goal のコミットがあるか確認してください。",
+  ],
+  "unsafe-repository": [
+    "リポジトリの安全性を確認できない",
+    "手元のリポジトリ設定を確認してください。",
+  ],
+  "publish-non-fast-forward": [
+    "リモートのブランチを早送りできない",
+    "リモートのブランチの履歴を確認してください。",
+  ],
+  "publish-screen-blocked": [
+    "公開前の検査で停止",
+    "履歴と PR に含まれる文面を確認してください。",
+  ],
+  "publish-push-failed": [
+    "プッシュに失敗",
+    "リモートへの接続と書き込み権限を確認してください。",
+  ],
+  "publish-pr-failed": [
+    "PR の作成または取得に失敗",
+    "GitHub の接続と PR の状態を確認してください。",
+  ],
+  "publish-auto-merge-failed": [
+    "自動マージの設定に失敗",
+    "GitHub で PR の自動マージ設定を確認してください。",
+  ],
+  "auto-merge-disarm-failed": [
+    "自動マージを解除できない",
+    "GitHub で PR の自動マージを解除してください。",
+  ],
+  "auto-merge-unavailable": [
+    "自動マージを利用できない",
+    "GitHub の設定を確認するか、PR を手動でマージしてください。",
+  ],
+  "publish-poll-failed": [
+    "PR の状態を取得できない",
+    "GitHub への接続と PR の状態を確認してください。",
+  ],
+  "publish-audit-failed": [
+    "公開の監査記録に失敗",
+    "Workplace の保存先を確認してください。",
+  ],
+} satisfies Record<PublishFailure, readonly [string, string]>;
 
 function turnReason(goal: GoalSummary): string {
   const { reason } = goal.turn;
@@ -1541,8 +1666,16 @@ function turnReason(goal: GoalSummary): string {
       return "書き出し可能";
     case "exported":
       return "手元に書き出し済み";
-    case "published":
-      return `PR #${reason.prNumber}（${publishStateLabels[goal.publish.state]}）`;
+    case "publishing":
+      return "公開中";
+    case "pr-open":
+      return `PR #${reason.prNumber}`;
+    case "merged":
+      return `PR #${reason.prNumber} · ${publishStateLabels[goal.publish.state]}`;
+    case "pr-closed":
+      return `PR #${reason.prNumber} · クローズ済み`;
+    case "publish-failed":
+      return publishFailures[reason.code][0];
     case "completed":
       return "作業完了";
     case "idle":
@@ -1550,7 +1683,7 @@ function turnReason(goal: GoalSummary): string {
   }
 }
 
-function goalTurn(goal: GoalSummary, showReason = false) {
+function goalTurn(goal: GoalSummary, showReason = false, linkPr = false) {
   const { owner, reason } = goal.turn;
   const [glyph, label] = (
     {
@@ -1565,22 +1698,43 @@ function goalTurn(goal: GoalSummary, showReason = false) {
   const resultGlyph =
     reason.kind === "exported"
       ? "export"
-      : reason.kind === "published"
-        ? "merge"
+      : reason.kind === "pr-open" ||
+          reason.kind === "publishing" ||
+          reason.kind === "merged" ||
+          reason.kind === "pr-closed" ||
+          reason.kind === "publish-failed"
+        ? publishStateIcons[goal.publish.state]
         : null;
   const visible =
     showReason || reason.kind === "failed" || resultGlyph !== null;
   const mark = visual(
     resultGlyph ?? glyph,
-    visible ? label : `${label}。 ${explanation}`,
+    `${label}。 ${explanation}`,
     `owner ${owner}`,
   );
   mark.title = explanation;
+  const prLink = linkPr ? goalPrLink(goal.publish) : null;
+  const prLabel = prLink?.textContent ?? "";
+  const reasonText =
+    prLink && explanation.startsWith(prLabel)
+      ? [prLink, explanation.slice(prLabel.length)]
+      : [explanation, ...(prLink ? [" · ", prLink] : [])];
+  const reasonLabel = textElement("span", "", "meta");
+  reasonLabel.append(...reasonText);
   return group(
     "div",
     "turn-line",
     mark,
-    ...(visible ? [textElement("span", explanation, "meta")] : []),
+    ...(visible ? [reasonLabel] : []),
+    ...(reason.kind === "pr-open" && reason.checks
+      ? [
+          visual(
+            checkState[reason.checks][0],
+            checkState[reason.checks][1],
+            "pr-check",
+          ),
+        ]
+      : []),
   );
 }
 
@@ -1643,7 +1797,7 @@ function goalRow(
     link,
     goalProgress(goal),
   );
-  const turn = goalTurn(goal);
+  const turn = goalTurn(goal, false, true);
   const row = group("article", "card goal-row", header, turn);
   if (goal.turn.owner === "human" && hasDecisions) {
     const cards = group("div", "stack");
@@ -2419,20 +2573,32 @@ function confirmedAction(
   getPreview: () => Promise<{
     lines: string[];
     phrase?: string;
+    submitLabel?: string;
+    danger?: boolean;
     apply: (confirm: string) => Promise<unknown>;
   }>,
-  refresh: () => void,
+  refresh: (message?: string) => void,
+  options?: {
+    changeSource: EventTarget;
+    available: () => boolean;
+    onConfirming: (confirming: boolean) => void;
+  },
 ) {
-  const panel = group("div", "stack");
+  const panel = group(
+    "div",
+    options ? "stack publish-setting-action" : "stack",
+  );
   const status = textElement("p", "", "meta");
   status.setAttribute("role", "status");
   status.hidden = true;
   const start = action(label, key, () => {
+    if (start.disabled || start.hidden) return;
     start.disabled = true;
+    options?.onConfirming(true);
     panel.dataset.operatorConfirming = "true";
     status.hidden = true;
     void getPreview()
-      .then(({ lines, phrase, apply }) => {
+      .then(({ lines, phrase, submitLabel, danger, apply }) => {
         const input = phrase ? document.createElement("input") : undefined;
         if (input) {
           input.type = "text";
@@ -2445,7 +2611,7 @@ function confirmedAction(
           refresh();
         });
         const submit = action(
-          label,
+          submitLabel ?? label,
           `${key}:confirm`,
           () => {
             if (submit.disabled) return;
@@ -2457,7 +2623,7 @@ function confirmedAction(
               })
               .catch(failed);
           },
-          "btn primary",
+          danger ? "btn danger" : "btn primary",
         );
         if (input) {
           submit.disabled = true;
@@ -2465,6 +2631,8 @@ function confirmedAction(
             submit.disabled = input.value !== phrase;
           });
         }
+        confirmation.className = danger ? "confirm reject" : "confirm";
+        confirmation.hidden = false;
         confirmation.append(
           ...lines.map((line) => textElement("p", line)),
           ...(phrase && input ? [textElement("code", phrase), input] : []),
@@ -2474,13 +2642,26 @@ function confirmedAction(
       })
       .catch(failed);
   });
-  const confirmation = group("div", "stack");
+  const confirmation = group("div", "");
+  confirmation.setAttribute("role", "group");
+  confirmation.setAttribute("aria-label", "操作の確認");
+  confirmation.hidden = true;
   panel.append(start, status, confirmation);
+  if (options) {
+    start.hidden = !options.available();
+    options.changeSource.addEventListener("change", () => {
+      start.hidden = !options.available();
+    });
+  }
   return panel;
 
   function reset() {
     confirmation.replaceChildren();
+    confirmation.className = "";
+    confirmation.hidden = true;
     start.disabled = false;
+    options?.onConfirming(false);
+    if (options) start.hidden = !options.available();
     delete panel.dataset.operatorConfirming;
   }
 
@@ -2507,12 +2688,337 @@ function confirmedAction(
                 "confirmation-mismatch",
                 "goal-base-stale",
                 "goal-base-ineligible",
+                "invalid-transition",
                 "environment-current",
+                "publish-stale-head",
               ].includes(code)
             ? "状況が変わりました。最新の内容を確認してください。"
-            : "操作を完了できませんでした。";
-    refresh();
+            : code === "goal-head-unavailable"
+              ? "Goal のブランチを確認できないため、取り消せません。"
+              : code === "goal-busy"
+                ? "Goal は作業中のため、取り消せません。"
+                : "操作を完了できませんでした。";
+    if (Object.hasOwn(publishFailures, code)) {
+      const [label, next] = publishFailures[code as PublishFailure];
+      status.textContent = `${label}。 ${next}`;
+    }
+    if (code === "goal-pr-open") status.textContent = goalPrOpenGuidance;
+    refresh(status.textContent);
   }
+}
+
+function autoMergeBlock(goal: GoalDetail) {
+  const { enabled } = goal.publish;
+  if (!enabled) return "プロジェクトで PR 公開が無効です。";
+  if (goal.status === "cancelled") return "Goal は取り消し済みです。";
+  if (goal.prState === "closed") return "PR はクローズ済みです。";
+  if (goal.prState === "merged") return "PR はマージ済みです。";
+  return "";
+}
+
+/** The only external origin the panel links to (navigation, never loading). */
+const GITHUB_ORIGIN = "https://github.com";
+
+function goalPrLink({ prNumber, prUrl }: GoalSummary["publish"]) {
+  if (!prNumber || !prUrl) return null;
+  let url: URL;
+  try {
+    url = new URL(prUrl);
+  } catch {
+    return null;
+  }
+  if (
+    url.href !== prUrl ||
+    url.origin !== GITHUB_ORIGIN ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !/^\/[a-z0-9-]+\/[a-z0-9_.-]+\/pull\/[1-9][0-9]*$/i.test(url.pathname) ||
+    !url.pathname.endsWith(`/pull/${prNumber}`)
+  )
+    return null;
+  const link = textElement("a", `PR #${prNumber}`);
+  link.setAttribute("href", prUrl);
+  link.setAttribute("target", "_blank");
+  link.setAttribute("rel", "noopener noreferrer");
+  return link;
+}
+
+export function goalPublishPanel(
+  channel: OperatorRequest,
+  goal: GoalDetail,
+  message: string,
+  refresh: (message?: string) => void,
+) {
+  const publish = goal.publish;
+  if (!publish.enabled && publish.state === "disabled") return [];
+
+  const stateLabel =
+    publish.state === "pending" && goal.turn.reason.kind === "publishing"
+      ? "公開待ち"
+      : publishStateLabels[publish.state];
+  const state = group(
+    "div",
+    "turn-line",
+    visual(publishStateIcons[publish.state], stateLabel),
+    textElement("span", stateLabel),
+  );
+  if (publish.prNumber)
+    state.append(
+      goalPrLink(publish) ?? textElement("span", `PR #${publish.prNumber}`),
+    );
+  const check = publish.checks && checkState[publish.checks];
+  const failure = publish.failure && publishFailures[publish.failure];
+  const feedback = textElement("p", message, "meta decision-event");
+  feedback.setAttribute("role", "status");
+  feedback.hidden = !message;
+
+  const blocked = autoMergeBlock(goal);
+  const method = document.createElement("select");
+  method.className = "publish-method";
+  method.setAttribute("aria-label", "自動マージの方式");
+  for (const value of autoMergeMethods) {
+    const option = textElement("option", autoMergeLabels[value]);
+    option.value = value;
+    method.append(option);
+  }
+  method.value = publish.autoMerge;
+  method.disabled = Boolean(blocked);
+  const key = goal.id;
+  const methodChanged = () => method.value !== publish.autoMerge;
+  const setting = confirmedAction(
+    "変更を確認",
+    `auto-merge:${key}`,
+    async () => {
+      const selected = method.value as (typeof autoMergeMethods)[number];
+      const current = await channel.request("goal.get", { id: key });
+      if (autoMergeBlock(current) || current.ref !== goal.ref)
+        throw new Error("stale-confirmation");
+      const confirm = current.autoMergeConfirmations[selected];
+      return {
+        lines: [`自動マージを「${autoMergeLabels[selected]}」に変更します。`],
+        submitLabel: "変更を確定",
+        apply: () =>
+          channel.request("goal.setAutoMerge", {
+            id: key,
+            method: selected,
+            confirm,
+          }),
+      };
+    },
+    refresh,
+    {
+      changeSource: method,
+      available: methodChanged,
+      onConfirming: (confirming) => {
+        method.disabled = confirming;
+      },
+    },
+  );
+  const source =
+    publish.autoMergeSource === "goal"
+      ? "この Goal の設定"
+      : "プロジェクトの既定値";
+  const prMethod = publish.autoMergeEnabled ?? "off";
+  return [
+    group(
+      "section",
+      "card stack goal-publish",
+      sectionTitle("PR 公開"),
+      state,
+      facts([
+        ["ブランチ", publish.branch],
+        ["最終確認", formatTimestamp(publish.lastCheckedAt ?? null)],
+      ]),
+      check
+        ? group(
+            "div",
+            "turn-line",
+            visual(check[0], check[1]),
+            textElement("span", check[1]),
+          )
+        : textElement("p", "チェックの結果なし", "meta"),
+      ...(failure
+        ? [
+            group(
+              "div",
+              "stack",
+              textElement("p", failure[0]),
+              textElement("p", failure[1], "meta"),
+            ),
+          ]
+        : []),
+      ...(publish.autoMergeUnavailable
+        ? [
+            textElement(
+              "p",
+              "自動マージは使えません（GitHub の設定を確認してください）",
+              "meta",
+            ),
+          ]
+        : []),
+      ...(goal.status === "active" && goal.prState === "open"
+        ? [textElement("p", goalPrOpenGuidance, "meta")]
+        : []),
+      ...(goal.mergeCompletion
+        ? [
+            textElement(
+              "p",
+              (publish.state === "merged-stale"
+                ? "マージされた PR のコミットと Goal の先端または公開したコミットが一致しません。"
+                : "PR はマージ済みですが、Goal の完了条件を満たしていません。") +
+                "GitHub でマージ内容を確認し、作業が完了していれば手で完了にできます。",
+              "meta",
+            ),
+            confirmedAction(
+              "手で完了にする",
+              `complete-after-merge:${key}`,
+              async () => {
+                const current = await channel.request("goal.get", { id: key });
+                const preview = current.mergeCompletion;
+                if (
+                  !preview ||
+                  preview.confirm !== goal.mergeCompletion?.confirm
+                )
+                  throw new Error("stale-confirmation");
+                const { prNumber, mergedHead, confirm } = preview;
+                return {
+                  lines: [
+                    `PR #${prNumber} のマージ済みコミット ${mergedHead.slice(0, 12)} を確認して、${current.ref} を完了にします。`,
+                  ],
+                  submitLabel: "完了を確定",
+                  apply: () =>
+                    channel.request("goal.completeAfterMerge", {
+                      id: key,
+                      confirm,
+                    }),
+                };
+              },
+              refresh,
+            ),
+          ]
+        : []),
+      ...(goal.publishPreview
+        ? [
+            confirmedAction(
+              publish.state === "failed" || publish.state === "closed"
+                ? "もう一度送る"
+                : "PR を作る",
+              `publish:${key}`,
+              async () => {
+                const current = await channel.request("goal.get", { id: key });
+                if (!current.publishPreview || current.ref !== goal.ref)
+                  throw new Error("stale-confirmation");
+                const { expectedHead } = current.publishPreview;
+                const { prNumber, branch } = current.publish;
+                const expectedPr: GoalPublishConfirmationPr =
+                  prNumber && current.prState
+                    ? { number: prNumber, state: current.prState }
+                    : null;
+                return {
+                  lines: [
+                    `${branch} に ${expectedHead.slice(0, 12)} を送り、PR を公開します。`,
+                    ...(current.prState === "closed"
+                      ? [`PR #${prNumber} はクローズ済みです。`]
+                      : []),
+                  ],
+                  phrase: goalPublishConfirmation(current.ref, expectedHead),
+                  apply: (confirm: string) =>
+                    channel.request("goal.publish", {
+                      id: key,
+                      expectedHead,
+                      confirm,
+                      expectedPr,
+                    }),
+                };
+              },
+              refresh,
+            ),
+          ]
+        : []),
+      ...(goal.prState === "closed" && goal.status === "active"
+        ? [
+            confirmedAction(
+              "Goal を取り消す",
+              `publish-discard:${key}`,
+              async () => {
+                const current = await channel.request("goal.get", { id: key });
+                const expectedClosedPrNumber = current.publish.prNumber;
+                if (
+                  current.ref !== goal.ref ||
+                  current.prState !== "closed" ||
+                  current.status !== "active" ||
+                  !expectedClosedPrNumber ||
+                  expectedClosedPrNumber !== publish.prNumber
+                )
+                  throw new Error("stale-confirmation");
+                if (!current.headAvailable)
+                  throw new Error("goal-head-unavailable");
+                return {
+                  lines: [
+                    `${current.ref} を取り消します。取り消すと戻せません。`,
+                  ],
+                  submitLabel: "取り消しを確定",
+                  danger: true,
+                  apply: () =>
+                    channel.request("goal.discard", {
+                      id: key,
+                      confirm: current.ref,
+                      expectedHead: current.head,
+                      expectedClosedPrNumber,
+                    }),
+                };
+              },
+              refresh,
+            ),
+          ]
+        : []),
+      group(
+        "div",
+        "stack",
+        group(
+          "label",
+          "publish-setting",
+          textElement("span", "自動マージ"),
+          method,
+        ),
+        textElement("p", blocked ? `${source}。 ${blocked}` : source, "meta"),
+        ...(publish.prNumber &&
+        !["merged", "merged-stale", "closed"].includes(publish.state) &&
+        prMethod !== publish.autoMerge
+          ? [
+              textElement(
+                "p",
+                `PR 側の自動マージは「${autoMergeLabels[prMethod]}」です。`,
+                "meta",
+              ),
+            ]
+          : []),
+        ...(!blocked ? [setting] : []),
+      ),
+      feedback,
+    ),
+  ];
+}
+
+function projectPublishSettings(
+  publish: Methods["status"]["result"]["publish"],
+) {
+  return [
+    sectionTitle("PR 公開"),
+    facts([
+      ["公開", publish.enabled ? "有効" : "無効"],
+      ["リモート", publish.remote],
+      ["ベース", publish.base],
+      ["既定の自動マージ", autoMergeLabels[publish.autoMerge]],
+    ]),
+    textElement(
+      "p",
+      "変更するにはプロジェクトの local.json を編集してください。",
+      "meta",
+    ),
+  ];
 }
 
 export function goalBaseUpdate(
@@ -3051,6 +3557,7 @@ export function createHostPanel(
   let problems: Problem[][] = [];
   let lastGoal: GoalDetail | undefined;
   const exportMessages = new Map<string, string>();
+  const publishMessages = new Map<string, string>();
   let environment: Methods["environment.status"]["result"] | undefined;
   const nowButton = element("now-toggle");
   const nowPopover = element("now-popover");
@@ -3714,6 +4221,7 @@ export function createHostPanel(
           history,
           activityResult,
           environmentResult,
+          projectStatus,
         ] = await Promise.allSettled([
           refreshBadges || loadWork
             ? channel.request("inbox.list", {})
@@ -3736,6 +4244,7 @@ export function createHostPanel(
           decisionTab ? channel.request("decision.history", {}) : undefined,
           channel.request("activity.get", {}),
           channel.request("environment.status", {}),
+          section === "connection" ? channel.request("status", {}) : undefined,
         ] as const);
         if (disconnected || socket !== channel.socket) continue;
         if (itemResult.status === "fulfilled" && itemResult.value) {
@@ -3842,6 +4351,17 @@ export function createHostPanel(
             panel.replaceChildren(empty("設定を取得できませんでした。"));
           continue;
         }
+        if (section === "connection") {
+          const settings =
+            projectStatus.status === "fulfilled" &&
+            projectStatus.value?.publish;
+          element("publish-settings").replaceChildren(
+            ...(settings
+              ? projectPublishSettings(settings)
+              : [empty("PR 公開の設定を取得できませんでした。")]),
+          );
+          continue;
+        }
 
         if (decisionTab) {
           if (itemResult.status === "fulfilled") {
@@ -3881,6 +4401,7 @@ export function createHostPanel(
         } else if (goal.status === "fulfilled" && goal.value) {
           const detail = (lastGoal = goal.value);
           const exportMessage = exportMessages.get(detail.id) ?? "";
+          const publishMessage = publishMessages.get(detail.id) ?? "";
           const tasks = new Set(detail.tasks.map(({ id }) => id));
           const related = (item: PanelInboxItem) =>
             item.subject.goalId === detail.id ||
@@ -3923,6 +4444,7 @@ export function createHostPanel(
               problem,
               draftedPlans.has(detail.ref),
               exportMessage,
+              publishMessage,
             ],
             () =>
               goalDetail(
@@ -3980,6 +4502,16 @@ export function createHostPanel(
                   navigate({ tab: "goals", goalId: detail.id, taskId }),
                 watch,
                 [
+                  ...goalPublishPanel(
+                    channel,
+                    detail,
+                    publishMessage,
+                    (message = "") => {
+                      publishMessages.set(detail.id, message);
+                      previousView = "";
+                      void refresh();
+                    },
+                  ),
                   goalExport(channel, detail, exportMessage, (message) => {
                     exportMessages.set(detail.id, message);
                     previousView = "";

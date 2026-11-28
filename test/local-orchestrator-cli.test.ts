@@ -102,6 +102,12 @@ test("status reports counts and pending gates, and show and proposals include co
   assert.equal(status.code, 0);
   assert.deepEqual(JSON.parse(status.stdout), {
     counts: { goals: 0, tasks: 0, proposals: 1, pending: 1 },
+    publish: {
+      enabled: false,
+      remote: "origin",
+      base: "main",
+      autoMerge: "off",
+    },
     recentTasks: [],
     recentExecutions: [],
     pending: [

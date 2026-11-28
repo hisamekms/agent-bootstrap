@@ -207,6 +207,7 @@ agent-bootstrap --target /path/to/project reject "$proposal_id"
 agent-bootstrap --target /path/to/project approve "$proposal_id" --on-behalf --delegate-session "$session_id" --authorization "$authorization"
 agent-bootstrap --target /path/to/project export-goal-branch "$goal_id"
 agent-bootstrap --target /path/to/project publish-goal "$goal_id"
+agent-bootstrap --target /path/to/project complete-goal "$goal_id"
 agent-bootstrap --target /path/to/project set-auto-merge "$goal_id" off
 ```
 
@@ -441,6 +442,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap verification show | verification clear | verification set --profile <name> -- <argv...>` → { profile, argv } or null for show. { target, current, verification } for set or clear.
 - `agent-bootstrap export-goal-branch <goalId> [--target <checkout>]` → { goalId, checkout, branch, from, to } for the completed export.
 - `agent-bootstrap publish-goal <goalId>` → Goal publish state and PR details.
+- `agent-bootstrap complete-goal <goalId>` → PR number, merged head and Goal head, followed by the completion receipt on confirmation.
 - `agent-bootstrap set-auto-merge <goalId> <off|squash|merge|rebase>` → { autoMerge, autoMergeSource }
 - `agent-bootstrap analyze [--audit <file>] [--out <dir>] [--sql <file>]` → { report } with human-readable tables, export path, and manual DuckDB command.
 - `agent-bootstrap denials [--since <iso>] [--limit <1-1000>]` → { report } with human-readable summary and export details.
