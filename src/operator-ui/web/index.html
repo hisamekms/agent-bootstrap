@@ -91,11 +91,12 @@
               type="button"
               id="now-toggle"
               class="now-pill"
+              aria-label="いまの状況"
               aria-controls="now-popover"
               aria-expanded="false"
               aria-haspopup="dialog"
             >
-              AI は待機中
+              いま
             </button>
             <button
               type="button"
@@ -182,12 +183,22 @@
         >
           <div id="inbox" class="content">
             <div class="col">
-              <div id="answer-results" role="status"></div>
-              <p id="empty-inbox" class="card empty" hidden>
-                判断待ちはありません。
-              </p>
-              <ul id="inbox-items"></ul>
-              <section id="decision-history"></section>
+              <div id="decision-queue" class="stack">
+                <div id="answer-results" role="status"></div>
+                <p id="empty-inbox" class="card empty" hidden>
+                  判断待ちはありません。
+                </p>
+                <div id="inbox-items"></div>
+                <button type="button" id="decision-history-open" class="link">
+                  AI が判断したもの ›
+                </button>
+              </div>
+              <section id="decision-history-view" class="stack" hidden>
+                <button type="button" id="decision-history-back" class="link">
+                  ← 判断待ち
+                </button>
+                <div id="decision-history" class="stack"></div>
+              </section>
             </div>
           </div>
           <div id="answer-batch" class="batchbar" hidden></div>

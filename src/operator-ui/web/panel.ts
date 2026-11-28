@@ -17,7 +17,6 @@ import { failureReason } from "../../local-orchestrator/operator-attention.ts";
 import type { PanelAnswer } from "../../local-orchestrator/proposal-answer.ts";
 import type { WorkplaceChannel } from "./channel.ts";
 import {
-  activityLabel,
   estimateLabel,
   gateLabels,
   settingLabel,
@@ -43,6 +42,8 @@ import {
   type TaskSummary,
 } from "./protocol.ts";
 
+import { icon, visual } from "./icons.ts";
+
 const labels = {
   registered: "登録",
   running: "実行",
@@ -59,11 +60,10 @@ const answerLabels = {
   task: "Task の提案",
   integration: "統合",
 } as const;
-const proposalLabels: Partial<Record<PanelInboxItem["kind"], string>> = {
-  "goal-registration": answerLabels.goal,
-  "task-registration": answerLabels.task,
-  integration: answerLabels.integration,
-  "secret-test-required": "シークレットの動作確認",
+const proposalKinds = {
+  "goal-registration": ["flag", answerLabels.goal],
+  "task-registration": ["checklist", answerLabels.task],
+  integration: ["merge", answerLabels.integration],
 } as const;
 
 function chip(label: string, tone: string) {
@@ -84,12 +84,8 @@ function displayState(state: keyof typeof labels) {
   return chip(labels[state], tone);
 }
 
-function aiTag() {
-  const tag = textElement("span", "AI", "aitag");
-  tag.title = "モデルが書いた文";
-  tag.setAttribute("role", "img");
-  tag.setAttribute("aria-label", "モデル生成");
-  return tag;
+function modelAttribution() {
+  return textElement("span", "AI の記述 ", "sr-only");
 }
 
 function modelTitle<K extends "h2" | "h3" | "span">(
@@ -97,7 +93,12 @@ function modelTitle<K extends "h2" | "h3" | "span">(
   value: string,
   classes = "title",
 ) {
-  return group(tag, classes, aiTag(), textElement("bdi", value));
+  return group(
+    tag,
+    `${classes} model-title`,
+    modelAttribution(),
+    textElement("bdi", value),
+  );
 }
 
 function packageDiffLines(entries: readonly string[], total: number) {
@@ -109,7 +110,12 @@ function modelBox(label: string, lines: readonly string[]) {
   return group(
     "div",
     "card",
-    group("h3", "section-title", aiTag(), document.createTextNode(label)),
+    group(
+      "h3",
+      "section-title",
+      modelAttribution(),
+      document.createTextNode(label),
+    ),
     ...lines.map((line) => textElement("pre", line, "model-content")),
   );
 }
@@ -214,7 +220,242 @@ function proposalHasWithheld(proposal: Proposal) {
   );
 }
 
-function proposalEvidence(proposal: Proposal) {
+function aiPending(item: PanelInboxItem) {
+  return (
+    "answer" in item &&
+    item.answer.takeover === true &&
+    !item.answer.approve &&
+    !item.answer.reject
+  );
+}
+
+function splitDecisions(items: readonly PanelInboxItem[]) {
+  const human: PanelInboxItem[] = [];
+  const ai: PanelInboxItem[] = [];
+  for (const item of items) (aiPending(item) ? ai : human).push(item);
+  return { human, ai };
+}
+
+function rememberedDetails(
+  label: string,
+  key: string,
+  opened: Set<string>,
+  ...children: Node[]
+) {
+  const summary = textElement("summary", label);
+  summary.dataset.focusKey = key;
+  const details = group("details", "card fold", summary, ...children);
+  details.open = opened.has(key);
+  details.addEventListener("toggle", () => {
+    if (!details.isConnected) return;
+    if (details.open) opened.add(key);
+    else opened.delete(key);
+  });
+  return details;
+}
+
+function aiSection(
+  items: PanelInboxItem[],
+  surface: string,
+  opened: Set<string>,
+  render: (item: PanelInboxItem) => HTMLElement,
+) {
+  return rememberedDetails(
+    `AI が答える予定（${items.length} 件）`,
+    `ai-decisions:${surface}`,
+    opened,
+    group("div", "stack", ...items.map(render)),
+  );
+}
+
+function diffSummary(proposal: Extract<Proposal, { kind: "integration" }>) {
+  const { changedLines, diffStat } = proposal;
+  const stat = typeof diffStat === "string" ? diffStat.trim() : "";
+  const summary =
+    /^\d+ files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?$/.exec(
+      stat.slice(stat.lastIndexOf("\n") + 1).trim(),
+    );
+  const added = Number(summary?.[1] ?? 0);
+  const removed = Number(summary?.[2] ?? 0);
+  const total = added + removed;
+  const split =
+    summary &&
+    Number.isSafeInteger(total) &&
+    (changedLines === null
+      ? !/\|\s+Bin \d+ -> \d+ bytes$/m.test(stat)
+      : total === changedLines);
+  const addedBlocks =
+    split && added > 0
+      ? removed === 0
+        ? 5
+        : Math.min(4, Math.max(1, Math.round((added / total) * 5)))
+      : 0;
+  const blocks = group(
+    "span",
+    "diff-blocks",
+    ...Array.from({ length: 5 }, (_, index) => {
+      const kind =
+        !split || total === 0
+          ? "neutral"
+          : index < addedBlocks
+            ? "added"
+            : "removed";
+      return group(
+        "span",
+        `diff-block ${kind}`,
+        icon(
+          kind === "added" ? "plus" : kind === "removed" ? "minus" : "circle",
+        ),
+      );
+    }),
+  );
+  const label = split
+    ? `追加 ${added} 行、削除 ${removed} 行`
+    : changedLines === null
+      ? "変更行数は不明"
+      : `変更 ${changedLines} 行`;
+  const result = group(
+    "span",
+    "visual diff-summary",
+    blocks,
+    ...(split
+      ? [
+          textElement("span", `+${added}`, "added"),
+          textElement("span", `−${removed}`, "removed"),
+        ]
+      : [
+          textElement(
+            "span",
+            changedLines === null ? "—" : String(changedLines),
+          ),
+        ]),
+  );
+  result.setAttribute("role", "img");
+  result.setAttribute("aria-label", label);
+  result.title = label;
+  return result;
+}
+
+function proposalKeyFacts(proposal: Proposal) {
+  if (proposal.kind === "integration") {
+    const passed = proposal.modelText.verdict === "pass";
+    return [
+      visual(
+        passed ? "check" : "cross",
+        passed ? "AI レビュー合格" : "AI レビューに懸念あり",
+        passed ? "added" : "removed",
+      ),
+      visual(
+        "file",
+        `${proposal.changedFiles} ファイル`,
+        "",
+        String(proposal.changedFiles),
+      ),
+      diffSummary(proposal),
+    ];
+  }
+  const { acceptance } = proposal.modelText;
+  const conditions =
+    "withheld" in acceptance
+      ? textElement("span", withheldText)
+      : visual(
+          "checklist",
+          `受け入れ条件 ${acceptance.length} 件`,
+          "",
+          String(acceptance.length),
+        );
+  const paths = proposal.paths;
+  const pathFact =
+    "withheld" in paths
+      ? textElement("span", withheldText)
+      : visual(
+          "folder",
+          paths.length ? `対象パス ${paths.join("、")}` : "対象パスなし",
+          "path-fact",
+          textElement("bdi", paths[0] ?? "—"),
+          ...(paths.length > 1
+            ? [textElement("span", `+${paths.length - 1}`, "chip info")]
+            : []),
+        );
+  return [
+    conditions,
+    ...(proposal.kind === "goal"
+      ? [
+          visual(
+            "tasks",
+            `Task 上限 ${proposal.maxTasks}`,
+            "",
+            String(proposal.maxTasks),
+          ),
+        ]
+      : []),
+    pathFact,
+  ];
+}
+
+function delegationExplanation(gates: readonly (keyof typeof gateLabels)[]) {
+  return `承認すると、この先の判断を AI に任せる設定が入ります（${gates.map((gate) => gateLabels[gate]).join("、")}）。`;
+}
+
+function warningSummary(label: string, explanation: string, key: string) {
+  const warning = group(
+    "span",
+    "visual warning warning-summary",
+    icon("warning"),
+  );
+  warning.append(
+    label,
+    textElement("span", ` ${explanation}`, "warning-explanation"),
+  );
+  warning.title = explanation;
+  warning.tabIndex = 0;
+  warning.dataset.focusKey = key;
+  return warning;
+}
+
+function delegationWarning(
+  gates: readonly (keyof typeof gateLabels)[],
+  key: string,
+) {
+  return warningSummary(
+    "委任を拡大",
+    delegationExplanation(gates),
+    `delegation:${key}`,
+  );
+}
+
+function proposalWarnings(
+  proposal: Proposal,
+  pendingGates: readonly (keyof typeof gateLabels)[],
+  key: string,
+) {
+  const violations = proposal.pathViolations;
+  const gates = [...new Set([...pendingGates, ...proposal.loosening])];
+  return [
+    ...("withheld" in violations || violations.length
+      ? [
+          warningSummary(
+            "withheld" in violations ? "範囲外" : `範囲外 ${violations.length}`,
+            "withheld" in violations
+              ? withheldText
+              : `範囲外のパス\n${violations.join("\n")}`,
+            `scope:${key}`,
+          ),
+        ]
+      : []),
+    ...(gates.length ? [delegationWarning(gates, key)] : []),
+    ...(proposalHasWithheld(proposal)
+      ? [textElement("p", withheldApproval, "warning")]
+      : []),
+  ];
+}
+
+function proposalEvidence(
+  proposal: Proposal,
+  pendingGates: readonly (keyof typeof gateLabels)[],
+) {
+  const { pathViolations } = proposal;
+  const gates = [...new Set([...pendingGates, ...proposal.loosening])];
   const { origin, budgets, effectivePolicy, policySource, ruleId, ruleName } =
     proposal;
   const policy =
@@ -245,25 +486,16 @@ function proposalEvidence(proposal: Proposal) {
       "予算",
       `${formatDuration(budgets.maxExecutionMs)} / ${formatTokens(budgets.maxTokens)} トークン / 再試行 ${budgets.maxRetries} 回`,
     ],
-    ["範囲外のパス", proposalList(proposal.pathViolations)],
   ];
-  if (proposal.humanAnswerRequired || proposal.humanApprovalRequired)
-    hostFacts.push(["人の判断", "必要"]);
-  if (proposal.loosening.length)
-    hostFacts.push(["委任範囲", "拡大を含みます。"]);
 
   const model = group(
     "section",
     "stack",
     textElement("h4", "AI の記述", "section-title"),
   );
+  let evidence: HTMLElement;
   if (proposal.kind === "integration") {
-    hostFacts.unshift(
-      ["変更ファイル数", String(proposal.changedFiles)],
-      [
-        "変更行数",
-        proposal.changedLines === null ? "—" : String(proposal.changedLines),
-      ],
+    evidence = facts([
       ["変更パス", proposalList(proposal.changedPaths)],
       [
         "変更規模",
@@ -271,9 +503,13 @@ function proposalEvidence(proposal: Proposal) {
           ? textElement("pre", proposal.diffStat.trim())
           : withheldText,
       ],
-    );
+    ]);
     const { verdict, findings } = proposal.modelText;
-    model.append(textElement("p", `レビュー（AI）: ${verdict}`));
+    model.append(
+      verdict === "pass"
+        ? textElement("p", "AI レビューに合格しました。")
+        : textElement("p", "AI レビューで懸念が報告されました。", "warning"),
+    );
     if (findings !== null)
       model.append(
         facts([
@@ -288,7 +524,7 @@ function proposalEvidence(proposal: Proposal) {
         ]),
       );
   } else {
-    hostFacts.unshift(["対象パス", proposalList(proposal.paths)]);
+    evidence = facts([["対象パス", proposalList(proposal.paths)]]);
     if (proposal.kind === "goal")
       hostFacts.push(
         ["実行ロール", proposal.actors.join("、") || "なし"],
@@ -330,10 +566,27 @@ function proposalEvidence(proposal: Proposal) {
       ]),
     );
   }
-  const content = group("div", "stack", facts(hostFacts), model);
-  if (proposalHasWithheld(proposal))
-    content.append(textElement("p", withheldApproval, "warning"));
-  return content;
+  return group(
+    "div",
+    "stack",
+    ...("withheld" in pathViolations || pathViolations.length
+      ? [facts([["範囲外のパス", proposalList(pathViolations)]])]
+      : []),
+    ...(gates.length
+      ? [textElement("p", delegationExplanation(gates), "warning")]
+      : []),
+    evidence,
+    model,
+    group(
+      "details",
+      "execution-conditions",
+      textElement("summary", "実行の条件"),
+      ...(proposal.humanAnswerRequired || proposal.humanApprovalRequired
+        ? [textElement("p", "人の判断が必要")]
+        : []),
+      facts(hostFacts),
+    ),
+  );
 }
 
 type Watch = (
@@ -367,11 +620,13 @@ export function createInboxPanel(
     >
   >();
   const expanded = new Set<string>();
+  const openedSections = new Set<string>();
   const stale = new Map<string, string>();
   const previews = new Map<
     string,
-    { digest: string; pending: Promise<Proposal> }
+    { key: string; pending: Promise<Proposal> }
   >();
+  let prefetch = Promise.resolve();
   let proposals: PanelInboxItem[] = [];
   let controls: (() => void)[] = [];
   let answering = false;
@@ -415,16 +670,22 @@ export function createInboxPanel(
     batchButton.textContent = `${chosen.size} 件をまとめて承認`;
   }
 
-  function preview(id: string, digest: string) {
+  function preview(id: string, answer?: AnswerableProposal) {
+    const key = JSON.stringify([
+      answer?.digest,
+      answer?.approve,
+      answer?.reject,
+      answer?.takeover,
+    ]);
     const existing = previews.get(id);
-    if (existing?.digest === digest) return existing.pending;
+    if (existing?.key === key) return existing.pending;
     const pending = channel
       .request("proposal.get", { id })
       .catch((error: unknown) => {
         if (previews.get(id)?.pending === pending) previews.delete(id);
         throw error;
       });
-    previews.set(id, { digest, pending });
+    previews.set(id, { key, pending });
     return pending;
   }
 
@@ -438,7 +699,7 @@ export function createInboxPanel(
   }
 
   async function validate(answer: AnswerableProposal) {
-    const proposal = await preview(answer.id, answer.digest);
+    const proposal = await preview(answer.id, answer);
     if (proposal.digest !== answer.digest) throw new Error("stale-digest");
     if (proposal.status !== "pending") throw new Error("invalid-transition");
     if (proposalHasWithheld(proposal)) throw new Error("withheld");
@@ -645,6 +906,7 @@ export function createInboxPanel(
           ...errors.map((error) => textElement("p", error, "warning")),
         );
         submit.disabled = errors.length > 0;
+        submit.hidden = errors.includes(withheldApproval);
       });
     }
   }
@@ -682,23 +944,45 @@ export function createInboxPanel(
       "span",
       needsReview
         ? answerError("stale-digest")
-        : answer?.takeover && !answer.approve && !answer.reject
-          ? "AI の判断待ちです。"
-          : "確認が必要です。",
+        : !aiPending(item) && (!options.surface || options.surface === "list")
+          ? "あなたが答える"
+          : "",
+      "decision-reason",
     );
-    const kind = proposalLabels[item.kind] ?? item.title;
+    const kind =
+      item.kind in proposalKinds
+        ? proposalKinds[item.kind as keyof typeof proposalKinds]
+        : undefined;
+    const subject = item.subject;
+    const goalProposal = item.kind === "goal-registration";
+    const subjectRef =
+      subject.taskRef ??
+      (goalProposal ? (subject.ref ?? subject.goalRef) : undefined);
     const top = group(
       "div",
       "card-top",
-      chip(kind, item.kind === "integration" || !answer ? "warn" : "accent"),
-      ...refNodes(item.subject.ref, options.goalRef),
+      kind
+        ? visual(kind[0], kind[1], "chip info")
+        : chip(
+            item.kind === "secret-test-required"
+              ? "シークレットの動作確認"
+              : item.title,
+            "warn",
+          ),
+      ...refNodes(subjectRef, options.goalRef),
+      ...(aiPending(item) ? [chip("AI が回答予定", "ai-pending")] : []),
       reason,
     );
     const row = textElement(
       options.batch ? "li" : "article",
       "",
-      options.flat ? "card flat" : "card",
+      `card${options.flat ? " flat" : ""}${aiPending(item) ? " ai-pending-card" : ""}`,
     );
+    const keyFact = textElement("div", "", "decision-key-fact");
+    keyFact.hidden = true;
+    const warnings = group("div", "stack decision-warnings");
+    if (answer?.agentGates.length)
+      warnings.append(delegationWarning(answer.agentGates, item.id));
     const detail = textElement("div", "", "stack decision-detail");
     detail.hidden = !expanded.has(item.id);
     const info = textElement("div", "", "stack");
@@ -709,16 +993,33 @@ export function createInboxPanel(
       item.next,
       "CLI コマンドをコピー",
       `copy:${item.id}`,
-      true,
+      !answer,
     );
-    const fallback = group(
-      "div",
-      "stack",
-      command.text,
-      group("div", "actions", command.copy, command.status),
-    );
-    fallback.hidden = Boolean(answer?.approve || answer?.takeover);
-    detail.append(fallback);
+    const more = textElement("summary", "…");
+    more.setAttribute("aria-label", "提案のその他の操作");
+    more.dataset.focusKey = `more:${item.id}`;
+    const menu = group("details", "decision-menu", more, command.copy);
+    command.status.className = "muted decision-command-status";
+    command.copy.addEventListener("click", () => {
+      if (menu.hidden) return;
+      menu.open = false;
+      more.focus();
+    });
+    menu.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !menu.open) return;
+      event.stopPropagation();
+      menu.open = false;
+      more.focus();
+    });
+    const inlineCopy = group("div", "actions");
+    inlineCopy.hidden = true;
+    function showCommand() {
+      menu.hidden = true;
+      command.text.hidden = false;
+      inlineCopy.hidden = false;
+      inlineCopy.append(command.copy);
+    }
+    if (!answer) showCommand();
     const toggle = action(
       "",
       `detail:${item.id}`,
@@ -740,33 +1041,41 @@ export function createInboxPanel(
       "div",
       "actions decision-actions",
       toggle,
+      menu,
       textElement("span", "", "spacer"),
       hint,
     );
     const answerArea = group("div", "stack", actions, status);
     let viewed: Proposal | undefined;
+    let loading = false;
+    let approvalWithheld = false;
     let approve: HTMLButtonElement | undefined;
     let reject: HTMLButtonElement | undefined;
     let takeover: HTMLButtonElement | undefined;
     let sending = false;
+    function canApprove() {
+      return (
+        !answering &&
+        !sending &&
+        viewed?.status === "pending" &&
+        viewed.digest === answer?.digest &&
+        !approvalWithheld
+      );
+    }
     function updateButtons() {
       if (reject) reject.disabled = answering;
       if (takeover) takeover.disabled = answering;
-      if (approve)
-        approve.disabled =
-          answering ||
-          (!detail.hidden &&
-            (!viewed ||
-              viewed.status !== "pending" ||
-              viewed.digest !== answer?.digest ||
-              proposalHasWithheld(viewed)));
+      if (approve) {
+        approve.disabled = !canApprove();
+        approve.hidden = approvalWithheld;
+      }
+      hint.hidden = detail.hidden || !answer?.approve || approvalWithheld;
     }
     function updateDisclosure() {
       const parent = detail.hidden ? answerArea : detail;
       if (actions.parentElement !== parent) parent.prepend(actions);
       if (!detail.hidden && detail.lastElementChild !== actions)
         detail.append(actions);
-      hint.hidden = detail.hidden || !answer?.approve;
       toggle.textContent = detail.hidden ? "詳細" : "詳細を閉じる";
       toggle.setAttribute("aria-expanded", String(!detail.hidden));
       updateButtons();
@@ -781,6 +1090,7 @@ export function createInboxPanel(
         `${name ?? kind} をまとめて承認する項目に追加`,
       );
       checkbox.addEventListener("change", () => {
+        if (checkbox.disabled) return;
         cancelConfirmation?.();
         if (checkbox.checked) chosen.set(answer.id, answer.digest);
         else chosen.delete(answer.id);
@@ -789,8 +1099,10 @@ export function createInboxPanel(
       updateSelection = () => {
         checkbox.checked = chosen.get(answer.id) === answer.digest;
         checkbox.disabled =
-          answering || (!checkbox.checked && chosen.size >= 20);
+          !canApprove() || (!checkbox.checked && chosen.size >= 20);
+        checkbox.hidden = approvalWithheld;
       };
+      updateSelection();
       controls.push(updateSelection);
       top.prepend(checkbox);
     }
@@ -842,26 +1154,34 @@ export function createInboxPanel(
     row.append(
       top,
       name ? modelTitle("h3", name) : textElement("h3", item.title, "title"),
-      ...(options.goalRef
+      ...(options.goalRef || (goalProposal && subjectRef)
         ? []
-        : goalLink(item.subject.goalId, item.subject.goalRef)),
-      ...(answer?.agentGates.length
-        ? [
-            textElement(
-              "p",
-              `この提案には AI へ判断を委任する設定が含まれます（${answer.agentGates.map((gate) => gateLabels[gate]).join("、")}）。`,
-              "warning",
-            ),
-          ]
-        : []),
+        : goalLink(subject.goalId, subject.goalRef)),
+      keyFact,
+      warnings,
+      command.text,
+      inlineCopy,
+      command.status,
       detail,
       answerArea,
     );
+    function renderEvidence() {
+      if (viewed && !detail.hidden && !info.firstElementChild)
+        info.replaceChildren(
+          proposalEvidence(viewed, answer?.agentGates ?? []),
+        );
+    }
     async function load() {
-      if (!id || viewed) return;
-      info.textContent = "提案の詳細を読み込み中…";
+      if (viewed) {
+        renderEvidence();
+        return;
+      }
+      if (!id) return;
+      if (!detail.hidden) info.textContent = "提案の詳細を読み込み中…";
+      if (loading) return;
+      loading = true;
       try {
-        const proposal = await preview(id, answer?.digest ?? "");
+        const proposal = await preview(id, answer);
         if (answer && proposal.digest !== answer.digest) {
           reason.textContent = answerError("stale-digest");
           info.replaceChildren();
@@ -869,17 +1189,36 @@ export function createInboxPanel(
           return;
         }
         viewed = proposal;
-        info.replaceChildren(proposalEvidence(proposal));
-        if (proposalHasWithheld(proposal)) fallback.hidden = false;
+        approvalWithheld = proposalHasWithheld(proposal);
+        keyFact.replaceChildren(...proposalKeyFacts(proposal));
+        keyFact.hidden = false;
+        restoreFocus(warnings, () =>
+          warnings.replaceChildren(
+            ...proposalWarnings(proposal, answer?.agentGates ?? [], item.id),
+          ),
+        );
+        if (approvalWithheld) {
+          showCommand();
+          if (answer && chosen.get(answer.id) === answer.digest) {
+            cancelConfirmation?.(batch);
+            chosen.delete(answer.id);
+            updateControls();
+          }
+        }
+        renderEvidence();
         updateButtons();
+        updateSelection?.();
       } catch {
         info.textContent = "提案の詳細を取得できませんでした。";
+      } finally {
+        loading = false;
       }
     }
-    if (!detail.hidden) {
-      expanded.add(item.id);
-      void load();
-    }
+    // Proposal reads can be expensive and share the host's serial connection.
+    // Keep eager summaries in order while detail and answer actions can read immediately.
+    if (detail.hidden)
+      prefetch = prefetch.then(() => (row.isConnected ? load() : undefined));
+    else void load();
     watch(row, item.state === "open" ? [item.id] : []);
     if (options.surface) {
       const surfaces = cards.get(item.id) ?? new Map();
@@ -896,6 +1235,7 @@ export function createInboxPanel(
 
   return {
     card,
+    openedSections,
     cancelConfirmation(root: HTMLElement) {
       cancelConfirmation?.(root);
     },
@@ -951,14 +1291,45 @@ export function createInboxPanel(
         inbox,
         () => {
           unwatch(inbox);
-          inbox.replaceChildren(
-            ...withTracking(rows, extra, (item) =>
+          const { human, ai } = splitDecisions(rows);
+          const aiIds = new Set(ai.map(({ id }) => id));
+          const humanCards = withTracking(
+            human,
+            { ...extra, anchors: extra.anchors.filter((id) => !aiIds.has(id)) },
+            (item) =>
               card(item, goalLink, {
                 batch: true,
                 surface: "decisions",
                 goalTitle: goalTitle(item.subject.goalId) ?? "",
               }),
-            ),
+          );
+          inbox.replaceChildren(
+            ...(rows.length || humanCards.length
+              ? [
+                  group(
+                    "section",
+                    "stack",
+                    sectionTitle(`あなたが答える（${human.length} 件）`),
+                    humanCards.length
+                      ? group("ul", "stack", ...humanCards)
+                      : textElement(
+                          "p",
+                          "あなたが答える項目はありません。",
+                          "meta",
+                        ),
+                  ),
+                ]
+              : []),
+            ...(ai.length
+              ? [
+                  aiSection(ai, "decisions", openedSections, (item) =>
+                    card(item, goalLink, {
+                      surface: "decisions",
+                      goalTitle: goalTitle(item.subject.goalId) ?? "",
+                    }),
+                  ),
+                ]
+              : []),
           );
         },
         element("tab-decisions"),
@@ -987,6 +1358,20 @@ function withTracking(
   });
 }
 
+const timelineIcons = {
+  started: "start",
+  succeeded: "check",
+  failed: "stop",
+  approved: "approved",
+  rejected: "rejected",
+  integrated: "merge",
+  exported: "export",
+} as const;
+
+function timelineMark(kind: keyof typeof timelineIcons, label: string) {
+  return visual(timelineIcons[kind], label, `timeline-mark ${kind}`);
+}
+
 function historyCards(
   rows: AgentDecision[],
   openSettings: () => void,
@@ -998,7 +1383,7 @@ function historyCards(
     rows.length
       ? group(
           "div",
-          "card",
+          "card timeline",
           ...rows.map((entry) => {
             const approved = entry.result === "approve";
             const title = titleFor(entry);
@@ -1035,11 +1420,11 @@ function historyCards(
             const row = group(
               "div",
               "activity",
-              time(entry.at),
-              chip(
+              timelineMark(
+                approved ? "approved" : "rejected",
                 approved ? "AI が承認" : "AI が却下",
-                approved ? "ok" : "info",
               ),
+              time(entry.at),
               names,
             );
             if (!entry.reasons.length) return row;
@@ -1077,58 +1462,94 @@ function turnReason(reason: GoalSummary["turn"]["reason"]) {
     case "approvals":
       return `判断 ${reason.count} 件`;
     case "cancelled":
-      return "Goal を取り消しました";
+      return "取り消し済み";
     case "failed":
-      return `が${failureReason(reason.code)}で失敗`;
+      return `${reason.taskRef} ${failureReason(reason.code)}`;
     case "planning":
-      return "Planner が Task を分けています";
+      return "計画中";
     case "running":
-      return `${reason.taskRef ? "を" : ""}作業中（${reason.actor}）`;
+      return "作業中";
     case "queued":
       return "順番待ち";
     case "not-planned":
-      return "計画がまだ依頼されていません";
+      return "計画前";
     case "exportable":
-      return "統合済み。書き出せます";
+      return "書き出し可能";
     case "completed":
-      return "Goal が完了しました";
+      return "作業完了";
     case "idle":
-      return "動いている作業はありません";
+      return "作業なし";
   }
 }
 
-function goalTurn(goal: GoalSummary, local = false) {
+function goalTurn(goal: GoalSummary, showReason = false) {
   const { owner, reason } = goal.turn;
-  const [label, tone] = (
+  const [glyph, label] = (
     {
-      human: ["あなたの番", "warn"],
-      stopped: ["止まっています", "danger"],
-      ai: ["AI の番", "accent"],
-      idle: ["待機中", "info"],
-      done: ["完了", "ok"],
+      human: ["person", "あなたの番"],
+      stopped: ["stop", "止まっています"],
+      ai: ["robot", "AI の番"],
+      idle: ["idle", "待機中"],
+      done: ["check", "完了"],
     } as const
   )[owner];
-  const task =
-    "taskRef" in reason
-      ? refNodes(reason.taskRef, local ? goal.ref : undefined)
-      : [];
+  const explanation = turnReason(reason);
+  const visible = showReason || reason.kind === "failed";
+  const mark = visual(
+    glyph,
+    visible ? label : `${label}。 ${explanation}`,
+    `owner ${owner}`,
+  );
+  mark.title = explanation;
   return group(
     "div",
     "turn-line",
-    chip(label, tone),
-    group(
-      "span",
-      "meta",
-      ...task,
-      document.createTextNode(`${task.length ? " " : ""}${turnReason(reason)}`),
-    ),
+    mark,
+    ...(visible ? [textElement("span", explanation, "meta")] : []),
   );
 }
 
-function goalProgress(goal: GoalSummary) {
-  const { done, total } = goal.progress;
-  const estimate = estimateLabel(goal.estimate.remainingMs);
-  return `${done} / ${total} Task 完了${estimate ? ` · ${estimate}` : ""}`;
+function shortEta(estimate: GoalSummary["estimate"]) {
+  const label = estimateLabel(estimate.remainingMs);
+  return label
+    ? [visual("clock", label, "eta", label.replace("（現時点の計画では）", ""))]
+    : [];
+}
+
+export function goalProgress(goal: GoalSummary) {
+  const { done, total, running, failed, cancelled = 0 } = goal.progress;
+  const waiting = total - done - running - failed - cancelled;
+  const segments = [
+    ["done", "check", done, "完了"],
+    ["running", "start", running, "実行中"],
+    ["waiting", "hourglass", waiting, "待機"],
+    ["failed", "cross", failed, "失敗"],
+    ["cancelled", "rejected", cancelled, "キャンセル"],
+  ] as const;
+  const bar = group("span", "goal-progress-bar");
+  for (const [stage, glyph, count, name] of segments) {
+    if (!count) continue;
+    const segment = group(
+      "span",
+      `goal-progress-segment ${stage}`,
+      icon(glyph),
+    );
+    // Hovering one segment names its stage and count.
+    segment.title = `${name} ${count} 件`;
+    segment.style.flexGrow = String(count);
+    bar.append(segment);
+  }
+  const summary = group(
+    "span",
+    "visual goal-progress",
+    bar,
+    textElement("span", `${done}/${total}`),
+  );
+  const label = `Task ${done} / ${total} 完了、実行中 ${running}、待機 ${waiting}、失敗 ${failed}${cancelled ? `、キャンセル ${cancelled}` : ""}`;
+  summary.setAttribute("role", "img");
+  summary.setAttribute("aria-label", label);
+  summary.title = label;
+  return group("span", "goal-metrics", summary, ...shortEta(goal.estimate));
 }
 
 function goalRow(
@@ -1145,11 +1566,11 @@ function goalRow(
     "goal-head",
     ...refNodes(goal.ref),
     link,
-    textElement("span", goalProgress(goal), "meta"),
+    goalProgress(goal),
   );
   const turn = goalTurn(goal);
   const row = group("article", "card goal-row", header, turn);
-  if (hasDecisions) {
+  if (goal.turn.owner === "human" && hasDecisions) {
     const cards = group("div", "stack");
     const toggle = action(
       "",
@@ -1175,15 +1596,53 @@ function goalRow(
   return row;
 }
 
+function taskStepper(task: TaskSummary) {
+  const steps = ["作業", "検証", "レビュー", "統合", "完了"];
+  const stage =
+    task.failureStage ?? (task.verification ? "review" : task.stage);
+  const index =
+    stage === "review"
+      ? task.verification
+        ? 1
+        : 2
+      : stage === "awaiting-integration"
+        ? 3
+        : stage === "done"
+          ? 4
+          : 0;
+  const markers = {
+    failed: [`失敗（${steps[index]}）`, "cross", "failed"],
+    cancelled: ["キャンセル", "rejected", "current"],
+    registered: ["待機", "hourglass", "current"],
+    done: ["完了", "check", "current"],
+    running: [steps[index], "start", "current"],
+    review: [steps[index], "start", "current"],
+    "awaiting-integration": [steps[index], "start", "current"],
+  } as const;
+  const [status, glyph, tone] = markers[task.stage];
+  const label = `現在: ${status}`;
+  const stepper = group(
+    "span",
+    "task-stepper",
+    ...steps.map((_, step) => {
+      if (step === index) return group("span", `step ${tone}`, icon(glyph));
+      return group("span", "step", icon(step < index ? "minus" : "circle"));
+    }),
+  );
+  stepper.setAttribute("role", "img");
+  stepper.setAttribute("aria-label", label);
+  stepper.title = `${steps.join(" → ")}。 ${label}`;
+  return stepper;
+}
+
 function taskRow(task: TaskSummary, goalRef: string, open: () => void) {
   const row = action("", task.id, open, "taskrow");
-  const estimate = estimateLabel(task.estimate.remainingMs);
   row.append(
     ...refNodes(task.ref, goalRef),
     modelTitle("span", task.title, "t"),
-    displayState(task.stage),
+    taskStepper(task),
+    ...shortEta(task.estimate),
   );
-  if (estimate) row.append(textElement("span", estimate, "eta"));
   return row;
 }
 
@@ -1221,6 +1680,62 @@ function elapsedLabel(startedAt: string | null) {
     : "—";
 }
 
+const goalTabs = [
+  ["overview", "概要"],
+  ["delegation", "任せ方"],
+  ["history", "履歴"],
+  ["details", "詳細"],
+] as const;
+type GoalTab = (typeof goalTabs)[number][0];
+
+function goalDetailTabs(
+  selected: GoalTab,
+  contents: Record<GoalTab, Node[]>,
+  remember: (tab: GoalTab) => void,
+) {
+  const tabs = group("div", "goal-tabs");
+  tabs.setAttribute("role", "tablist");
+  tabs.setAttribute("aria-label", "Goal の表示");
+  const entries = goalTabs.map(([key, label], index) => {
+    const tab = action(label, `goal-tab:${key}`, () => select(key), "tab");
+    const panel = group("section", "stack", ...contents[key]);
+    tab.id = `goal-tab-${key}`;
+    panel.id = `goal-panel-${key}`;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-controls", panel.id);
+    panel.setAttribute("role", "tabpanel");
+    panel.setAttribute("aria-labelledby", tab.id);
+    panel.tabIndex = 0;
+    panel.dataset.focusKey = `goal-panel:${key}`;
+    tab.addEventListener("keydown", (event) => {
+      const next = {
+        ArrowLeft: (index + goalTabs.length - 1) % goalTabs.length,
+        ArrowRight: (index + 1) % goalTabs.length,
+        Home: 0,
+        End: goalTabs.length - 1,
+      }[event.key];
+      const entry = next === undefined ? undefined : entries[next];
+      if (!entry) return;
+      event.preventDefault();
+      select(entry.key);
+      entry.tab.focus();
+    });
+    tabs.append(tab);
+    return { key, tab, panel };
+  });
+  function select(key: GoalTab) {
+    remember(key);
+    for (const entry of entries) {
+      const active = entry.key === key;
+      entry.tab.setAttribute("aria-selected", String(active));
+      entry.tab.tabIndex = active ? 0 : -1;
+      entry.panel.hidden = !active;
+    }
+  }
+  select(selected);
+  return [tabs, ...entries.map(({ panel }) => panel)];
+}
+
 function goalDetail(
   goal: GoalDetail,
   now: Node[],
@@ -1231,61 +1746,83 @@ function goalDetail(
   selectTask: (id: string) => void,
   watch: Watch,
   goalControls: Node[],
+  selectedTab: GoalTab,
+  selectTab: (tab: GoalTab) => void,
 ) {
   const scope = goal.scope;
-  const details = group(
-    "details",
-    "card",
-    textElement("summary", "Goal の詳細"),
-    facts([
-      ["対象パス", scope.paths.join(", ")],
-      ["利用できるアクター", scope.actors.join(", ") || "—"],
-      ["プロファイル", scope.profiles.join(", ") || "—"],
-      ["Task 上限", String(scope.maxTasks)],
-      [
-        "予算",
-        `${formatDuration(goal.budgets.maxExecutionMs)} / ${formatTokens(goal.budgets.maxTokens)} トークン / 再試行 ${goal.budgets.maxRetries} 回`,
-      ],
-      ["ブランチ", goal.branch],
-      ["ベースコミット", goal.baseCommit ?? "—"],
-    ]),
+  const details = [
+    group(
+      "div",
+      "card",
+      facts([
+        ["対象パス", scope.paths.join(", ")],
+        ["アクター", scope.actors.join(", ") || "—"],
+        ["プロファイル", scope.profiles.join(", ") || "—"],
+        ["Task 上限", String(scope.maxTasks)],
+        [
+          "予算",
+          `${formatDuration(goal.budgets.maxExecutionMs)} / ${formatTokens(goal.budgets.maxTokens)} トークン / 再試行 ${goal.budgets.maxRetries} 回`,
+        ],
+        ["ブランチ", goal.branch],
+        ["ベースコミット", goal.baseCommit ?? "—"],
+      ]),
+    ),
     ...(goal.description ? [modelBox("説明", [goal.description])] : []),
     modelBox("受け入れ条件", goal.acceptance),
+  ];
+  const recent = [
+    ...activity.map((item) => {
+      const kind =
+        item.kind === "task-running"
+          ? "started"
+          : item.kind === "task-failed"
+            ? "failed"
+            : "succeeded";
+      const label =
+        kind === "started" ? "開始" : kind === "failed" ? "失敗" : "完了";
+      const row = group(
+        "div",
+        "activity",
+        timelineMark(kind, label),
+        time(item.at),
+        ...refNodes(item.subject.taskRef ?? item.subject.goalRef, goal.ref),
+        ...(item.modelText ? [modelTitle("span", item.modelText, "grow")] : []),
+        textElement("span", kind === "failed" ? item.title : label),
+      );
+      watch(row, item.state === "open" ? [item.id] : []);
+      return { at: item.at, row };
+    }),
+    ...(goal.timeline ?? []).map(({ kind, at, ref, proposalKind }) => {
+      const result = {
+        approved: "承認",
+        rejected: "却下",
+        integrated: "統合",
+        exported: "書き出し",
+      }[kind];
+      const label = proposalKind
+        ? `${answerLabels[proposalKind]}を${result}`
+        : result;
+      return {
+        at,
+        row: group(
+          "div",
+          "activity",
+          timelineMark(kind, result),
+          time(at),
+          ...refNodes(ref, goal.ref),
+          textElement("span", label),
+        ),
+      };
+    }),
+  ].sort((a, b) => Date.parse(b.at ?? "") - Date.parse(a.at ?? ""));
+  const header = group(
+    "header",
+    "goal-head",
+    ...refNodes(goal.ref),
+    modelTitle("h2", goal.title),
+    goalProgress(goal),
   );
-  const activityLabels: Partial<Record<PanelInboxItem["kind"], string>> = {
-    "task-running": "Task の実行を開始しました。",
-    "task-succeeded": "Task が完了しました。",
-    "goal-completed": "Goal が完了しました。",
-  };
-  const recent = activity.map((item) => {
-    const row = group(
-      "div",
-      "activity",
-      time(item.at),
-      ...refNodes(item.subject.taskRef ?? item.subject.goalRef, goal.ref),
-      group(
-        "span",
-        "grow",
-        document.createTextNode(activityLabels[item.kind] ?? item.title),
-        ...(item.modelText
-          ? [
-              document.createTextNode(" "),
-              modelTitle("span", item.modelText, "model-content"),
-            ]
-          : []),
-      ),
-    );
-    watch(row, item.state === "open" ? [item.id] : []);
-    return row;
-  });
-  return [
-    group(
-      "header",
-      "goal-head",
-      ...refNodes(goal.ref),
-      modelTitle("h2", goal.title),
-      textElement("span", goalProgress(goal), "meta"),
-    ),
+  const overview = [
     ...now,
     ...decisions,
     ...problem,
@@ -1309,12 +1846,24 @@ function goalDetail(
           ),
         ]
       : []),
-    delegation,
-    sectionTitle("最近の動き"),
-    recent.length
-      ? group("div", "card", ...recent)
-      : empty("最近の動きはありません。"),
-    details,
+  ];
+  return [
+    header,
+    ...goalDetailTabs(
+      selectedTab,
+      {
+        overview,
+        delegation: [delegation],
+        history: [
+          sectionTitle("最近の動き"),
+          recent.length
+            ? group("div", "card timeline", ...recent.map(({ row }) => row))
+            : empty("最近の動きはありません。"),
+        ],
+        details,
+      },
+      selectTab,
+    ),
   ];
 }
 
@@ -1528,19 +2077,25 @@ export function goalExport(
   return group("section", "card", area, fallback);
 }
 
-function tokenBudget(task: TaskDetail) {
-  const tokens = task.tokensUsed;
-  const max = task.budgets.maxTokens;
+function tokenBudget(
+  tokens: number | null,
+  max: number,
+  incomplete = false,
+  prefix = "",
+) {
   const usage =
     tokens === null
       ? "不明"
-      : `${task.tokensIncomplete ? "少なくとも " : ""}${formatTokens(tokens)}`;
+      : `${incomplete ? "少なくとも " : ""}${formatTokens(tokens)}`;
   const label = `${usage} / ${formatTokens(max)} トークン`;
+  const over = tokens !== null && max > 0 && tokens > max;
+  const caption = textElement("p", prefix + label, "meta");
+  if (over) caption.append(" ", visual("warning", "予算超過", "removed"));
   return [
-    textElement("p", label, "meta"),
+    caption,
     ...(tokens === null || max === 0
       ? []
-      : [progress(tokens, max, label, tokens > max)]),
+      : [progress(tokens, max, label, over)]),
   ];
 }
 
@@ -1673,7 +2228,11 @@ function taskDetail(
           `${formatDuration(task.elapsedMs)}（上限 ${formatDuration(task.budgets.maxExecutionMs)}）`,
         ],
       ]),
-      ...tokenBudget(task),
+      ...tokenBudget(
+        task.tokensUsed,
+        task.budgets.maxTokens,
+        task.tokensIncomplete,
+      ),
     ),
     delegation,
     group(
@@ -1758,9 +2317,10 @@ function taskDetail(
                 "stack",
                 textElement(
                   "p",
-                  `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)} · ${formatTokens(tokens)} トークン${environment ? ` · 環境 ${environment.key}（${environment.failure ? failureReason(environment.failure) : environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
+                  `${actor === "Executor" && harness === "codex" ? "Executor（Codex）" : actor}${model ? ` / ${model}` : ""} / ${mode} / ${status} · ${formatTimestamp(startedAt)} → ${formatTimestamp(finishedAt)}${environment ? ` · 環境 ${environment.key}（${environment.failure ? failureReason(environment.failure) : environment.cacheHit ? "キャッシュ" : "ビルド"}）` : ""}`,
                   "meta",
                 ),
+                ...tokenBudget(tokens, task.budgets.maxTokens),
                 ...(code ? [textElement("code", code)] : []),
                 ...(next ? [textElement("p", next, "meta")] : []),
               ),
@@ -2356,21 +2916,23 @@ function problemCard(
                   ({ id }) => id === executionId,
                 )?.tokens;
                 if (tokens == null) return [];
-                const label = `${formatTokens(tokens)} / ${formatTokens(max)} トークン`;
-                return [
-                  textElement(
-                    "p",
-                    `実行 ${executionId?.slice(0, 8)} · ${label}`,
-                    "meta",
-                  ),
-                  ...(max ? [progress(tokens, max, label, true)] : []),
-                ];
+
+                return tokenBudget(
+                  tokens,
+                  max,
+                  false,
+                  `実行 ${executionId?.slice(0, 8)} · `,
+                );
               });
               usage.append(...reports);
               if (reports.length === 0) {
                 usage.append(
                   sectionTitle("Task 全体のトークン使用量"),
-                  ...tokenBudget(task),
+                  ...tokenBudget(
+                    task.tokensUsed,
+                    task.budgets.maxTokens,
+                    task.tokensIncomplete,
+                  ),
                 );
               }
             })
@@ -2385,7 +2947,7 @@ function problemCard(
 
 const tabs = ["decisions", "problems", "goals"] as const;
 type Tab = (typeof tabs)[number];
-type View = { tab: Tab; goalId?: string; taskId?: string };
+type View = { tab: Tab; goalId?: string; taskId?: string; history?: true };
 const settingsSections = {
   delegation: "delegation",
   display: "display-settings",
@@ -2421,6 +2983,8 @@ export function createHostPanel(
     inbox?.cancelConfirmation(nowPopover),
   );
   const inlineGoals = new Set<string>();
+  const openedGoalGroups = new Set<string>();
+  const selectedGoalTabs = new Map<string, GoalTab>();
   const draftedPlans = new Set<string>();
   const tracks = new Map<string, { ref: string; title: string }>();
   const problemReceipts = new Map<
@@ -2584,16 +3148,32 @@ export function createHostPanel(
   }
 
   function renderNow(pending: PanelInboxItem[]) {
+    const { human, ai } = splitDecisions(pending);
     const preparing = environment?.build?.state === "running";
-    nowButton.textContent = preparing
-      ? "環境を準備中"
-      : activityLabel({
-          ...activity,
-          yourTurn: pending.length + problems.length,
-        });
-    nowButton.dataset.running = String(
-      preparing || activity.running.length > 0,
+    const working = activity.running.length;
+    const workLabel = `AI 作業中 ${working} 件`;
+    const queueLabel = `順番待ち ${activity.queuedCount} 件`;
+    const turnLabel = `あなたの番 ${human.length} 件`;
+    const status = preparing
+      ? "。環境を準備中"
+      : activity.running.some(
+            ({ resolvingDependencies }) => resolvingDependencies,
+          )
+        ? "。依存を解決中"
+        : activity.running.some(
+              ({ preparingEnvironment }) => preparingEnvironment,
+            )
+          ? "。環境を準備中"
+          : "";
+    const label = `いま。 ${workLabel}、${queueLabel}、${turnLabel}${status}`;
+    nowButton.replaceChildren(
+      visual("robot", workLabel + status, "now-working", String(working)),
+      visual("hourglass", queueLabel, "", String(activity.queuedCount)),
+      visual("person", turnLabel, "", String(human.length)),
     );
+    nowButton.setAttribute("aria-label", label);
+    nowButton.title = label;
+    nowButton.dataset.running = String(working > 0);
     if (nowPopover.hidden) return;
     const snapshot = JSON.stringify([
       activity,
@@ -2637,40 +3217,29 @@ export function createHostPanel(
           ...Array.from(tracks.keys(), (id) => trackingCard(id, false)).filter(
             (card) => card !== undefined,
           ),
-          ...(pending.length || problems.length
-            ? [sectionTitle("あなたの番")]
+          ...(human.length && inbox
+            ? [
+                group(
+                  "section",
+                  "stack",
+                  sectionTitle(`あなたの番（${human.length} 件）`),
+                  ...human.map(nowDecision),
+                ),
+              ]
             : []),
-          ...(inbox
-            ? pending.map((item) =>
-                inbox.card(item, goalLink, {
-                  flat: true,
-                  surface: "popover",
-                  goalTitle: goalTitle(item.subject.goalId) ?? "",
-                }),
-              )
+          ...(ai.length && inbox
+            ? [aiSection(ai, "popover", inbox.openedSections, nowDecision)]
             : []),
-          ...problems.map((rows) => {
-            const { taskId, goalId, executionId, ref } = rows[0]!;
-            const title = rows.find((row) => row.title)?.title;
-            return group(
-              "div",
-              "now-problem",
-              ...refNodes(ref),
-              title
-                ? modelTitle("span", title, "grow")
-                : textElement("span", taskId ?? goalId ?? "実行", "grow"),
-              chip(problemReason(rows), "danger"),
-              ...rows
-                .filter((row) => "code" in row && row.code === "env-missing")
-                .map(({ detail }) => textElement("p", detail, "reason")),
-              action(
-                "問題を見る ›",
-                `now-problem:${taskId ?? executionId ?? goalId}`,
-                () => navigate({ tab: "problems" }),
-                "link",
-              ),
-            );
-          }),
+          ...(problems.length
+            ? [
+                group(
+                  "section",
+                  "stack",
+                  sectionTitle(`問題（${problems.length} 件）`),
+                  ...problems.map(nowProblem),
+                ),
+              ]
+            : []),
           ...(channel && environment
             ? environmentControls(
                 channel,
@@ -2685,6 +3254,35 @@ export function createHostPanel(
       },
       nowPopover,
     );
+    function nowProblem(rows: Problem[]) {
+      const { taskId, goalId, executionId, ref } = rows[0]!;
+      const title = rows.find((row) => row.title)?.title;
+      return group(
+        "div",
+        "now-problem",
+        ...refNodes(ref),
+        title
+          ? modelTitle("span", title, "grow")
+          : textElement("span", taskId ?? goalId ?? "実行", "grow"),
+        chip(problemReason(rows), "danger"),
+        ...rows
+          .filter((row) => "code" in row && row.code === "env-missing")
+          .map(({ detail }) => textElement("p", detail, "reason")),
+        action(
+          "問題を見る ›",
+          `now-problem:${taskId ?? executionId ?? goalId}`,
+          () => navigate({ tab: "problems" }),
+          "link",
+        ),
+      );
+    }
+    function nowDecision(item: PanelInboxItem) {
+      return inbox!.card(item, goalLink, {
+        flat: true,
+        surface: "popover",
+        goalTitle: goalTitle(item.subject.goalId) ?? "",
+      });
+    }
   }
 
   nowButton.addEventListener("click", () => {
@@ -2766,14 +3364,16 @@ export function createHostPanel(
       "",
       `goal:${id}`,
       () => navigate({ tab: "goals", goalId: id }),
-      "link",
+      "link visual",
     );
-    link.append(
-      ...refNodes(ref),
-      ...(title ? [textElement("bdi", title)] : []),
-      " ›",
+    link.append(icon("flag"), ...refNodes(ref));
+
+    link.setAttribute(
+      "aria-label",
+      ["Goal", ref, title].filter(Boolean).join(" "),
     );
-    return [group("div", "meta", document.createTextNode("Goal: "), link)];
+    link.title = title ?? `Goal ${ref}`;
+    return [group("div", "meta", link)];
   }
 
   function updateVisibility() {
@@ -2784,6 +3384,9 @@ export function createHostPanel(
       button.tabIndex = selected ? 0 : -1;
       element(tab).hidden = Boolean(settings) || !selected;
     }
+    element("decision-queue").hidden = Boolean(view.history);
+    element("decision-history-view").hidden = !view.history;
+    element("decisions").dataset.history = String(Boolean(view.history));
     element("host-tabs").hidden = Boolean(settings);
     element("settings-back").hidden = !settings;
     element("settings").hidden = !settings;
@@ -2891,6 +3494,8 @@ export function createHostPanel(
     now.close(false);
     if (view.tab === "problems" && next.tab !== "problems")
       problemReceipts.clear();
+    if (next.history) inbox?.cancelConfirmation(element("decisions"));
+    const wasHistory = view.history;
     view = next;
     previousView = "";
     pendingFocus = decisionId;
@@ -2908,18 +3513,36 @@ export function createHostPanel(
       if (view.goalId || view.taskId) contents.querySelector("button")?.focus();
       else element(`tab-${view.tab}`).focus();
     } else {
-      if (!focusDecision()) element("tab-decisions").focus();
+      element("inbox").scrollTop = 0;
+      if (view.history) element("decision-history-back").focus();
+      else if (wasHistory && !decisionId)
+        element("decision-history-open").focus();
+      else if (!focusDecision()) element("tab-decisions").focus();
     }
     void refresh();
   }
 
+  element("decision-history-open").addEventListener("click", () =>
+    navigate({ tab: "decisions", history: true }),
+  );
+  element("decision-history-back").addEventListener("click", () =>
+    navigate({ tab: "decisions" }),
+  );
+
   function focusDecision() {
     if (!pendingFocus) return false;
     const target = Array.from(
-      element("inbox-items").querySelectorAll<HTMLButtonElement>("button"),
+      element("inbox-items").querySelectorAll<HTMLButtonElement>(
+        "[data-focus-key]",
+      ),
     ).find((node) => node.dataset.focusKey === `detail:${pendingFocus}`);
     if (!target) return false;
     pendingFocus = undefined;
+    const section = target.closest("details.fold") as HTMLDetailsElement | null;
+    if (section) {
+      section.open = true;
+      inbox?.openedSections.add("ai-decisions:decisions");
+    }
     target.focus();
     return true;
   }
@@ -2961,7 +3584,8 @@ export function createHostPanel(
     restoreFocus(
       panel,
       () => {
-        const open = panel.querySelector<HTMLDetailsElement>("details[open]");
+        const open =
+          task && panel.querySelector<HTMLDetailsElement>("details[open]");
         unwatch(panel);
         panel.replaceChildren(...breadcrumb(view, task, goal), ...contents());
         const disclosure = panel.querySelector("details");
@@ -2972,6 +3596,7 @@ export function createHostPanel(
   }
 
   function savedPolicy() {
+    inbox?.invalidate();
     previousView = previousPolicy = "";
     void refresh(false);
   }
@@ -3084,7 +3709,12 @@ export function createHostPanel(
             trackSlots(true),
             trackingData(),
           );
-        badge("decisions", pending.length);
+        const { human, ai } = splitDecisions(pending);
+        badge("decisions", human.length);
+        element("tab-decisions").setAttribute(
+          "aria-label",
+          `判断待ち。あなたが答える ${human.length} 件、AI が答える予定 ${ai.length} 件`,
+        );
         badge("problems", problems.length);
         badge(
           "goals",
@@ -3145,6 +3775,9 @@ export function createHostPanel(
           }
           const rows =
             history.status === "fulfilled" ? history.value : undefined;
+          element("decision-history-open").textContent = rows
+            ? `AI が判断したもの（${rows.length} 件）›`
+            : "AI が判断したもの ›";
           const historyTitle = (entry: AgentDecision) =>
             entry.taskId
               ? (lastGoal?.tasks.find(({ id }) => id === entry.taskId)?.title ??
@@ -3178,8 +3811,16 @@ export function createHostPanel(
             item.subject.goalId === detail.id ||
             Boolean(item.subject.taskId && tasks.has(item.subject.taskId));
           const decisions = pending.filter(related);
+          const goalDecisions = splitDecisions(decisions);
+          const decisionCard = (item: PanelInboxItem) =>
+            inbox!.card(item, goalLink, {
+              goalRef: detail.ref,
+              surface: "goal",
+            });
           const recent = items.filter(
-            (item) => item.weight === "info" && related(item),
+            (item) =>
+              (item.weight === "info" || item.kind === "task-failed") &&
+              related(item),
           );
           const running = activity.running.filter(
             ({ goalId }) => goalId === detail.id,
@@ -3225,15 +3866,28 @@ export function createHostPanel(
                       : []),
                   ),
                 ],
-                decisions.length && inbox
+                inbox
                   ? [
-                      sectionTitle("あなたの番"),
-                      ...decisions.map((item) =>
-                        inbox.card(item, goalLink, {
-                          goalRef: detail.ref,
-                          surface: "goal",
-                        }),
-                      ),
+                      ...(goalDecisions.human.length
+                        ? [
+                            group(
+                              "section",
+                              "stack",
+                              sectionTitle("あなたの番"),
+                              ...goalDecisions.human.map(decisionCard),
+                            ),
+                          ]
+                        : []),
+                      ...(goalDecisions.ai.length
+                        ? [
+                            aiSection(
+                              goalDecisions.ai,
+                              `goal:${detail.id}`,
+                              inbox.openedSections,
+                              decisionCard,
+                            ),
+                          ]
+                        : []),
                     ]
                   : [],
                 problem
@@ -3258,6 +3912,8 @@ export function createHostPanel(
                   }),
                   ...goalBaseUpdate(channel, detail, () => void refresh(false)),
                 ],
+                selectedGoalTabs.get(detail.id) ?? "overview",
+                (tab) => selectedGoalTabs.set(detail.id, tab),
               ),
             undefined,
             detail,
@@ -3349,9 +4005,12 @@ export function createHostPanel(
           const byGoal = new Map(
             goals.map((goal) => [
               goal.id,
-              pending.filter(
-                ({ subject }) =>
-                  subject.goalId === goal.id || subject.goalRef === goal.ref,
+              human.filter(
+                (item) =>
+                  "answer" in item &&
+                  (item.answer.approve || item.answer.reject) &&
+                  (item.subject.goalId === goal.id ||
+                    item.subject.goalRef === goal.ref),
               ),
             ]),
           );
@@ -3361,31 +4020,36 @@ export function createHostPanel(
                   const groupGoals = goals.filter(({ turn }) =>
                     owners.includes(turn.owner),
                   );
-                  return groupGoals.length
+                  if (!groupGoals.length) return [];
+                  const rows = groupGoals.map((entry) => {
+                    const decisions = byGoal.get(entry.id) ?? [];
+                    return goalRow(
+                      entry,
+                      () => navigate({ tab: "goals", goalId: entry.id }),
+                      () =>
+                        inbox
+                          ? decisions.map((item) =>
+                              inbox.card(item, goalLink, {
+                                flat: true,
+                                surface: "list",
+                                goalTitle: goalTitle(item.subject.goalId) ?? "",
+                              }),
+                            )
+                          : [],
+                      decisions.length > 0,
+                      inlineGoals,
+                    );
+                  });
+                  return owners.includes("done")
                     ? [
-                        sectionTitle(label),
-                        ...groupGoals.map((entry) => {
-                          const decisions = byGoal.get(entry.id) ?? [];
-                          return goalRow(
-                            entry,
-                            () => navigate({ tab: "goals", goalId: entry.id }),
-                            () =>
-                              inbox
-                                ? decisions.map((item) =>
-                                    inbox.card(item, goalLink, {
-                                      flat: true,
-                                      surface: "list",
-                                      goalTitle:
-                                        goalTitle(item.subject.goalId) ?? "",
-                                    }),
-                                  )
-                                : [],
-                            decisions.length > 0,
-                            inlineGoals,
-                          );
-                        }),
+                        rememberedDetails(
+                          `${label}（${rows.length} 件）`,
+                          "done-goals",
+                          openedGoalGroups,
+                          group("div", "stack", ...rows),
+                        ),
                       ]
-                    : [];
+                    : [sectionTitle(label), ...rows];
                 })
               : [empty("Goal はありません。")],
           );
@@ -3424,6 +4088,8 @@ export function createHostPanel(
     sessionEnded() {
       now.close(false);
       nowButton.setAttribute("disabled", "");
+      nowButton.removeAttribute("aria-label");
+      nowButton.removeAttribute("title");
       nowButton.textContent = "Workplace は終了しました";
       notice.textContent = "Workplace は終了しました。";
     },

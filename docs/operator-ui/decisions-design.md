@@ -12,6 +12,9 @@ the panel to become the place where work is followed and decided. This
 document records what the operator needs, the layout chosen from three
 previews, and the host changes that layout needs.
 
+Run `bun spike/operator-ui/preview.ts [--port <n>]` and open the printed
+URL to try Workplace with in-memory examples.
+
 ## What the operator needs
 
 In the operator's order of priority:
@@ -114,15 +117,20 @@ choice?}` and `proposal.answerMany` with a list of the same. The bridge
 
 ### Activity and in-place decisions
 
-The header pill summarizes running work, queued work, and items in
-「あなたの番」. The popover lists the same decision cards as the Decisions
-tab and Goal views, followed by one compact row per problem Task.
+The header pill and decision tab badge share the human decision count.
+The pill also summarizes running and queued work. The decision queue,
+popover, and Goal overview put human decisions first and show AI-pending
+decisions in a collapsed section.
+The Goal list offers inline answers for human decisions and folds finished Goals.
+The popover has a problem section with one compact row per problem Task.
 The inbox refresh updates all copies after the host records an answer.
 Every view uses Goal and Task refs. Inside a Goal detail, its Task refs
 use the shorter `#m` form.
 
 The Goal list groups rows by who can act next. A Goal detail shows its
-turn, running work, decisions and failures above the Task list. An approved
+turn, running work, decisions and failures above the Task list in 「概要」.
+「任せ方」 holds delegation settings, 「履歴」 shows recent activity, and
+「詳細」 holds scope and acceptance. An approved
 Goal proposal becomes a tracking card until a decision for that Goal arrives
 or the operator closes it. The plan and consultation buttons paste drafts
 into Concierge and transfer focus to its terminal.
@@ -138,17 +146,19 @@ contract is documented in [Activity and actions](activity-api.md).
 
 ### Proposal details and connection
 
-Opening a decision card fetches `proposal.get`. The response contains
-the approval digest and the details derived from that stored proposal.
-Workplace shows host-checked paths, size, limits, origin and policy above
-`AI の記述`. The description, acceptance criteria and Reviewer findings
-are plain text. The AI verdict is a textual reference. Goal scope is
-structured and appears as paths, eligible roles and profiles, and limits.
+Rendering a decision card fetches and caches `proposal.get` for its summary
+and warnings. 「詳細」 opens the evidence. 「実行の条件」 holds origin, policy,
+human decision requirements, budgets, and execution limits. The description,
+acceptance criteria and Reviewer findings are plain text. The card's 「…」 disclosure holds the CLI
+copy action. When fields are withheld, the command is visible on the card.
+The queue links to a separate view for decisions already answered by AI.
 
 The approve button in an open detail submits the digest for the evidence
 already shown. The button on a closed card opens a one-line confirmation.
+Approval and batch selection stay disabled until the preview loads.
+Withheld fields hide both controls.
 Closed and batch approvals read the pinned proposal before enabling
-submission. Withheld fields block approval. Workplace keeps the digest
+submission. Workplace keeps the digest
 internal. If the host reports a stale digest, the panel refreshes the
 inbox, reopens the affected card and fetches its details again. For integration, the Git diff has its own digest. The
 creation event names the successful, candidate-pinned Reviewer execution.
