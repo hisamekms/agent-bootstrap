@@ -208,7 +208,7 @@ export const helpTopics = {
       `${target} update-goal-base "$goal_id"`,
     ],
     output:
-      "Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Base updates require an eligible, untouched Goal and preview both commits.",
+      "Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Use `--timeout-ms` before the delimiter to set a positive integer up to 3,600,000 milliseconds. The default is 240,000 milliseconds, and the Task's `maxExecutionMs` can lower it. Base updates require an eligible, untouched Goal and preview both commits.",
     next: "Launch with the same target. Keep verification configured until its integration proposals are resolved.",
     human: `The operator confirms verification changes and eligible base updates from a host TTY. ${humanRepo}`,
   },
@@ -377,8 +377,8 @@ export const operatorOutputs = {
   },
   verification: {
     usage:
-      "verification show | verification clear | verification set --profile <name> -- <argv...>",
-    json: "{ profile, argv } or null for show. { target, current, verification } for set or clear.",
+      "verification show | verification clear | verification set --profile <name> [--timeout-ms <1..3600000>] -- <argv...>",
+    json: "{ profile, argv, timeoutMs? } or null for show. { target, current, verification } for set or clear.",
     next: "Run doctor --target <path> and use the same target for Concierge.",
   },
   "export-goal-branch": {

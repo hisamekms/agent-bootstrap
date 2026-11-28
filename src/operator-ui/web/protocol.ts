@@ -25,8 +25,8 @@ import type {
   operatorProposal,
   operatorActivity,
   operatorStatus,
-  operatorTask,
   operatorTaskList,
+  readOperatorTask,
 } from "../../local-orchestrator/operator-read.ts";
 import {
   credentialMaskMarker,
@@ -60,7 +60,9 @@ export type ActivityRow = Activity["running"][number];
 export type TaskSummary = NonNullable<
   ReturnType<typeof operatorTaskList>
 >[number];
-export type TaskDetail = NonNullable<ReturnType<typeof operatorTask>>;
+export type TaskDetail = NonNullable<
+  Awaited<ReturnType<typeof readOperatorTask>>
+>;
 export type Problem = ReturnType<typeof operatorProblems>[number];
 export type PanelInboxItem = ReturnType<typeof operatorInbox>[number];
 export type AnswerableProposal = Extract<

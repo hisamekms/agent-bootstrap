@@ -13,19 +13,24 @@ import {
   IntegrationJournal,
   MAX_REVISIONS,
   NOTE_LIMIT_BYTES,
+  VERIFICATION_NOTE_LIMIT_BYTES,
   type IntegrationEvent,
 } from "./integration-journal.ts";
 import type { ProfileName } from "./sandbox-profiles.ts";
-import type {
-  SandboxCommand,
-  SandboxFile,
-  SandboxEnvironment,
-  SandboxSpec,
+import {
+  VERIFICATION_LIFETIME_GRACE_MS,
+  VERIFICATION_TAIL_LIMIT,
+  type SandboxCommand,
+  type SandboxFile,
+  type SandboxEnvironment,
+  type SandboxSpec,
 } from "./sandbox-runtime.ts";
+import { maskCredentials } from "./local-orchestrator/credential-scan.ts";
 import type {
   ReviewerRun,
   TrustedHost,
   TrustedHostRunOptions,
+  VerificationRun,
 } from "./trusted-host.ts";
 import {
   diffWorkspace,
@@ -69,6 +74,9 @@ export type Verification = {
   readonly profile?: ProfileName;
   /** Host-pinned test files, delivered read-only under `suite/`. */
   readonly suite?: readonly SandboxFile[];
+  readonly captureFailureTail?: true;
+  /** Stable argv for pins created before the configured wrapper collected output. */
+  readonly identityArgv?: readonly string[];
 };
 
 const SUITE_PREFIX = "suite/";
@@ -274,6 +282,8 @@ function copyVerification(input: Verification): Verification {
     command: { ...input.command, argv: [...input.command.argv] },
     ...(input.profile !== undefined ? { profile: input.profile } : {}),
     ...(files.length ? { suite: files } : {}),
+    ...(input.captureFailureTail ? { captureFailureTail: true } : {}),
+    ...(input.identityArgv ? { identityArgv: [...input.identityArgv] } : {}),
   };
 }
 
@@ -287,6 +297,32 @@ const sha256 = (data: Uint8Array | string) =>
   createHash("sha256").update(data).digest("hex");
 
 const NO_NOTES = sha256("");
+
+async function screenedVerificationTail(
+  raw: Uint8Array,
+  scan: Plan["scanCandidate"],
+): Promise<string | undefined> {
+  // A full-sized tail may start partway through a credential.
+  if (raw.byteLength === VERIFICATION_TAIL_LIMIT) {
+    const newline = raw.indexOf(0x0a);
+    if (newline === -1) return;
+    raw = raw.subarray(newline + 1);
+  }
+  const text = new TextDecoder()
+    .decode(raw)
+    .replace(/[\p{Cc}\p{Cf}]/gu, (char) =>
+      char === "\n" || char === "\t" ? char : "",
+    );
+  const masked = await maskCredentials(text, [], scan);
+  if (!masked?.text.trim()) return;
+  const bytes = Buffer.from(masked.text);
+  let start = Math.max(0, bytes.length - VERIFICATION_TAIL_LIMIT);
+  while ((bytes[start]! & 0xc0) === 0x80) start++;
+  return (
+    "Verification command exited unsuccessfully.\n\nUntrusted Verification output (tail)\n" +
+    bytes.subarray(start).toString("utf8")
+  );
+}
 
 type Tests = { passed: number; failed: number };
 
@@ -542,7 +578,9 @@ export class ReviewedIntegration {
         tree ? "tree" : "file",
         sorted(tree?.scope),
         sorted(tree?.protectedPaths),
-        verification?.command.argv ?? null,
+        // identityArgv is host-only and must never come from config. Deliberately
+        // assign a new value if the wrapper's meaning changes.
+        verification?.identityArgv ?? verification?.command.argv ?? null,
         verification?.command.timeoutMs ?? null,
         verification?.profile ?? "base",
         (verification?.suite ?? []).map((file) => [
@@ -963,13 +1001,14 @@ export class ReviewedIntegration {
     const notes = rejected
       ? last.notes
       : verificationFailed
-        ? await this.#journal.saveNote(
+        ? (verification.notes ??
+          (await this.#journal.saveNote(
             verification.failure === "env-lock-mismatch"
               ? environmentLockMismatchNote
               : verification.failure === "env-output-collision"
                 ? environmentOutputCollisionNote
                 : "The host verification suite failed for the previous candidate. Revise the candidate before verification is run again.",
-          )
+          )))
         : noted?.kind === "review.noted" && noted.run === review?.run
           ? noted.notes
           : NO_NOTES;
@@ -987,7 +1026,12 @@ export class ReviewedIntegration {
         : [
             {
               path: "review-notes.txt",
-              bytes: await this.#journal.readNote(notes),
+              bytes: await this.#journal.readNote(
+                notes,
+                verificationFailed
+                  ? VERIFICATION_NOTE_LIMIT_BYTES
+                  : NOTE_LIMIT_BYTES,
+              ),
             },
           ];
     if (this.#plan.tree)
@@ -1414,7 +1458,7 @@ export class ReviewedIntegration {
     const prepared = this.#plan.tree
       ? await this.#git.prepareWorkspace({ base: pin.candidate })
       : undefined;
-    let verification: ReviewerRun;
+    let verification: VerificationRun;
     let held: Awaited<ReturnType<EnsureTaskEnvironment>> | undefined;
     try {
       held =
@@ -1428,7 +1472,10 @@ export class ReviewedIntegration {
       verification = await this.#host.runVerification(
         {
           sandbox: {
-            maxLifetimeMs: 300_000,
+            maxLifetimeMs: Math.max(
+              300_000,
+              plan.command.timeoutMs + VERIFICATION_LIFETIME_GRACE_MS,
+            ),
             readOnlyFiles: files,
             ...(profile !== undefined ? { profile } : {}),
             ...(held ? { environment: held.environment } : {}),
@@ -1437,6 +1484,7 @@ export class ReviewedIntegration {
               : {}),
           },
           command: plan.command,
+          ...(plan.captureFailureTail ? { captureFailureTail: true } : {}),
         },
         id,
       );
@@ -1466,12 +1514,34 @@ export class ReviewedIntegration {
       }
     }
     const { review: verified, tests } = verificationResult(verification);
+    const rawTail = verification.failureTail;
+    let tailDigest: string | undefined;
+    let notes: string | undefined;
+    if (
+      plan.captureFailureTail &&
+      verified === "revise" &&
+      rawTail &&
+      rawTail.byteLength <= VERIFICATION_TAIL_LIMIT
+    ) {
+      tailDigest = sha256(rawTail);
+      const screened = await screenedVerificationTail(
+        rawTail,
+        this.#plan.scanCandidate,
+      );
+      if (screened)
+        notes = await this.#journal.saveNote(
+          screened,
+          VERIFICATION_NOTE_LIMIT_BYTES,
+        );
+    }
     await append({
       kind: "verification.finished",
       run: verification.id,
       digest: pin.digest,
       review: verified,
       ...(tests ? { tests } : {}),
+      ...(tailDigest ? { tailDigest } : {}),
+      ...(notes ? { notes } : {}),
     });
     return verified === "pass";
   }

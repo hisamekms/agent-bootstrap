@@ -50,6 +50,10 @@ import {
   permitsProviderHeader,
   sameProvider,
   SandboxRuntimeError,
+  VERIFICATION_LIFETIME_GRACE_MS,
+  VERIFICATION_TAIL_LIMIT,
+  VERIFICATION_TAIL_PATH,
+  VERIFICATION_TIMEOUT_LIMIT_MS,
   WORKER_MESSAGE_LIMIT,
   WORKER_MESSAGE_PATH,
   terminalEnvEntries,
@@ -324,6 +328,7 @@ type State = {
   directory: string;
   deadline: number;
   interactive: boolean;
+  verification: boolean;
   environment?: { outputs: readonly string[]; path: string };
   terminal?: { stop(): void; finished: Promise<{ exitCode: number | null }> };
   busy: boolean;
@@ -1039,6 +1044,21 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     const lifetime =
       spec.maxLifetimeMs ?? MICROSANDBOX_LIMITS.defaultLifetimeMs;
     const requestedInteractive = spec.interactive;
+    const verification = spec.verification === true;
+    if (
+      verification &&
+      (requestedInteractive ||
+        spec.debugMounts ||
+        spec.provider ||
+        spec.egressGateway ||
+        spec.tools !== undefined ||
+        spec.claude !== undefined ||
+        spec.claudeSecretSocket !== undefined ||
+        spec.claudeManagedSettings !== undefined ||
+        spec.mounts !== undefined ||
+        spec.hostTcpPort !== undefined)
+    )
+      invalid();
     const interactive =
       requestedInteractive && "vsock" in requestedInteractive
         ? { ...requestedInteractive, vsock: { ...requestedInteractive.vsock } }
@@ -1060,7 +1080,9 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       lifetime,
       requestedInteractive
         ? MICROSANDBOX_LIMITS.interactiveMaxLifetimeMs
-        : MICROSANDBOX_LIMITS.maxLifetimeMs,
+        : verification
+          ? VERIFICATION_TIMEOUT_LIMIT_MS + VERIFICATION_LIFETIME_GRACE_MS
+          : MICROSANDBOX_LIMITS.maxLifetimeMs,
     );
     const tools = checkTools(spec.tools ?? [], secretSocket !== undefined);
     const { args: networkArgs, gateway, provider } = this.#network(spec);
@@ -1269,6 +1291,7 @@ export class MicrosandboxRuntime implements SandboxRuntime {
         deadline: performance.now() + lifetime,
         interactive:
           requestedInteractive !== undefined || spec.debugMounts !== undefined,
+        verification,
         ...(environment
           ? {
               environment: {
@@ -1419,7 +1442,12 @@ export class MicrosandboxRuntime implements SandboxRuntime {
     command: SandboxCommand,
   ): Promise<ExecResult> {
     const state = this.#state(handle);
-    boundedInteger(command.timeoutMs, MICROSANDBOX_LIMITS.commandTimeoutMs);
+    boundedInteger(
+      command.timeoutMs,
+      state.verification
+        ? VERIFICATION_TIMEOUT_LIMIT_MS
+        : MICROSANDBOX_LIMITS.commandTimeoutMs,
+    );
     if (
       !command.argv.length ||
       command.argv.length > 128 ||
@@ -1670,6 +1698,27 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       if (spec.tree !== true || Object.keys(spec).length !== 1) invalid();
       return this.#collectTree(state);
     }
+    if ("verificationTail" in spec) {
+      if (
+        !state.verification ||
+        spec.verificationTail !== true ||
+        Object.keys(spec).length !== 1
+      )
+        invalid();
+      state.busy = true;
+      try {
+        const bytes = await this.#collectDiagnostic(
+          VERIFICATION_TAIL_PATH,
+          VERIFICATION_TAIL_LIMIT,
+          state,
+        );
+        return {
+          files: bytes ? [{ path: VERIFICATION_TAIL_PATH, bytes }] : [],
+        };
+      } finally {
+        state.busy = false;
+      }
+    }
     if (
       !Array.isArray(spec.paths) ||
       spec.paths.length > MICROSANDBOX_LIMITS.files ||
@@ -1825,15 +1874,27 @@ export class MicrosandboxRuntime implements SandboxRuntime {
   }
 
   async #collectMessage(state: State): Promise<Uint8Array | undefined> {
+    return this.#collectDiagnostic(
+      WORKER_MESSAGE_PATH,
+      WORKER_MESSAGE_LIMIT,
+      state,
+    );
+  }
+
+  async #collectDiagnostic(
+    path: string,
+    limit: number,
+    state: State,
+  ): Promise<Uint8Array | undefined> {
     // Bound the read itself, even if the guest replaces the checked file.
     const result = await this.#execute(
       state,
       [
         "/bin/sh",
         "-ec",
-        `p=${WORKER_MESSAGE_PATH};
+        `p=${path};
           [ ! -L "\${p%/*}" ] && [ ! -L "$p" ] && [ -f "$p" ] || exit 3;
-          head -c ${WORKER_MESSAGE_LIMIT + 1} -- "$p" | base64`,
+          head -c ${limit + 1} -- "$p" | base64`,
       ],
       10_000,
     );
@@ -1844,14 +1905,14 @@ export class MicrosandboxRuntime implements SandboxRuntime {
       .toString("latin1")
       .replace(/[\r\n]/g, "");
     if (
-      encoded.length > 4 * Math.ceil(WORKER_MESSAGE_LIMIT / 3) ||
+      encoded.length > 4 * Math.ceil(limit / 3) ||
       !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
         encoded,
       )
     )
       return;
     const bytes = Buffer.from(encoded, "base64");
-    if (bytes.byteLength <= WORKER_MESSAGE_LIMIT) return bytes;
+    if (bytes.byteLength <= limit) return bytes;
   }
 
   #destroy(state: State): Promise<void> {

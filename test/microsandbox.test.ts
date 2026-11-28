@@ -32,6 +32,10 @@ import { RoutingSandboxRuntime } from "../src/routing-runtime.ts";
 import { ProfileCatalog } from "../src/sandbox-profiles.ts";
 import {
   SandboxRuntimeError,
+  VERIFICATION_LIFETIME_GRACE_MS,
+  VERIFICATION_TAIL_LIMIT,
+  VERIFICATION_TAIL_PATH,
+  VERIFICATION_TIMEOUT_LIMIT_MS,
   type SandboxSpec,
   type TerminalCommand,
 } from "../src/sandbox-runtime.ts";
@@ -170,7 +174,7 @@ if (args[0] === '--version') {
   }
   else if (command[0] === '/usr/local/bin/bun' || command[3] === 'environment') { /* capture only */ }
   else if (command[0] === '/bin/sh' && String(command[2]).includes('tar -cf')) { if (mode === 'pack-fail') process.exitCode = 1; }
-  else if (command[0] === '/bin/sh' && String(command[2]).includes('p=/tmp/agent-bootstrap/commit-message;')) {
+  else if (command[0] === '/bin/sh' && (String(command[2]).includes('p=/tmp/agent-bootstrap/commit-message;') || String(command[2]).includes('p=${VERIFICATION_TAIL_PATH};'))) {
     const limit = Number(command[2].match(/head -c ([0-9]+)/)?.[1]);
     if (!limit) fail();
     // The swap yields zeros after the checks, like a link to a character device.
@@ -179,6 +183,7 @@ if (args[0] === '--version') {
       'max-message': Buffer.alloc(4096, 'a'),
       'big-message': Buffer.alloc(4097, 'a'),
       'message-swapped': Buffer.alloc(limit),
+      'verification-tail': Buffer.alloc(${VERIFICATION_TAIL_LIMIT}, 'v'),
     }[mode];
     if (contents) console.log(contents.subarray(0, limit).toString('base64').match(/.{1,76}/g).join('\\n'));
     else process.exitCode = 3; // Missing path, directory or symlink at check time.
@@ -602,6 +607,88 @@ test("collection rejects traversal before invocation and rejects oversized respo
     /collection/,
   );
   await assertCleanup(f);
+});
+
+test("Verification adapter refuses tools and host channels before invoking the backend", async (t) => {
+  const f = await fixture(t);
+  const extras: Partial<SandboxSpec>[] = [
+    { tools: [] },
+    { claude: true },
+    { claudeSecretSocket: "/fixture/secret.sock" },
+    { claudeManagedSettings: "/fixture/settings.json" },
+    { mounts: [] },
+    { hostTcpPort: 4242 },
+  ];
+  for (const extra of extras) {
+    await assert.rejects(
+      f.runtime.create({ verification: true, ...extra }),
+      { code: "invalid-input" },
+      Object.keys(extra).join(", "),
+    );
+  }
+  assert.deepEqual(await f.events(), []);
+});
+
+test("Verification adapter allows one hour and collects a bounded diagnostic", async (t) => {
+  const f = await fixture(t);
+  const timeoutMs = VERIFICATION_TIMEOUT_LIMIT_MS;
+  const maxLifetimeMs = timeoutMs + VERIFICATION_LIFETIME_GRACE_MS;
+  await assert.rejects(f.runtime.create({ maxLifetimeMs }), /invalid-input/);
+  const ordinary = await f.runtime.create({});
+  const command = {
+    argv: ["fixture-write", "result.txt", "fixture"],
+    timeoutMs,
+  };
+  await assert.rejects(f.runtime.exec(ordinary, command), /invalid-input/);
+  await assert.rejects(
+    f.runtime.collect(ordinary, { verificationTail: true }),
+    /invalid-input/,
+  );
+  await f.runtime.destroy(ordinary);
+  const handle = await createBound(f.runtime, {
+    verification: true,
+    maxLifetimeMs,
+  });
+  await assert.rejects(
+    f.runtime.exec(handle, { ...command, timeoutMs: timeoutMs + 1 }),
+    /invalid-input/,
+  );
+  const extraKeys = { verificationTail: true, paths: [] } as const;
+  await assert.rejects(f.runtime.collect(handle, extraKeys), {
+    code: "invalid-input",
+  });
+  const pending = f.runtime.exec(handle, command);
+  await assert.rejects(f.runtime.collect(handle, { verificationTail: true }), {
+    code: "busy",
+  });
+  assert.equal((await pending).exitCode, 0);
+  await f.setMode("verification-tail");
+  assert.deepEqual(
+    (await f.runtime.collect(handle, { verificationTail: true })).files,
+    [
+      {
+        path: VERIFICATION_TAIL_PATH,
+        bytes: Buffer.alloc(VERIFICATION_TAIL_LIMIT, "v"),
+      },
+    ],
+  );
+  await f.setMode("message-swapped");
+  assert.deepEqual(
+    (await f.runtime.collect(handle, { verificationTail: true })).files,
+    [],
+  );
+  const events = await f.events();
+  assert.ok(
+    events.some(
+      ({ args }) =>
+        args[0] === "create" &&
+        args[args.indexOf("--max-duration") + 1] === "3750s",
+    ),
+  );
+  const exec = events.find(({ args }) => args.includes("fixture-write"))!.args;
+  assert.equal(exec[exec.indexOf("--timeout") + 1], "3602s");
+  await f.runtime.destroy(handle);
+  await assertCleanup(f, 2);
 });
 
 test("two concurrent fake sandboxes have distinct copies with no cross-worker writes", async (t) => {

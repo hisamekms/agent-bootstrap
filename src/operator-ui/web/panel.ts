@@ -2577,6 +2577,12 @@ function taskDetail(
       "details",
       "card",
       textElement("summary", "Task の詳細"),
+      ...(task.verificationNote
+        ? [
+            sectionTitle("検証の失敗出力"),
+            textElement("pre", task.verificationNote, "model-content"),
+          ]
+        : []),
       ...(task.category
         ? [modelBox("Planner の申告カテゴリー", [task.category])]
         : []),

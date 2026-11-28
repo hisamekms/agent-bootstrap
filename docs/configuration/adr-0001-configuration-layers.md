@@ -90,8 +90,8 @@ with plumbing commands only:
 
 Version 1 allows only these keys:
 
-- `verification`: `profile` and `argv`, as the target config holds them
-  today.
+- `verification`: `profile`, `argv`, and optional integer `timeoutMs`
+  from 1 to 3,600,000, with a default of 240,000 milliseconds.
 - `profiles`: sandbox profiles. They must stay within each role's
   allowlist in `src/sandbox-profiles.ts`. A declaration cannot widen that
   allowlist.

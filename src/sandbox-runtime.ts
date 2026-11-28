@@ -239,6 +239,8 @@ export interface SandboxSpec {
   readonly claudeSecretSocket?: string;
   readonly mounts?: readonly SandboxMount[];
   readonly maxLifetimeMs?: number;
+  /** Assigned by the trusted host for an offline Verification command. */
+  readonly verification?: true;
   /** Optional trusted host trace ID for locating a sandbox after restart. */
   readonly invocationId?: string;
 }
@@ -285,10 +287,19 @@ export interface ExecResult {
 
 /** Either named small files, or the whole workspace except `.git` as a tar. */
 export type CollectSpec =
-  { readonly paths: readonly string[] } | { readonly tree: true };
+  | { readonly paths: readonly string[] }
+  | { readonly tree: true }
+  | { readonly verificationTail: true };
 
 export const WORKER_MESSAGE_PATH = "/tmp/agent-bootstrap/commit-message";
 export const WORKER_MESSAGE_LIMIT = 4096;
+export const VERIFICATION_TIMEOUT_LIMIT_MS = 3_600_000;
+// Allow for backend create, repository extraction and diagnostic collection.
+export const VERIFICATION_LIFETIME_GRACE_MS = 150_000;
+export const VERIFICATION_TAIL_PATH = "/tmp/agent-bootstrap-verification/tail";
+export const VERIFICATION_TAIL_LIMIT = 16 * 1024;
+export const VERIFICATION_FAILURE_VERDICT =
+  '{"review":"revise","tests":{"passed":0,"failed":1,"failures":["Verification command exited unsuccessfully"]}}\n';
 
 export interface CollectedArtifacts {
   readonly files: readonly SandboxFile[];

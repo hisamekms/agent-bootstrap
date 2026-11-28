@@ -37,7 +37,11 @@ import { PROFILE_LOCK_PATH, parseProfileLock } from "../profile-lock.ts";
 import { ALPINE_3_23 } from "../image-recipes.ts";
 import { userStateDirectory } from "../config/layers.ts";
 import { secretTestFacts } from "./secret-test-record.ts";
-import { operatorStatus, operatorTask } from "./operator-read.ts";
+import {
+  operatorStatus,
+  operatorTask,
+  readTaskVerificationNote,
+} from "./operator-read.ts";
 import {
   changedInboxIds,
   formatInboxItem,
@@ -129,7 +133,7 @@ const usage = `Usage: bun run src/local-orchestrator/cli.ts [--db <path>] [--tar
   approve <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   reject <proposalId> [--on-behalf --delegate-session <id> --authorization <text>]
   verification show
-  verification set --profile <name> -- <argv...>
+  verification set --profile <name> [--timeout-ms <1..3600000>] -- <argv...>
   verification clear
   policy show
   policy set <gate> <human|agent>
@@ -327,14 +331,23 @@ function parseCommand([kind, ...args]: readonly string[]): Command {
         return { kind: "verification-show" };
       if (args.length === 1 && args[0] === "clear")
         return { kind: "verification-clear" };
-      if (args[0] === "set" && args[1] === "--profile" && args[3] === "--")
+      if (args[0] === "set" && args[1] === "--profile") {
+        const duration = args[3] === "--timeout-ms" ? args[4] : undefined;
+        const separator = args[3] === "--timeout-ms" ? 5 : 3;
+        if (
+          args[separator] !== "--" ||
+          (separator === 5 && !/^[0-9]+$/.test(duration ?? ""))
+        )
+          throw new ContractError();
         return {
           kind: "verification-set",
           config: parseVerificationConfig({
             profile: args[2],
-            argv: args.slice(4),
+            argv: args.slice(separator + 1),
+            ...(duration !== undefined ? { timeoutMs: Number(duration) } : {}),
           }),
         };
+      }
       break;
     case "policy":
       if (args.length === 1 && args[0] === "show")
@@ -792,12 +805,16 @@ async function execute(
             task.status === "failed"
               ? store.taskPathViolations(task.id)
               : undefined;
+          const verificationNote = directory
+            ? await readTaskVerificationNote(directory, task, scan)
+            : undefined;
           await writeCheckedJson({
             ...task,
             ...usage,
             budgetTokens: usage.tokens,
             totalTokens: store.taskTokens(task.id),
             ...(rejectedPaths && { rejectedPaths }),
+            ...(verificationNote ? { verificationNote } : {}),
             ...((failure?.code === "env-missing" ||
               failure?.code === "env-update-disabled") && {
               code: failure.code,

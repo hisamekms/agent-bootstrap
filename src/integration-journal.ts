@@ -2,6 +2,7 @@ import { environmentPath } from "./environments/bun.ts";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { VERIFICATION_TAIL_LIMIT } from "./sandbox-runtime.ts";
 import {
   PrivateJournal,
   checkPrivateDirectory,
@@ -11,6 +12,7 @@ import {
 
 /** Review notes are untrusted text; only their digest enters the journal. */
 export const NOTE_LIMIT_BYTES = 2048;
+export const VERIFICATION_NOTE_LIMIT_BYTES = VERIFICATION_TAIL_LIMIT + 128;
 /** Revised candidates allowed after the first one. */
 export const MAX_REVISIONS = 3;
 const sha256 = (data: Uint8Array | string) =>
@@ -69,6 +71,8 @@ type EventDetails = {
     readonly failure?:
       "env-lock-mismatch" | "env-output-collision" | "env-missing";
     readonly tests?: { readonly passed: number; readonly failed: number };
+    readonly tailDigest?: string;
+    readonly notes?: string;
   };
   "candidate.created": {
     /** Tree mode only. The paths are recomputed from the pinned diff. */
@@ -129,6 +133,22 @@ function decode(value: unknown): IntegrationEvent {
     throw new Error("Invalid integration event fields");
   const hasTests =
     kind === "verification.finished" && Object.hasOwn(data, "tests");
+  const hasTailDigest =
+    kind === "verification.finished" && Object.hasOwn(data, "tailDigest");
+  const hasNotes =
+    kind === "verification.finished" && Object.hasOwn(data, "notes");
+  if (
+    (hasTailDigest &&
+      (hasFailure ||
+        data.review !== "revise" ||
+        typeof data.tailDigest !== "string" ||
+        !fields.digest.test(data.tailDigest))) ||
+    (hasNotes &&
+      (!hasTailDigest ||
+        typeof data.notes !== "string" ||
+        !fields.notes.test(data.notes)))
+  )
+    throw new Error("Invalid integration event fields");
   const hasProtectedCount =
     kind === "candidate.created" && Object.hasOwn(data, "protectedCount");
   const hasMessageDigest =
@@ -173,6 +193,8 @@ function decode(value: unknown): IntegrationEvent {
     hasChangedPaths,
     hasFailure,
     hasTests,
+    hasTailDigest,
+    hasNotes,
     hasProtectedCount,
     hasMessageDigest,
     hasProtectedDigest,
@@ -239,9 +261,9 @@ export class IntegrationJournal {
   }
 
   /** Store review notes as a private, content-addressed file. */
-  async saveNote(text: string): Promise<string> {
+  async saveNote(text: string, limit = NOTE_LIMIT_BYTES): Promise<string> {
     const bytes = Buffer.from(text, "utf8");
-    if (!bytes.length || bytes.length > NOTE_LIMIT_BYTES || text.includes("\0"))
+    if (!bytes.length || bytes.length > limit || text.includes("\0"))
       throw new Error("Invalid review notes");
     await checkPrivateDirectory(this.#root);
     const hash = sha256(bytes);
@@ -250,21 +272,21 @@ export class IntegrationJournal {
     } catch (error) {
       if (
         (error as NodeJS.ErrnoException).code !== "EEXIST" ||
-        sha256(await this.readNote(hash)) !== hash
+        sha256(await this.readNote(hash, limit)) !== hash
       )
         throw new Error("Review notes could not be stored");
     }
     return hash;
   }
 
-  async readNote(hash: string): Promise<Uint8Array> {
+  async readNote(hash: string, limit = NOTE_LIMIT_BYTES): Promise<Uint8Array> {
     if (!fields.notes.test(hash)) throw new Error("Invalid notes digest");
     const path = join(this.#root, `note-${hash}`);
     const info = await lstat(path);
-    if (!info.isFile() || info.size > NOTE_LIMIT_BYTES)
+    if (!info.isFile() || info.size > limit)
       throw new Error("Review notes integrity check failed");
     const data = await readFile(path);
-    if (data.length > NOTE_LIMIT_BYTES || sha256(data) !== hash)
+    if (data.length > limit || sha256(data) !== hash)
       throw new Error("Review notes integrity check failed");
     return data;
   }

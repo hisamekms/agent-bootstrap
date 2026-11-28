@@ -55,8 +55,8 @@ import {
   operatorProblems,
   operatorProposal,
   operatorStatus,
-  operatorTask,
   operatorTaskList,
+  readOperatorTask,
 } from "./operator-read.ts";
 import {
   answerFromPanel,
@@ -924,7 +924,12 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
         }
         case "task.get": {
           const { id } = fields(params, ["id"]);
-          const result = operatorTask(store, identifier(id));
+          const result = await readOperatorTask(
+            store,
+            stateDirectory,
+            identifier(id),
+            scan,
+          );
           if (!result) return failure("not-found");
           await checkRegisteredProposalText(
             result,

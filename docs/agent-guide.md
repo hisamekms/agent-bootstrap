@@ -284,7 +284,7 @@ agent-bootstrap --target /path/to/project update-goal-base "$goal_id"
 ```
 
 **Expected output**  
-Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Base updates require an eligible, untouched Goal and preview both commits.
+Verification show returns the effective command or null. Set and clear edit the local layer after confirmation. Use `--timeout-ms` before the delimiter to set a positive integer up to 3,600,000 milliseconds. The default is 240,000 milliseconds, and the Task's `maxExecutionMs` can lower it. Base updates require an eligible, untouched Goal and preview both commits.
 
 **Next action**  
 Launch with the same target. Keep verification configured until its integration proposals are resolved.
@@ -441,7 +441,7 @@ Provision the configured Keychain entry and authorize model API access before ru
 - `agent-bootstrap reconcile` → { reconciled } with sessions, executions, and tasks.
 - `agent-bootstrap update-goal-base <goalId>` → { preview, result } with old and new commits and updated Goal.
 - `agent-bootstrap discard-goal <goalId>` → { goalId, branch, head } preview, followed by the cancelled Goal record on confirmation.
-- `agent-bootstrap verification show | verification clear | verification set --profile <name> -- <argv...>` → { profile, argv } or null for show. { target, current, verification } for set or clear.
+- `agent-bootstrap verification show | verification clear | verification set --profile <name> [--timeout-ms <1..3600000>] -- <argv...>` → { profile, argv, timeoutMs? } or null for show. { target, current, verification } for set or clear.
 - `agent-bootstrap export-goal-branch <goalId> [--target <checkout>]` → { goalId, checkout, branch, from, to } for the completed export.
 - `agent-bootstrap publish-goal <goalId>` → Goal publish state and PR details.
 - `agent-bootstrap merge-goal <goalId> [--method <squash|merge|rebase>] [--no-checks]` → PR check state preview, followed by the Goal publish state and PR details on confirmation. The confirmation phrase includes the displayed check state.

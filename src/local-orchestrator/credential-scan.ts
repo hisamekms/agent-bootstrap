@@ -443,18 +443,22 @@ export function proposalCredentialCheck(
 export async function maskCredentials(
   source: string | Uint8Array,
   patterns: readonly string[] = [],
+  scan: CredentialScanner = builtInCredentialScanner,
 ) {
   try {
     const input =
       typeof source === "string"
         ? source
         : new TextDecoder("utf-8", { fatal: true }).decode(source);
+    const options = scannerOptions.get(scan);
     const check = proposalCredentialCheck(builtInCredentialScanner, undefined, {
-      patterns,
+      patterns: [...patterns, ...(options?.patterns ?? [])],
+      ...(options?.evidence ? { evidence: options.evidence } : {}),
     });
     const [result] = await check([[input]]);
     const matches = result?.[0];
     const masked = matches && maskCredentialSpans(input, matches);
+    if (masked && !options) await scan(masked.text);
     return (
       (masked && { text: masked.text, masked: masked.spans.length }) || null
     );
