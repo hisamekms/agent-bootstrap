@@ -17,7 +17,7 @@ which stays per adapter. Each VM still lives for one invocation.
 | `db`        | `base` plus SQLite and PostgreSQL          | Database tests and migrations               |
 | `browser`   | `db` plus headless Chromium and Playwright | End-to-end tests                            |
 | `concierge` | `base` plus socat and Git                  | Concierge MCP stdio relay and local history |
-| `bun`       | Alpine 3.23 with Bun 1.4.5 and Git         | Bun/TypeScript development and verification |
+| `bun`       | Alpine 3.23 with Bun 1.4.5, Git and bash   | Bun/TypeScript development and verification |
 
 Images are built ahead of time and pinned by digest, because a VM has no
 package network. The Concierge runs with networking disabled. It uses socat
@@ -194,7 +194,9 @@ for commands such as `bun test`. Stage the official aarch64 musl ZIP at
 `.local/bun/1.4.5/bun-linux-aarch64-musl.zip` and build
 `bun` with `spike/images/build-profile.ts`. The host checks the ZIP hash.
 The build VM checks the extracted binary hash before making it executable
-and adding the `bunx` symlink. The smoke test checks Bun 1.4.5 and Git.
+and adding the `bunx` symlink. The smoke test checks Bun 1.4.5, Git and bash. The `bash` feature pins
+Alpine's signed bash and readline packages, because target suites and guest
+scripts often assume `/bin/bash`.
 
 ### Build steps (Alpine)
 
