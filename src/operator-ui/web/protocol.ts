@@ -27,6 +27,12 @@ import type {
   operatorTask,
   operatorTaskList,
 } from "../../local-orchestrator/operator-read.ts";
+import {
+  credentialMaskMarker,
+  isWithheld as withheld,
+  proposalField,
+  proposalMaskableFields,
+} from "../../local-orchestrator/proposal-screening.ts";
 import type {
   PanelAnswer,
   PanelAnswerResult,
@@ -365,9 +371,7 @@ function textList(
   );
 }
 
-export function withheld(value: unknown) {
-  return record(value) && keys(value, ["withheld"]) && value.withheld === true;
-}
+export { withheld };
 
 const actors = ["Concierge", "Planner", "Researcher", "Executor", "Reviewer"];
 
@@ -434,6 +438,23 @@ export function isProposal(value: unknown): value is Proposal {
     !record(modelText)
   )
     return false;
+  if (Object.hasOwn(value, "maskedFields")) {
+    const { maskedFields } = value;
+    if (
+      !textList(maskedFields, proposalMaskableFields.length, 1) ||
+      new Set(maskedFields).size !== maskedFields.length ||
+      !maskedFields.every((field) => {
+        const known = proposalMaskableFields.find((name) => name === field);
+        if (!known) return false;
+        const text = proposalField(value, modelText, known);
+        return (Array.isArray(text) ? text : [text]).some(
+          (item) =>
+            typeof item === "string" && item.includes(credentialMaskMarker),
+        );
+      })
+    )
+      return false;
+  }
   const common = [
     "id",
     "ref",
@@ -456,6 +477,7 @@ export function isProposal(value: unknown): value is Proposal {
     "pathViolations",
     "diffStat",
     "modelText",
+    "maskedFields",
   ];
   if (value.kind === "integration")
     return (

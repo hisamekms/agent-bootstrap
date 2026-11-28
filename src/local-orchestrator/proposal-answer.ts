@@ -6,6 +6,12 @@ import {
   type OrchestratorStore,
   type StoreErrorCode,
 } from "./store.ts";
+import { screenOperatorProposal } from "./operator-read.ts";
+import {
+  isWithheld,
+  proposalWithheldFields,
+  type ProposalMaskableField,
+} from "./proposal-screening.ts";
 import { candidateDiffStat } from "./tasks.ts";
 
 type ProposalDetails = NonNullable<
@@ -84,6 +90,64 @@ export async function proposalDecisionPreview(
   };
 }
 
+type OperatorProposal = Awaited<ReturnType<typeof screenOperatorProposal>>;
+
+// Preserve the aggregate scan of the approval preview, substituting the
+// screened display values where the original fields were masked.
+function panelApprovalPreview(
+  proposal: ProposalDetails,
+  display: OperatorProposal,
+) {
+  const mask = <T>(
+    field: ProposalMaskableField,
+    raw: T,
+    screened: T | { withheld: true },
+  ) =>
+    display.maskedFields?.includes(field) && !isWithheld(screened)
+      ? screened
+      : raw;
+  const {
+    diffSize: _diffSize,
+    pinnedReview: _pinnedReview,
+    budgets: _budgets,
+    pathViolations: _pathViolations,
+    ...original
+  } = displayProposal(proposal);
+  if (proposal.kind === "integration" && display.kind === "integration") {
+    const { content } = proposal;
+    return {
+      ...original,
+      diffStat: display.diffStat,
+      content: {
+        ...content,
+        review: {
+          ...content.review,
+          notes: mask(
+            "findings",
+            content.review.notes,
+            display.modelText.findings ?? undefined,
+          ),
+        },
+      },
+    };
+  }
+  if (proposal.kind === "integration" || display.kind === "integration")
+    throw new ContractError();
+  const modelText = {
+    description: mask(
+      "description",
+      proposal.content.description,
+      display.modelText.description,
+    ),
+    acceptance: mask(
+      "acceptance",
+      proposal.content.acceptance,
+      display.modelText.acceptance,
+    ),
+  };
+  return { ...original, content: { ...proposal.content, ...modelText } };
+}
+
 export async function answerFromPanel(
   store: OrchestratorStore,
   directory: string,
@@ -91,7 +155,9 @@ export async function answerFromPanel(
   scan?: CredentialScanner,
 ): Promise<PanelAnswerResult> {
   try {
-    const proposal = store.getProposalDetails(id);
+    const proposal = store.getProposalDetails(id, {
+      includeEvidence: decision === "approve",
+    });
     if (!proposal) throw new OrchestratorStoreError("not-found");
     if (proposal.digest !== digest)
       throw new OrchestratorStoreError("stale-digest");
@@ -99,20 +165,36 @@ export async function answerFromPanel(
       throw new OrchestratorStoreError("invalid-transition");
     if (!permitsPanelAnswer(proposal.origin, proposal, decision, takeover))
       throw new OrchestratorStoreError("approval-forbidden");
-    const preview = await proposalDecisionPreview(
-      directory,
-      proposal,
-      decision,
-      scan,
-    );
-    await scan?.(JSON.stringify(preview));
+    const expectedRule =
+      decision === "approve"
+        ? { ruleId: proposal.ruleId, ruleName: proposal.ruleName }
+        : undefined;
+    if (decision === "approve") {
+      const display = await screenOperatorProposal(proposal, directory, scan);
+      if (proposalWithheldFields(display).length)
+        throw new OrchestratorStoreError("write-failed");
+      if (scan)
+        await scan(JSON.stringify(panelApprovalPreview(proposal, display)));
+    } else {
+      const preview = await proposalDecisionPreview(
+        directory,
+        proposal,
+        decision,
+        scan,
+      );
+      await scan?.(JSON.stringify(preview));
+    }
     // The store rechecks the digest, transition and policy under its write lock.
-    store.decide(id, {
-      digest,
-      decision,
-      answerer: { kind: "human", channel: "operator-ui" },
-      ...(takeover === true && { takeover }),
-    });
+    store.decide(
+      id,
+      {
+        digest,
+        decision,
+        answerer: { kind: "human", channel: "operator-ui" },
+        ...(takeover === true && { takeover }),
+      },
+      expectedRule,
+    );
     return { id, ok: true };
   } catch (error) {
     return {

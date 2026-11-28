@@ -15,6 +15,7 @@ import { createConnection } from "node:net";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { createConciergeTerminalHub } from "../src/local-orchestrator/concierge-terminal.ts";
 import type { TerminalExit } from "../src/sandbox-runtime.ts";
 import {
@@ -27,6 +28,7 @@ import {
   operatorGoal,
   operatorGoalList,
   operatorInbox,
+  operatorProposal,
   operatorProblems,
   operatorStatus,
   operatorTask,
@@ -240,6 +242,33 @@ test("operator delegation methods validate, audit and expose the effective setti
   );
 });
 
+test("policy settings screen rule names that may be masked in proposal evidence", async () => {
+  using fixture = orchestratorFixture("lo-op-policy-mask-");
+  const { root, store } = fixture;
+  const rule = {
+    id: "small",
+    name: "project-only",
+    gate: "integration",
+    action: "agent",
+    enabled: true,
+    order: 0,
+    conditions: { maxChangedFiles: 2 },
+  };
+  store.setRules([rule], "cli");
+  const scan = createCredentialScanner(
+    { leakPatterns: ["^project-only$"] },
+    root,
+    () => {},
+  );
+  assert.deepEqual(await dispatchPolicy(store, "policy.get", {}, scan), {
+    error: { code: "read-failed" },
+  });
+  store.setRules([{ ...rule, name: "sk-ant-" + "x".repeat(30) }], "cli");
+  assert.deepEqual(await dispatchPolicy(store, "policy.get", {}), {
+    error: { code: "read-failed" },
+  });
+});
+
 test("operator API answers return per-item errors in order and audit the panel origin", async () => {
   using fixture = orchestratorFixture("lo-op-answer-");
   const { root, store } = fixture;
@@ -272,7 +301,9 @@ test("operator API answers return per-item errors in order and audit the panel o
         ],
       },
       async (source) => {
-        screened.push(JSON.parse(String(source)));
+        const text = String(source);
+        if (text.startsWith("{") || text.startsWith("["))
+          screened.push(JSON.parse(text));
       },
     ),
     [
@@ -285,6 +316,9 @@ test("operator API answers return per-item errors in order and audit the panel o
   );
   assert.partialDeepStrictEqual(screened, [
     [first.id, first.id, "missing", first.id, second.id],
+    {
+      modelText: { description: goal.description, acceptance: goal.acceptance },
+    },
     { content: { title: goal.title } },
     { id: second.id, digest: second.digest, status: "pending" },
   ]);
@@ -447,6 +481,223 @@ test("operator API enforces decision-specific human requirements under an agent 
     { id: normal.id, error: { code: "approval-forbidden" } },
   );
   assert.equal(store.getProposal(normal.id)?.status, "pending");
+});
+
+test("Workplace single and batch approvals accept masked fields but block withheld fields", async () => {
+  using fixture = orchestratorFixture("lo-op-mask-");
+  const { root, store } = fixture;
+  const token = "sk-ant-" + "x".repeat(30);
+  const propose = (description: string) => {
+    const { id, digest } = store.proposeGoal(
+      { ...goal, description },
+      { kind: "operator" },
+    );
+    return { id, digest, decision: "approve" } as const;
+  };
+  const single = propose(`Example: ${token}`);
+  const batch = propose("Use demo-key in the example");
+  const withheld = propose("external-only");
+  const scanner = createCredentialScanner(
+    { leakPatterns: ["demo-key", "external-only|伏せ字］(?= for this)"] },
+    root,
+    () => {},
+  );
+  assert.deepEqual(await answerFromPanel(store, root, single, scanner), {
+    id: single.id,
+    ok: true,
+  });
+  const unmaskable = propose(`Example: ${token} for this`);
+  assert.deepEqual(
+    await answerManyFromPanel(
+      store,
+      root,
+      { answers: [unmaskable, batch] },
+      scanner,
+    ),
+    [
+      { id: unmaskable.id, error: { code: "write-failed" } },
+      { id: batch.id, ok: true },
+    ],
+  );
+  assert.deepEqual(
+    await answerFromPanel(store, root, withheld, async (...fields) => {
+      if (fields.includes("external-only")) throw new Error();
+    }),
+    { id: withheld.id, error: { code: "write-failed" } },
+  );
+  assert.equal(store.getProposal(unmaskable.id)?.status, "pending");
+  assert.equal(store.getProposal(withheld.id)?.status, "pending");
+});
+
+test("Workplace withholds prose spanning whitespace and blocks scope and policy matches", async () => {
+  using fixture = orchestratorFixture("lo-op-mask-");
+  const { root, store } = fixture;
+  const origin = { kind: "operator" } as const;
+  const mockToken = "sk-ant-" + "x".repeat(30);
+  const proposal = store.proposeGoal(
+    {
+      ...goal,
+      description:
+        '{"accessToken":"Approval relevant prose","refreshToken":"fake","expiresAt":123}',
+      scope: { ...goal.scope, paths: [`docs/${mockToken}/.github/workflows`] },
+    },
+    origin,
+  );
+  const display = await operatorProposal(store, root, proposal.id);
+  assert.partialDeepStrictEqual(display, {
+    modelText: { description: { withheld: true } },
+    paths: { withheld: true },
+  });
+  assert.equal(display?.maskedFields, undefined);
+  assert.doesNotMatch(
+    JSON.stringify(display),
+    /Approval relevant prose|sk-ant-/,
+  );
+
+  const approve = (
+    { id, digest }: { id: string; digest: string },
+    patterns: string[] = [],
+  ) =>
+    answerFromPanel(
+      store,
+      root,
+      { id, digest, decision: "approve" },
+      createCredentialScanner({ leakPatterns: patterns }, root, () => {}),
+    );
+  for (const blocked of [
+    proposal,
+    store.proposeGoal(
+      {
+        ...goal,
+        scope: {
+          ...goal.scope,
+          paths: [`docs/${mockToken}/.github/workflows`],
+        },
+      },
+      origin,
+    ),
+    store.proposeGoal(
+      {
+        ...goal,
+        description:
+          '{"accessToken":"Approval relevant prose","refreshToken":"fake","expiresAt":123}',
+      },
+      origin,
+    ),
+  ]) {
+    assert.deepEqual(await approve(blocked), {
+      id: blocked.id,
+      error: { code: "write-failed" },
+    });
+    assert.equal(store.getProposal(blocked.id)?.status, "pending");
+  }
+  const scoped = store.proposeGoal(goal, origin);
+  assert.deepEqual(await approve(scoped, ["^base$"]), {
+    id: scoped.id,
+    error: { code: "write-failed" },
+  });
+
+  const { goalId } = store.decide(scoped.id, {
+    digest: scoped.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  store.setRules(
+    [
+      {
+        id: "private-rule",
+        name: "Private Rule",
+        gate: "task-registration",
+        action: "human",
+        enabled: true,
+        order: 0,
+        conditions: { pathsWithin: ["src/**"] },
+      },
+    ],
+    "cli",
+  );
+  const task = store.proposeTask(
+    {
+      title: "Task",
+      goalId,
+      description: "Update the source.",
+      acceptance: ["Pass"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["src/a.ts"],
+      dependsOn: [],
+      budgets: goal.scope.budgets,
+      policies: { integration: "human" },
+    },
+    { kind: "actor", actor: "Planner" },
+  );
+  const rules = ["^private-rule$", "^Private Rule$"];
+  const scan = createCredentialScanner({ leakPatterns: rules }, root, () => {});
+  assert.partialDeepStrictEqual(
+    await operatorProposal(store, root, task.id, scan),
+    {
+      ruleId: { withheld: true },
+      ruleName: { withheld: true },
+    },
+  );
+  for (const patterns of [rules, ['^\\{"integration":"human"\\}$']]) {
+    assert.deepEqual(await approve(task, patterns), {
+      id: task.id,
+      error: { code: "write-failed" },
+    });
+  }
+});
+
+test("panel approval refuses a rule changed after its preview was screened", async () => {
+  using fixture = orchestratorFixture("lo-rule-race-");
+  const { root, store } = fixture;
+  const origin = { kind: "operator" } as const;
+  const goalProposal = store.proposeGoal(goal, origin);
+  const { goalId } = store.decide(goalProposal.id, {
+    digest: goalProposal.digest,
+    decision: "approve",
+    answerer: { kind: "human" },
+  });
+  const rule = {
+    id: "source-rule",
+    name: "Source changes",
+    gate: "task-registration",
+    action: "human",
+    enabled: true,
+    order: 0,
+    conditions: { pathsWithin: ["src/**"] },
+  };
+  store.setRules([rule], "cli");
+  const proposal = store.proposeTask(
+    {
+      goalId,
+      title: "Task",
+      description: "Update the source.",
+      acceptance: ["Pass"],
+      actor: "Executor",
+      profile: "base",
+      paths: ["src/a.ts"],
+      dependsOn: [],
+      budgets: goal.scope.budgets,
+    },
+    { kind: "actor", actor: "Planner" },
+  );
+  assert.equal(proposal.status, "pending");
+  assert.equal(store.getProposalDetails(proposal.id)?.ruleName, rule.name);
+  const answer = await answerFromPanel(
+    store,
+    root,
+    { id: proposal.id, digest: proposal.digest, decision: "approve" },
+    async (source) => {
+      if (String(source).includes('"content":'))
+        store.setRules([{ ...rule, name: "Changed rule" }], "cli");
+    },
+  );
+  assert.deepEqual(answer, {
+    id: proposal.id,
+    error: { code: "stale-policy" },
+  });
+  assert.equal(store.getProposal(proposal.id)?.status, "pending");
 });
 
 test("panel takeover and a pinned Reviewer race like a human CLI answer", async () => {
@@ -1441,8 +1692,10 @@ test(
     const api = await listenOperatorApi({
       ...options,
       async scan(...sources) {
-        screened.push(JSON.parse(String(sources[0])));
-        if (reject) throw new Error("secret must not escape");
+        if (sources.length === 1) {
+          screened.push(JSON.parse(String(sources[0])));
+          if (reject) throw new Error("secret must not escape");
+        }
       },
     });
     try {

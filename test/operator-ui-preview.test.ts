@@ -37,6 +37,15 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
       assert.equal(row.answer.reject, true);
       assert.ok(row.next.includes(id));
     }
+    if (id === "proposal-masked") {
+      assert.equal(evidence.kind, "task");
+      assert.deepEqual(evidence.maskedFields, ["description"]);
+      assert.equal(
+        evidence.modelText.description,
+        "接続例にある ［伏せ字］ を環境変数に置き換えます。",
+      );
+      assert.doesNotMatch(JSON.stringify(evidence), /sk-ant-/);
+    }
     if (row.answer.approve && id !== withheldId)
       approvals.push({ id, digest, decision: "approve" });
     if (takeover) assert.equal(evidence.effectivePolicy, "agent");
@@ -45,8 +54,8 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     pending.filter((row) => "answer" in row && row.answer.takeover).length,
     2,
   );
-  assert.equal(pending.length, 9);
-  assert.equal(approvals.length, 5);
+  assert.equal(pending.length, 10);
+  assert.equal(approvals.length, 6);
   assert.ok(
     methods["proposal.get"]({ id: "proposal-out-of-scope" })
       .humanAnswerRequired,
@@ -84,7 +93,7 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
   const detailed = methods["goal.get"]({ id: "G1" });
   assert.deepEqual(detailed.turn, {
     owner: "human",
-    reason: { kind: "approvals", count: 5 },
+    reason: { kind: "approvals", count: 6 },
   });
   assert.deepEqual(
     new Set(detailed.timeline.map(({ kind }) => kind)),
@@ -100,7 +109,7 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
   assert.equal(detailed.policyOverrides["task-registration"], "human");
   const activity = methods["activity.get"]({});
   assert.ok(activity.running.length);
-  assert.equal(activity.yourTurn, 11);
+  assert.equal(activity.yourTurn, 12);
   const exportable = methods["goal.get"]({ id: "G5" });
   assert.equal(exportable.turn.reason.kind, "exportable");
   assert.ok(exportable.exportPreview);
@@ -139,6 +148,16 @@ test("preview fixtures cover Workplace panes and keep answers in memory", () => 
     !methods["inbox.list"]({}).some((row) => row.id === takeoverRow.id),
   );
 
+  const withheld = methods["proposal.get"]({ id: withheldId });
+  assert.throws(
+    () =>
+      methods["proposal.answer"]({
+        id: withheldId,
+        digest: withheld.digest,
+        decision: "approve",
+      }),
+    { message: "write-failed" },
+  );
   const outcomes = methods["proposal.answerMany"]({ answers: approvals });
   assert.ok(outcomes.every((outcome) => "ok" in outcome));
   assert.equal(methods["goal.list"]({}).length, goals.length + 1);

@@ -21,7 +21,10 @@ import { isTerminalSize } from "../sandbox-runtime.ts";
 import { escapeTerminalControls } from "./analysis.ts";
 import { ClaudeRunError } from "./claude-errors.ts";
 import type { ConciergeTerminalHub } from "./concierge-terminal.ts";
-import type { CredentialScanner } from "./credential-scan.ts";
+import {
+  builtInCredentialScanner,
+  type CredentialScanner,
+} from "./credential-scan.ts";
 import {
   changedInboxIds,
   inboxLimit,
@@ -533,6 +536,25 @@ async function removeStaleSocket(path: string) {
   unlinkSync(path);
 }
 
+function ruleText({
+  ruleId,
+  ruleName,
+}: {
+  ruleId?: string | undefined;
+  ruleName?: string | undefined;
+}) {
+  return [ruleId, ruleName].filter((value) => value !== undefined);
+}
+
+// These fields repeat raw values also present in the proposal read model.
+async function checkWorkplaceText(
+  scan: CredentialScanner | undefined,
+  ...sources: string[]
+) {
+  const check = scan ?? builtInCredentialScanner;
+  if (sources.length) await check(...sources);
+}
+
 export async function dispatchPolicy(
   store: OrchestratorStore,
   method: string,
@@ -542,16 +564,25 @@ export async function dispatchPolicy(
   const origin = "operator-ui";
   try {
     switch (method) {
-      case "policy.get":
+      case "policy.get": {
         fields(params, []);
-        return { result: store.policySettings() };
+        const settings = store.policySettings();
+        await checkWorkplaceText(
+          scan,
+          ...settings.rules.flatMap(({ id, name }) => [id, name]),
+        );
+        return { result: settings };
+      }
       case "decision.history": {
         const { limit } = fields(params, ["limit"]);
-        return {
-          result: store.decisionHistory(
-            limit === undefined ? undefined : integer(limit, 1, 200),
-          ),
-        };
+        const history = store.decisionHistory(
+          limit === undefined ? undefined : integer(limit, 1, 200),
+        );
+        await checkWorkplaceText(
+          scan,
+          ...history.flatMap(({ setting }) => ruleText(setting)),
+        );
+        return { result: history };
       }
       case "policy.setDefault": {
         const { gate, policy } = fields(params, ["gate", "policy"]);
@@ -615,7 +646,11 @@ export async function dispatchPolicy(
   } catch (error) {
     if (error instanceof ContractError) return failure("invalid-params");
     if (error instanceof OrchestratorStoreError) return failure(error.code);
-    return failure("write-failed");
+    return failure(
+      method === "policy.get" || method === "decision.history"
+        ? "read-failed"
+        : "write-failed",
+    );
   }
 }
 
@@ -695,6 +730,27 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
     }
   }
 
+  // Registered Goal and Task details repeat the original proposal text.
+  // Check the individual fields as well, including anchored project patterns.
+  async function checkRegisteredProposalText(
+    {
+      description,
+      acceptance,
+    }: { description: string; acceptance: readonly string[] },
+    paths: readonly string[],
+    ...extra: string[]
+  ) {
+    await checkWorkplaceText(
+      scan,
+      description,
+      ...acceptance,
+      JSON.stringify(acceptance),
+      ...paths,
+      JSON.stringify(paths),
+      ...extra,
+    );
+  }
+
   async function dispatch(method: string, params: unknown): Promise<Reply> {
     try {
       switch (method) {
@@ -749,11 +805,22 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
           store.markInboxSeen(known);
           return { result: { marked: known.length } };
         }
-        case "status":
+        case "status": {
           fields(params, []);
+          const status = operatorStatus(store);
+          let { pending } = status;
+          try {
+            await checkWorkplaceText(scan, ...pending.flatMap(ruleText));
+          } catch {
+            // Keep repository connection metadata available to Workplace.
+            pending = pending.map(
+              ({ ruleId: _ruleId, ruleName: _ruleName, ...entry }) => entry,
+            );
+          }
           return {
             result: {
-              ...operatorStatus(store),
+              ...status,
+              pending,
               ...(options.repository && {
                 project: options.repository.project,
                 repositoryPath: escapeTerminalControls(
@@ -762,6 +829,7 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
               }),
             },
           };
+        }
         case "goal.list": {
           const { status } = fields(params, ["status"]);
           return {
@@ -779,12 +847,20 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
             identifier(id),
             options,
           );
-          return result ? { result } : failure("not-found");
+          if (!result) return failure("not-found");
+          await checkRegisteredProposalText(result, result.scope.paths);
+          return { result };
         }
         case "task.get": {
           const { id } = fields(params, ["id"]);
           const result = operatorTask(store, identifier(id));
-          return result ? { result } : failure("not-found");
+          if (!result) return failure("not-found");
+          await checkRegisteredProposalText(
+            result,
+            result.paths,
+            ...ruleText(result.effectiveIntegrationPolicy),
+          );
+          return { result };
         }
         case "task.list": {
           const { goalId } = fields(params, ["goalId"]);
@@ -916,6 +992,12 @@ export async function listenOperatorApi(options: OperatorApiOptions) {
                   if (Buffer.byteLength(serialized) > maxPendingBytes - 1024)
                     reply = failure("read-failed");
                   // Proposal text is screened field by field before escaping.
+                  else if (
+                    message.method === "goal.get" ||
+                    message.method === "task.get"
+                  )
+                    // Approved proposal text is also present in Goal and Task details.
+                    await (scan ?? builtInCredentialScanner)(serialized);
                   else if (message.method !== "proposal.get")
                     await scan?.(serialized);
                 }

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { test } from "node:test";
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { goalBranch } from "../src/local-orchestrator/model.ts";
 import {
   operatorGoalList,
@@ -34,7 +36,7 @@ function setup(store: ReturnType<typeof orchestratorFixture>["store"]) {
     });
   const goalId = approve(store.proposeGoal(goal, { kind: "operator" })).goalId!;
   store.recordGoalCommit(goalId, base, "base");
-  const task = (title: string) => {
+  const task = (title: string, paths = ["src/a.ts"]) => {
     const receipt = store.proposeTask(
       {
         title,
@@ -43,7 +45,7 @@ function setup(store: ReturnType<typeof orchestratorFixture>["store"]) {
         acceptance: ["Pass"],
         actor: "Executor",
         profile: "base",
-        paths: ["src/a.ts"],
+        paths,
         budgets: goal.scope.budgets,
         dependsOn: [],
       },
@@ -92,7 +94,7 @@ test("proposal detail returns checked scope and screens each model field before 
     decision: "approve",
     answerer: { kind: "human" },
   });
-  const synthetic = "bearer " + "x".repeat(24);
+  const synthetic = "sk-ant-" + "x".repeat(24);
   const task = store.proposeTask(
     {
       title: "Task",
@@ -111,14 +113,239 @@ test("proposal detail returns checked scope and screens each model field before 
   assert.ok(isProposal(taskDetail));
   assert.partialDeepStrictEqual(taskDetail, {
     digest: task.digest,
+    maskedFields: ["description"],
     origin: host,
     pathViolations: ["outside/file.ts"],
     modelText: {
-      description: { withheld: true },
+      description: "［伏せ字］",
       acceptance: ["First\nSecond\nThird\\u0009line"],
     },
   });
   assert.ok(!JSON.stringify(taskDetail).includes(synthetic));
+  const scoped = await operatorProposal(
+    store,
+    state.root,
+    task.id,
+    createCredentialScanner(
+      { leakPatterns: ["^outside/file\\.ts$"] },
+      state.root,
+      () => {},
+    ),
+  );
+  assert.partialDeepStrictEqual(scoped, {
+    paths: { withheld: true },
+    pathViolations: { withheld: true },
+    maskedFields: ["description"],
+  });
+});
+
+test("configured proposal screening masks fields and withholds on failed re-scan, timeout or bounds", async () => {
+  using state = orchestratorFixture("lo-mask-");
+  const { root, store } = state;
+  const token = "sk-ant-" + "x".repeat(30);
+  const origin = { kind: "operator" } as const;
+  const proposal = store.proposeGoal(
+    {
+      ...goal,
+      description: `Use ${token} for the example.`,
+      acceptance: ["Keep demo-12 private", "Keep demo-34 private"],
+    },
+    origin,
+  );
+  const scanner = (leakPatterns: string[]) =>
+    createCredentialScanner({ leakPatterns }, root, () => {});
+  const masked = await operatorProposal(
+    store,
+    root,
+    proposal.id,
+    scanner(["demo-\\d+"]),
+  );
+  assert.ok(isProposal(masked));
+  assert.partialDeepStrictEqual(masked, {
+    digest: proposal.digest,
+    maskedFields: ["description", "acceptance"],
+    modelText: {
+      description: "Use ［伏せ字］ for the example.",
+      acceptance: ["Keep ［伏せ字］ private", "Keep ［伏せ字］ private"],
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(masked), /sk-ant-|demo-/);
+  const stored = store.getProposal(proposal.id);
+  assert.ok(stored?.kind === "goal");
+  assert.equal(stored.content.description, `Use ${token} for the example.`);
+
+  const check = async (acceptance: string[], patterns: string[]) => {
+    const { id } = store.proposeGoal({ ...goal, acceptance }, origin);
+    return operatorProposal(store, root, id, scanner(patterns));
+  };
+  for (const display of [
+    await check(["Keep demo-12 private"], ["demo-\\d+", "伏せ字"]),
+    await check(["a".repeat(120) + "!"], ["(a+)+$"]),
+    await check(
+      Array.from(
+        { length: 11 },
+        (_, index) => `${index} ${Array(3).fill(token).join(" ")}`,
+      ),
+      [],
+    ),
+    await check(["alpha", "beta"], ['"alpha","beta"']),
+    await check(["alpha", "beta"], ['alpha","beta', "alpha"]),
+  ]) {
+    assert.ok(display?.kind === "goal");
+    assert.deepEqual(display.modelText.acceptance, { withheld: true });
+    assert.equal(display.maskedFields, undefined);
+  }
+});
+
+test("display reads record credential evidence once per digest", async () => {
+  using state = orchestratorFixture("lo-mask-");
+  const { root, store } = state;
+  const evidence = () =>
+    readdirSync(root).filter((file) => file.startsWith("credential-leak-"));
+  const token = "demo-" + "x".repeat(30);
+  const scan = createCredentialScanner(
+    { leakPatterns: ["demo-x{6}"] },
+    root,
+    () => {},
+  );
+  const create = (title: string) =>
+    store.proposeGoal(
+      {
+        ...goal,
+        title,
+        description: `Use ${token} here`,
+        acceptance: [`Keep password=${token} private`],
+      },
+      { kind: "operator" },
+    );
+  const first = create("First");
+  const displays = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      operatorProposal(store, root, first.id, scan),
+    ),
+  );
+  for (const display of displays) {
+    assert.partialDeepStrictEqual(display, {
+      maskedFields: ["description", "acceptance"],
+      modelText: {
+        description: "Use ［伏せ字］ here",
+        acceptance: ["Keep ［伏せ字］ private"],
+      },
+    });
+  }
+  assert.equal(evidence().length, 1);
+  await operatorProposal(store, root, create("Second").id, scan);
+  assert.equal(evidence().length, 2);
+  await assert.rejects(scan(token), { code: "credential-leak" });
+  await assert.rejects(scan(token), { code: "credential-leak" });
+  assert.equal(evidence().length, 4);
+});
+
+test("the proposal read withholds distributed credentials and fails closed when evidence cannot be written", async () => {
+  using state = orchestratorFixture("lo-mask-");
+  const { root, filename, store } = state;
+  const origin = { kind: "operator" } as const;
+  const split = store.proposeGoal(
+    {
+      ...goal,
+      description: '"accessToken":"demo-access"',
+      acceptance: ['"refreshToken":"demo-refresh", "expiresAt":123'],
+    },
+    origin,
+  );
+  const splitDisplay = await operatorProposal(store, root, split.id);
+  assert.ok(isProposal(splitDisplay));
+  assert.deepEqual(splitDisplay.modelText, {
+    description: { withheld: true },
+    acceptance: { withheld: true },
+  });
+  assert.doesNotMatch(JSON.stringify(splitDisplay), /demo-access|demo-refresh/);
+
+  const crossField = store.proposeGoal(
+    {
+      ...goal,
+      description: "demo-alpha",
+      acceptance: ["keep demo-beta private"],
+    },
+    origin,
+  );
+  const crossFieldScan = createCredentialScanner(
+    {
+      leakPatterns: [
+        "demo-alpha",
+        String.raw`demo-alpha","acceptance":\["keep demo-beta`,
+      ],
+    },
+    root,
+    () => {},
+  );
+  const crossFieldDisplay = await operatorProposal(
+    store,
+    root,
+    crossField.id,
+    crossFieldScan,
+  );
+  assert.ok(isProposal(crossFieldDisplay));
+  assert.deepEqual(crossFieldDisplay.modelText, {
+    description: { withheld: true },
+    acceptance: { withheld: true },
+  });
+  assert.doesNotMatch(
+    JSON.stringify(crossFieldDisplay),
+    /demo-alpha|demo-beta/,
+  );
+
+  const proposal = store.proposeGoal(
+    { ...goal, description: "demo-project-key" },
+    origin,
+  );
+  const scan = createCredentialScanner(
+    { leakPatterns: ["demo-project-key"] },
+    filename,
+    () => {},
+  );
+  const display = await operatorProposal(store, root, proposal.id, scan);
+  assert.ok(isProposal(display) && display.kind === "goal");
+  assert.deepEqual(display.modelText.description, { withheld: true });
+});
+
+test("a credential in a changed path withholds both the paths and the Git stat", async () => {
+  using state = orchestratorFixture("lo-mask-path-");
+  const { store } = state;
+  const { goalId, task } = setup(store);
+  const taskId = task("T", ["src/"]);
+  store.claimTask(taskId);
+  const review = store.createExecution({
+    taskId,
+    actor: "Reviewer",
+    mode: "review",
+    requestedBy: host,
+  }).id;
+  store.startExecution(review);
+  const pin = { base, candidate: "b".repeat(40), digest: "c".repeat(64) };
+  store.finishExecution(review, "succeeded", { review: "pass", pin });
+  const token = "sk-ant-" + "x".repeat(30);
+  const proposal = store.proposeIntegration(
+    {
+      taskId,
+      goalId,
+      branch: goalBranch(goalId),
+      ...pin,
+      changedPaths: [`src/${token}@example.ts`],
+      review: { result: "pass", notes: `Example: ${token}` },
+    },
+    review,
+  );
+  const display = await operatorProposal(store, state.root, proposal.id);
+  assert.ok(isProposal(display));
+  assert.partialDeepStrictEqual(display, {
+    digest: proposal.digest,
+    maskedFields: ["findings"],
+    changedPaths: { withheld: true },
+    diffStat: { withheld: true },
+    modelText: { verdict: "pass", findings: "Example: ［伏せ字］" },
+  });
+  assert.ok(!JSON.stringify(display).includes(token));
 });
 
 test("an integrating Task reads as awaiting integration, not running", () => {

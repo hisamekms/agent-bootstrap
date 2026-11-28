@@ -165,16 +165,38 @@ creation event names the successful, candidate-pinned Reviewer execution.
 The execution is immutable, and the proposal digest also covers the
 findings saved in the proposal row.
 
-The host screens each model field before escaping terminal controls.
-With a configured scanner, it uses the same scanner as the candidate
-diff. Otherwise it uses the built-in credential check for the new
-fields and the Git stat. A failed check replaces the field with a marker.
-If the changed paths are withheld, the display also withholds their Git
-stat. A withheld field blocks approval from Workplace. Rejection remains
-available, and the card directs the operator to the CLI to review the
-proposal. The panel keeps the raw fields off the browser connection,
-including when the operator answers in the AI's place. Host approvals
-also require the proposal preview to pass any configured credential scan.
+The host screens each field before escaping terminal controls. It uses the
+configured scanner when available and the built-in scanner otherwise. Only
+`description`, `acceptance`, `findings`, and `diffStat` can display the
+`［伏せ字］` marker. Each match expands to the surrounding run of
+non-whitespace characters, stopping at the enclosing quote in a JSON string
+value. For the built-in token triple, each span covers the entire JSON value.
+Project `leakPatterns` only need to detect the secret. The host expands each
+match to the whole token, merges overlaps, and screens the result again.
+
+A span containing whitespace after expansion causes the whole field to be
+withheld. A match in `paths`, `changedPaths`, `pathViolations`, `ruleId`,
+`ruleName`, or any other scope or policy field withholds the affected
+evidence and blocks Workplace approval. Withheld changed paths also
+withhold the diff stat because Git can quote or abbreviate paths. The
+host withholds evidence when it cannot locate a match safely, including
+when a match crosses fields, a scanner lacks span support, a scan times out
+or fails, text is invalid, a field needs more than 32 replacements, or a
+re-scan still finds a match.
+
+The card shows 「伏せ字あり」 for masked fields and names them in the details.
+The confirmation strip calls out masking in single and batch approvals.
+Proposals with only masked fields can be approved in Workplace. The
+proposal digest still covers the stored proposal. The card names withheld
+fields and shows the CLI command. Rejection remains available. CLI `show`
+uses its existing host-terminal path.
+
+The host enforces these approval rules for single and batch requests,
+including takeover. Configured candidate diff and commit-message
+screening still applies. Masked display values exist only in the host
+read path and its response. They do not replace stored proposal content.
+Other Workplace reads that repeat those values still screen them before
+sending them to the browser.
 
 The connection settings show the project and its repository path
 relative to the configured repository root. The page keeps the bridge

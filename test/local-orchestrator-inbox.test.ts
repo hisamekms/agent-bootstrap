@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { projectStateDirectory } from "../src/config/layers.ts";
 import { addProject } from "../src/config/projects.ts";
+import { createCredentialScanner } from "../src/local-orchestrator/credential-scan.ts";
 import { projectInbox } from "../src/local-orchestrator/inbox.ts";
 import { LocalGitIntegration } from "../src/git-integration.ts";
 import {
@@ -297,15 +298,33 @@ test("inbox projects gates, failure, retry, budget, integration, and completion"
     diffStat: { withheld: true },
     changedFiles: 1,
   });
+  const message = t.mock.method(
+    LocalGitIntegration.prototype,
+    "candidateMessage",
+    async () => Uint8Array.of(0xff),
+  );
+  try {
+    const scan = createCredentialScanner({}, state.root, () => {});
+    assert.partialDeepStrictEqual(
+      await operatorProposal(store, state.root, integration.id, scan),
+      { changedPaths: ["src/a.ts"], diffStat: { withheld: true } },
+    );
+  } finally {
+    message.mock.restore();
+  }
   const stat = t.mock.method(
     LocalGitIntegration.prototype,
     "diffStat",
-    async () => " bearer " + "x".repeat(24) + " | 1 +\n",
+    async () => " sk-ant-" + "x".repeat(24) + " | 1 +\n",
   );
   try {
     assert.partialDeepStrictEqual(
       await operatorProposal(store, state.root, integration.id),
-      { changedPaths: ["src/a.ts"], diffStat: { withheld: true } },
+      {
+        changedPaths: ["src/a.ts"],
+        diffStat: " ［伏せ字］ | 1 +\n",
+        maskedFields: ["diffStat"],
+      },
     );
   } finally {
     stat.mock.restore();

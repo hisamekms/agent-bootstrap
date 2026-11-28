@@ -558,6 +558,65 @@ test("a stale approval reopens the card and previews the new digest before resub
   assert.deepEqual(submitted, [first, updated]);
 });
 
+test("masked proposal fields show their names and allow single approval", async (t) => {
+  const { inbox, click, findAction } = decisionDocument(t);
+  const submitted: Methods["proposal.answer"]["params"][] = [];
+  const panel = createInboxPanel(
+    {
+      async request<M extends keyof Methods>(
+        method: M,
+        params: Methods[M]["params"],
+      ) {
+        if (method === "proposal.get")
+          return {
+            ...details(first),
+            maskedFields: ["description", "acceptance"],
+            modelText: {
+              description: "説明の例 ［伏せ字］",
+              acceptance: ["条件 ［伏せ字］"],
+            },
+          } as Methods[M]["result"];
+        assert.equal(method, "proposal.answer");
+        submitted.push(params as Methods["proposal.answer"]["params"]);
+        return { id, ok: true } as Methods[M]["result"];
+      },
+    },
+    () => {},
+    () => {},
+    () => {},
+  );
+  panel.render(
+    [row(first)],
+    () => [],
+    () => undefined,
+  );
+  await settle();
+  const chip = inbox.find((node) => node.className.includes("warning-summary"));
+  assert.match(chip!.visibleText, /伏せ字あり/);
+  assert.ok(chip!.querySelector("svg"));
+  assert.equal(
+    findAction("approve:goal-registration:proposal")!.disabled,
+    false,
+  );
+  click("detail:goal-registration:proposal");
+  const detail = inbox.querySelector(".decision-detail")!;
+  assert.match(
+    detail.visibleText,
+    /説明・受け入れ条件に資格情報らしい文字列があり、伏せています。/,
+  );
+  assert.match(detail.visibleText, /説明の例 ［伏せ字］/);
+  click("detail:goal-registration:proposal");
+  click("approve:goal-registration:proposal");
+  await settle();
+  assert.match(
+    inbox.querySelector(".confirm")!.visibleText,
+    /伏せ字を含む提案があります。/,
+  );
+  click("submit-answer");
+  await settle();
+  assert.deepEqual(submitted, [{ id, digest: first, decision: "approve" }]);
+});
+
 test("withheld proposal fields hide approval and batch selection before opening details", async (t) => {
   const { inbox, click, findAction } = decisionDocument(t);
   const submitted: Methods["proposal.answer"]["params"][] = [];
@@ -607,6 +666,7 @@ test("withheld proposal fields hide approval and batch selection before opening 
     inbox.visibleText,
     /隠した項目があるため、画面からは承認できません。CLI で内容を確認してください。/,
   );
+  assert.match(inbox.visibleText, /非表示の項目は受け入れ条件です/);
   assert.match(inbox.visibleText, /approve proposal/);
   assert.deepEqual(submitted, []);
 
@@ -788,7 +848,7 @@ test("the closed card confirms on one line; opening detail approves the viewed d
   );
 });
 
-test("batch confirmation is one line and preserves both selected digests", async (t) => {
+test("batch confirmation warns about masked proposals and excludes withheld ones", async (t) => {
   const { batch, click, findAction } = decisionDocument(t);
   const second = "b".repeat(64);
   const calls: unknown[] = [];
@@ -801,8 +861,21 @@ test("batch confirmation is one line and preserves both selected digests", async
         if (method === "proposal.get") {
           const { id } = params as Methods["proposal.get"]["params"];
           return {
-            ...details(id === "another" ? second : first),
+            ...details(id === "proposal" ? first : second),
             id,
+            ...(id === "another" && {
+              maskedFields: ["acceptance"],
+              modelText: {
+                ...details(second).modelText,
+                acceptance: ["Pass ［伏せ字］"],
+              },
+            }),
+            ...(id === "withheld" && {
+              modelText: {
+                ...details(second).modelText,
+                acceptance: { withheld: true },
+              },
+            }),
           } as Methods[M]["result"];
         }
         assert.equal(method, "proposal.answerMany");
@@ -815,11 +888,12 @@ test("batch confirmation is one line and preserves both selected digests", async
     () => {},
   );
   panel.render(
-    [row(first), row(second, "another")],
+    [row(second, "withheld"), row(first), row(second, "another")],
     () => [],
     () => undefined,
   );
   await settle();
+  assert.ok(findAction("choose:goal-registration:withheld")!.hidden);
   for (const id of ["proposal", "another"]) {
     const check = findAction(`choose:goal-registration:${id}`)!;
     assert.equal(check.disabled, false);
@@ -831,7 +905,7 @@ test("batch confirmation is one line and preserves both selected digests", async
   await settle();
   assert.equal(
     batch.querySelector(".confirm")?.textContent,
-    "2 件を承認します。戻す承認を確定",
+    "2 件を承認します。 伏せ字を含む提案があります。戻す承認を確定",
   );
   click("submit-answer");
   await settle();
@@ -1883,7 +1957,7 @@ test("Workplace preview fixtures render refs, turns, and all Goal tabs", async (
   assert.equal(findAction("inline:goal-G9", goals), undefined);
   click("goal-G1", goals);
   await settle();
-  assert.match(goals.querySelector(".goal-now")!.visibleText, /判断 5 件/);
+  assert.match(goals.querySelector(".goal-now")!.visibleText, /判断 6 件/);
   assert.deepEqual(taskCardRefs(goals), []);
   for (const [tab, text] of [
     ["delegation", /この Goal の任せ方/],

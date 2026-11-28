@@ -132,6 +132,28 @@ test("proposal messages reject malformed field markers, controls, and review evi
       modelText: { verdict: "pass", findings: "First\nSecond" },
     }),
   );
+  const masked = {
+    ...details,
+    diffStat: " ［伏せ字］ | 1 +\n",
+    maskedFields: ["diffStat"],
+  };
+  assert.ok(isProposal(masked));
+  for (const fields of [
+    [],
+    ["diffStat", "diffStat"],
+    ["changedPaths"],
+    ["findings"],
+    ["unexpected"],
+    "changedPaths",
+  ])
+    assert.ok(!isProposal({ ...masked, maskedFields: fields }));
+  assert.ok(
+    !isProposal({
+      ...details,
+      changedPaths: ["a/［伏せ字］.txt"],
+      maskedFields: ["changedPaths"],
+    }),
+  );
   for (const replacement of [
     { changedFiles: 2 },
     { changedLines: -1 },
