@@ -423,6 +423,14 @@ function taskSummary(
     timing?.activeExecution,
     "code" in task ? (task.code as string | undefined) : undefined,
   );
+  const verification =
+    (stage === "review" ||
+      (((stage === "running" && !timing?.activeExecution) ||
+        stage === "failed") &&
+        timing?.lastStage === "review")) &&
+    timing?.lastReviewMode === "verification";
+  const failureStage =
+    stage === "failed" ? (timing?.lastStage ?? "registered") : undefined;
   const started = timing?.times.running;
   const stageStarted =
     stage === "failed" || stage === "cancelled"
@@ -434,6 +442,8 @@ function taskSummary(
     title: content.title,
     status,
     stage,
+    ...(verification && { verification: true as const }),
+    ...(failureStage && { failureStage }),
     retries,
     attempt: {
       current: attempts,
@@ -481,6 +491,7 @@ export function operatorGoal(store: OrchestratorStore, key: string) {
     policyOverrides: store.goalPolicyOverrides(id),
     autoMergeConfirmations: store.goalAutoMergeConfirmations(id),
     tasks: taskSummaries(store, id),
+    timeline: store.operatorGoalTimeline(id),
   };
 }
 

@@ -4018,6 +4018,37 @@ export class OrchestratorStore {
     );
   }
 
+  operatorGoalTimeline(goalId: string) {
+    return this.#read(() =>
+      this.#db
+        .query<{
+          kind: "approved" | "rejected" | "integrated" | "exported";
+          at: string;
+          ref: string | null;
+          proposalKind: "goal" | "task" | "integration" | null;
+        }>(
+          `SELECT kind, at, ref, proposalKind FROM (
+             SELECT CASE a.decision WHEN 'approve' THEN 'approved' ELSE 'rejected' END AS kind,
+                    e.at, coalesce(t.ref, g.ref) AS ref, p.kind AS proposalKind, e.rowid AS position
+             FROM approvals a JOIN proposals p ON p.id = a.proposal_id
+               JOIN events e ON e.subject_kind = 'proposal' AND e.subject_id = p.id
+                 AND e.kind = 'proposal.decided' AND json_extract(e.data, '$.approvalId') = a.id
+               LEFT JOIN tasks t ON t.proposal_id = p.id OR t.id = json_extract(p.content_json, '$.taskId')
+               LEFT JOIN goals g ON g.proposal_id = p.id
+             WHERE coalesce(g.id, json_extract(p.content_json, '$.goalId')) = ?1
+             UNION ALL
+             SELECT 'integrated', e.at, t.ref, NULL, e.rowid
+             FROM events e JOIN tasks t ON t.id = e.subject_id
+             WHERE e.subject_kind = 'task' AND e.kind = 'task.integrated' AND t.goal_id = ?1
+             UNION ALL
+             SELECT 'exported', e.at, NULL, NULL, e.rowid FROM events e
+             WHERE e.subject_kind = 'goal' AND e.kind = 'goal.exported' AND e.subject_id = ?1
+           ) ORDER BY at DESC, position DESC LIMIT 20`,
+        )
+        .all(this.#goalId(identifier(goalId))),
+    );
+  }
+
   operatorTaskTimeline(goalId: string, taskId?: string) {
     return this.#read(() =>
       this.#db
@@ -4408,6 +4439,7 @@ export class OrchestratorStore {
           total: number;
           done: number;
           failed: number;
+          cancelled: number;
           running: number;
           awaitingIntegration: number;
           failedRef: string | null;
@@ -4427,6 +4459,7 @@ export class OrchestratorStore {
              SELECT t.goal_id, count(*) AS total,
                count(*) FILTER (WHERE t.status = 'succeeded') AS done,
                count(*) FILTER (WHERE t.status = 'failed') AS failed,
+               count(*) FILTER (WHERE t.status = 'cancelled') AS cancelled,
                count(*) FILTER (WHERE t.status = 'running') AS running,
                count(*) FILTER (WHERE t.status = 'awaiting-integration') AS awaitingIntegration,
                min(t.rowid) FILTER (WHERE t.status = 'failed') AS firstFailed,
@@ -4447,7 +4480,7 @@ export class OrchestratorStore {
            )
            SELECT g.id AS goalId, coalesce(t.total, 0) AS total,
              coalesce(t.done, 0) AS done, coalesce(t.failed, 0) AS failed,
-             coalesce(t.running, 0) AS running,
+             coalesce(t.running, 0) AS running, coalesce(t.cancelled, 0) AS cancelled,
              coalesce(t.awaitingIntegration, 0) AS awaitingIntegration,
              failed.ref AS failedRef, coalesce((
                SELECT json_extract(e.data, '$.code') FROM events e
@@ -4480,6 +4513,7 @@ export class OrchestratorStore {
             total,
             done,
             failed,
+            cancelled,
             running,
             awaitingIntegration,
             ...facts
@@ -4487,7 +4521,14 @@ export class OrchestratorStore {
             goalId,
             {
               ...facts,
-              progress: { total, done, failed, running, awaitingIntegration },
+              progress: {
+                total,
+                done,
+                failed,
+                running,
+                awaitingIntegration,
+                ...(cancelled > 0 && { cancelled }),
+              },
               approvals: approvals.get(goalId) ?? 0,
             },
           ],

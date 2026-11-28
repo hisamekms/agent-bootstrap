@@ -135,13 +135,14 @@ new ResizeObserver(fitTerminal).observe(terminal);
 function transferInput() {
   if (terminalState === "ended") return;
   setTerminalState("read-only");
-  terminalNotice.textContent = "Read-only. Another client has Concierge input.";
+  terminalNotice.textContent =
+    "別の画面で Concierge に入力しているため、ここでは読み取り専用です。";
 }
 
 function terminalError(error: Error) {
   if (error.message === "terminal-read-only") transferInput();
   else if (error.message !== "disconnected" && terminalState === "interactive")
-    terminalNotice.textContent = "Could not send data to the Concierge.";
+    terminalNotice.textContent = "Concierge に入力を送れませんでした。";
 }
 
 function sendInput(bytes: Uint8Array) {
@@ -173,8 +174,8 @@ function openChannel() {
         setTerminalState("ended");
         terminalNotice.textContent =
           params.exitCode === null
-            ? "Concierge exited without an exit code."
-            : `Concierge exited (code ${params.exitCode}).`;
+            ? "Concierge が終了しました。終了コードはありません。"
+            : `Concierge が終了しました（コード: ${params.exitCode}）。`;
         break;
       case "concierge.notice":
         if (params.code === "input-transferred") transferInput();
